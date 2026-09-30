@@ -752,6 +752,12 @@ impl SearchEngine for CompositeEngine {
     }
 
     #[cfg(test)]
+    fn inject_replay_commit_failure_for_test(&self, raw_os_error: i32, successful_commits: usize) {
+        self.text
+            .inject_replay_commit_failure_for_test(raw_os_error, successful_commits);
+    }
+
+    #[cfg(test)]
     fn writer_is_failed_for_test(&self) -> bool {
         self.text.writer_is_failed_for_test()
     }

@@ -370,6 +370,12 @@ pub struct HotEngine {
     #[cfg(test)]
     refresh_after_commit_release_receiver: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     #[cfg(test)]
+    replay_after_reset_sender: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    #[cfg(test)]
+    replay_after_reset_release_receiver: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    #[cfg(test)]
+    replay_commit_failure: Mutex<Option<(i32, usize)>>,
+    #[cfg(test)]
     peer_recovery_snapshot_ready_sender: Mutex<Option<std::sync::mpsc::Sender<u64>>>,
     #[cfg(test)]
     peer_recovery_snapshot_release_receiver: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
@@ -1028,6 +1034,12 @@ impl HotEngine {
             refresh_after_commit_sender: Mutex::new(None),
             #[cfg(test)]
             refresh_after_commit_release_receiver: Mutex::new(None),
+            #[cfg(test)]
+            replay_after_reset_sender: Mutex::new(None),
+            #[cfg(test)]
+            replay_after_reset_release_receiver: Mutex::new(None),
+            #[cfg(test)]
+            replay_commit_failure: Mutex::new(None),
             #[cfg(test)]
             peer_recovery_snapshot_ready_sender: Mutex::new(None),
             #[cfg(test)]
@@ -2360,6 +2372,17 @@ impl HotEngine {
             .reload()
             .with_context(|| format!("reader reload failed before {context} replay"))?;
         self.reset_apply_state_to_commit(committed.clone())?;
+        #[cfg(test)]
+        if let Some(sender) = self.replay_after_reset_sender.lock().unwrap().take() {
+            sender.send(()).unwrap();
+            self.replay_after_reset_release_receiver
+                .lock()
+                .unwrap()
+                .take()
+                .expect("replay pause requires a release receiver")
+                .recv()
+                .unwrap();
+        }
         #[cfg(feature = "protocol-trace")]
         let trace_copy = crate::protocol_trace::current_open_copy();
         #[cfg(feature = "protocol-trace")]
@@ -2456,6 +2479,19 @@ impl HotEngine {
                     |_| Ok(()),
                 );
                 result?;
+                #[cfg(test)]
+                {
+                    let mut failure = self.replay_commit_failure.lock().unwrap();
+                    if let Some((raw_os_error, successful_commits)) = failure.as_mut() {
+                        if *successful_commits == 0 {
+                            let error = std::io::Error::from_raw_os_error(*raw_os_error);
+                            *failure = None;
+                            writer_state.fail(format!("injected replay commit failure: {error}"));
+                            return Err(error).context("injected replay commit failure");
+                        }
+                        *successful_commits -= 1;
+                    }
+                }
                 let boundary = self.current_committed_boundary()?;
                 let boundary = self.commit_writer_at_boundary(writer_state, context, boundary)?;
                 self.persist_committed_boundary(&boundary)?;
@@ -3683,6 +3719,25 @@ impl HotEngine {
             .refresh_after_commit_release_receiver
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(release);
+    }
+
+    #[cfg(test)]
+    fn pause_after_replay_reset_for_test(
+        &self,
+        sender: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.replay_after_reset_sender.lock().unwrap() = Some(sender);
+        *self.replay_after_reset_release_receiver.lock().unwrap() = Some(release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_replay_commit_failure_for_test(
+        &self,
+        raw_os_error: i32,
+        successful_commits: usize,
+    ) {
+        *self.replay_commit_failure.lock().unwrap() = Some((raw_os_error, successful_commits));
     }
 
     #[cfg(test)]
@@ -7728,6 +7783,11 @@ impl tantivy::collector::SegmentCollector for AggSegmentCollector {
 
 impl super::SearchEngine for HotEngine {
     #[cfg(test)]
+    fn inject_replay_commit_failure_for_test(&self, raw_os_error: i32, successful_commits: usize) {
+        HotEngine::inject_replay_commit_failure_for_test(self, raw_os_error, successful_commits);
+    }
+
+    #[cfg(test)]
     fn writer_is_failed_for_test(&self) -> bool {
         HotEngine::writer_is_failed_for_test(self)
     }
@@ -9487,6 +9547,9 @@ mod tests {
             refresh_before_writer_sender: Mutex::new(None),
             refresh_after_commit_sender: Mutex::new(None),
             refresh_after_commit_release_receiver: Mutex::new(None),
+            replay_after_reset_sender: Mutex::new(None),
+            replay_after_reset_release_receiver: Mutex::new(None),
+            replay_commit_failure: Mutex::new(None),
             peer_recovery_snapshot_ready_sender: Mutex::new(None),
             peer_recovery_snapshot_release_receiver: Mutex::new(None),
             field_registry: RwLock::new(FieldRegistry {
@@ -10650,6 +10713,238 @@ mod tests {
         refresh.join().unwrap().unwrap();
 
         assert_eq!(engine.get_document("doc").unwrap().unwrap()["value"], 2);
+    }
+
+    fn realtime_get_while_translog_is_held(
+        engine: Arc<HotEngine>,
+        doc_id: &'static str,
+    ) -> Result<Option<super::super::DocumentRead>> {
+        let translog = engine.translog.lock().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let get_engine = engine.clone();
+        let get = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(get_engine.get_document_with_metadata(doc_id, true))
+                .unwrap();
+        });
+        started_rx.recv_timeout(TEST_SYNC_TIMEOUT).unwrap();
+        let result = result_rx.recv_timeout(TEST_SYNC_TIMEOUT);
+        drop(translog);
+        get.join().unwrap();
+        result.expect("realtime GET must complete before the translog mutex is released")
+    }
+
+    #[test]
+    fn realtime_get_map_miss_does_not_wait_for_translog() {
+        let (_dir, engine) = create_engine();
+        let receipt = engine
+            .add_document_with_receipt("old", json!({"value": 1}))
+            .unwrap();
+        engine.refresh().unwrap();
+        assert!(
+            engine
+                .apply_state
+                .lock()
+                .unwrap()
+                .versions
+                .lookup("old")
+                .unwrap()
+                .is_none()
+        );
+        let document = realtime_get_while_translog_is_held(Arc::new(engine), "old")
+            .unwrap()
+            .unwrap();
+        assert_eq!(document.source, json!({"value": 1}));
+        assert_eq!(document.seq_no, receipt.seq_no);
+        assert_eq!(document.primary_term, receipt.primary_term);
+    }
+
+    #[test]
+    fn realtime_get_tombstone_does_not_wait_for_translog() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("deleted", json!({"value": 1})).unwrap();
+        engine.refresh().unwrap();
+        engine.delete_document("deleted").unwrap();
+        assert!(matches!(
+            engine
+                .apply_state
+                .lock()
+                .unwrap()
+                .versions
+                .lookup("deleted")
+                .unwrap(),
+            Some(VersionValue::Delete(_))
+        ));
+        assert!(
+            realtime_get_while_translog_is_held(Arc::new(engine), "deleted")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn realtime_get_during_replay_never_returns_the_stale_commit() {
+        let (_dir, engine) = create_engine();
+        let engine = Arc::new(engine);
+        engine.add_document("doc", json!({"value": 1})).unwrap();
+        engine.refresh().unwrap();
+        let acknowledged = engine
+            .add_document_with_receipt("doc", json!({"value": 2}))
+            .unwrap();
+        engine.inject_refresh_commit_failures_for_test(1);
+        assert!(engine.refresh().is_err());
+        let (reset_tx, reset_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        engine.pause_after_replay_reset_for_test(reset_tx, release_rx);
+        let replay_engine = engine.clone();
+        let replay = std::thread::spawn(move || replay_engine.refresh());
+        reset_rx.recv_timeout(TEST_SYNC_TIMEOUT).unwrap();
+        assert!(
+            engine
+                .apply_state
+                .lock()
+                .unwrap()
+                .versions
+                .lookup("doc")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            engine
+                .get_document_with_metadata("doc", false)
+                .unwrap()
+                .unwrap()
+                .source,
+            json!({"value": 1})
+        );
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let get_engine = engine.clone();
+        let get = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(get_engine.get_document_with_metadata("doc", true))
+                .unwrap();
+        });
+        started_rx.recv_timeout(TEST_SYNC_TIMEOUT).unwrap();
+        let early = result_rx.recv_timeout(Duration::from_millis(100));
+        release_tx.send(()).unwrap();
+        replay.join().unwrap().unwrap();
+        get.join().unwrap();
+        if let Ok(result) = early {
+            assert!(
+                result.is_err(),
+                "GET returned during incomplete replay: {result:?}"
+            );
+        } else {
+            let document = result_rx
+                .recv_timeout(TEST_SYNC_TIMEOUT)
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(document.source, json!({"value": 2}));
+            assert_eq!(document.seq_no, acknowledged.seq_no);
+            assert_eq!(document.primary_term, acknowledged.primary_term);
+        }
+    }
+
+    #[test]
+    fn realtime_get_after_partial_replay_failure_fails_closed() {
+        let (_dir, engine) = create_engine();
+        let committed = engine
+            .add_document_with_receipt("old", json!({"value": 1}))
+            .unwrap();
+        engine.add_document("deleted", json!({"value": 1})).unwrap();
+        engine.refresh().unwrap();
+        let mut suffix = (0..2 * TRANSLOG_REPLAY_BATCH_SIZE)
+            .map(|i| (format!("filler-{i}"), json!({"value": i})))
+            .collect::<Vec<_>>();
+        suffix.push(("old".into(), json!({"value": 2})));
+        suffix.push(("fresh".into(), json!({"value": 3})));
+        let acknowledged = engine.bulk_add_documents_with_receipt(suffix).unwrap();
+        engine.delete_document("deleted").unwrap();
+        engine.inject_refresh_commit_failures_for_test(1);
+        assert!(engine.refresh().is_err());
+        engine.inject_replay_commit_failure_for_test(28, 1);
+        let replay_error = engine.refresh().unwrap_err();
+        assert!(
+            replay_error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.raw_os_error() == Some(28))
+            }),
+            "{replay_error:#}"
+        );
+        assert!(engine.writer_is_failed_for_test());
+        let reads = ["old", "fresh", "deleted", "filler-0"]
+            .map(|doc_id| (doc_id, engine.get_document_with_metadata(doc_id, true)));
+        for (doc_id, result) in reads {
+            let error = result.expect_err(&format!(
+                "GET [{doc_id}] must not trust a partial version map after replay failure"
+            ));
+            assert!(error.is::<TantivyWriterUnavailableError>(), "{error:#}");
+            assert!(format!("{error:#}").contains("No space left"), "{error:#}");
+        }
+        assert_eq!(
+            engine
+                .get_document_with_metadata("old", false)
+                .unwrap()
+                .unwrap()
+                .source,
+            json!({"value": 1})
+        );
+        let error = engine
+            .add_document_with_condition_at_term(
+                "old",
+                json!({"wrong": true}),
+                committed.primary_term,
+                super::super::WriteCondition::IfMatch {
+                    seq_no: committed.seq_no,
+                    primary_term: committed.primary_term,
+                },
+            )
+            .unwrap_err();
+        assert!(
+            error.is::<super::super::VersionConflictError>(),
+            "{error:#}"
+        );
+        let error = engine
+            .add_document_with_condition_at_term(
+                "fresh",
+                json!({"wrong": true}),
+                acknowledged.primary_term,
+                super::super::WriteCondition::Create,
+            )
+            .unwrap_err();
+        assert!(
+            error.is::<super::super::VersionConflictError>(),
+            "{error:#}"
+        );
+        assert_eq!(
+            engine
+                .get_document_with_metadata("old", true)
+                .unwrap()
+                .unwrap()
+                .source,
+            json!({"value": 2})
+        );
+        assert_eq!(
+            engine
+                .get_document_with_metadata("fresh", true)
+                .unwrap()
+                .unwrap()
+                .source,
+            json!({"value": 3})
+        );
+        assert!(
+            engine
+                .get_document_with_metadata("deleted", true)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

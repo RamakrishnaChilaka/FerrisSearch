@@ -433,6 +433,15 @@ pub trait SearchEngine: Send + Sync {
     fn inject_engine_apply_failures_for_test(&self, _raw_os_error: i32, _attempts: usize) {}
 
     #[cfg(test)]
+    fn inject_replay_commit_failure_for_test(
+        &self,
+        _raw_os_error: i32,
+        _successful_commits: usize,
+    ) {
+        panic!("replay commit fault injection requires a local shard engine");
+    }
+
+    #[cfg(test)]
     fn writer_is_failed_for_test(&self) -> bool {
         false
     }
