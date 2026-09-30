@@ -309,16 +309,7 @@ impl TransportClient {
         let mut client = self.connect(&node.host, node.transport_port).await?;
         let documents_json: Vec<Vec<u8>> = docs
             .iter()
-            .map(|(id, payload)| {
-                // Write directly to buffer — avoids creating intermediate serde_json::Value
-                let mut buf = Vec::with_capacity(128 + id.len());
-                buf.extend_from_slice(b"{\"_doc_id\":");
-                serde_json::to_writer(&mut buf, id)?;
-                buf.extend_from_slice(b",\"_source\":");
-                serde_json::to_writer(&mut buf, payload)?;
-                buf.push(b'}');
-                Ok::<Vec<u8>, serde_json::Error>(buf)
-            })
+            .map(|(id, payload)| encode_bulk_document(id, payload))
             .collect::<Result<_, _>>()?;
         let request = tonic::Request::new(ShardBulkRequest {
             index_name: index_name.to_string(),
@@ -420,9 +411,7 @@ impl TransportClient {
         let mut client = self.connect(&node.host, node.transport_port).await?;
         let documents_json = docs
             .iter()
-            .map(|(doc_id, source, _)| {
-                serde_json::to_vec(&serde_json::json!({"_doc_id": doc_id, "_source": source}))
-            })
+            .map(|(doc_id, source, _)| encode_bulk_document(doc_id, source))
             .collect::<Result<Vec<_>, _>>()?;
         let response = client
             .bulk_index(tonic::Request::new(ShardBulkRequest {
@@ -1403,6 +1392,19 @@ impl TransportClient {
             error: (!response.error.is_empty()).then_some(response.error),
         }))
     }
+}
+
+fn encode_bulk_document(
+    doc_id: &str,
+    source: &serde_json::Value,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let mut buffer = Vec::with_capacity(128 + doc_id.len());
+    buffer.extend_from_slice(b"{\"_doc_id\":");
+    serde_json::to_writer(&mut buffer, doc_id)?;
+    buffer.extend_from_slice(b",\"_source\":");
+    serde_json::to_writer(&mut buffer, source)?;
+    buffer.push(b'}');
+    Ok(buffer)
 }
 
 fn decode_shard_doc_response(

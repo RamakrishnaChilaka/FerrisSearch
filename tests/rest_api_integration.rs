@@ -2022,6 +2022,74 @@ async fn rest_distributed_forcemerge_is_async_and_tracks_all_nodes() -> Result<(
 }
 
 #[tokio::test]
+async fn moved_bulk_and_update_sources_preserve_values_and_receipt_order() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let (status, _) = harness
+        .put_json(
+            "/owned-sources",
+            json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}}),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+    let original = json!({
+        "body": "quoted \" slash \\ newline \n",
+        "number": 9_007_199_254_740_993u64,
+        "metadata": {"labels": ["a", "b"], "null": null}
+    });
+    let latest = json!({
+        "body": "latest nested source",
+        "number": 9_007_199_254_740_993u64,
+        "metadata": {"labels": ["last"], "flag": true}
+    });
+    for endpoint in ["/owned-sources/_bulk?refresh=true", "/_bulk?refresh=true"] {
+        let mut ndjson = String::new();
+        for (doc_id, source) in [("same", &original), ("other", &original), ("same", &latest)] {
+            ndjson.push_str(
+                &json!({"index": {"_index": "owned-sources", "_id": doc_id}}).to_string(),
+            );
+            ndjson.push('\n');
+            ndjson.push_str(&source.to_string());
+            ndjson.push('\n');
+        }
+        let (status, body) = harness.post_ndjson(endpoint, &ndjson).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["errors"], false);
+        let items = body["items"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        let first_seq_no = items[0]["index"]["_seq_no"].as_u64().unwrap();
+        for (offset, doc_id) in ["same", "other", "same"].into_iter().enumerate() {
+            assert_eq!(items[offset]["index"]["_id"], doc_id);
+            assert_eq!(
+                items[offset]["index"]["_seq_no"].as_u64(),
+                Some(first_seq_no + offset as u64)
+            );
+        }
+        let (status, body) = harness.get_json("/owned-sources/_doc/same").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["_source"], latest);
+        let (_, body) = harness.get_json("/owned-sources/_doc/other").await?;
+        assert_eq!(body["_source"], original);
+    }
+    let (status, body) = harness
+        .post_json(
+            "/owned-sources/_update/same",
+            json!({"doc": {"metadata": {"updated": true}, "extra": "moved"}}),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"], "updated");
+    let (status, _) = harness.get_json("/owned-sources/_refresh").await?;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = harness.get_json("/owned-sources/_doc/same").await?;
+    assert_eq!(status, StatusCode::OK);
+    let mut expected = latest;
+    expected["metadata"]["updated"] = json!(true);
+    expected["extra"] = json!("moved");
+    assert_eq!(body["_source"], expected);
+    Ok(())
+}
+
+#[tokio::test]
 async fn rest_can_bulk_index_and_search_via_query_and_dsl() -> Result<()> {
     let harness = RestTestHarness::start().await?;
     create_products_index(&harness).await?;

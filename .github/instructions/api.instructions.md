@@ -203,6 +203,10 @@ primary WAL-assigned `_seq_no`; sequence zero is valid. Bulk finalization must
 apply each target receipt by request-order offset, not by document-ID lookup,
 because duplicate IDs can appear in one batch. Missing or inconsistent target
 receipts are item failures, never `_seq_no: 0` fallbacks.
+Bulk forwarding moves source values into target-owned batches; retained routed
+records are metadata-only for response finalization and refresh selection.
+Partial-update assembly moves the validated `doc` object and owned existing
+source into the merge instead of cloning either document.
 Each encoded WAL operation is limited to 32 MiB, including its four-byte frame
 header and the internal `_doc_id` / `_source` wrapper. The usable JSON document
 body is therefore slightly smaller and depends on its ID and serialized shape.

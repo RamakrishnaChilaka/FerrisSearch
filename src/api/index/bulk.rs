@@ -273,9 +273,9 @@ pub(super) fn route_bulk_doc(
 async fn forward_bulk_batches(
     state: &AppState,
     cluster_state: &crate::cluster::state::ClusterState,
-    routed_docs: &[RoutedBulkDoc],
+    routed_docs: &mut [RoutedBulkDoc],
 ) -> BulkTargetResults {
-    let mut batches: HashMap<BulkTargetKey, Vec<&RoutedBulkDoc>> = HashMap::new();
+    let mut batches: HashMap<BulkTargetKey, Vec<&mut RoutedBulkDoc>> = HashMap::new();
     for document in routed_docs {
         batches
             .entry((
@@ -286,7 +286,7 @@ async fn forward_bulk_batches(
             .or_default()
             .push(document);
     }
-    join_all(batches.into_iter().map(|(key, batch)| async move {
+    join_all(batches.into_iter().map(|(key, mut batch)| async move {
         let Some(node) = cluster_state.nodes.get(&key.1) else {
             return (
                 key,
@@ -298,14 +298,14 @@ async fn forward_bulk_batches(
         let mut results = Vec::with_capacity(batch.len());
         let mut cursor = 0;
         while cursor < batch.len() {
-            let document = batch[cursor];
+            let document = &mut *batch[cursor];
             if document.action == "update" {
                 let (if_seq_no, if_primary_term) = document.condition.expected_version();
                 let (status, Json(mut response)) = execute_update(
                     state,
                     &document.index_name,
                     &document.doc_id,
-                    &document.payload,
+                    document.payload.take(),
                     &UpdateParams {
                         if_seq_no,
                         if_primary_term,
@@ -325,9 +325,9 @@ async fn forward_bulk_batches(
             while cursor < batch.len() && batch[cursor].action != "update" {
                 cursor += 1;
             }
-            let run = &batch[start..cursor];
+            let run = &mut batch[start..cursor];
             let operations = run
-                .iter()
+                .iter_mut()
                 .map(|document| {
                     let kind = match document.action.as_str() {
                         "index" => ShardBulkOpKind::Index,
@@ -338,7 +338,7 @@ async fn forward_bulk_batches(
                     let (if_seq_no, if_primary_term) = document.condition.expected_version();
                     (
                         document.doc_id.clone(),
-                        document.payload.clone(),
+                        document.payload.take(),
                         ShardBulkOperation {
                             kind: kind as i32,
                             if_seq_no,
@@ -527,7 +527,8 @@ async fn execute_bulk(
     for (position, document) in documents.into_iter().enumerate() {
         let index = document
             .index
-            .clone()
+            .as_deref()
+            .map(str::to_owned)
             .or_else(|| default_index.map(str::to_string));
         if let Err(response) = validate_bulk_document(&document) {
             let failure = BulkTargetFailure::from_api_response(response);
@@ -592,7 +593,7 @@ async fn execute_bulk(
             }
         }
     }
-    let outcomes = forward_bulk_batches(state, &cluster_state, &routed).await;
+    let outcomes = forward_bulk_batches(state, &cluster_state, &mut routed).await;
     if refresh.should_refresh() {
         let indices = routed
             .iter()

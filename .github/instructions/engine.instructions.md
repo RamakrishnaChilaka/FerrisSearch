@@ -146,6 +146,11 @@ tokio::select! {
 - `vector_recovery` serializes those rebuild paths with vector mutations so a
   later failed text operation cannot be hidden by an earlier rebuild clearing
   the marker.
+- Prepared vector side effects use operation kind, document ID, sequence, term,
+  and the prepared vector only; do not retain a deep copy of document JSON for
+  post-rebuild application. Replica planning borrows its input operations and
+  document IDs, and already-appended primary/replay operations do not construct
+  another WAL envelope.
 - Background refresh must call the composite `refresh()` path, not
   `HotEngine::refresh()` directly, or it bypasses vector recovery.
 

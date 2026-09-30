@@ -1303,7 +1303,7 @@ pub async fn update_document(
     Query(params): Query<UpdateParams>,
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
-    execute_update(&state, &index_name, &doc_id, &body, &params).await
+    execute_update(&state, &index_name, &doc_id, body, &params).await
 }
 
 fn validate_update_body(body: &Value) -> Result<(), (StatusCode, Json<Value>)> {
@@ -1344,17 +1344,26 @@ fn validate_update_body(body: &Value) -> Result<(), (StatusCode, Json<Value>)> {
     Ok(())
 }
 
-fn merge_update_source(target: &mut Value, partial: &Value) {
-    if let (Some(target), Some(partial)) = (target.as_object_mut(), partial.as_object()) {
-        for (key, value) in partial {
-            if let Some(existing) = target.get_mut(key) {
-                merge_update_source(existing, value);
-            } else {
-                target.insert(key.clone(), value.clone());
+fn merge_update_source(target: &mut Value, partial: Value) -> bool {
+    match partial {
+        Value::Object(partial) if target.is_object() => {
+            let target = target.as_object_mut().expect("checked object");
+            let mut changed = false;
+            for (key, value) in partial {
+                if let Some(existing) = target.get_mut(&key) {
+                    changed |= merge_update_source(existing, value);
+                } else {
+                    target.insert(key, value);
+                    changed = true;
+                }
             }
+            changed
         }
-    } else {
-        *target = partial.clone();
+        partial if *target != partial => {
+            *target = partial;
+            true
+        }
+        _ => false,
     }
 }
 
@@ -1408,10 +1417,10 @@ async fn execute_update(
     state: &AppState,
     index_name: &str,
     doc_id: &str,
-    body: &Value,
+    mut body: Value,
     params: &UpdateParams,
 ) -> (StatusCode, Json<Value>) {
-    if let Err(response) = validate_update_body(body) {
+    if let Err(response) = validate_update_body(&body) {
         return response;
     }
     let requested = match crate::engine::WriteCondition::from_optional_values(
@@ -1454,15 +1463,20 @@ async fn execute_update(
             );
         }
         let (source, condition) = if let Some(existing) = existing {
-            let mut merged = existing.source.clone();
-            if let Some(partial) = body.get("doc") {
-                merge_update_source(&mut merged, partial);
-            }
+            let mut merged = existing.source;
+            let changed = body.get_mut("doc").is_some_and(|partial| {
+                let partial = if retries > 0 {
+                    partial.clone()
+                } else {
+                    partial.take()
+                };
+                merge_update_source(&mut merged, partial)
+            });
             if body
                 .get("detect_noop")
                 .and_then(Value::as_bool)
                 .unwrap_or(true)
-                && merged == existing.source
+                && !changed
             {
                 return (
                     StatusCode::OK,
@@ -1482,11 +1496,12 @@ async fn execute_update(
                 },
             )
         } else {
-            let source = if body["doc_as_upsert"] == true {
-                body.get("doc")
+            let key = if body["doc_as_upsert"] == true {
+                "doc"
             } else {
-                body.get("upsert")
+                "upsert"
             };
+            let source = body.get_mut(key);
             let Some(source) = source else {
                 return crate::api::error_response(
                     StatusCode::NOT_FOUND,
@@ -1494,7 +1509,14 @@ async fn execute_update(
                     format!("[{doc_id}]: document missing"),
                 );
             };
-            (source.clone(), crate::engine::WriteCondition::Create)
+            (
+                if retries > 0 {
+                    source.clone()
+                } else {
+                    source.take()
+                },
+                crate::engine::WriteCondition::Create,
+            )
         };
         if let Err(response) = validate_document_source_for_api(&source) {
             return response;
