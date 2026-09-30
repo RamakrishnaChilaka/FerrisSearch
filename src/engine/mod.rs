@@ -127,6 +127,10 @@ pub struct PeerRecoverySnapshot {
     pub snapshot_cursor: crate::wal::WalCursor,
     #[cfg(test)]
     pub snapshot_next_seq_no: u64,
+    #[cfg(feature = "protocol-trace")]
+    pub trace_processed_seqs: Vec<u64>,
+    #[cfg(feature = "protocol-trace")]
+    pub trace_documents: Vec<(String, serde_json::Value, u64, u64)>,
     #[allow(dead_code)]
     pub(crate) committed_boundary: sequence::CommittedBoundaryRecord,
     pub retention_pin_id: u64,
@@ -186,6 +190,10 @@ pub struct PeerRecoverySnapshotPreparation {
     pub snapshot_cursor: crate::wal::WalCursor,
     #[cfg(test)]
     pub snapshot_next_seq_no: u64,
+    #[cfg(feature = "protocol-trace")]
+    pub trace_processed_seqs: Vec<u64>,
+    #[cfg(feature = "protocol-trace")]
+    pub trace_documents: Vec<(String, serde_json::Value, u64, u64)>,
     pub(crate) committed_boundary: sequence::CommittedBoundaryRecord,
     pub retention_pin: PeerRecoveryRetentionPin,
     pub file_names: Vec<String>,
@@ -195,6 +203,10 @@ pub struct PreparedPeerRecoverySnapshot {
     pub snapshot_cursor: crate::wal::WalCursor,
     #[cfg(test)]
     pub snapshot_next_seq_no: u64,
+    #[cfg(feature = "protocol-trace")]
+    pub trace_processed_seqs: Vec<u64>,
+    #[cfg(feature = "protocol-trace")]
+    pub trace_documents: Vec<(String, serde_json::Value, u64, u64)>,
     pub(crate) committed_boundary: sequence::CommittedBoundaryRecord,
     pub retention_pin: PeerRecoveryRetentionPin,
     pub files: Vec<PeerRecoveryFileMetadata>,
@@ -206,6 +218,10 @@ impl PeerRecoverySnapshotPreparation {
             snapshot_cursor,
             #[cfg(test)]
             snapshot_next_seq_no,
+            #[cfg(feature = "protocol-trace")]
+            trace_processed_seqs,
+            #[cfg(feature = "protocol-trace")]
+            trace_documents,
             committed_boundary,
             retention_pin,
             file_names,
@@ -239,6 +255,10 @@ impl PeerRecoverySnapshotPreparation {
             snapshot_cursor,
             #[cfg(test)]
             snapshot_next_seq_no,
+            #[cfg(feature = "protocol-trace")]
+            trace_processed_seqs,
+            #[cfg(feature = "protocol-trace")]
+            trace_documents,
             committed_boundary,
             retention_pin,
             files,
@@ -299,6 +319,13 @@ impl SqlStreamingBatchHandle {
         (self.next_batch)()
     }
 }
+
+#[cfg(feature = "protocol-trace")]
+pub type ProtocolTraceCopyEvidence = (
+    Vec<(String, serde_json::Value, u64, u64)>,
+    Vec<crate::protocol_trace::TraceActualDocument>,
+    Vec<crate::protocol_trace::TraceWalEntry>,
+);
 
 /// Trait abstracting a search engine backend.
 /// Each shard/split is backed by one `SearchEngine` implementation.
@@ -402,6 +429,23 @@ pub trait SearchEngine: Send + Sync {
 
     /// Retrieve a document by its `_id`. Returns the `_source` JSON if found.
     fn get_document(&self, doc_id: &str) -> Result<Option<serde_json::Value>>;
+
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_documents(&self) -> Result<Vec<(String, serde_json::Value, u64, u64)>> {
+        anyhow::bail!("protocol trace document enumeration is not supported by this engine")
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_processed_sequences(&self) -> Result<Vec<u64>> {
+        anyhow::bail!(
+            "protocol trace processed-sequence enumeration is not supported by this engine"
+        )
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_copy_evidence(&self) -> Result<ProtocolTraceCopyEvidence> {
+        anyhow::bail!("protocol trace copy evidence is not supported by this engine")
+    }
 
     /// Commit in-memory buffer and reload the reader so new docs become searchable.
     fn refresh(&self) -> Result<()>;

@@ -53,6 +53,7 @@ zstd = "0.13"
 default = []
 transport-tls = ["dep:tonic-types", "dep:tokio-rustls", "dep:rustls-pemfile", "tonic/tls-ring"]
 http-tls = ["dep:axum-server", "dep:tokio-rustls", "tokio-rustls/ring"]
+protocol-trace = []
 
 [lints.clippy]
 # Edition-2024 idiom: prefer inlined format args (`format!("{x}")` over `format!("{}", x)`).

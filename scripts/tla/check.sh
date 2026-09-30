@@ -196,9 +196,9 @@ d1-term-collision-restart-identity pass: identity restores fence collision max
 d1-primary-gap-max      expected B3NoRecoveryLoop: max-based detector loops
 d1-primary-gap-processed pass: compare replica and primary processed checkpoints
 d1-promotion-replay-noop pass: replay, fill NoOp, activate despite replica gap
-d1-trace-actions        pass: captured commit, truncation, arbitrary restart, failed replay
-d1-failover-actions     pass: NoOp fan-out, apply, redelivery, activation, and collision
-d1-noop-collision-actions pass: promotion NoOp collision, NACK, and exact removal
+d1-trace-actions        pass: captured commit, truncation, restart/in-place replay, failed replay
+d1-failover-actions     pass: physical NoOp fill, activation, send, redelivery, and collision
+d1-noop-collision-actions pass: physical NoOp fill, send, collision, NACK, and removal
 trace-validator         pass: strict JSONL conversion and D1 trace acceptance/rejection
 trace-validator-round4  pass: slow restart, truncation, NoOp, and late-message traces
 two-shard               pass: red sibling does not block failover/allocation

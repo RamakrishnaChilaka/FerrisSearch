@@ -48,6 +48,22 @@ pub struct Node {
     pub remote_store_reader_cache: Arc<crate::engine::remote_store::RemoteSplitReaderCache>,
 }
 
+#[cfg(feature = "protocol-trace")]
+pub fn start_peer_recovery_for_protocol_trace_test(
+    state: &ClusterState,
+    local_node_id: &str,
+    cluster_manager: Arc<ClusterManager>,
+    shard_manager: Arc<ShardManager>,
+) {
+    peer_recovery::PeerRecoveryDriver::new(1).reconcile(
+        state,
+        local_node_id,
+        cluster_manager,
+        shard_manager,
+        TransportClient::new(),
+    );
+}
+
 #[derive(Debug)]
 #[cfg_attr(not(feature = "transport-tls"), allow(dead_code))]
 struct TransportTlsPaths<'a> {

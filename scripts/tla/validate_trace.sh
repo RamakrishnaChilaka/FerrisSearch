@@ -126,7 +126,7 @@ case "$PROFILE" in
         TYPE_INVARIANT="TraceTypeOK"
         SAFETY_INVARIANT="TraceCoreSafety"
         ;;
-    d1-combined)
+    d1-combined|d1-full)
         TRACE_MODULE="TraceD1"
         ACCEPT_INVARIANT="TraceNotAccepted"
         TYPE_INVARIANT="TraceTypeOK"

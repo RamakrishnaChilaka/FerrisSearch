@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use datafusion::arrow::record_batch::RecordBatch;
 use std::any::Any;
 use std::borrow::Cow;
+#[cfg(feature = "protocol-trace")]
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -18,6 +20,8 @@ use super::sequence::{
     CommittedBoundaryRecord, LocalCheckpointTracker, PrimaryTermSequenceState, SequenceStats,
     initialize_term_sequence_state,
 };
+#[cfg(feature = "protocol-trace")]
+use super::version_map::VersionValue;
 use super::version_map::{DEFAULT_VERSION_MAP_MAX_BYTES, LiveVersionMap, PrunedTombstone};
 use crate::wal::{
     HotTranslog, TranslogDurability, WalDocumentOperation, WriteAheadLog, document_operation,
@@ -1033,6 +1037,11 @@ impl HotEngine {
             column_cache,
         };
 
+        #[cfg(feature = "protocol-trace")]
+        if let Some(copy) = crate::protocol_trace::current_open_copy() {
+            crate::protocol_trace::record_node_restarted(&copy, engine.sequence_stats());
+        }
+
         // Replay any uncommitted translog entries from before a crash
         engine.replay_translog()?;
 
@@ -1126,6 +1135,25 @@ impl HotEngine {
                     .mark_persisted_through(processed_checkpoint);
                 let boundary = state.committed_boundary();
                 boundary.validate()?;
+                #[cfg(feature = "protocol-trace")]
+                if let Some(copy) = crate::protocol_trace::current_open_copy() {
+                    crate::protocol_trace::record_commit_captured(
+                        &copy,
+                        super::SequenceStats {
+                            processed_checkpoint: boundary.processed_checkpoint,
+                            persisted_checkpoint: boundary.persisted_checkpoint,
+                            max_seq_no: boundary.max_seq_no,
+                        },
+                        boundary.term_sequence_state.current_term,
+                        boundary.term_sequence_state.max_seq_no_at_term_start,
+                        boundary
+                            .term_sequence_state
+                            .processed_in_current_term_below_start_max
+                            .iter()
+                            .map(|range| (range.start, range.end))
+                            .collect(),
+                    );
+                }
                 Ok(boundary)
             }
             Err(source) => {
@@ -1338,9 +1366,29 @@ impl HotEngine {
             .apply_state
             .lock()
             .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+        #[cfg(feature = "protocol-trace")]
+        let trace_copy = crate::protocol_trace::current_open_copy();
+        #[cfg(feature = "protocol-trace")]
+        let arrival_order_apply = crate::protocol_trace::current_apply_origin()
+            == Some(crate::protocol_trace::ApplyOrigin::LiveReplication)
+            && crate::protocol_trace::mutation_enabled(
+                crate::protocol_trace::MutationMode::ArrivalOrderApply,
+            );
+        #[cfg(not(feature = "protocol-trace"))]
+        let arrival_order_apply = false;
+        #[cfg(feature = "protocol-trace")]
+        let seq_only_redelivery = crate::protocol_trace::current_apply_origin()
+            == Some(crate::protocol_trace::ApplyOrigin::LiveReplication)
+            && crate::protocol_trace::mutation_enabled(
+                crate::protocol_trace::MutationMode::SeqOnlyRedelivery,
+            );
+        #[cfg(not(feature = "protocol-trace"))]
+        let seq_only_redelivery = false;
         let planning_snapshot = state.planning_snapshot();
         let mut planned = Vec::with_capacity(operations.len());
         let mut shadow_versions = HashMap::<String, CurrentVersion>::new();
+        #[cfg(feature = "protocol-trace")]
+        let mut collision_operation = None;
 
         let planning_result = (|| {
             for operation in operations {
@@ -1351,14 +1399,29 @@ impl HotEngine {
                         .raise_term(operation.primary_term, max_seq_no)?;
                 }
                 let already_processed = state.checkpoints.has_processed(operation.seq_no);
-                state.term_sequences.check_before_redelivery(
-                    operation.primary_term,
-                    operation.seq_no,
-                    already_processed,
-                )?;
+                if !seq_only_redelivery
+                    && let Err(error) = state.term_sequences.check_before_redelivery(
+                        operation.primary_term,
+                        operation.seq_no,
+                        already_processed,
+                    )
+                {
+                    #[cfg(feature = "protocol-trace")]
+                    {
+                        collision_operation = Some(operation.clone());
+                    }
+                    return Err(error);
+                }
                 if already_processed {
-                    if wal_disposition.validates_redelivery() {
-                        self.validate_redelivery(translog, &operation)?;
+                    if wal_disposition.validates_redelivery()
+                        && !seq_only_redelivery
+                        && let Err(error) = self.validate_redelivery(translog, &operation)
+                    {
+                        #[cfg(feature = "protocol-trace")]
+                        {
+                            collision_operation = Some(operation.clone());
+                        }
+                        return Err(error);
                     }
                     planned.push(PlannedOperation {
                         operation,
@@ -1390,7 +1453,11 @@ impl HotEngine {
                             Some(CurrentVersion::Native(version))
                                 if version.seq_no() > operation.seq_no =>
                             {
-                                super::ApplyOutcome::Stale
+                                if arrival_order_apply {
+                                    super::ApplyOutcome::Applied
+                                } else {
+                                    super::ApplyOutcome::Stale
+                                }
                             }
                             Some(CurrentVersion::Native(version))
                                 if version.seq_no() == operation.seq_no =>
@@ -1407,16 +1474,33 @@ impl HotEngine {
                                 );
                                 if version.primary_term() != operation.primary_term || !kind_matches
                                 {
-                                    return Err(SequenceOperationCollisionError {
-                                        primary_term: operation.primary_term,
-                                        seq_no: operation.seq_no,
+                                    if seq_only_redelivery {
+                                        super::ApplyOutcome::Redelivery
+                                    } else {
+                                        #[cfg(feature = "protocol-trace")]
+                                        {
+                                            collision_operation = Some(operation.clone());
+                                        }
+                                        return Err(SequenceOperationCollisionError {
+                                            primary_term: operation.primary_term,
+                                            seq_no: operation.seq_no,
+                                        }
+                                        .into());
                                     }
-                                    .into());
+                                } else {
+                                    if wal_disposition.validates_redelivery()
+                                        && !seq_only_redelivery
+                                        && let Err(error) =
+                                            self.validate_redelivery(translog, &operation)
+                                    {
+                                        #[cfg(feature = "protocol-trace")]
+                                        {
+                                            collision_operation = Some(operation.clone());
+                                        }
+                                        return Err(error);
+                                    }
+                                    super::ApplyOutcome::Redelivery
                                 }
-                                if wal_disposition.validates_redelivery() {
-                                    self.validate_redelivery(translog, &operation)?;
-                                }
-                                super::ApplyOutcome::Redelivery
                             }
                             _ => super::ApplyOutcome::Applied,
                         };
@@ -1456,6 +1540,17 @@ impl HotEngine {
         })();
         if let Err(error) = planning_result {
             state.restore_planning_snapshot(planning_snapshot);
+            #[cfg(feature = "protocol-trace")]
+            let trace_collision_result = match (trace_copy.as_ref(), collision_operation.as_ref()) {
+                (Some(copy), Some(operation)) => crate::protocol_trace::record_operation_collision(
+                    copy,
+                    operation,
+                    state.checkpoints.stats(),
+                ),
+                _ => Ok(()),
+            };
+            #[cfg(feature = "protocol-trace")]
+            trace_collision_result.context("record protocol trace operation collision")?;
             if wal_disposition.is_already_in_local_wal() {
                 if let Some(writer_state) = writer_override.as_deref_mut() {
                     writer_state.fail(format!(
@@ -1493,6 +1588,20 @@ impl HotEngine {
         if appended && let Err(error) = translog.append_batch_with_seq(&wal_entries) {
             state.restore_planning_snapshot(planning_snapshot);
             return Err(error);
+        }
+        #[cfg(feature = "protocol-trace")]
+        if appended && let Some(copy) = trace_copy.as_ref() {
+            let durable = matches!(self.durability, TranslogDurability::Request);
+            for planned_operation in planned
+                .iter()
+                .filter(|planned| planned.outcome != super::ApplyOutcome::Redelivery)
+            {
+                crate::protocol_trace::record_wal_appended(
+                    copy,
+                    &planned_operation.operation,
+                    durable,
+                )?;
+            }
         }
 
         let has_applied = planned
@@ -1587,6 +1696,15 @@ impl HotEngine {
                             .checkpoints
                             .mark_persisted(planned_operation.operation.seq_no);
                     }
+                }
+                #[cfg(feature = "protocol-trace")]
+                if let Some(copy) = trace_copy.as_ref() {
+                    crate::protocol_trace::record_operation_processed(
+                        copy,
+                        &planned_operation.operation,
+                        planned_operation.outcome,
+                        state.checkpoints.stats(),
+                    )?;
                 }
             }
             Ok::<(), anyhow::Error>(())
@@ -1708,6 +1826,14 @@ impl HotEngine {
                         source: payload.clone(),
                     },
                 };
+                #[cfg(feature = "protocol-trace")]
+                if let Some(copy) = crate::protocol_trace::current_open_copy() {
+                    crate::protocol_trace::record_wal_appended(
+                        &copy,
+                        &operation,
+                        matches!(self.durability, TranslogDurability::Request),
+                    )?;
+                }
                 self.apply_sequenced_batch_locked(
                     translog,
                     vec![operation],
@@ -1780,6 +1906,16 @@ impl HotEngine {
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
+                #[cfg(feature = "protocol-trace")]
+                if let Some(copy) = crate::protocol_trace::current_open_copy() {
+                    for operation in &operations {
+                        crate::protocol_trace::record_wal_appended(
+                            &copy,
+                            operation,
+                            matches!(self.durability, TranslogDurability::Request),
+                        )?;
+                    }
+                }
                 self.apply_sequenced_batch_locked(
                     translog,
                     operations,
@@ -1821,15 +1957,24 @@ impl HotEngine {
                     crate::wal::WalOperation::Delete,
                     serde_json::json!({ "_doc_id": doc_id }),
                 )?;
+                let operation = super::SequencedOperation {
+                    seq_no: receipt.seq_no,
+                    primary_term,
+                    mutation: super::DocumentMutation::Delete {
+                        doc_id: doc_id_owned.clone(),
+                    },
+                };
+                #[cfg(feature = "protocol-trace")]
+                if let Some(copy) = crate::protocol_trace::current_open_copy() {
+                    crate::protocol_trace::record_wal_appended(
+                        &copy,
+                        &operation,
+                        matches!(self.durability, TranslogDurability::Request),
+                    )?;
+                }
                 self.apply_sequenced_batch_locked(
                     translog,
-                    vec![super::SequencedOperation {
-                        seq_no: receipt.seq_no,
-                        primary_term,
-                        mutation: super::DocumentMutation::Delete {
-                            doc_id: doc_id_owned.clone(),
-                        },
-                    }],
+                    vec![operation],
                     WalDisposition::AlreadyInLocalWal {
                         persisted: matches!(self.durability, TranslogDurability::Request),
                         validate_redelivery: true,
@@ -2001,6 +2146,15 @@ impl HotEngine {
     ) -> Result<u64> {
         let committed = self.load_committed_boundary()?;
         self.reset_apply_state_to_commit(committed.clone())?;
+        #[cfg(feature = "protocol-trace")]
+        let trace_copy = crate::protocol_trace::current_open_copy();
+        #[cfg(feature = "protocol-trace")]
+        let trace_replay = match trace_copy.as_ref() {
+            Some(copy) => {
+                crate::protocol_trace::record_replay_started(copy, self.sequence_stats())?.is_some()
+            }
+            None => false,
+        };
         let committed_next_seq = committed
             .processed_checkpoint
             .and_then(|checkpoint| checkpoint.checked_add(1))
@@ -2012,6 +2166,10 @@ impl HotEngine {
             );
         }
         if committed_next_seq == wal_next_seq {
+            #[cfg(feature = "protocol-trace")]
+            if trace_replay && let Some(copy) = trace_copy.as_ref() {
+                crate::protocol_trace::record_replay_finished(copy, "completed")?;
+            }
             return Ok(0);
         }
 
@@ -2022,9 +2180,43 @@ impl HotEngine {
             if batch.is_empty() {
                 return Ok(());
             }
-            self.apply_sequenced_batch_locked(
+            let operations = std::mem::take(batch);
+            #[cfg(feature = "protocol-trace")]
+            let result = if trace_replay {
+                crate::protocol_trace::with_apply_scope(
+                    crate::protocol_trace::ApplyOrigin::Replay,
+                    operations.clone(),
+                    || {
+                        self.apply_sequenced_batch_locked(
+                            translog,
+                            operations,
+                            WalDisposition::AlreadyInLocalWal {
+                                persisted: true,
+                                validate_redelivery: false,
+                            },
+                            Some(writer_state),
+                            false,
+                            |_| Ok(()),
+                        )
+                    },
+                )
+            } else {
+                self.apply_sequenced_batch_locked(
+                    translog,
+                    operations,
+                    WalDisposition::AlreadyInLocalWal {
+                        persisted: true,
+                        validate_redelivery: false,
+                    },
+                    Some(writer_state),
+                    false,
+                    |_| Ok(()),
+                )
+            };
+            #[cfg(not(feature = "protocol-trace"))]
+            let result = self.apply_sequenced_batch_locked(
                 translog,
-                std::mem::take(batch),
+                operations,
                 WalDisposition::AlreadyInLocalWal {
                     persisted: true,
                     validate_redelivery: false,
@@ -2032,7 +2224,8 @@ impl HotEngine {
                 Some(writer_state),
                 false,
                 |_| Ok(()),
-            )?;
+            );
+            result?;
             let boundary = self.current_committed_boundary()?;
             let boundary = self.commit_writer_at_boundary(writer_state, context, boundary)?;
             self.persist_committed_boundary(&boundary)?;
@@ -2044,6 +2237,15 @@ impl HotEngine {
                 .processed_checkpoint
                 .is_some_and(|checkpoint| entry.seq_no <= checkpoint)
             {
+                #[cfg(feature = "protocol-trace")]
+                if trace_replay && let Some(copy) = trace_copy.as_ref() {
+                    let operation = sequenced_operation_from_entry(&entry)?;
+                    crate::protocol_trace::record_replay_skip(
+                        copy,
+                        &operation,
+                        self.sequence_stats(),
+                    )?;
+                }
                 return Ok(());
             }
             if replayed == 0 {
@@ -2059,14 +2261,26 @@ impl HotEngine {
         if let Err(error) = replay_result {
             let message = format!("translog replay failed during {context}: {error}");
             writer_state.fail(format!("{message}: {error:#}"));
+            #[cfg(feature = "protocol-trace")]
+            if trace_replay && let Some(copy) = trace_copy.as_ref() {
+                crate::protocol_trace::record_replay_finished(copy, "failed")?;
+            }
             return Err(error).context(message);
         }
         if replayed == 0 {
+            #[cfg(feature = "protocol-trace")]
+            if trace_replay && let Some(copy) = trace_copy.as_ref() {
+                crate::protocol_trace::record_replay_finished(copy, "completed")?;
+            }
             return Ok(0);
         }
         flush_batch(&mut batch)?;
         if let Err(error) = self.reader.reload() {
             writer_state.fail(format!("reader reload failed after {context}: {error}"));
+            #[cfg(feature = "protocol-trace")]
+            if trace_replay && let Some(copy) = trace_copy.as_ref() {
+                crate::protocol_trace::record_replay_finished(copy, "failed")?;
+            }
             return Err(error).with_context(|| format!("reader reload failed after {context}"));
         }
         let committed_boundary = last_committed_boundary
@@ -2075,6 +2289,10 @@ impl HotEngine {
             writer_state.fail(format!(
                 "committed checkpoint persistence failed after {context}: {error:#}"
             ));
+            #[cfg(feature = "protocol-trace")]
+            if trace_replay && let Some(copy) = trace_copy.as_ref() {
+                crate::protocol_trace::record_replay_finished(copy, "failed")?;
+            }
             return Err(error).with_context(|| {
                 format!("committed checkpoint persistence failed after {context}")
             });
@@ -2092,6 +2310,10 @@ impl HotEngine {
             context,
             replayed
         );
+        #[cfg(feature = "protocol-trace")]
+        if trace_replay && let Some(copy) = trace_copy.as_ref() {
+            crate::protocol_trace::record_replay_finished(copy, "completed")?;
+        }
         Ok(replayed)
     }
 
@@ -3114,7 +3336,12 @@ impl HotEngine {
     }
 
     fn persist_committed_boundary(&self, boundary: &CommittedBoundaryRecord) -> Result<()> {
-        boundary.persist(&self.committed_boundary_path)
+        boundary.persist(&self.committed_boundary_path)?;
+        #[cfg(feature = "protocol-trace")]
+        if let Some(copy) = crate::protocol_trace::current_open_copy() {
+            crate::protocol_trace::record_commit_persisted(&copy)?;
+        }
+        Ok(())
     }
 
     fn persist_committed_boundary_durable(&self, boundary: &CommittedBoundaryRecord) -> Result<()> {
@@ -3583,6 +3810,117 @@ impl HotEngine {
             .unwrap_or_else(|error| error.into_inner())
             .checkpoints
             .stats()
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    pub(crate) fn protocol_trace_processed_sequences(&self) -> Result<Vec<u64>> {
+        let state = self
+            .apply_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+        let Some(max_seq_no) = state.checkpoints.max_seq_no() else {
+            return Ok(Vec::new());
+        };
+        Ok((0..=max_seq_no)
+            .filter(|seq_no| state.checkpoints.has_processed(*seq_no))
+            .collect())
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    pub(crate) fn protocol_trace_documents_snapshot(
+        &self,
+    ) -> Result<Vec<(String, serde_json::Value, u64, u64)>> {
+        let mut documents = Vec::new();
+        self.for_each_vector_rebuild_batch(|batch| {
+            documents.extend(batch);
+            Ok(())
+        })?;
+        Ok(documents)
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    pub(crate) fn protocol_trace_copy_evidence(&self) -> Result<super::ProtocolTraceCopyEvidence> {
+        let live_documents = self.protocol_trace_documents_snapshot()?;
+        let versions = self
+            .apply_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
+            .versions
+            .protocol_trace_versions()?;
+        let mut actual = BTreeMap::new();
+        for (doc, source, seq_no, term) in &live_documents {
+            actual.insert(
+                doc.clone(),
+                crate::protocol_trace::TraceActualDocument {
+                    doc: doc.clone(),
+                    state: "live",
+                    seq_no: Some(*seq_no),
+                    term: Some(*term),
+                    content_hash: Some(crate::protocol_trace::content_hash(
+                        &super::DocumentMutation::Index {
+                            doc_id: doc.clone(),
+                            source: source.clone(),
+                        },
+                    )),
+                },
+            );
+        }
+        for (doc, version) in versions {
+            match version {
+                VersionValue::Index(version) => {
+                    let observed = actual.get(&doc).with_context(|| {
+                        format!(
+                            "version map records live document [{doc}] that is absent from the refreshed reader"
+                        )
+                    })?;
+                    if observed.seq_no != Some(version.seq_no)
+                        || observed.term != Some(version.primary_term)
+                    {
+                        anyhow::bail!(
+                            "version map identity for live document [{doc}] differs from the refreshed reader"
+                        );
+                    }
+                }
+                VersionValue::Delete(version) => {
+                    if actual.contains_key(&doc) {
+                        anyhow::bail!(
+                            "version map records deleted document [{doc}] that remains in the refreshed reader"
+                        );
+                    }
+                    actual.insert(
+                        doc.clone(),
+                        crate::protocol_trace::TraceActualDocument {
+                            doc: doc.clone(),
+                            state: "deleted",
+                            seq_no: Some(version.seq_no),
+                            term: Some(version.primary_term),
+                            content_hash: Some(crate::protocol_trace::content_hash(
+                                &super::DocumentMutation::Delete { doc_id: doc },
+                            )),
+                        },
+                    );
+                }
+            }
+        }
+        let wal_entries = self.with_translog("protocol trace WAL evidence", |translog| {
+            translog
+                .read_all()?
+                .into_iter()
+                .map(|entry| {
+                    let operation = sequenced_operation_from_entry(&entry)?;
+                    let (doc, op, content_hash) =
+                        crate::protocol_trace::operation_parts(&operation);
+                    Ok(crate::protocol_trace::TraceWalEntry {
+                        seq_no: operation.seq_no,
+                        term: operation.primary_term,
+                        doc,
+                        op,
+                        content_hash,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        Ok((live_documents, actual.into_values().collect(), wal_entries))
     }
 
     pub fn current_primary_term(&self) -> u64 {
@@ -7236,6 +7574,21 @@ impl super::SearchEngine for HotEngine {
         Ok(None)
     }
 
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_documents(&self) -> Result<Vec<(String, serde_json::Value, u64, u64)>> {
+        self.protocol_trace_documents_snapshot()
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_processed_sequences(&self) -> Result<Vec<u64>> {
+        HotEngine::protocol_trace_processed_sequences(self)
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_copy_evidence(&self) -> Result<super::ProtocolTraceCopyEvidence> {
+        HotEngine::protocol_trace_copy_evidence(self)
+    }
+
     fn refresh(&self) -> Result<()> {
         self.refresh_with_pruned_tombstones().map(|_| ())
     }
@@ -7581,6 +7934,10 @@ impl super::SearchEngine for HotEngine {
             snapshot_cursor: prepared.snapshot_cursor,
             #[cfg(test)]
             snapshot_next_seq_no: prepared.snapshot_next_seq_no,
+            #[cfg(feature = "protocol-trace")]
+            trace_processed_seqs: prepared.trace_processed_seqs,
+            #[cfg(feature = "protocol-trace")]
+            trace_documents: prepared.trace_documents,
             committed_boundary: prepared.committed_boundary,
             retention_pin_id: prepared.retention_pin.into_pin_id(),
             files: prepared.files,
@@ -7639,9 +7996,34 @@ impl super::SearchEngine for HotEngine {
                     })?;
                 }
                 std::fs::File::open(snapshot_dir)?.sync_all()?;
+                #[cfg(feature = "protocol-trace")]
+                {
+                    self.reader.reload()?;
+                    let processed_seqs = self.protocol_trace_processed_sequences()?;
+                    let documents = self.protocol_trace_documents_snapshot()?;
+                    Ok((file_names, processed_seqs, documents))
+                }
+                #[cfg(not(feature = "protocol-trace"))]
                 Ok(file_names)
             })();
 
+            #[cfg(feature = "protocol-trace")]
+            match result {
+                Ok((file_names, processed_seqs, documents)) => Ok((
+                    snapshot_cursor,
+                    committed_boundary,
+                    retention_pin_id,
+                    file_names,
+                    processed_seqs,
+                    documents,
+                )),
+                Err(error) => {
+                    let _ = translog.release_retention_pin(retention_pin_id);
+                    let _ = std::fs::remove_dir_all(snapshot_dir);
+                    Err(error)
+                }
+            }
+            #[cfg(not(feature = "protocol-trace"))]
             match result {
                 Ok(file_names) => Ok((
                     snapshot_cursor,
@@ -7656,6 +8038,22 @@ impl super::SearchEngine for HotEngine {
                 }
             }
         });
+        #[cfg(feature = "protocol-trace")]
+        let (
+            snapshot_cursor,
+            committed_boundary,
+            retention_pin_id,
+            file_names,
+            trace_processed_seqs,
+            trace_documents,
+        ) = match preparation {
+            Ok(preparation) => preparation,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(snapshot_dir);
+                return Err(error);
+            }
+        };
+        #[cfg(not(feature = "protocol-trace"))]
         let (snapshot_cursor, committed_boundary, retention_pin_id, file_names) = match preparation
         {
             Ok(preparation) => preparation,
@@ -7672,6 +8070,10 @@ impl super::SearchEngine for HotEngine {
                 .max_seq_no
                 .and_then(|seq_no| seq_no.checked_add(1))
                 .unwrap_or(0),
+            #[cfg(feature = "protocol-trace")]
+            trace_processed_seqs,
+            #[cfg(feature = "protocol-trace")]
+            trace_documents,
             committed_boundary,
             retention_pin: super::PeerRecoveryRetentionPin::new(
                 self.translog.clone(),
@@ -7802,6 +8204,22 @@ impl super::SearchEngine for HotEngine {
             if operations.is_empty() {
                 return Ok(operations);
             }
+            #[cfg(feature = "protocol-trace")]
+            crate::protocol_trace::with_apply_scope(
+                crate::protocol_trace::ApplyOrigin::Promotion,
+                operations.clone(),
+                || {
+                    self.apply_sequenced_batch_locked(
+                        translog,
+                        operations.clone(),
+                        WalDisposition::Append,
+                        None,
+                        false,
+                        |_| Ok(()),
+                    )
+                },
+            )?;
+            #[cfg(not(feature = "protocol-trace"))]
             self.apply_sequenced_batch_locked(
                 translog,
                 operations.clone(),
@@ -7817,6 +8235,15 @@ impl super::SearchEngine for HotEngine {
                 .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
             for operation in &operations {
                 state.checkpoints.mark_persisted(operation.seq_no);
+            }
+            #[cfg(feature = "protocol-trace")]
+            if let Some(copy) = crate::protocol_trace::current_open_copy() {
+                crate::protocol_trace::record_promotion_noop_fill(
+                    &copy,
+                    primary_term,
+                    &operations,
+                    state.checkpoints.stats(),
+                )?;
             }
             Ok(operations)
         })

@@ -815,6 +815,8 @@ pub struct ShardManager {
     /// Shared column cache for SQL fast-field Arrow arrays and grouped-partials
     /// full-segment decoded columns.
     column_cache: Arc<crate::engine::column_cache::ColumnCache>,
+    #[cfg(feature = "protocol-trace")]
+    protocol_trace_node: RwLock<Option<String>>,
 }
 
 impl ShardManager {
@@ -877,7 +879,37 @@ impl ShardManager {
             isr_tracker: IsrTracker::new(1000),
             durability,
             column_cache,
+            #[cfg(feature = "protocol-trace")]
+            protocol_trace_node: RwLock::new(None),
         }
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    pub fn set_protocol_trace_node(&self, node_id: impl Into<String>) {
+        *self
+            .protocol_trace_node
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(node_id.into());
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_copy(
+        &self,
+        index: &str,
+        shard_id: u32,
+    ) -> Option<crate::protocol_trace::TraceCopy> {
+        let node = self
+            .protocol_trace_node
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()?;
+        let identity = self.copy_identity(index, shard_id)?;
+        Some(crate::protocol_trace::TraceCopy {
+            node,
+            index_uuid: identity.index_uuid,
+            shard: shard_id,
+            allocation: identity.allocation_id,
+        })
     }
 
     /// Get the base data directory.
@@ -2076,7 +2108,7 @@ impl ShardManager {
 
         let mut cleaned_stale_schema = false;
         for attempt in 0..=LOCK_BUSY_RETRIES {
-            let open_result = match mode {
+            let open = || match mode {
                 CompositeOpenMode::ExistingOnly => CompositeEngine::open_existing_with_mappings(
                     shard_dir,
                     refresh_interval,
@@ -2092,6 +2124,13 @@ impl ShardManager {
                     self.column_cache.clone(),
                 ),
             };
+            #[cfg(feature = "protocol-trace")]
+            let open_result = match self.protocol_trace_copy(index, shard_id) {
+                Some(copy) => crate::protocol_trace::with_open_copy(copy, open),
+                None => open(),
+            };
+            #[cfg(not(feature = "protocol-trace"))]
+            let open_result = open();
             match open_result {
                 Ok(engine) => return Ok(Arc::new(engine)),
                 Err(err) => {
@@ -2588,6 +2627,14 @@ impl ShardManager {
             .get(&key)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("replica shard engine is not open"))?;
+        #[cfg(feature = "protocol-trace")]
+        let trace_copy = self.protocol_trace_copy(index, shard_id);
+        #[cfg(feature = "protocol-trace")]
+        if let Some(copy) = trace_copy.as_ref() {
+            for operation in crate::protocol_trace::current_apply_operation_values() {
+                crate::protocol_trace::record_replica_received(copy, &operation)?;
+            }
+        }
         if context.message_term > identity.replica_fence {
             let fence_max_seq_no = engine
                 .sequence_stats()
@@ -2613,10 +2660,25 @@ impl ShardManager {
             }
             self.clear_copy_io_failure(&retry_key);
             self.cache_copy_identity(&key, identity.clone());
+            #[cfg(feature = "protocol-trace")]
+            if let Some(copy) = trace_copy.as_ref() {
+                crate::protocol_trace::record_fence(
+                    copy,
+                    identity.replica_fence,
+                    identity.fence_max_seq_no,
+                    "replication",
+                );
+            }
             engine
                 .reconcile_term_sequence_state(identity.replica_fence, identity.fence_max_seq_no)?;
         }
         self.ensure_local_apply_allowed(context.index_uuid, shard_id, context.allocation_id)?;
+        #[cfg(feature = "protocol-trace")]
+        let result = match trace_copy {
+            Some(copy) => crate::protocol_trace::with_open_copy(copy, || operation(engine)),
+            None => operation(engine),
+        };
+        #[cfg(not(feature = "protocol-trace"))]
         let result = operation(engine);
         self.record_local_apply_result(context.index_uuid, shard_id, context.allocation_id, result)
     }
@@ -2675,6 +2737,15 @@ impl ShardManager {
                 }
                 shard_manager.clear_copy_io_failure(&retry_key);
                 shard_manager.cache_copy_identity(&key, identity.clone());
+                #[cfg(feature = "protocol-trace")]
+                if let Some(copy) = shard_manager.protocol_trace_copy(&index, shard_id) {
+                    crate::protocol_trace::record_fence(
+                        &copy,
+                        identity.replica_fence,
+                        identity.fence_max_seq_no,
+                        "activation",
+                    );
+                }
                 engine.reconcile_term_sequence_state(
                     identity.replica_fence,
                     identity.fence_max_seq_no,
@@ -3064,6 +3135,55 @@ impl ShardManager {
         index_uuid: String,
         allocation_id: AllocationId,
     ) -> Result<PathBuf> {
+        self.prepare_peer_recovery_target_blocking_with_observer(
+            index,
+            shard_id,
+            index_uuid,
+            allocation_id,
+            || {},
+        )
+        .await
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    pub(crate) async fn prepare_peer_recovery_target_blocking_traced(
+        self: &Arc<Self>,
+        index: String,
+        shard_id: u32,
+        index_uuid: String,
+        allocation_id: AllocationId,
+        trace: crate::protocol_trace::RecoveryTraceContext,
+    ) -> Result<PathBuf> {
+        self.prepare_peer_recovery_target_blocking_with_observer(
+            index,
+            shard_id,
+            index_uuid,
+            allocation_id,
+            move || {
+                crate::protocol_trace::record_recovery_started(
+                    &trace.source_node,
+                    &trace.target_node,
+                    &trace.index_uuid,
+                    trace.shard,
+                    trace.allocation,
+                    &trace.session_id,
+                );
+            },
+        )
+        .await
+    }
+
+    async fn prepare_peer_recovery_target_blocking_with_observer<F>(
+        self: &Arc<Self>,
+        index: String,
+        shard_id: u32,
+        index_uuid: String,
+        allocation_id: AllocationId,
+        observer: F,
+    ) -> Result<PathBuf>
+    where
+        F: FnOnce() + Send + 'static,
+    {
         let shard_manager = self.clone();
         tokio::task::spawn_blocking(move || {
             if allocation_id == 0 {
@@ -3119,16 +3239,50 @@ impl ShardManager {
             file.sync_all()?;
             std::fs::rename(&temporary_path, &marker_path)?;
             std::fs::File::open(&shard_dir)?.sync_all()?;
+            observer();
             Ok(shard_dir)
         })
         .await
         .map_err(|e| anyhow::anyhow!("blocking peer recovery target preparation failed: {e}"))?
     }
 
+    #[cfg_attr(feature = "protocol-trace", allow(dead_code))]
     pub(crate) async fn finalize_peer_recovery_target_blocking(
         self: &Arc<Self>,
         install: PeerRecoveryTargetInstall,
     ) -> Result<Arc<dyn SearchEngine>> {
+        self.finalize_peer_recovery_target_blocking_with_observer(install, || {})
+            .await
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    pub(crate) async fn finalize_peer_recovery_target_blocking_traced(
+        self: &Arc<Self>,
+        install: PeerRecoveryTargetInstall,
+        trace: crate::protocol_trace::RecoveryTraceContext,
+    ) -> Result<Arc<dyn SearchEngine>> {
+        self.finalize_peer_recovery_target_blocking_with_observer(install, move || {
+            crate::protocol_trace::record_recovery_installed(
+                &trace.source_node,
+                &trace.target_node,
+                &trace.index_uuid,
+                trace.shard,
+                trace.allocation,
+                &trace.session_id,
+                trace.snapshot_next_seq_no,
+            );
+        })
+        .await
+    }
+
+    async fn finalize_peer_recovery_target_blocking_with_observer<F>(
+        self: &Arc<Self>,
+        install: PeerRecoveryTargetInstall,
+        observer: F,
+    ) -> Result<Arc<dyn SearchEngine>>
+    where
+        F: FnOnce() + Send + 'static,
+    {
         let shard_manager = self.clone();
         tokio::task::spawn_blocking(move || {
             let PeerRecoveryTargetInstall {
@@ -3246,6 +3400,7 @@ impl ShardManager {
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(key, dynamic_engine.clone());
+            observer();
             Ok(dynamic_engine)
         })
         .await
@@ -3722,6 +3877,60 @@ impl ShardManager {
             .iter()
             .map(|(k, e)| (k.clone(), e.clone()))
             .collect()
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    pub fn capture_protocol_trace_copy_state(
+        &self,
+        index: &str,
+        shard_id: u32,
+    ) -> Result<crate::protocol_trace::TraceCopySnapshot> {
+        let copy = self
+            .protocol_trace_copy(index, shard_id)
+            .ok_or_else(|| anyhow::anyhow!("protocol trace copy is not open"))?;
+        let engine = self
+            .get_shard(index, shard_id)
+            .ok_or_else(|| anyhow::anyhow!("protocol trace shard engine is not open"))?;
+        let (documents, actual_documents, wal_entries) =
+            crate::protocol_trace::with_open_copy(copy.clone(), || {
+                engine.refresh()?;
+                engine.protocol_trace_copy_evidence()
+            })?;
+        let live_documents = documents
+            .into_iter()
+            .map(|(doc, source, seq_no, term)| {
+                let content_hash =
+                    crate::protocol_trace::content_hash(&crate::engine::DocumentMutation::Index {
+                        doc_id: doc.clone(),
+                        source,
+                    });
+                (doc, seq_no, term, content_hash)
+            })
+            .collect::<Vec<_>>();
+        Ok(crate::protocol_trace::TraceCopySnapshot {
+            copy,
+            live_documents,
+            actual_documents,
+            wal_entries,
+        })
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    pub fn close_protocol_trace_shard_for_restart(&self, index: &str, shard_id: u32) {
+        let key = ShardKey::new(index, shard_id);
+        let per_shard_lock = self.shard_open_lock(&key);
+        let _guard = per_shard_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.shards
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&key);
+        self.copy_identities
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&key);
+        self.isr_tracker.remove_shard(index, shard_id);
     }
 
     /// Close and remove all shard engines for an index, then delete the data directory.

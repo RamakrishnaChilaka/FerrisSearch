@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== 1/5 Check formatting ==="
+echo "=== 1/7 Check formatting ==="
 cargo fmt --check
 
-echo "=== 2/5 Clippy lints ==="
+echo "=== 2/7 Clippy lints ==="
 cargo clippy --all-targets --all-features -- -D warnings
 
-echo "=== 3/5 Build ==="
+echo "=== 3/7 Build ==="
 cargo build
 
-echo "=== 4/5 Run tests ==="
+echo "=== 4/7 Run tests ==="
 cargo test
 
-echo "=== 5/5 Run bounded TLA+ checks ==="
+echo "=== 5/7 Build D1 protocol trace harness ==="
+cargo test --features protocol-trace --test d1_protocol_trace --no-run
+
+echo "=== 6/7 Validate seeded D1 protocol traces ==="
+./scripts/tla/test_d1_protocol_trace_ci.sh
+
+echo "=== 7/7 Run bounded TLA+ checks ==="
 ./scripts/tla/check.sh
 
 # ── Change-locality advisory ──────────────────────────────────────────

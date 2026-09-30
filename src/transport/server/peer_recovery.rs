@@ -998,6 +998,21 @@ impl TransportService {
             }
 
             let (snapshot, snapshot_dir) = prepared.into_parts();
+            #[cfg(feature = "protocol-trace")]
+            crate::protocol_trace::record_recovery_snapshot(
+                &local_node_id,
+                &request.target_node_id,
+                &request.index_uuid,
+                request.shard_id,
+                &task_session_id,
+                snapshot
+                    .committed_boundary
+                    .max_seq_no
+                    .and_then(|seq_no| seq_no.checked_add(1))
+                    .unwrap_or(0),
+                snapshot.trace_processed_seqs.clone(),
+                snapshot.trace_documents.clone(),
+            );
             let files = snapshot
                 .files
                 .iter()
@@ -1787,6 +1802,16 @@ impl TransportService {
             let observation = self.observe_membership(&authority);
             match observation {
                 MembershipObservation::InSync => {
+                    #[cfg(feature = "protocol-trace")]
+                    crate::protocol_trace::record_recovery_membership(
+                        &authority.primary_node_id,
+                        &authority.target_node_id,
+                        &authority.index_uuid,
+                        authority.shard_id,
+                        authority.target_allocation_id,
+                        &session_id,
+                        "admitted",
+                    );
                     let removed = self.peer_recovery_state.remove_session(&session_id).await;
                     if let Some(removed) = removed {
                         cleanup_session(removed).await;
@@ -1797,6 +1822,31 @@ impl TransportService {
                     });
                 }
                 MembershipObservation::Impossible => {
+                    #[cfg(feature = "protocol-trace")]
+                    {
+                        let state = self.cluster_manager.get_state();
+                        let promoted = state
+                            .indices
+                            .get(&authority.index_name)
+                            .and_then(|metadata| metadata.shard_routing.get(&authority.shard_id))
+                            .is_some_and(|routing| {
+                                routing.primary == authority.target_node_id
+                                    && state.shard_allocation_id(
+                                        &authority.index_name,
+                                        authority.shard_id,
+                                        &authority.target_node_id,
+                                    ) == Some(authority.target_allocation_id)
+                            });
+                        crate::protocol_trace::record_recovery_membership(
+                            &authority.primary_node_id,
+                            &authority.target_node_id,
+                            &authority.index_uuid,
+                            authority.shard_id,
+                            authority.target_allocation_id,
+                            &session_id,
+                            if promoted { "promoted" } else { "rejected" },
+                        );
+                    }
                     let removed = self.peer_recovery_state.remove_session(&session_id).await;
                     if let Some(removed) = removed {
                         cleanup_session(removed).await;

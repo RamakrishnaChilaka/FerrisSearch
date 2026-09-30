@@ -974,6 +974,21 @@ impl SearchEngine for CompositeEngine {
         self.text.get_document(doc_id)
     }
 
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_documents(&self) -> Result<Vec<(String, serde_json::Value, u64, u64)>> {
+        self.text.protocol_trace_documents_snapshot()
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_processed_sequences(&self) -> Result<Vec<u64>> {
+        self.text.protocol_trace_processed_sequences()
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_copy_evidence(&self) -> Result<super::ProtocolTraceCopyEvidence> {
+        self.text.protocol_trace_copy_evidence()
+    }
+
     fn refresh(&self) -> Result<()> {
         let _vector_recovery = self
             .vector_recovery

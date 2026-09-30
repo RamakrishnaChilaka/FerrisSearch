@@ -18,6 +18,30 @@ fn test_remote_store_reader_cache() -> Arc<crate::engine::remote_store::RemoteSp
     Arc::new(crate::engine::remote_store::RemoteSplitReaderCache::default())
 }
 
+#[cfg(feature = "protocol-trace")]
+#[test]
+fn protocol_trace_replica_rejection_reasons_cover_pre_apply_boundaries() {
+    for (message, expected) in [
+        ("shard copy collision quarantine is active", "quarantined"),
+        (
+            "replication primary term 1 is below local fence 2",
+            "term_fence",
+        ),
+        ("replication allocation mismatch", "identity_mismatch"),
+        (
+            "replica is installing a peer recovery snapshot",
+            "recovery_gate",
+        ),
+        ("replica shard engine is not open", "copy_unavailable"),
+        ("injected WAL sync failure", "apply_failure"),
+    ] {
+        assert_eq!(
+            TransportService::protocol_trace_replica_rejection_reason(&anyhow::anyhow!(message)),
+            expected
+        );
+    }
+}
+
 fn gap_test_state(replica_port: u16) -> DomainClusterState {
     let mut state = DomainClusterState::new("gap-probe".into());
     for (node_id, transport_port) in [("source", 0), ("replica", replica_port)] {

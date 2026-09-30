@@ -40,10 +40,20 @@ Validate one implementation trace or run the trace validator's self-tests:
 
 ```bash
 ./scripts/tla/validate_trace.sh path/to/d1-trace.jsonl
+./scripts/tla/check_d1_trace_invariants.py path/to/d1-trace.jsonl
+./scripts/tla/test_d1_protocol_trace.sh
+./scripts/tla/test_d1_protocol_trace_ci.sh
 ./scripts/tla/test_trace_validator.sh
 ./scripts/tla/check.sh trace-validator
 ./scripts/tla/check.sh trace-validator-round4
 ```
+
+`check_d1_trace_invariants.py` is an independent invariant oracle rather than a
+full protocol-conformance checker. Activation/fan-out/replay ordering,
+commit-term-state shape, and hidden-action budget violations may therefore be
+TLA+-only rejections. Use `--fixture` only for hand-written fixtures that omit
+final copy-state observations; it skips that one completeness requirement.
+Rust harness traces always require the strict mode and actual-state sidecar.
 
 `validate_trace.sh` defaults to 120 seconds and a 4 GiB Java heap per TLC run.
 Exit code `0` means accepted, `1` means rejected, and `3` with an
@@ -57,6 +67,61 @@ The self-test scripts run independent fixtures with
 writes an isolated log, and the parent prints logs in declaration order after
 all children finish. The deliberate out-of-memory case keeps its 24 MiB heap.
 Set `TLA_TRACE_JOBS=1` to reproduce the sequential schedule.
+
+`test_d1_protocol_trace.sh` runs the scripted three-node in-process gRPC fault
+scenario behind the `protocol-trace` Cargo feature. It captures a correct
+schema-v4 trace plus the `arrival-order` and `seq-only-redelivery` mutations.
+The independent invariant checker and TLC accept the 158-event correct trace
+and reject the mutations at `operation_processed` steps 27 and 117.
+
+The Rust trace evidence currently scopes out periodic refresh, automatic or
+API-driven flush, force merge, and their WAL truncation. The harness sets a
+long refresh interval and disables automatic flush because those background
+maintenance callbacks do not yet carry an engine-owned trace copy identity.
+Replay, activation, recovery, and final-state capture commits remain covered.
+Do not use these traces as evidence for maintenance/flush interleavings until
+that follow-up instrumentation and randomized scheduling are implemented.
+
+`test_d1_protocol_trace_ci.sh` adds randomized correct-code seeds
+`16,44,102,149,160`. The fixed set spans 20 to 60 document operations, 277 to
+737 trace events, request delay and drop variation, replica restart with WAL
+replay, primary failover with NoOp gap fill, exact replica removal, and peer
+recovery. CI builds the integration target in a separate untimed step; only the
+capture and validation wrapper has the five-minute timeout. On September 30,
+2026, the validation wrapper completed in 1m33.01s with 721,452 KB peak RSS
+under `taskset -c 0-3` on the development host; compilation was completed
+before that timed command.
+
+Run the full deterministic sweep manually:
+
+```bash
+CARGO_TARGET_DIR=target/protocol-trace \
+python3 scripts/tla/sweep_d1_protocol_trace.py \
+  --mode correct \
+  --seeds 1..=200 \
+  --output-dir target/d1-trace-sweep/correct \
+  --jobs 2 \
+  --tla-timeout 300 \
+  --tla-heap 2g
+
+for mode in arrival-order seq-only-redelivery; do
+  CARGO_TARGET_DIR=target/protocol-trace \
+  python3 scripts/tla/sweep_d1_protocol_trace.py \
+    --mode "$mode" \
+    --seeds 1..=50 \
+    --output-dir "target/d1-trace-sweep/$mode" \
+    --jobs 2 \
+    --tla-timeout 300 \
+    --tla-heap 2g
+done
+```
+
+On September 30, 2026, all 200 correct-code seeds passed. The independent
+checker took 0.11s p50 and 2.46s maximum; TLC took 13.58s p50 and 26.48s
+maximum. Both checkers detected all 50 arrival-order and all 50
+sequence-only-redelivery mutations. These are development-host validation
+times from two concurrent one-worker TLC processes with 2 GiB heaps, not
+performance benchmarks.
 
 Use an existing verified jar or retain raw logs:
 
@@ -111,9 +176,9 @@ liveness configurations use neither symmetry nor a state constraint.
 | `MC_D1_TermCollisionRestart.tla` | B1 crash/rebuild after fence raise, committed-record-only versus identity-based restoration of collision state. |
 | `MC_D1_PrimaryGap.tla` | Primary engine-apply gap, max-based recovery loop, and processed-checkpoint comparison. |
 | `MC_D1_PromotionReplayNoOp.tla` | Promotion ordering: replay local WAL, fill gaps with NoOps, tolerate failed NoOp replication, then activate. |
-| `MC_D1_TraceActions.tla` | Checked coverage for earlier captured-boundary persistence, trace truncation, arbitrary-node restart/replay, and failed-replay unavailability. |
-| `MC_D1_FailoverActions.tla` | One scripted three-copy action path covering promotion fencing, NoOp fan-out/apply/redelivery, activation, sequence reuse, and fail-closed collision handling. |
-| `MC_D1_NoOpCollisionActions.tla` | One scripted path covering promotion NoOp collision, NACK delivery, and exact in-sync removal. |
+| `MC_D1_TraceActions.tla` | Checked coverage for earlier captured-boundary persistence, trace truncation, restart replay, alive-copy replay, and failed-replay unavailability. |
+| `MC_D1_FailoverActions.tla` | One scripted three-copy action path covering promotion fencing, physical NoOp append/process/sync, post-activation send, apply/redelivery, sequence reuse, and fail-closed collision handling. |
+| `MC_D1_NoOpCollisionActions.tla` | One scripted path covering physical promotion NoOp fill, post-activation send, collision, NACK delivery, and exact in-sync removal. |
 | `TraceD1.tla` | Existential schema-v4 witness search over real `MC_D1_SeqNoApply` actions, with evidence-directed hidden D1 actions and copy-state observations. |
 | `TraceD1Authority.tla` | Exact composition with Raft routing views, failover, durable fencing, activation, and primary write gating. |
 | `TraceD1Collision.tla` | Exact composition with the bounded B1 term/sequence collision and in-sync removal actions. |
@@ -366,8 +431,9 @@ entire trace through real actions:
 
 The converter infers the composition from the event vocabulary; the emitter
 does not select a profile. Core replication and authority/failover events may
-use the combined composition in one trace. Peer recovery remains a separate
-composition.
+use the combined composition in one trace. A trace that also contains peer
+recovery uses the full composition in `TraceD1.tla`; recovery-only fixtures
+continue to use `TraceD1Recovery.tla`.
 Observed low-level WAL, fence, and commit records may be D1 stuttering steps,
 but they are tied to a later real action and semantic `copy_state`. Observed
 records cannot be reordered or discarded.
@@ -385,11 +451,16 @@ replay records name their physical WAL receipts. Hidden promotion, activation,
 view-delivery, removal, replay-skip, and transport steps are constrained by
 the next observation rather than explored as unrelated choices.
 
-Recovery control actions are used only by `TraceD1Recovery` and compose with
-the D1 fixed planner for live replication and ordered catch-up. The ordering
-premise is an activated-primary source scanning the pinned physical WAL in
-file order with one exclusive sequence cursor. Out-of-order or duplicate
-catch-up batches are therefore not expressible in that composition.
+Recovery control actions are used by `TraceD1Recovery` and the full
+`TraceD1` composition. They compose with the D1 fixed planner for live
+replication, promotion NoOps, fresh-allocation replacement, and ordered
+catch-up. Snapshot and barrier observations compare the exact processed
+sequence set, including promotion NoOps; live-document evidence projects
+delete identities to absence while the model retains tombstone metadata. The
+ordering premise is an activated-primary source scanning the pinned physical
+WAL in file order with one exclusive sequence cursor. Out-of-order or
+duplicate catch-up batches are therefore not expressible in either
+composition.
 
 Bulk traces may record every per-item WAL append before any item is processed;
 the append and processing records remain ordered inside one translog critical
@@ -435,6 +506,7 @@ verdict for every checked-in baseline and every Opus review mutation:
 | Collision mislabeled as redelivery | Rejected | Rejected at step 32, `operation_processed` |
 | Reviewer p7a, traced NoOp fan-out | Accepted | Accepted in 5.31s |
 | Reviewer p7b, omitted NoOp fan-out | Rejected | Rejected at step 190, `operation_processed` |
+| Round-6 processed-event identity mislabels | Rejected | NoOp term/sequence labels reject at step 186; recovery write identity rejects at step 16 |
 
 The former 217-event version-3 combined witness is 219 events in version 4.
 It uses 16 writes, three nodes, write terms 1 and 3, and the intermediate
@@ -1002,9 +1074,9 @@ performance benchmarks.
 | `d1-primary-gap-max` | 2 copies / seq 0..2 | Both checkpoints 1; primary max next 3 | Max-based detector | Expected `B3NoRecoveryLoop` violation | 4 / 4 | 4 | <1s |
 | `d1-primary-gap-processed` | Same primary gap | Compare processed checkpoint 1 to 1 | Processed detector | Pass | 3 / 3 | 3 | 1s |
 | `d1-promotion-replay-noop` | Promoted copy WAL `{0,2}` | Replay, NoOp 1, failed NoOp replication, activate | Promotion ordering | Pass | 8 / 7 | 6 | 1s |
-| `d1-trace-actions` | 2 nodes / 1 acknowledged write | Earlier captured commit; truncation; both-node restart; successful and failed replay | Trace action coverage | Pass | 16 / 16 | 16 | 2s |
-| `d1-failover-actions` | 3 nodes / 5 writes | Scripted gap/failover path; durable term-3 fences; NoOp fan-out/apply/redelivery; activation; collision | Scripted action coverage, not exhaustive model checking | Pass | 47 / 45 | 45 | 2s |
-| `d1-noop-collision-actions` | 3 nodes / 2 writes | Scripted promotion NoOp collision, NACK, and exact removal | Scripted action coverage, not exhaustive model checking | Pass | 28 / 27 | 27 | 2s |
+| `d1-trace-actions` | 2 nodes / 1 acknowledged write | Earlier captured commit; truncation; both-node restart; restart and alive-copy replay; failed replay | Trace action coverage | Pass | 19 / 19 | 19 | 2s |
+| `d1-failover-actions` | 3 nodes / 5 writes | Scripted gap/failover path; durable term-3 fences; physical NoOp fill; post-activation send/apply/redelivery; collision | Scripted action coverage, not exhaustive model checking | Pass | 50 / 48 | 48 | 3s |
+| `d1-noop-collision-actions` | 3 nodes / 2 writes | Scripted physical promotion NoOp fill, post-activation send, collision, NACK, and exact removal | Scripted action coverage, not exhaustive model checking | Pass | 31 / 30 | 30 | 2s |
 | `trace-validator` | Schema-v4 one-shard traces | Exact messages/crash sets/fill ranges; inferred core/authority/collision/recovery composition; semantic copy state | Four 2 GiB jobs; 120s per trace | Baselines plus m-, n-, p7-, and NoOp mutations match expected verdicts | Per-trace witness search | Per-trace witness search | 2m01s on four CPUs |
 | `trace-validator-round4` | Schema-v4 combined traces | Late delivery, truncation/restart, activation gaps, replayable NoOps | Four 2 GiB jobs; 120s per trace | Round-4 fixture verdicts match | Per-trace witness search | Per-trace witness search | 28.14s on four CPUs |
 | `two-shard` | 3 nodes / 2 shards | One shard red; sibling primary failure, promotion, and allocation | Per-shard update validation | Safety and liveness pass | 4 / 4 | 4 | 1s |
@@ -1018,9 +1090,10 @@ remained isolated. Every expected pass and expected counterexample matched.
 The two large exhaustive runs remain manual eight-worker commands.
 
 `d1-failover-actions` was introduced as scripted action coverage along one
-31-state path, not as exhaustive model checking. Explicit NoOp
-request/ACK/redelivery actions extend the current scripted path to 45 distinct
-states; its purpose remains coverage of named actions and order constraints.
+31-state path, not as exhaustive model checking. Explicit physical fill,
+post-activation request/ACK, and redelivery actions extend the current scripted
+path to 48 distinct states; its purpose remains coverage of named actions and
+order constraints.
 `d1-noop-collision-actions` is the same kind of scripted coverage for the
 collision/NACK/removal path.
 
@@ -1084,8 +1157,13 @@ well below the CI budget.
 - No Apalache inductive check has been run.
 - No TLAPS proof has been written.
 - The trace validator checks schema-v4 fixtures. Rust process/integration tests
-  do not yet emit those events, so no captured Rust execution is claimed as
-  validated evidence yet.
+  also emit schema-v4 events behind the test-only `protocol-trace` feature.
+  The seeded three-node real-gRPC scenario covers concurrent single and bulk
+  writes, request delay/drop, failover, promotion NoOp collision and exact
+  removal, primary restart/replay, and final semantic copy snapshots. Its
+  independent checker covers acknowledged-write retention, authoritative-copy
+  convergence, monotonic fences, and gap-aware checkpoints before TLC checks
+  the same trace against the D1 transition system.
 - Promotion NoOp WAL records use model identities carrying sequence and term
   but no client write ID. The validator checks exact fan-out, replica
   receipt/apply/fence/collision/result, persistence, replay, truncation, gap

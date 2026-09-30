@@ -187,6 +187,14 @@ impl TransportClient {
             .max_encoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE))
     }
 
+    #[cfg(feature = "protocol-trace")]
+    pub fn evict_protocol_trace_channel(&self, host: &str, port: u16) {
+        self.channels
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&format!("{host}:{port}"));
+    }
+
     /// Attempts to join the cluster by contacting the seed hosts.
     /// `raft_node_id` is sent to the leader so it can add this node to Raft membership.
     pub async fn join_cluster(

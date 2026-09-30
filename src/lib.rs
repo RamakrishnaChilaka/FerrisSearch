@@ -8,6 +8,8 @@ pub mod hybrid;
 pub mod indexing;
 pub mod metrics;
 pub mod node;
+#[cfg(feature = "protocol-trace")]
+pub mod protocol_trace;
 pub mod replication;
 pub mod search;
 pub mod security;

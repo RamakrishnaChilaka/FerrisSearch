@@ -104,6 +104,17 @@ EVENT_FIELDS = {
         "op",
         "content_hash",
     },
+    "replica_rejected": {
+        "node",
+        "index_uuid",
+        "shard",
+        "allocation",
+        "message_id",
+        "receipt_id",
+        "term",
+        "seq_no",
+        "reason",
+    },
     "replica_result": {
         "node",
         "index_uuid",
@@ -348,6 +359,10 @@ EVENT_FIELDS = {
         "outcome",
     },
 }
+EVENT_OPTIONAL_FIELDS = {
+    "operation_processed": {"batch_max_seq_no"},
+    "replay_entry": {"batch_max_seq_no"},
+}
 COMMON_FIELDS = {"schema", "run_id", "step", "event"}
 CHECKPOINT_FIELDS = {"processed", "persisted", "max_seq_no"}
 TERM_STATE_FIELDS = {
@@ -384,8 +399,14 @@ def fail(line: int, message: str) -> None:
     raise TraceSchemaError(f"line {line}: {message}")
 
 
-def exact_fields(value: dict[str, Any], expected: set[str], line: int) -> None:
-    unknown = sorted(set(value) - expected)
+def exact_fields(
+    value: dict[str, Any],
+    expected: set[str],
+    line: int,
+    optional: set[str] | None = None,
+) -> None:
+    optional = optional or set()
+    unknown = sorted(set(value) - expected - optional)
     missing = sorted(expected - set(value))
     if unknown:
         fail(line, f"unknown field(s): {', '.join(unknown)}")
@@ -547,7 +568,12 @@ def validate_event(
     event = value.get("event")
     if event not in EVENT_FIELDS:
         fail(line, f"unknown event {event!r}")
-    exact_fields(value, COMMON_FIELDS | EVENT_FIELDS[event], line)
+    exact_fields(
+        value,
+        COMMON_FIELDS | EVENT_FIELDS[event],
+        line,
+        EVENT_OPTIONAL_FIELDS.get(event),
+    )
     if value["schema"] != SCHEMA:
         fail(line, f"unsupported schema {value['schema']!r}; expected {SCHEMA!r}")
     if value["run_id"] != start["run_id"]:
@@ -597,6 +623,15 @@ def validate_event(
             fail(line, "content_hash must be lowercase SHA-256")
     if "checkpoints" in value:
         checkpoints(value["checkpoints"], line)
+    if "batch_max_seq_no" in value:
+        batch_max_seq_no = integer(
+            value["batch_max_seq_no"],
+            line,
+            "batch_max_seq_no",
+            nullable=True,
+        )
+        if batch_max_seq_no != value["checkpoints"]["max_seq_no"]:
+            fail(line, "batch_max_seq_no must equal checkpoints.max_seq_no")
     if "durable" in value:
         boolean(value["durable"], line, "durable")
 
@@ -606,7 +641,12 @@ def validate_event(
         if value["op"] not in {"index", "delete"}:
             fail(line, "client op must be index or delete")
     elif event in {"wal_appended", "operation_processed"}:
-        if value["origin"] not in {"primary", "live_replication", "recovery"}:
+        if value["origin"] not in {
+            "primary",
+            "live_replication",
+            "recovery",
+            "promotion",
+        }:
             fail(line, "origin is invalid")
         if value["op"] not in {"index", "delete", "noop"}:
             fail(line, "operation kind is invalid")
@@ -648,6 +688,17 @@ def validate_event(
         if value["source_node"] not in nodes:
             fail(line, "source_node is not declared")
         integer(value["source_incarnation"], line, "source_incarnation")
+    elif event == "replica_rejected":
+        if value["reason"] not in {
+            "quarantined",
+            "term_fence",
+            "identity_mismatch",
+            "recovery_gate",
+            "copy_unavailable",
+            "batch_rejected",
+            "apply_failure",
+        }:
+            fail(line, "replica rejection reason is invalid")
     elif event == "replica_result":
         if value["replica"] not in nodes:
             fail(line, "replica is not declared")
@@ -701,8 +752,25 @@ def validate_event(
             "max_seq_no_at_term_start",
             nullable=True,
         )
-        if not isinstance(state["processed_in_current_term_below_start_max"], list):
+        ranges = state["processed_in_current_term_below_start_max"]
+        if not isinstance(ranges, list):
             fail(line, "processed term ranges must be an array")
+        previous_end: int | None = None
+        for interval in ranges:
+            if not isinstance(interval, dict):
+                fail(line, "processed term range must be an object")
+            exact_fields(interval, {"start", "end"}, line)
+            start = integer(interval["start"], line, "term range start")
+            end = integer(interval["end"], line, "term range end")
+            assert start is not None and end is not None
+            if start > end:
+                fail(line, "processed term range start exceeds end")
+            if previous_end is not None and start <= previous_end + 1:
+                fail(line, "processed term ranges must be normalized")
+            maximum = state["max_seq_no_at_term_start"]
+            if maximum is None or end > maximum:
+                fail(line, "processed term range exceeds term-start maximum")
+            previous_end = end
     elif event == "node_crashed":
         integer(value["incarnation"], line, "incarnation")
         if value["outcome"] not in {"clean", "unclean"}:
@@ -957,6 +1025,7 @@ def load_trace(path: Path) -> LoadedTrace:
         kinds
         & {
             "replica_received",
+            "replica_rejected",
             "replica_result",
             "commit_captured",
             "commit_persisted",
@@ -970,7 +1039,29 @@ def load_trace(path: Path) -> LoadedTrace:
         }
     )
     has_client_write = "client_write_routed" in kinds
-    if has_recovery:
+    if has_recovery and (
+        has_authority
+        or has_collision
+        or bool(
+            kinds
+            & {
+                "commit_captured",
+                "commit_persisted",
+                "wal_truncated",
+                "node_crashed",
+                "node_restarted",
+                "replay_started",
+                "replay_entry",
+                "replay_finished",
+                "promotion_noop_fill",
+                "promotion_noop_replication_started",
+                "promotion_noop_received",
+                "promotion_noop_result",
+            }
+        )
+    ):
+        profile = "d1-full"
+    elif has_recovery:
         profile = "d1-recovery"
     elif has_collision and has_client_write:
         profile = "d1-combined"
@@ -990,6 +1081,7 @@ def load_trace(path: Path) -> LoadedTrace:
             "operation_processed",
             "primary_replication_started",
             "replica_received",
+            "replica_rejected",
             "replica_result",
             "client_result",
             "fence_persisted",
@@ -1023,6 +1115,7 @@ def load_trace(path: Path) -> LoadedTrace:
             "operation_processed",
             "primary_replication_started",
             "replica_received",
+            "replica_rejected",
             "replica_result",
             "client_result",
             "fence_persisted",
@@ -1044,6 +1137,39 @@ def load_trace(path: Path) -> LoadedTrace:
             "primary_activated",
             "copy_state",
         },
+        "d1-full": {
+            "client_write_routed",
+            "wal_appended",
+            "operation_processed",
+            "primary_replication_started",
+            "replica_received",
+            "replica_rejected",
+            "replica_result",
+            "client_result",
+            "fence_persisted",
+            "commit_captured",
+            "commit_persisted",
+            "wal_truncated",
+            "node_crashed",
+            "node_restarted",
+            "replay_started",
+            "replay_entry",
+            "replay_finished",
+            "routing_view",
+            "routing_promoted",
+            "in_sync_removed",
+            "promotion_noop_fill",
+            "promotion_noop_replication_started",
+            "promotion_noop_received",
+            "promotion_noop_result",
+            "primary_activated",
+            "recovery_snapshot",
+            "recovery_started",
+            "recovery_installed",
+            "recovery_barrier",
+            "recovery_membership",
+            "copy_state",
+        },
         "d1-collision": {
             "wal_appended",
             "operation_processed",
@@ -1059,6 +1185,7 @@ def load_trace(path: Path) -> LoadedTrace:
             "operation_processed",
             "primary_replication_started",
             "replica_received",
+            "replica_rejected",
             "replica_result",
             "client_result",
             "routing_view",
@@ -1124,18 +1251,58 @@ def load_trace(path: Path) -> LoadedTrace:
             "term": start["shard_state"]["term"],
             "in_sync": set(start["shard_state"]["in_sync"]),
             "allocations": dict(initial_allocations),
+            "initialized": start["shard_state"]["activated"],
         }
         for item in start["nodes"]
     }
+    node_alive = {item["node"]: True for item in start["nodes"]}
+    activated_terms = {item["node"]: 0 for item in start["nodes"]}
+    if start["shard_state"]["activated"]:
+        activated_terms[start["shard_state"]["primary"]] = start["shard_state"][
+            "term"
+        ]
     node_incarnations = {
         item["node"]: item["incarnation"] for item in start["nodes"]
     }
     message_attempts: dict[str, dict[str, Any]] = {}
+    received_message_ids: set[str] = set()
     attempt_by_receipt_target: dict[tuple[str, str], str] = {}
     noop_batches: dict[str, dict[str, Any]] = {}
     wal_entries_by_node: dict[str, list[str]] = {
         item["node"]: [] for item in start["nodes"]
     }
+    initial_term = start["shard_state"]["term"]
+    initial_fence_terms = {
+        item["node"]: item["fence_term"]
+        for item in start["shard_state"]["copies"]
+    }
+    term_state = {
+        item["node"]: {
+            "current_term": initial_fence_terms.get(item["node"], initial_term),
+            "max_seq_no_at_term_start": None,
+            "processed": set(),
+        }
+        for item in start["nodes"]
+    }
+    persisted_term_state = {
+        node: {
+            "current_term": state["current_term"],
+            "max_seq_no_at_term_start": state["max_seq_no_at_term_start"],
+            "processed": set(state["processed"]),
+        }
+        for node, state in term_state.items()
+    }
+    durable_fence = {
+        node: {
+            "term": initial_fence_terms.get(node, initial_term),
+            "max_seq_no": None,
+        }
+        for node in term_state
+    }
+    copy_max_seq_no: dict[str, int | None] = {
+        item["node"]: None for item in start["nodes"]
+    }
+    recovery_term_state: dict[str, dict[str, Any]] = {}
 
     def register_identity(
         ident: tuple[int, int],
@@ -1166,11 +1333,13 @@ def load_trace(path: Path) -> LoadedTrace:
         if message_id in message_attempts:
             fail(line, f"message_id {message_id!r} was reused")
         if key in attempt_by_receipt_target:
-            fail(
-                line,
-                "receipt/target already has a transport attempt: "
-                f"{attempt['receipt_id']!r}/{attempt['target']!r}",
-            )
+            previous = message_attempts[attempt_by_receipt_target[key]]
+            if previous["phase"] is not None:
+                fail(
+                    line,
+                    "receipt/target already has an in-flight transport attempt: "
+                    f"{attempt['receipt_id']!r}/{attempt['target']!r}",
+                )
         message_attempts[message_id] = attempt
         attempt_by_receipt_target[key] = message_id
 
@@ -1186,6 +1355,56 @@ def load_trace(path: Path) -> LoadedTrace:
         for attempt in message_attempts.values():
             if attempt["type"] == "write" and attempt["request_id"] == request:
                 attempt["phase"] = None
+
+    def copy_term_state(state: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "current_term": state["current_term"],
+            "max_seq_no_at_term_start": state["max_seq_no_at_term_start"],
+            "processed": set(state["processed"]),
+        }
+
+    def reset_term_state(node: str) -> None:
+        persisted = persisted_term_state[node]
+        fence = durable_fence[node]
+        if fence["term"] > persisted["current_term"]:
+            term_state[node] = {
+                "current_term": fence["term"],
+                "max_seq_no_at_term_start": fence["max_seq_no"],
+                "processed": set(),
+            }
+        else:
+            term_state[node] = copy_term_state(persisted)
+
+    def mark_term_processed(
+        node: str,
+        primary_term: int,
+        seq_no: int,
+        outcome: str,
+    ) -> None:
+        if outcome not in {"applied_newer", "stale", "noop"}:
+            return
+        state = term_state[node]
+        if primary_term < state["current_term"]:
+            return
+        if primary_term > state["current_term"]:
+            state["current_term"] = primary_term
+            state["max_seq_no_at_term_start"] = copy_max_seq_no[node]
+            state["processed"] = set()
+        maximum = state["max_seq_no_at_term_start"]
+        if maximum is not None and seq_no <= maximum:
+            state["processed"].add(seq_no)
+        current_maximum = copy_max_seq_no[node]
+        if current_maximum is None or seq_no > current_maximum:
+            copy_max_seq_no[node] = seq_no
+
+    def normalized_ranges(values: set[int]) -> list[dict[str, int]]:
+        ranges: list[dict[str, int]] = []
+        for value in sorted(values):
+            if ranges and value == ranges[-1]["end"] + 1:
+                ranges[-1]["end"] = value
+            else:
+                ranges.append({"start": value, "end": value})
+        return ranges
 
     for event in events:
         kind = event["event"]
@@ -1219,7 +1438,11 @@ def load_trace(path: Path) -> LoadedTrace:
 
         elif kind == "wal_appended":
             receipt = event["receipt_id"]
-            if event["origin"] == "primary" and request not in routed:
+            if (
+                event["origin"] == "primary"
+                and request not in routed
+                and not (request is None and event["op"] == "noop")
+            ):
                 fail(line, "primary WAL append has no routed request")
             register_receipt(receipt, ident, line)
             copy_key = (receipt, event["node"])
@@ -1236,7 +1459,11 @@ def load_trace(path: Path) -> LoadedTrace:
                     event["_message_id"] = message_id
 
         elif kind == "operation_processed":
+            event["_batch_max_seq_no"] = event.get(
+                "batch_max_seq_no", event["checkpoints"]["max_seq_no"]
+            )
             receipt = event["receipt_id"]
+            register_receipt(receipt, ident, line)
             if copy_key := attempt_by_receipt_target.get(
                 (receipt, event["node"])
             ):
@@ -1252,13 +1479,28 @@ def load_trace(path: Path) -> LoadedTrace:
                 and profile != "d1-collision"
             ):
                 fail(line, "processed live operation has no message attempt")
+            if (
+                event["origin"] == "live_replication"
+                and profile != "d1-collision"
+                and event["_message_id"] not in received_message_ids
+            ):
+                fail(line, "processed live operation has no replica receive event")
             process_by_receipt[receipt] = event
             processed_by_copy.add((receipt, event["node"]))
+            mark_term_processed(
+                event["node"],
+                event["term"],
+                event["seq_no"],
+                event["outcome"],
+            )
             if event["origin"] == "primary":
-                if request not in routed:
+                if request not in routed and not (
+                    request is None and event["op"] == "noop"
+                ):
                     fail(line, "primary process has no routed request")
-                request_state[request] = "Replicating"
-                request_primary[request] = event["node"]
+                if request is not None:
+                    request_state[request] = "Replicating"
+                    request_primary[request] = event["node"]
             if "_message_id" in event:
                 attempt = message_attempts[event["_message_id"]]
                 if attempt["phase"] != "request":
@@ -1322,6 +1564,8 @@ def load_trace(path: Path) -> LoadedTrace:
             attempt = message_attempts.get(message_id)
             if attempt is None or attempt["type"] != "write":
                 fail(line, "replica receipt names an unknown write message")
+            if message_id in received_message_ids:
+                fail(line, "replica receipt was emitted twice")
             if (
                 attempt["phase"] != "request"
                 or attempt["receipt_id"] != event["receipt_id"]
@@ -1333,6 +1577,24 @@ def load_trace(path: Path) -> LoadedTrace:
                 or attempt["target_allocation"] != event["allocation"]
             ):
                 fail(line, "replica receipt does not match its message attempt")
+            event["_message_id"] = message_id
+            received_message_ids.add(message_id)
+
+        elif kind == "replica_rejected":
+            message_id = event["message_id"]
+            attempt = message_attempts.get(message_id)
+            if attempt is None:
+                fail(line, "replica rejection names an unknown message")
+            if (
+                attempt["phase"] != "request"
+                or attempt["receipt_id"] != event["receipt_id"]
+                or attempt["target"] != event["node"]
+                or attempt["term"] != event["term"]
+                or attempt["seq_no"] != event["seq_no"]
+                or attempt["target_allocation"] != event["allocation"]
+            ):
+                fail(line, "replica rejection does not match its message attempt")
+            attempt["phase"] = "nack"
             event["_message_id"] = message_id
 
         elif kind == "replica_result":
@@ -1413,18 +1675,61 @@ def load_trace(path: Path) -> LoadedTrace:
                 request_state[request] = "Failed"
                 clear_write_attempts(request)
 
+        elif kind == "fence_persisted":
+            fence = durable_fence[event["node"]]
+            if event["term"] > fence["term"]:
+                fence["term"] = event["term"]
+                fence["max_seq_no"] = event["fence_max_seq_no"]
+            state = term_state[event["node"]]
+            if event["term"] > state["current_term"]:
+                state["current_term"] = event["term"]
+                state["max_seq_no_at_term_start"] = event["fence_max_seq_no"]
+                state["processed"] = set()
+
         elif kind == "commit_captured":
+            state = term_state[event["node"]]
+            expected_term_state = {
+                "current_term": state["current_term"],
+                "max_seq_no_at_term_start": state[
+                    "max_seq_no_at_term_start"
+                ],
+                "processed_in_current_term_below_start_max": normalized_ranges(
+                    state["processed"]
+                ),
+            }
+            if event["term_state"] != expected_term_state:
+                fail(
+                    line,
+                    "commit_captured term_state does not match traced copy state: "
+                    f"observed={event['term_state']!r}, "
+                    f"expected={expected_term_state!r}",
+                )
             commits[event["commit_id"]] = event
 
         elif kind == "commit_persisted":
             if event["commit_id"] not in commits:
                 fail(line, "commit_persisted has no captured boundary")
+            captured = commits[event["commit_id"]]["term_state"]
+            persisted_term_state[event["node"]] = {
+                "current_term": captured["current_term"],
+                "max_seq_no_at_term_start": captured[
+                    "max_seq_no_at_term_start"
+                ],
+                "processed": {
+                    seq_no
+                    for interval in captured[
+                        "processed_in_current_term_below_start_max"
+                    ]
+                    for seq_no in range(interval["start"], interval["end"] + 1)
+                },
+            }
 
         elif kind == "promotion_noop_fill":
             batch_id = event["batch_id"]
             if batch_id in noop_batches:
                 fail(line, f"promotion NoOp batch {batch_id!r} was reused")
             noops: dict[str, dict[str, Any]] = {}
+            physical_effects: list[bool] = []
             for noop in event["noops"]:
                 noop_ident = (event["term"], noop["seq_no"])
                 content = {
@@ -1434,18 +1739,61 @@ def load_trace(path: Path) -> LoadedTrace:
                 }
                 register_identity(noop_ident, content, line)
                 register_receipt(noop["receipt_id"], noop_ident, line)
-                if (noop["receipt_id"], event["node"]) in wal_by_copy:
-                    fail(line, "promotion NoOp receipt already exists on primary")
-                wal_by_copy.add((noop["receipt_id"], event["node"]))
-                wal_entries_by_node[event["node"]].append(noop["receipt_id"])
+                copy_key = (noop["receipt_id"], event["node"])
+                has_wal = copy_key in wal_by_copy
+                has_process = copy_key in processed_by_copy
+                if has_wal != has_process:
+                    fail(
+                        line,
+                        "promotion NoOp fill has only one physical apply effect",
+                    )
+                if has_wal:
+                    wal_event = wal_by_receipt[noop["receipt_id"]]
+                    process_event = process_by_receipt[noop["receipt_id"]]
+                    if (
+                        wal_event["node"] != event["node"]
+                        or wal_event["origin"] not in {"primary", "promotion"}
+                        or process_event["node"] != event["node"]
+                        or process_event["origin"] not in {"primary", "promotion"}
+                        or process_event["outcome"] != "noop"
+                    ):
+                        fail(
+                            line,
+                            "promotion NoOp physical effects do not match the fill",
+                        )
+                else:
+                    wal_by_receipt.setdefault(
+                        noop["receipt_id"],
+                        {
+                            "node": event["node"],
+                            "origin": "promotion",
+                            "durable": True,
+                        },
+                    )
+                    wal_by_copy.add(copy_key)
+                    processed_by_copy.add(copy_key)
+                    wal_entries_by_node[event["node"]].append(noop["receipt_id"])
+                mark_term_processed(
+                    event["node"],
+                    event["term"],
+                    noop["seq_no"],
+                    "noop",
+                )
+                physical_effects.append(has_wal)
                 noops[noop["receipt_id"]] = noop
-            expected_targets = set(latest_views[event["node"]]["in_sync"])
+            copy_max_seq_no[event["node"]] = event["checkpoints"]["max_seq_no"]
+            if any(physical_effects) and not all(physical_effects):
+                fail(line, "promotion NoOp fill mixes summary and physical effects")
+            event["_fill_physical"] = bool(physical_effects and physical_effects[0])
             noop_batches[batch_id] = {
                 "event": event,
                 "node": event["node"],
                 "term": event["term"],
                 "noops": noops,
-                "expected_targets": expected_targets,
+                "send_targets": None,
+                "send_allocations": None,
+                "candidate_targets": None,
+                "candidate_allocations": None,
                 "message_ids": [],
             }
 
@@ -1457,15 +1805,29 @@ def load_trace(path: Path) -> LoadedTrace:
             if noop is None:
                 fail(line, "promotion NoOp send has an unknown receipt")
             view = latest_views[event["node"]]
+            if batch["send_targets"] is None:
+                if (
+                    not node_alive[event["node"]]
+                    or activated_terms[event["node"]] != event["term"]
+                    or view["primary"] != event["node"]
+                    or view["term"] != event["term"]
+                    or not view["initialized"]
+                ):
+                    fail(line, "promotion NoOp send precedes a valid activation")
+                batch["send_targets"] = set(view["in_sync"])
+                batch["send_allocations"] = {
+                    target: view["allocations"][target]
+                    for target in view["in_sync"]
+                }
             if (
                 batch["node"] != event["node"]
                 or batch["term"] != event["term"]
                 or noop["seq_no"] != event["seq_no"]
                 or noop["content_hash"] != event["content_hash"]
                 or event["source_incarnation"] != node_incarnations[event["node"]]
-                or event["replica"] not in batch["expected_targets"]
+                or event["replica"] not in batch["send_targets"]
                 or event["replica_allocation"]
-                != view["allocations"][event["replica"]]
+                != batch["send_allocations"][event["replica"]]
                 or event["replica_incarnation"]
                 != node_incarnations[event["replica"]]
             ):
@@ -1495,6 +1857,8 @@ def load_trace(path: Path) -> LoadedTrace:
             attempt = message_attempts.get(message_id)
             if attempt is None or attempt["type"] != "noop":
                 fail(line, "promotion NoOp receipt names an unknown message")
+            if message_id in received_message_ids:
+                fail(line, "promotion NoOp receipt was emitted twice")
             if (
                 attempt["phase"] != "request"
                 or attempt["receipt_id"] != event["receipt_id"]
@@ -1507,6 +1871,7 @@ def load_trace(path: Path) -> LoadedTrace:
             ):
                 fail(line, "promotion NoOp receipt does not match its message")
             event["_message_id"] = message_id
+            received_message_ids.add(message_id)
 
         elif kind == "promotion_noop_result":
             message_id = event["message_id"]
@@ -1537,11 +1902,16 @@ def load_trace(path: Path) -> LoadedTrace:
             event["_message_id"] = message_id
 
         elif kind == "replay_started":
+            reset_term_state(event["node"])
+            copy_max_seq_no[event["node"]] = event["checkpoints"]["max_seq_no"]
             replay_active[event["node"]] = event["replay_id"]
             replay_ordinal[event["node"]] = 0
             replay_next_position[event["node"]] = 1
 
         elif kind == "replay_entry":
+            event["_batch_max_seq_no"] = event.get(
+                "batch_max_seq_no", event["checkpoints"]["max_seq_no"]
+            )
             if replay_active.get(event["node"]) != event["replay_id"]:
                 fail(line, "replay_entry has no active replay")
             expected = replay_ordinal[event["node"]]
@@ -1559,6 +1929,12 @@ def load_trace(path: Path) -> LoadedTrace:
             event["_wal_position"] = position
             replay_next_position[event["node"]] = position + 1
             replay_ordinal[event["node"]] = expected + 1
+            mark_term_processed(
+                event["node"],
+                event["term"],
+                event["seq_no"],
+                event["outcome"],
+            )
 
         elif kind == "replay_finished":
             if replay_active.get(event["node"]) != event["replay_id"]:
@@ -1613,7 +1989,25 @@ def load_trace(path: Path) -> LoadedTrace:
                     item["node"]: item["allocation"]
                     for item in event["allocations"]
                 },
+                "initialized": event["initialized"],
             }
+            for batch in noop_batches.values():
+                if (
+                    batch["node"] == event["node"]
+                    and batch["term"] == event["term"]
+                    and batch["send_targets"] is None
+                    and activated_terms[event["node"]] == event["term"]
+                ):
+                    if event["primary"] == event["node"] and event["initialized"]:
+                        batch["candidate_targets"] = set(event["in_sync"])
+                        batch["candidate_allocations"] = {
+                            item["node"]: item["allocation"]
+                            for item in event["allocations"]
+                            if item["node"] in event["in_sync"]
+                        }
+                    else:
+                        batch["candidate_targets"] = None
+                        batch["candidate_allocations"] = None
 
         elif kind == "node_crashed":
             if event["incarnation"] != node_incarnations[event["node"]]:
@@ -1644,12 +2038,18 @@ def load_trace(path: Path) -> LoadedTrace:
             for request_id in expected_failed:
                 request_state[request_id] = "Failed"
             available.discard(event["node"])
+            node_alive[event["node"]] = False
+            activated_terms[event["node"]] = 0
 
         elif kind == "node_restarted":
             if event["incarnation"] != node_incarnations[event["node"]] + 1:
                 fail(line, "node_restarted incarnation must advance by one")
             node_incarnations[event["node"]] = event["incarnation"]
             available.discard(event["node"])
+            node_alive[event["node"]] = True
+            activated_terms[event["node"]] = 0
+            reset_term_state(event["node"])
+            copy_max_seq_no[event["node"]] = event["checkpoints"]["max_seq_no"]
 
         elif kind == "routing_promoted":
             current_primary = event["new_primary"]
@@ -1664,10 +2064,49 @@ def load_trace(path: Path) -> LoadedTrace:
         elif kind == "primary_activated":
             available.add(event["node"])
             latest_views[event["node"]]["term"] = event["term"]
+            activated_terms[event["node"]] = event["term"]
+            view = latest_views[event["node"]]
+            for batch in noop_batches.values():
+                if (
+                    batch["node"] == event["node"]
+                    and batch["term"] == event["term"]
+                    and batch["send_targets"] is None
+                    and view["primary"] == event["node"]
+                    and view["initialized"]
+                ):
+                    batch["candidate_targets"] = set(view["in_sync"])
+                    batch["candidate_allocations"] = {
+                        target: view["allocations"][target]
+                        for target in view["in_sync"]
+                    }
 
         elif kind == "in_sync_removed":
             available.discard(event["removed_node"])
             latest_views[event["emitter"]]["in_sync"] = set(event["in_sync"])
+
+        elif kind == "recovery_snapshot":
+            recovery_term_state[event["session_id"]] = copy_term_state(
+                term_state[event["source_node"]]
+            )
+
+        elif kind == "recovery_installed":
+            snapshot_term_state = recovery_term_state.get(event["session_id"])
+            if snapshot_term_state is None:
+                fail(line, "recovery install has no captured source term state")
+            target = event["target_node"]
+            term_state[target] = copy_term_state(snapshot_term_state)
+            persisted_term_state[target] = copy_term_state(snapshot_term_state)
+            durable_fence[target] = {
+                "term": snapshot_term_state["current_term"],
+                "max_seq_no": snapshot_term_state[
+                    "max_seq_no_at_term_start"
+                ],
+            }
+            copy_max_seq_no[target] = (
+                event["snapshot_next_seq_no"] - 1
+                if event["snapshot_next_seq_no"] > 0
+                else None
+            )
 
         elif kind == "recovery_membership":
             if event["outcome"] == "admitted":
@@ -1677,10 +2116,17 @@ def load_trace(path: Path) -> LoadedTrace:
                 available.add(event["target_node"])
 
     for batch in noop_batches.values():
+        expected_targets = batch["send_targets"]
+        if expected_targets is None:
+            expected_targets = (
+                set(batch["candidate_targets"] or set())
+                if node_alive[batch["node"]]
+                else set()
+            )
         expected_pairs = {
             (receipt, target)
             for receipt in batch["noops"]
-            for target in batch["expected_targets"]
+            for target in expected_targets
         }
         actual_pairs = {
             (attempt["receipt_id"], attempt["target"])
@@ -1694,7 +2140,7 @@ def load_trace(path: Path) -> LoadedTrace:
                 "promotion NoOp sends must cover every filled sequence and "
                 "in-sync replica",
             )
-        batch["event"]["_required_message_ids"] = list(batch["message_ids"])
+        batch["event"]["_required_message_ids"] = []
 
     if last_copy_state != (events[-1]["step"] if events else -1):
         fail(len(records), "trace must end with copy_state")
@@ -1766,8 +2212,14 @@ def render(trace: LoadedTrace) -> tuple[str, str]:
         item["node"]: item["allocation"]
         for item in trace.start["shard_state"]["copies"]
     }
+    preserve_allocation_ids = trace.profile == "d1-full"
     allocation_values: dict[str, dict[int, int]] = {
-        raw: {allocation[raw]: 1} for raw in nodes_raw
+        raw: {
+            allocation[raw]: (
+                allocation[raw] if preserve_allocation_ids else 1
+            )
+        }
+        for raw in nodes_raw
     }
 
     def register_allocation(raw_node: str | None, raw_value: int | None) -> None:
@@ -1775,7 +2227,9 @@ def render(trace: LoadedTrace) -> tuple[str, str]:
             return
         values = allocation_values[raw_node]
         if raw_value not in values:
-            values[raw_value] = len(values) + 1
+            values[raw_value] = (
+                raw_value if preserve_allocation_ids else len(values) + 1
+            )
 
     for event in trace.events:
         register_allocation(event.get("node"), event.get("allocation"))
@@ -2028,6 +2482,7 @@ def render(trace: LoadedTrace) -> tuple[str, str]:
             "writeKind": json.dumps(write_kind),
             "origin": json.dumps(event.get("origin", "none")),
             "outcome": json.dumps(event.get("outcome", "none")),
+            "reason": json.dumps(event.get("reason", "none")),
             "seq": str(event.get("seq_no", 0)),
             "term": str(event.get("term", 0)),
             "allocation": str(
@@ -2046,6 +2501,9 @@ def render(trace: LoadedTrace) -> tuple[str, str]:
             "persistedNext": str(cp_next(checkpoints_value["persisted"])),
             "maxNext": str(cp_next(checkpoints_value["max_seq_no"])),
             "durable": "TRUE" if durable_observed else "FALSE",
+            "fillPhysical": (
+                "TRUE" if event.get("_fill_physical", False) else "FALSE"
+            ),
             "fenceObservedTerm": str(fence_observed),
             "fenceMaxNext": str(cp_next(event.get("fence_max_seq_no"))),
             "truncateNext": str(cp_next(event.get("truncate_through"))),
@@ -2168,6 +2626,7 @@ def render(trace: LoadedTrace) -> tuple[str, str]:
         "d1-core": 3,
         "d1-authority": 4,
         "d1-combined": 4,
+        "d1-full": 8,
         "d1-collision": 0,
         "d1-recovery": 8,
     }[trace.profile]
@@ -2185,7 +2644,7 @@ TraceDocs == {tla_set([doc[item] for item in docs_raw])}
 TraceInitialPrimary == {node[primary_raw]}
 TraceInitialInSync == {tla_set([node[item] for item in trace.start["shard_state"]["in_sync"]])}
 TraceQuiescent == {"TRUE" if trace.end["quiescent"] else "FALSE"}
-TraceCombined == {"TRUE" if trace.profile == "d1-combined" else "FALSE"}
+TraceCombined == {"TRUE" if trace.profile in {"d1-combined", "d1-full"} else "FALSE"}
 NoTraceMessage ==
     [kind |-> "Replicate",
      write |-> 1,
@@ -2297,13 +2756,14 @@ INVARIANT TraceAuthoritySafety
 INVARIANT TraceAuthorityNotAccepted
 """
     else:
+        recovery_enabled = profile == "d1-full"
         config = f"""CONSTANTS
     Nodes = {tla_set([node[item] for item in nodes_raw])}
     Docs = {tla_set([doc[item] for item in docs_raw])}
     MaxWrites = {max_writes}
     MaxCrashes = {max_crashes}
     MaxPartitions = 0
-    MaxRecoveries = 0
+    MaxRecoveries = {max(1, max_recoveries) if recovery_enabled else 0}
     MaxTerm = {max_term}
     MaxMessages = {max_messages}
     MaxViewLag = {max_view_lag}
@@ -2313,7 +2773,7 @@ INVARIANT TraceAuthorityNotAccepted
     FaultMode = "{d1_fault_mode}"
     InitialOutOfSync = {"TRUE" if len(trace.start["shard_state"]["in_sync"]) != len(nodes_raw) - 1 else "FALSE"}
     InitialInitialized = TRUE
-    EnableRecovery = FALSE
+    EnableRecovery = {"TRUE" if recovery_enabled else "FALSE"}
     AllocationIds = TRUE
     ReplicaFencing = TRUE
     DurableReplicaFence = TRUE

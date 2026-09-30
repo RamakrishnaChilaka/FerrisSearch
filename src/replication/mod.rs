@@ -12,6 +12,52 @@ use crate::wal::TranslogDurability;
 use std::sync::Arc;
 use tracing::error;
 
+#[cfg(feature = "protocol-trace")]
+fn trace_replication_failure(
+    node_id: impl Into<String>,
+    allocation_id: Option<u64>,
+    error: impl std::fmt::Display,
+) -> Vec<ReplicaReplicationFailure> {
+    vec![ReplicaReplicationFailure::message(
+        node_id,
+        allocation_id,
+        format!("protocol trace replication error: {error}"),
+    )]
+}
+
+#[cfg(feature = "protocol-trace")]
+fn trace_source_copy(
+    cluster_state: &ClusterState,
+    index_name: &str,
+    shard_id: u32,
+    source_node: &str,
+    index_uuid: &str,
+) -> Result<crate::protocol_trace::TraceCopy, Vec<ReplicaReplicationFailure>> {
+    let allocation = cluster_state
+        .shard_allocation_id(index_name, shard_id, source_node)
+        .ok_or_else(|| {
+            trace_replication_failure(
+                source_node,
+                None,
+                "source allocation is missing from the captured routing view",
+            )
+        })?;
+    Ok(crate::protocol_trace::TraceCopy {
+        node: source_node.to_string(),
+        index_uuid: index_uuid.to_string(),
+        shard: shard_id,
+        allocation,
+    })
+}
+
+#[cfg(feature = "protocol-trace")]
+fn trace_result_outcome(message_id: &str) -> &'static str {
+    match crate::protocol_trace::message_phase(message_id) {
+        Some("nack") => "failed",
+        _ => "timeout",
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicaReplicationFailure {
     pub node_id: String,
@@ -63,6 +109,8 @@ struct ReplicaWireOperation {
 
 struct ReplicaBatchRoute {
     index_uuid: String,
+    #[cfg(feature = "protocol-trace")]
+    primary_node: String,
     replica_node_ids: Vec<String>,
 }
 
@@ -95,11 +143,10 @@ fn resolve_replica_batch_route(
         .into_iter()
         .cloned()
         .collect::<Vec<_>>();
-    if replica_node_ids.is_empty() {
-        return Ok(None);
-    }
     Ok(Some(ReplicaBatchRoute {
         index_uuid: metadata.uuid.to_string(),
+        #[cfg(feature = "protocol-trace")]
+        primary_node: routing.primary.clone(),
         replica_node_ids,
     }))
 }
@@ -167,6 +214,45 @@ pub async fn replicate_write_with_durability(
     }
 
     let replica_node_ids = metadata.in_sync_replica_nodes(shard_id);
+    #[cfg(feature = "protocol-trace")]
+    let trace_operation = crate::engine::SequencedOperation {
+        seq_no,
+        primary_term,
+        mutation: match op {
+            "index" => crate::engine::DocumentMutation::Index {
+                doc_id: doc_id.to_string(),
+                source: payload.clone(),
+            },
+            "delete" => crate::engine::DocumentMutation::Delete {
+                doc_id: doc_id.to_string(),
+            },
+            other => {
+                return Err(trace_replication_failure(
+                    routing.primary.clone(),
+                    None,
+                    format!("unsupported traced replication operation '{other}'"),
+                ));
+            }
+        },
+    };
+    #[cfg(feature = "protocol-trace")]
+    let trace_messages = crate::protocol_trace::start_replication(
+        &routing.primary,
+        cluster_state,
+        index_name,
+        shard_id,
+        std::slice::from_ref(&trace_operation),
+        false,
+    )
+    .map_err(|error| trace_replication_failure(routing.primary.clone(), None, error))?;
+    #[cfg(feature = "protocol-trace")]
+    let trace_source = trace_source_copy(
+        cluster_state,
+        index_name,
+        shard_id,
+        &routing.primary,
+        &index_uuid,
+    )?;
     if replica_node_ids.is_empty() {
         return Ok(vec![]);
     }
@@ -218,8 +304,35 @@ pub async fn replicate_write_with_durability(
             continue;
         };
         let uuid = index_uuid.clone();
+        #[cfg(feature = "protocol-trace")]
+        let trace_message = trace_messages
+            .iter()
+            .find(|message| message.target == rid)
+            .cloned();
+        #[cfg(feature = "protocol-trace")]
+        let trace_source = trace_source.clone();
 
         futures.push(tokio::spawn(async move {
+            #[cfg(feature = "protocol-trace")]
+            if let Some(message) = trace_message.as_ref()
+                && crate::protocol_trace::apply_request_fault(&message.message_id).await
+            {
+                let _ = crate::protocol_trace::record_replica_result(
+                    &trace_source,
+                    message,
+                    "dropped",
+                    None,
+                );
+                return (
+                    rid.clone(),
+                    target_allocation_id,
+                    Err(ReplicaReplicationFailure::message(
+                        rid.clone(),
+                        Some(target_allocation_id),
+                        format!("{rid}: injected trace request drop"),
+                    )),
+                );
+            }
             let payload_json = match serde_json::to_vec(&pl) {
                 Ok(payload_json) => payload_json,
                 Err(error) => {
@@ -252,8 +365,46 @@ pub async fn replicate_write_with_durability(
                 )
                 .await
             {
-                Ok(checkpoint) => (rid, target_allocation_id, Ok(checkpoint)),
+                Ok(checkpoint) => {
+                    #[cfg(feature = "protocol-trace")]
+                    if let Some(message) = trace_message.as_ref() {
+                        if crate::protocol_trace::should_drop_response(&message.message_id) {
+                            let _ = crate::protocol_trace::record_replica_result(
+                                &trace_source,
+                                message,
+                                "dropped",
+                                checkpoint.persisted_checkpoint,
+                            );
+                            return (
+                                rid.clone(),
+                                target_allocation_id,
+                                Err(ReplicaReplicationFailure::message(
+                                    rid.clone(),
+                                    Some(target_allocation_id),
+                                    format!("{rid}: injected trace response drop"),
+                                )),
+                            );
+                        }
+                        let _ = crate::protocol_trace::record_replica_result(
+                            &trace_source,
+                            message,
+                            "acknowledged",
+                            checkpoint.persisted_checkpoint,
+                        );
+                    }
+                    (rid, target_allocation_id, Ok(checkpoint))
+                }
                 Err(error) => {
+                    #[cfg(feature = "protocol-trace")]
+                    if let Some(message) = trace_message.as_ref() {
+                        let outcome = trace_result_outcome(&message.message_id);
+                        let _ = crate::protocol_trace::record_replica_result(
+                            &trace_source,
+                            message,
+                            outcome,
+                            None,
+                        );
+                    }
                     let failure = ReplicaReplicationFailure::from_error(
                         rid.clone(),
                         target_allocation_id,
@@ -344,6 +495,42 @@ pub async fn replicate_bulk_with_durability(
     else {
         return Ok(Vec::new());
     };
+    if route.replica_node_ids.is_empty() {
+        #[cfg(feature = "protocol-trace")]
+        {
+            let trace_operations = docs
+                .iter()
+                .enumerate()
+                .map(|(offset, (doc_id, payload))| {
+                    let seq_no = start_seq_no.checked_add(offset as u64).ok_or_else(|| {
+                        trace_replication_failure(
+                            route.primary_node.clone(),
+                            None,
+                            "bulk replication sequence range overflows".to_string(),
+                        )
+                    })?;
+                    Ok(crate::engine::SequencedOperation {
+                        seq_no,
+                        primary_term,
+                        mutation: crate::engine::DocumentMutation::Index {
+                            doc_id: doc_id.clone(),
+                            source: payload.clone(),
+                        },
+                    })
+                })
+                .collect::<Result<Vec<_>, Vec<ReplicaReplicationFailure>>>()?;
+            crate::protocol_trace::start_replication(
+                &route.primary_node,
+                cluster_state,
+                index_name,
+                shard_id,
+                &trace_operations,
+                false,
+            )
+            .map_err(|error| trace_replication_failure(route.primary_node.clone(), None, error))?;
+        }
+        return Ok(Vec::new());
+    }
     let operations = docs
         .iter()
         .enumerate()
@@ -451,6 +638,9 @@ pub async fn replicate_noop_batch_with_durability(
     else {
         return Ok(Vec::new());
     };
+    if route.replica_node_ids.is_empty() {
+        return Ok(Vec::new());
+    }
     replicate_explicit_batch_with_durability(
         transport_client,
         cluster_state,
@@ -477,6 +667,80 @@ async fn replicate_explicit_batch_with_durability(
     durability: TranslogDurability,
     operation_label: &'static str,
 ) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>> {
+    #[cfg(feature = "protocol-trace")]
+    let trace_operations = operations
+        .iter()
+        .map(|operation| {
+            let mutation = match operation.op.as_str() {
+                "index" => crate::engine::DocumentMutation::Index {
+                    doc_id: operation.doc_id.clone(),
+                    source: serde_json::from_slice(&operation.payload_json).map_err(|error| {
+                        trace_replication_failure(
+                            route.primary_node.clone(),
+                            None,
+                            format!("decode traced replica payload: {error}"),
+                        )
+                    })?,
+                },
+                "delete" => crate::engine::DocumentMutation::Delete {
+                    doc_id: operation.doc_id.clone(),
+                },
+                "noop" => {
+                    let payload: serde_json::Value =
+                        serde_json::from_slice(&operation.payload_json).map_err(|error| {
+                            trace_replication_failure(
+                                route.primary_node.clone(),
+                                None,
+                                format!("decode traced promotion NoOp: {error}"),
+                            )
+                        })?;
+                    let reason = payload
+                        .get("_reason")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            trace_replication_failure(
+                                route.primary_node.clone(),
+                                None,
+                                "traced promotion NoOp has no _reason",
+                            )
+                        })?;
+                    crate::engine::DocumentMutation::NoOp {
+                        reason: reason.to_string(),
+                    }
+                }
+                other => {
+                    return Err(trace_replication_failure(
+                        route.primary_node.clone(),
+                        None,
+                        format!("unsupported traced batch operation '{other}'"),
+                    ));
+                }
+            };
+            Ok(crate::engine::SequencedOperation {
+                seq_no: operation.seq_no,
+                primary_term,
+                mutation,
+            })
+        })
+        .collect::<Result<Vec<_>, Vec<ReplicaReplicationFailure>>>()?;
+    #[cfg(feature = "protocol-trace")]
+    let trace_messages = crate::protocol_trace::start_replication(
+        &route.primary_node,
+        cluster_state,
+        index_name,
+        shard_id,
+        &trace_operations,
+        operation_label == "promotion NoOp",
+    )
+    .map_err(|error| trace_replication_failure(route.primary_node.clone(), None, error))?;
+    #[cfg(feature = "protocol-trace")]
+    let trace_source = trace_source_copy(
+        cluster_state,
+        index_name,
+        shard_id,
+        &route.primary_node,
+        &route.index_uuid,
+    )?;
     // Build futures for concurrent replication to all in-sync replicas
     let mut futures = Vec::with_capacity(route.replica_node_ids.len());
 
@@ -521,8 +785,38 @@ async fn replicate_explicit_batch_with_durability(
             continue;
         };
         let uuid = route.index_uuid.clone();
+        #[cfg(feature = "protocol-trace")]
+        let trace_target_messages = trace_messages
+            .iter()
+            .filter(|message| message.target == rid)
+            .cloned()
+            .collect::<Vec<_>>();
+        #[cfg(feature = "protocol-trace")]
+        let trace_source = trace_source.clone();
 
         futures.push(tokio::spawn(async move {
+            #[cfg(feature = "protocol-trace")]
+            for message in &trace_target_messages {
+                if crate::protocol_trace::apply_request_fault(&message.message_id).await {
+                    for result_message in &trace_target_messages {
+                        let _ = crate::protocol_trace::record_replica_result(
+                            &trace_source,
+                            result_message,
+                            "dropped",
+                            None,
+                        );
+                    }
+                    return (
+                        rid.clone(),
+                        target_allocation_id,
+                        Err(ReplicaReplicationFailure::message(
+                            rid.clone(),
+                            Some(target_allocation_id),
+                            format!("{rid}: injected trace request drop"),
+                        )),
+                    );
+                }
+            }
             let ops = operations
                 .iter()
                 .map(|operation| ReplicateDocRequest {
@@ -552,8 +846,50 @@ async fn replicate_explicit_batch_with_durability(
                 )
                 .await
             {
-                Ok(checkpoint) => (rid, target_allocation_id, Ok(checkpoint)),
+                Ok(checkpoint) => {
+                    #[cfg(feature = "protocol-trace")]
+                    {
+                        let drop_response = trace_target_messages.iter().any(|message| {
+                            crate::protocol_trace::should_drop_response(&message.message_id)
+                        });
+                        let outcome = if drop_response {
+                            "dropped"
+                        } else {
+                            "acknowledged"
+                        };
+                        for message in &trace_target_messages {
+                            let _ = crate::protocol_trace::record_replica_result(
+                                &trace_source,
+                                message,
+                                outcome,
+                                checkpoint.persisted_checkpoint,
+                            );
+                        }
+                        if drop_response {
+                            return (
+                                rid.clone(),
+                                target_allocation_id,
+                                Err(ReplicaReplicationFailure::message(
+                                    rid.clone(),
+                                    Some(target_allocation_id),
+                                    format!("{rid}: injected trace response drop"),
+                                )),
+                            );
+                        }
+                    }
+                    (rid, target_allocation_id, Ok(checkpoint))
+                }
                 Err(error) => {
+                    #[cfg(feature = "protocol-trace")]
+                    for message in &trace_target_messages {
+                        let outcome = trace_result_outcome(&message.message_id);
+                        let _ = crate::protocol_trace::record_replica_result(
+                            &trace_source,
+                            message,
+                            outcome,
+                            None,
+                        );
+                    }
                     let failure = ReplicaReplicationFailure::from_error(
                         rid.clone(),
                         target_allocation_id,

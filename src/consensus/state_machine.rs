@@ -39,6 +39,24 @@ impl ClusterStateMachine {
         self.state.clone()
     }
 
+    #[cfg(feature = "protocol-trace")]
+    pub fn from_state_for_protocol_trace_test(state: ClusterState) -> Self {
+        Self {
+            state: Arc::new(RwLock::new(state)),
+            last_applied: None,
+            last_membership: StoredMembership::default(),
+        }
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    pub fn apply_command_for_protocol_trace_test(
+        &self,
+        command: &ClusterCommand,
+        raft_log_index: u64,
+    ) -> ClusterResponse {
+        self.apply_command_at(command, raft_log_index)
+    }
+
     fn apply_command_at(&self, cmd: &ClusterCommand, raft_log_index: u64) -> ClusterResponse {
         let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
         match cmd {
@@ -633,6 +651,17 @@ impl ClusterStateMachine {
                         "invalid allocation metadata after failing copy for index '{index_name}' shard {shard_id}: {reason}"
                     ));
                 }
+                #[cfg(feature = "protocol-trace")]
+                let promoted_trace = is_primary.then(|| {
+                    (
+                        routing.primary.clone(),
+                        routing.primary_term,
+                        routing.in_sync_replicas.clone(),
+                    )
+                });
+                #[cfg(feature = "protocol-trace")]
+                let removed_trace = (!is_primary)
+                    .then(|| (routing.primary.clone(), routing.in_sync_replicas.clone()));
                 state.indices.insert(index_name.clone(), metadata);
                 state
                     .shard_allocations
@@ -640,6 +669,28 @@ impl ClusterStateMachine {
                     .expect("validated allocation map exists")
                     .insert(*shard_id, allocations);
                 state.version += 1;
+                #[cfg(feature = "protocol-trace")]
+                if let Some((new_primary, term, in_sync)) = promoted_trace {
+                    crate::protocol_trace::record_routing_promoted(
+                        &new_primary,
+                        index_uuid,
+                        *shard_id,
+                        &new_primary,
+                        term,
+                        &in_sync,
+                    );
+                }
+                #[cfg(feature = "protocol-trace")]
+                if let Some((emitter, in_sync)) = removed_trace {
+                    crate::protocol_trace::record_in_sync_removed(
+                        &emitter,
+                        index_uuid,
+                        *shard_id,
+                        node,
+                        *allocation_id,
+                        &in_sync,
+                    );
+                }
                 ClusterResponse::Ok
             }
             ClusterCommand::AddMappings {

@@ -114,6 +114,34 @@ FaultAction(action) ==
     /\ action
     /\ UNCHANGED <<ApplySafetyVars, D1Vars>>
 
+RecoveryAction(action) ==
+    /\ action
+    /\ UNCHANGED <<ApplySafetyVars, FaultVars, D1Vars>>
+
+RecoveryStable(action) ==
+    /\ action
+    /\ UNCHANGED
+          <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
+            sessionAllocation, pendingAllocation, ApplySafetyVars,
+            FaultVars, D1Vars>>
+
+RecoveryInstall(action) ==
+    /\ action
+    /\ UNCHANGED
+          <<sessionAllocation, pendingAllocation, ApplySafetyVars, FaultVars>>
+
+RecoveryTargetComplete(action) ==
+    /\ action
+    /\ UNCHANGED
+          <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
+            sessionAllocation, ApplySafetyVars, FaultVars, D1Vars>>
+
+RecoveryObserveAdmission(action) ==
+    /\ action
+    /\ UNCHANGED
+          <<copyAllocation, copyUuid, replicaFence, durableReplicaFence,
+            pendingAllocation, ApplySafetyVars, FaultVars, D1Vars>>
+
 ViewMatches(view, event) ==
     /\ view.primary = event.viewPrimary
     /\ view.term = event.viewTerm
@@ -178,6 +206,28 @@ ReplicaReceiveObservation(event) ==
           /\ message.seq = event.seq
           /\ message.targetAllocation = event.allocation
     /\ UNCHANGED d1vars
+    /\ UNCHANGED AuxVars
+
+ReplicaRejectedEvent(event) ==
+    /\ event.hasTransportMessage
+    /\ event.transportMessage \in messages
+    /\ LET message == event.transportMessage
+       IN /\ message.from = event.peer
+          /\ message.to = event.node
+          /\ message.term = event.term
+          /\ message.seq = event.seq
+          /\ message.targetAllocation = event.allocation
+          /\ CASE event.writeId = NoWrite ->
+                    /\ message.kind = "ReplicateNoOp"
+                    /\ D1FixedReplicaNoOpReject(message)
+             [] event.reason = "apply_failure" ->
+                    /\ message.kind = "Replicate"
+                    /\ message.write = event.writeId
+                    /\ FenceChangingReplication(ReplicaApplyFailure(message))
+             [] OTHER ->
+                    /\ message.kind = "Replicate"
+                    /\ message.write = event.writeId
+                    /\ StableReplication(ReplicaReject(message))
     /\ UNCHANGED AuxVars
 
 ReplicaWalObservation(event) ==
@@ -258,13 +308,13 @@ PromotionNoOpSendObservation(event) ==
     /\ TraceCombined
     /\ event.writeId = NoWrite
     /\ event.hasTransportMessage
-    /\ event.transportMessage \in messages
+    /\ D1RedeliverPromotionNoOp(event.node, event.peer, event.seq)
+    /\ event.transportMessage \in messages'
     /\ event.transportMessage.kind = "ReplicateNoOp"
     /\ event.transportMessage.from = event.node
     /\ event.transportMessage.to = event.peer
     /\ event.transportMessage.term = event.term
     /\ event.transportMessage.seq = event.seq
-    /\ UNCHANGED d1vars
     /\ UNCHANGED AuxVars
 
 PromotionNoOpReceiveObservation(event) ==
@@ -291,11 +341,31 @@ PromotionNoOpWalObservation(event) ==
     /\ UNCHANGED d1vars
     /\ UNCHANGED AuxVars
 
+PromotionFillWalEvent(event) ==
+    /\ TraceCombined
+    /\ event.writeId = NoWrite
+    /\ event.origin \in {"primary", "promotion"}
+    /\ D1AppendPromotionNoOp(event.node, event.seq, event.term)
+    /\ IF RequestDurability THEN event.durable ELSE TRUE
+    /\ UNCHANGED AuxVars
+
+PromotionFillProcessEvent(event) ==
+    /\ TraceCombined
+    /\ event.writeId = NoWrite
+    /\ event.origin \in {"primary", "promotion"}
+    /\ event.outcome = "noop"
+    /\ D1ProcessPromotionNoOp(event.node, event.seq, event.term)
+    /\ LiveCheckpointMatchesPrime(event.node, event)
+    /\ UNCHANGED AuxVars
+
 PromotionNoOpProcessEvent(event) ==
     /\ TraceCombined
     /\ event.writeId = NoWrite
     /\ event.hasTransportMessage
     /\ event.transportMessage \in messages
+    /\ event.transportMessage.to = event.node
+    /\ event.transportMessage.term = event.term
+    /\ event.transportMessage.seq = event.seq
     /\ CASE event.outcome = "noop" ->
               D1FixedReplicaNoOpProcess(event.transportMessage)
        [] event.outcome = "redelivery" ->
@@ -370,25 +440,32 @@ CommitCaptureEvent(event) ==
 
 CommitPersistEvent(event) ==
     /\ event.node \in Nodes
-    /\ captureActive[event.node]
-    /\ event.processedNext = captureBoundary[event.node]
-    /\ event.maxNext = captureMax[event.node]
-    /\ D1PersistBoundary(
-           event.node,
-           captureBoundary[event.node],
-           capturePersisted[event.node],
-           captureMax[event.node],
-           captureOps[event.node],
-           captureDocValue[event.node],
-           captureDocSeqNext[event.node],
-           captureTombstoneSeqNext[event.node],
-           TRUE)
-    /\ captureActive' =
-          [captureActive EXCEPT ![event.node] = FALSE]
-    /\ UNCHANGED
-          <<captureBoundary, capturePersisted, captureMax, captureOps, captureDocValue,
-            captureDocSeqNext,
-            captureTombstoneSeqNext>>
+    /\ CASE captureActive[event.node] ->
+              /\ event.processedNext = captureBoundary[event.node]
+              /\ event.persistedNext = capturePersisted[event.node]
+              /\ event.maxNext = captureMax[event.node]
+              /\ D1PersistBoundary(
+                     event.node,
+                     captureBoundary[event.node],
+                     capturePersisted[event.node],
+                     captureMax[event.node],
+                     captureOps[event.node],
+                     captureDocValue[event.node],
+                     captureDocSeqNext[event.node],
+                     captureTombstoneSeqNext[event.node],
+                     TRUE)
+              /\ captureActive' =
+                    [captureActive EXCEPT ![event.node] = FALSE]
+              /\ UNCHANGED
+                    <<captureBoundary, capturePersisted, captureMax, captureOps,
+                      captureDocValue, captureDocSeqNext,
+                      captureTombstoneSeqNext>>
+       [] ~captureActive[event.node] ->
+              /\ event.processedNext = persistedProcessedNext[event.node]
+              /\ event.persistedNext = persistedCommittedNext[event.node]
+              /\ event.maxNext = persistedMaxSeqNext[event.node]
+              /\ UNCHANGED d1vars
+              /\ UNCHANGED CaptureVars
     /\ UNCHANGED replicaResponsePersisted
 
 CrashEvent(event) ==
@@ -404,10 +481,14 @@ RestartEvent(event) ==
 
 ReplayStartObservation(event) ==
     /\ event.node \in Nodes
-    /\ replaying[event.node]
-    /\ replayBoundary[event.node] = event.processedNext
-    /\ LiveCheckpointMatches(event.node, event)
-    /\ UNCHANGED d1vars
+    /\ CASE replaying[event.node] ->
+              /\ replayBoundary[event.node] = event.processedNext
+              /\ LiveCheckpointMatches(event.node, event)
+              /\ UNCHANGED d1vars
+       [] ~replaying[event.node] ->
+              /\ D1StartInPlaceReplay(event.node)
+              /\ replayBoundary'[event.node] = event.processedNext
+              /\ LiveCheckpointMatchesPrime(event.node, event)
     /\ UNCHANGED AuxVars
 
 ReplayEntryEvent(event) ==
@@ -492,9 +573,11 @@ InSyncRemovalObservation(event) ==
 
 PromotionNoOpFillObservation(event) ==
     /\ TraceCombined
-    /\ D1FillPromotionNoOps(event.node, event.observedProcessed)
+    /\ IF event.fillPhysical
+          THEN D1ObservePromotionNoOpFill(
+                   event.node, event.observedProcessed, event.term)
+          ELSE D1FillPromotionNoOps(event.node, event.observedProcessed)
     /\ event.term = routing.term
-    /\ event.requiredMessages \subseteq messages'
     /\ LiveCheckpointMatchesPrime(event.node, event)
     /\ UNCHANGED AuxVars
 
@@ -505,17 +588,90 @@ ActivationEvent(event) ==
     /\ activated'[event.node] = event.term
     /\ UNCHANGED AuxVars
 
+RecoverySnapshotEvent(event) ==
+    /\ EnableRecovery
+    /\ event.source \in Nodes
+    /\ event.target \in Nodes
+    /\ sessionSource[event.target] = event.source
+    /\ RecoveryStable(SourceSnapshot(event.target))
+    /\ sessionBoundary'[event.target] = event.snapshotNext
+    /\ D1SnapshotSequences(
+           event.source,
+           sessionSnapshot'[event.target],
+           sessionBoundary'[event.target])
+          = event.observedProcessed
+    /\ D1VisibleDocValue(sessionSnapshot'[event.target])
+          = event.snapshotDocValue
+    /\ UNCHANGED AuxVars
+
+RecoveryStartEvent(event) ==
+    /\ EnableRecovery
+    /\ RecoveryStable(TargetBeginInstall(event.target))
+    /\ UNCHANGED AuxVars
+
+RecoveryInstallEvent(event) ==
+    /\ EnableRecovery
+    /\ RecoveryInstall(D1InstallRecoverySnapshot(event.target))
+    /\ nextSeq'[event.target] = event.snapshotNext
+    /\ UNCHANGED AuxVars
+
+RecoveryWalObservation(event) ==
+    /\ EnableRecovery
+    /\ sessionFetched[event.node] = event.writeId
+    /\ IF RequestDurability THEN event.durable ELSE TRUE
+    /\ UNCHANGED d1vars
+    /\ UNCHANGED AuxVars
+
+RecoveryApplyEvent(event) ==
+    /\ EnableRecovery
+    /\ sessionFetched[event.node] = event.writeId
+    /\ D1FixedRecoveryApply(event.node)
+    /\ IF event.outcome = "applied_newer"
+          THEN docValue'[event.node][event.doc] = event.writeId
+          ELSE IF event.outcome = "stale"
+               THEN docValue'[event.node][event.doc]
+                    = docValue[event.node][event.doc]
+               ELSE FALSE
+    /\ event.writeId \in durableOps'[event.node]
+    /\ LiveCheckpointMatchesPrime(event.node, event)
+    /\ UNCHANGED AuxVars
+
+RecoveryBarrierEvent(event) ==
+    /\ EnableRecovery
+    /\ sessionHead[event.target] = event.barrierNext
+    /\ sessionCursor[event.target] = event.barrierNext
+    /\ processedSeqs[event.target] = event.observedProcessed
+    /\ RecoveryTargetComplete(TargetComplete(event.target))
+    /\ UNCHANGED AuxVars
+
+RecoveryMembershipEvent(event) ==
+    /\ EnableRecovery
+    /\ event.outcome = "admitted"
+    /\ RecoveryTargetComplete(TargetObserveAdmitted(event.target))
+    /\ event.target \in routing.inSync
+    /\ UNCHANGED AuxVars
+
 CoreEvent(event) ==
     CASE event.kind = "client_write_routed" -> ClientWriteEvent(event)
       [] event.kind = "wal_appended" ->
-            IF event.origin = "primary"
+            IF event.writeId = NoWrite
+                  /\ event.origin \in {"primary", "promotion"}
+            THEN PromotionFillWalEvent(event)
+            ELSE IF event.origin = "primary"
             THEN PrimaryWalObservation(event)
+            ELSE IF event.origin = "recovery"
+                 THEN RecoveryWalObservation(event)
             ELSE IF event.writeId = NoWrite
                  THEN PromotionNoOpWalObservation(event)
                  ELSE ReplicaWalObservation(event)
       [] event.kind = "operation_processed" ->
-            IF event.origin = "primary"
+            IF event.writeId = NoWrite
+                  /\ event.origin \in {"primary", "promotion"}
+            THEN PromotionFillProcessEvent(event)
+            ELSE IF event.origin = "primary"
             THEN PrimaryProcessEvent(event)
+            ELSE IF event.origin = "recovery"
+                 THEN RecoveryApplyEvent(event)
             ELSE IF event.writeId = NoWrite
                  THEN PromotionNoOpProcessEvent(event)
                  ELSE ReplicaProcessEvent(event)
@@ -523,6 +679,8 @@ CoreEvent(event) ==
             PrimaryReplicationObservation(event)
       [] event.kind = "replica_received" ->
             ReplicaReceiveObservation(event)
+      [] event.kind = "replica_rejected" ->
+            ReplicaRejectedEvent(event)
       [] event.kind = "replica_result" ->
             ReplicaResultEvent(event)
       [] event.kind = "client_result" ->
@@ -560,6 +718,16 @@ CoreEvent(event) ==
             PromotionNoOpResultEvent(event)
       [] event.kind = "primary_activated" ->
             ActivationEvent(event)
+      [] event.kind = "recovery_snapshot" ->
+            RecoverySnapshotEvent(event)
+      [] event.kind = "recovery_started" ->
+            RecoveryStartEvent(event)
+      [] event.kind = "recovery_installed" ->
+            RecoveryInstallEvent(event)
+      [] event.kind = "recovery_barrier" ->
+            RecoveryBarrierEvent(event)
+      [] event.kind = "recovery_membership" ->
+            RecoveryMembershipEvent(event)
       [] OTHER -> FALSE
 
 ConsumeEvent ==
@@ -597,6 +765,13 @@ HiddenReplayAction(event) ==
     /\ event.kind \in {"replay_entry", "replay_finished"}
     /\ event.walPosition > replayPos[event.node]
     /\ D1SkipTruncatedReplayPrefix(event.node, event.walPosition)
+
+HiddenBatchPlanning(event) ==
+    /\ event.kind \in {"operation_processed", "replay_entry"}
+    /\ event.outcome # "collision"
+    /\ event.maxNext > maxSeqNext[event.node]
+    /\ D1ObserveBatchPlan(event.node, event.maxNext)
+    /\ UNCHANGED AuxVars
 
 HiddenCoreMaintenance(event) ==
     /\ ~TraceCombined
@@ -656,13 +831,64 @@ HiddenRemovalAction(event) ==
               /\ FailureCommandMatches(command, event)
               /\ FenceChangingReplication(CommitRaft(command))
 
+HiddenRecoveryAction(event) ==
+    /\ EnableRecovery
+    /\ event.kind \in
+          {"recovery_snapshot", "recovery_started", "recovery_installed",
+           "recovery_barrier", "recovery_membership", "routing_view",
+           "wal_appended", "operation_processed"}
+    /\ \/ \E target \in Nodes, source \in Nodes :
+              /\ event.kind = "recovery_snapshot"
+              /\ target = event.target
+              /\ source = event.source
+              /\ RecoveryAction(StartRecovery(target, source))
+       \/ \E leader \in Nodes, target \in Nodes :
+              /\ event.kind = "routing_view"
+              /\ FaultAction(AllocateAfterLifecycle(leader, target))
+       \/ \E target \in Nodes :
+              /\ event.kind \in {"routing_view", "recovery_snapshot"}
+              /\ FaultAction(ObserveAllocationAccepted(target))
+       \/ \E target \in Nodes :
+              /\ event.kind \in
+                    {"wal_appended", "operation_processed", "recovery_barrier"}
+              /\ RecoveryStable(FetchOps(target))
+       \/ \E target \in Nodes :
+              /\ event.kind = "recovery_barrier"
+              /\ RecoveryStable(FinishCatchUp(target))
+       \/ \E target \in Nodes :
+              /\ event.kind = "recovery_barrier"
+              /\ RecoveryStable(BeginPrepareFinalize(target))
+       \/ \E target \in Nodes :
+              /\ event.kind = "recovery_barrier"
+              /\ RecoveryStable(AcquireFinalizeBarrier(target))
+       \/ \E target \in Nodes :
+              /\ event.kind = "recovery_barrier"
+              /\ RecoveryStable(FinishFinalizeTail(target))
+       \/ \E target \in Nodes :
+              /\ event.kind \in {"routing_view", "recovery_membership"}
+              /\ RecoveryStable(BeginSettlement(target))
+       \/ \E target \in Nodes :
+              /\ event.kind \in {"routing_view", "recovery_membership"}
+              /\ RecoveryStable(ProposeMarkInSync(target))
+       \/ \E command \in pendingRaft :
+              /\ event.kind \in {"routing_view", "recovery_membership"}
+              /\ FenceChangingReplication(CommitRaft(command))
+       \/ \E node \in Nodes :
+              /\ event.kind = "routing_view"
+              /\ FenceChangingReplication(DeliverView(node))
+       \/ \E target \in Nodes :
+              /\ event.kind = "recovery_membership"
+              /\ RecoveryObserveAdmission(ObserveAdmission(target))
+
 HiddenD1Action(event) ==
+    \/ HiddenBatchPlanning(event)
     \/ HiddenReplayAction(event)
     \/ HiddenCoreMaintenance(event)
     \/ HiddenPromotionAction(event)
     \/ HiddenActivationAction(event)
     \/ HiddenViewDelivery(event)
     \/ HiddenRemovalAction(event)
+    \/ HiddenRecoveryAction(event)
 
 HiddenStep ==
     LET event == Trace[tracePos]
