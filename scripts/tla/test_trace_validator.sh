@@ -43,6 +43,7 @@ run_invalid arrival-order invalid-arrival-order.jsonl 16 operation_processed
 run_invalid seq-only-redelivery invalid-seq-only-redelivery.jsonl 6 operation_processed
 run_invalid highest-commit invalid-highest-commit-replay.jsonl 16 commit_captured
 run_invalid replay-wrong-at-replay invalid-replay-boundary-at-replay.jsonl 33 replay_entry
+run_invalid replayed-delete-redelivery invalid-replayed-delete-redelivery.jsonl 33 replay_entry
 run_valid truncated-retained-skip valid-truncated-copy-restart-retained-skip.jsonl
 run_invalid truncated-reapply invalid-truncated-copy-replay-applies-committed-entry.jsonl 16 replay_entry
 
