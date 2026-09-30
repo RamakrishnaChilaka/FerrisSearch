@@ -1212,6 +1212,74 @@ pub fn record_replica_received(copy: &TraceCopy, operation: &SequencedOperation)
     }
 }
 
+pub fn record_replica_rejected(
+    copy: &TraceCopy,
+    operations: &[OperationKey],
+    reason: &str,
+) -> Result<()> {
+    if !matches!(
+        reason,
+        "quarantined"
+            | "term_fence"
+            | "identity_mismatch"
+            | "recovery_gate"
+            | "copy_unavailable"
+            | "batch_rejected"
+            | "apply_failure"
+    ) {
+        anyhow::bail!("unknown protocol trace replica rejection reason [{reason}]");
+    }
+    match with_state(|state| -> Result<()> {
+        for key in operations {
+            let message_id = state
+                .message_by_copy_operation
+                .get(&(key.clone(), copy.node.clone()))
+                .cloned()
+                .context("replica rejection has no trace message")?;
+            let message = state
+                .messages
+                .get(&message_id)
+                .cloned()
+                .context("replica rejection trace message disappeared")?;
+            if message.phase == Some(MessagePhase::Nack) {
+                continue;
+            }
+            if message.phase != Some(MessagePhase::Request) {
+                anyhow::bail!("replica rejection message [{message_id}] is not in request phase");
+            }
+            let operation = state
+                .operations
+                .get(&message.message.key)
+                .cloned()
+                .context("replica rejection operation is unknown")?;
+            push_event(
+                state,
+                "replica_rejected",
+                json!({
+                    "node": copy.node,
+                    "index_uuid": copy.index_uuid,
+                    "shard": copy.shard,
+                    "allocation": copy.allocation,
+                    "message_id": message_id,
+                    "receipt_id": operation.receipt_id,
+                    "term": key.term,
+                    "seq_no": key.seq_no,
+                    "reason": reason,
+                }),
+            );
+            state
+                .messages
+                .get_mut(&message.message.message_id)
+                .expect("replica rejection message remains registered")
+                .phase = Some(MessagePhase::Nack);
+        }
+        Ok(())
+    }) {
+        Some(result) => result,
+        None => Ok(()),
+    }
+}
+
 pub fn message_phase(message_id: &str) -> Option<&'static str> {
     with_state(|state| {
         state

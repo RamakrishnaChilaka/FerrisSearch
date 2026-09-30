@@ -584,8 +584,7 @@ ReplicaReject(message) ==
     /\ copyExists[replica]
     /\ epoch[replica] = message.toEpoch
     /\ epoch[message.from] = message.fromEpoch
-    /\ \/ /\ BlocksLiveReplication(replica)
-          /\ ~ApplyMutationFails(replica)
+    /\ \/ BlocksLiveReplication(replica)
        \/ ~ReplicaMessageValid(message)
     /\ messages' = (messages \ {message}) \cup {response}
     /\ UNCHANGED

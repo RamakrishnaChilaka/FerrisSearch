@@ -208,6 +208,28 @@ ReplicaReceiveObservation(event) ==
     /\ UNCHANGED d1vars
     /\ UNCHANGED AuxVars
 
+ReplicaRejectedEvent(event) ==
+    /\ event.hasTransportMessage
+    /\ event.transportMessage \in messages
+    /\ LET message == event.transportMessage
+       IN /\ message.from = event.peer
+          /\ message.to = event.node
+          /\ message.term = event.term
+          /\ message.seq = event.seq
+          /\ message.targetAllocation = event.allocation
+          /\ CASE event.writeId = NoWrite ->
+                    /\ message.kind = "ReplicateNoOp"
+                    /\ D1FixedReplicaNoOpReject(message)
+             [] event.reason = "apply_failure" ->
+                    /\ message.kind = "Replicate"
+                    /\ message.write = event.writeId
+                    /\ FenceChangingReplication(ReplicaApplyFailure(message))
+             [] OTHER ->
+                    /\ message.kind = "Replicate"
+                    /\ message.write = event.writeId
+                    /\ StableReplication(ReplicaReject(message))
+    /\ UNCHANGED AuxVars
+
 ReplicaWalObservation(event) ==
     /\ event.writeId \in WriteIds
     /\ event.hasTransportMessage
@@ -657,6 +679,8 @@ CoreEvent(event) ==
             PrimaryReplicationObservation(event)
       [] event.kind = "replica_received" ->
             ReplicaReceiveObservation(event)
+      [] event.kind = "replica_rejected" ->
+            ReplicaRejectedEvent(event)
       [] event.kind = "replica_result" ->
             ReplicaResultEvent(event)
       [] event.kind = "client_result" ->

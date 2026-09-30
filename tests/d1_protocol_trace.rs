@@ -527,6 +527,13 @@ async fn seeded_three_node_fault_trace() -> Result<()> {
         "term-aware collision behavior did not match the selected mutation"
     );
     if collision_quarantined {
+        {
+            let _operation = operation_gate.read().await;
+            q.service
+                .protocol_trace_activate_primary_for_test(INDEX, SHARD)
+                .await
+                .map_err(anyhow::Error::msg)?;
+        }
         let _exclusive = operation_gate.write().await;
         assert_command_ok(
             state_machine.apply_command_for_protocol_trace_test(

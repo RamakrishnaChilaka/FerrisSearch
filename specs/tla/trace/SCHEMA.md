@@ -248,18 +248,32 @@ physical order while the one translog critical section remains held.
 | Event | Required fields | Emit in current Rust code | Required lock and ordering |
 | --- | --- | --- | --- |
 | `replica_received` | `node`, `index_uuid`, `shard`, `allocation`, `source_node`, `source_incarnation`, `message_id`, `receipt_id`, `term`, `seq_no`, `doc`, `op`, `content_hash` | Inside the write-pool closures in `TransportService::replicate_doc` and `TransportService::replicate_bulk`, through `ShardManager::apply_replica_operation`, after UUID/allocation and term validation but before fence persistence, WAL append, or planner mutation. | Hold the per-shard `shard_open_lock`. The attempt must exist in phase `request` and match its send-time source and target incarnations. |
+| `replica_rejected` | `node`, `index_uuid`, `shard`, `allocation`, `message_id`, `receipt_id`, `term`, `seq_no`, `reason` | In `TransportService::replicate_doc` and `TransportService::replicate_bulk`, immediately after a routing, recovery-gate, assigned-open, or write-task rejection is known and before returning the RPC result. The write-task path records only messages still in `request`; an item already changed to `nack` by `operation_processed/collision` is not duplicated. | Routing/open checks have just completed their per-shard linearization. Worker rejections are observed before releasing the RPC result, after `ShardManager::apply_replica_operation` releases `shard_open_lock`. Under the trace-state mutex, change the exact message from `request` to `nack` and append the event. `reason` is `quarantined`, `term_fence`, `identity_mismatch`, `recovery_gate`, `copy_unavailable`, `batch_rejected`, or `apply_failure`. |
 | `replica_result` | `node`, `index_uuid`, `shard`, `request_id`, `receipt_id`, `message_id`, `replica`, `replica_incarnation`, `outcome`, `message_phase`, nullable `persisted_checkpoint` | On the primary in `replicate_write_with_durability` or `replicate_explicit_batch_with_durability`, immediately after the target RPC resolves and before its result is merged into the request result. | Use the response-carried checkpoint; do not reread replica state. Under the trace-state mutex, verify and clear the named phase. |
 | `fence_persisted` | `node`, `index_uuid`, `shard`, `allocation`, `term`, nullable `fence_max_seq_no`, `reason` | In `ShardManager::apply_replica_operation` or `ShardManager::raise_copy_fence_blocking`, after `persist_copy_identity` has durably replaced the identity record and before later apply/activation work. | Hold `shard_open_lock`. `reason` is `replication`, `activation`, or `recovery`. |
 
 The replica receive event is intentionally inside the per-shard write task.
 Emitting it at gRPC ingress is incorrect because concurrent requests can enter
-the write pool in a different order.
+the write pool in a different order. Every live-replication
+`operation_processed` must be preceded by the exact message's
+`replica_received` or `promotion_noop_received` event. A
+`replica_rejected` event is the only terminal request-phase observation that
+does not require a receive event, because it records rejection before apply.
+
+One `ReplicateBulkRequest` still represents one transport result, but trace
+state is per sequence-target message. A rejected bulk RPC emits
+`replica_rejected` for every item whose message remains in `request`, in wire
+order. If the batch-wide planner precheck already emitted one
+`operation_processed/collision`, that item remains the collision NACK and the
+other items emit `batch_rejected`. The primary then emits one
+`replica_result` or `promotion_noop_result` per item, all carrying the RPC's
+same outcome and response checkpoint.
 
 ### Commit and truncation
 
 | Event | Required fields | Emit in current Rust code | Required lock and ordering |
 | --- | --- | --- | --- |
-| `commit_captured` | `node`, `index_uuid`, `shard`, `allocation`, `commit_id`, `checkpoints`, `term_state` | `HotEngine::commit_writer_at_boundary`, after the successful Tantivy commit and after the immutable `CommittedBoundaryRecord` is derived. | Hold the writer lock and `apply_state`. `term_state` contains `current_term`, nullable `max_seq_no_at_term_start`, and sorted `processed_in_current_term_below_start_max`. |
+| `commit_captured` | `node`, `index_uuid`, `shard`, `allocation`, `commit_id`, `checkpoints`, `term_state` | `HotEngine::commit_writer_at_boundary`, after the successful Tantivy commit and after the immutable `CommittedBoundaryRecord` is derived. | Hold the writer lock and `apply_state`. `term_state` contains `current_term`, nullable `max_seq_no_at_term_start`, and normalized, sorted `processed_in_current_term_below_start_max` ranges. The validator reconstructs these values from fence, processing, commit-persistence, restart, and replay events and requires an exact match. |
 | `commit_persisted` | `node`, `index_uuid`, `shard`, `allocation`, `commit_id` | `HotEngine::persist_committed_boundary`, after every successful `CommittedBoundaryRecord::persist` call has fsynced the temporary file, renamed it, and fsynced the parent directory. | Carry the immutable `commit_id`; do not reread checkpoints. Re-persisting the same captured boundary emits another event with the same `commit_id`. |
 | `wal_truncated` | `node`, `index_uuid`, `shard`, `allocation`, `truncate_through` | `HotTranslog::truncate_below`, after the rolled manifest and sequence high-watermark are persisted and generation deletion attempts finish. | The translog state mutex linearizes manifest mutation. Emit after deletion attempts so the event describes the completed truncation operation. |
 
@@ -385,6 +399,8 @@ Before TLC, `trace_to_tla.py` rejects, among other structural failures:
 - request-durability acknowledgement without durable WAL on the primary and
   every required replica;
 - replica apply or acknowledgement without the exact transport attempt;
+- failed replica results without a matching collision/apply-failure or
+  `replica_rejected` transition to `nack`;
 - NoOp batches missing any sequence/target send from the validated post-
   activation snapshot while the primary remains able to send;
 - crash lost sets that differ from exact trace transport/request state;

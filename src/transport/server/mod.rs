@@ -2106,6 +2106,8 @@ impl InternalTransport for TransportService {
             .ok_or_else(|| {
                 Status::invalid_argument("replication requires a target allocation ID")
             })?;
+        #[cfg(feature = "protocol-trace")]
+        let trace_seq_nos = [req.seq_no];
         let index_source = if req.op == "index" {
             Some(parse_replica_index_source(
                 &req.payload_json,
@@ -2122,6 +2124,16 @@ impl InternalTransport for TransportService {
         ) {
             Ok(assigned) => assigned,
             Err(error) => {
+                #[cfg(feature = "protocol-trace")]
+                self.record_protocol_trace_replica_rejection(
+                    &req.index_uuid,
+                    req.shard_id,
+                    allocation_id,
+                    primary_term,
+                    &trace_seq_nos,
+                    "identity_mismatch",
+                )
+                .map_err(|trace_error| Status::internal(trace_error.to_string()))?;
                 return Ok(Response::new(ReplicateDocResponse {
                     success: false,
                     error,
@@ -2136,6 +2148,16 @@ impl InternalTransport for TransportService {
             .shard_manager
             .rejects_live_replication(&req.index_name, req.shard_id)
         {
+            #[cfg(feature = "protocol-trace")]
+            self.record_protocol_trace_replica_rejection(
+                &req.index_uuid,
+                req.shard_id,
+                allocation_id,
+                primary_term,
+                &trace_seq_nos,
+                "recovery_gate",
+            )
+            .map_err(|trace_error| Status::internal(trace_error.to_string()))?;
             return Ok(Response::new(ReplicateDocResponse {
                 success: false,
                 error: "replica is installing a peer recovery snapshot".to_string(),
@@ -2163,6 +2185,16 @@ impl InternalTransport for TransportService {
             )
             .await
         {
+            #[cfg(feature = "protocol-trace")]
+            self.record_protocol_trace_replica_rejection(
+                &req.index_uuid,
+                req.shard_id,
+                allocation_id,
+                primary_term,
+                &trace_seq_nos,
+                Self::protocol_trace_replica_rejection_reason(&error),
+            )
+            .map_err(|trace_error| Status::internal(trace_error.to_string()))?;
             if assigned_authoritative {
                 self.report_local_copy_failure(
                     &req.index_name,
@@ -2232,15 +2264,34 @@ impl InternalTransport for TransportService {
             primary_term,
             mutation: operation,
         };
+        #[cfg(feature = "protocol-trace")]
+        let trace_seq_nos = trace_seq_nos.to_vec();
         let result = self
             .worker_pools
             .spawn_write(move || {
-                let current = service
-                    .replica_apply_routing(&index_name, shard_id, &index_uuid, allocation_id)
-                    .map_err(anyhow::Error::msg)?;
+                let current = match service.replica_apply_routing(
+                    &index_name,
+                    shard_id,
+                    &index_uuid,
+                    allocation_id,
+                ) {
+                    Ok(current) => current,
+                    Err(error) => {
+                        #[cfg(feature = "protocol-trace")]
+                        service.record_protocol_trace_replica_rejection(
+                            &index_uuid,
+                            shard_id,
+                            allocation_id,
+                            primary_term,
+                            &trace_seq_nos,
+                            "identity_mismatch",
+                        )?;
+                        return Err(anyhow::Error::msg(error));
+                    }
+                };
                 #[cfg(feature = "protocol-trace")]
                 {
-                    crate::protocol_trace::with_apply_scope(
+                    let result = crate::protocol_trace::with_apply_scope(
                         crate::protocol_trace::ApplyOrigin::LiveReplication,
                         vec![sequenced_operation.clone()],
                         || {
@@ -2256,7 +2307,18 @@ impl InternalTransport for TransportService {
                                 |engine| engine.apply_replica_operation(sequenced_operation),
                             )
                         },
-                    )
+                    );
+                    if let Err(error) = &result {
+                        service.record_protocol_trace_replica_rejection(
+                            &index_uuid,
+                            shard_id,
+                            allocation_id,
+                            primary_term,
+                            &trace_seq_nos,
+                            Self::protocol_trace_replica_rejection_reason(error),
+                        )?;
+                    }
+                    result
                 }
                 #[cfg(not(feature = "protocol-trace"))]
                 service.shard_manager.apply_replica_operation(
@@ -2348,6 +2410,12 @@ impl InternalTransport for TransportService {
             .ok_or_else(|| {
                 Status::invalid_argument("bulk replication requires a target allocation ID")
             })?;
+        #[cfg(feature = "protocol-trace")]
+        let trace_seq_nos = req
+            .ops
+            .iter()
+            .map(|operation| operation.seq_no)
+            .collect::<Vec<_>>();
         let index_sources = req
             .ops
             .iter()
@@ -2371,6 +2439,16 @@ impl InternalTransport for TransportService {
         ) {
             Ok(assigned) => assigned,
             Err(error) => {
+                #[cfg(feature = "protocol-trace")]
+                self.record_protocol_trace_replica_rejection(
+                    &req.index_uuid,
+                    req.shard_id,
+                    allocation_id,
+                    primary_term,
+                    &trace_seq_nos,
+                    "identity_mismatch",
+                )
+                .map_err(|trace_error| Status::internal(trace_error.to_string()))?;
                 return Ok(Response::new(ReplicateBulkResponse {
                     success: false,
                     error,
@@ -2385,6 +2463,16 @@ impl InternalTransport for TransportService {
             .shard_manager
             .rejects_live_replication(&req.index_name, req.shard_id)
         {
+            #[cfg(feature = "protocol-trace")]
+            self.record_protocol_trace_replica_rejection(
+                &req.index_uuid,
+                req.shard_id,
+                allocation_id,
+                primary_term,
+                &trace_seq_nos,
+                "recovery_gate",
+            )
+            .map_err(|trace_error| Status::internal(trace_error.to_string()))?;
             return Ok(Response::new(ReplicateBulkResponse {
                 success: false,
                 error: "replica is installing a peer recovery snapshot".to_string(),
@@ -2412,6 +2500,16 @@ impl InternalTransport for TransportService {
             )
             .await
         {
+            #[cfg(feature = "protocol-trace")]
+            self.record_protocol_trace_replica_rejection(
+                &req.index_uuid,
+                req.shard_id,
+                allocation_id,
+                primary_term,
+                &trace_seq_nos,
+                Self::protocol_trace_replica_rejection_reason(&error),
+            )
+            .map_err(|trace_error| Status::internal(trace_error.to_string()))?;
             if assigned_authoritative {
                 self.report_local_copy_failure(
                     &req.index_name,
@@ -2529,12 +2627,29 @@ impl InternalTransport for TransportService {
         let write_result = self
             .worker_pools
             .spawn_write(move || {
-                let current = service
-                    .replica_apply_routing(&index_name, shard_id, &index_uuid, allocation_id)
-                    .map_err(anyhow::Error::msg)?;
+                let current = match service.replica_apply_routing(
+                    &index_name,
+                    shard_id,
+                    &index_uuid,
+                    allocation_id,
+                ) {
+                    Ok(current) => current,
+                    Err(error) => {
+                        #[cfg(feature = "protocol-trace")]
+                        service.record_protocol_trace_replica_rejection(
+                            &index_uuid,
+                            shard_id,
+                            allocation_id,
+                            primary_term,
+                            &trace_seq_nos,
+                            "identity_mismatch",
+                        )?;
+                        return Err(anyhow::Error::msg(error));
+                    }
+                };
                 #[cfg(feature = "protocol-trace")]
                 {
-                    crate::protocol_trace::with_apply_scope(
+                    let result = crate::protocol_trace::with_apply_scope(
                         crate::protocol_trace::ApplyOrigin::LiveReplication,
                         trace_operations,
                         || {
@@ -2550,7 +2665,18 @@ impl InternalTransport for TransportService {
                                 |engine| engine.apply_replica_batch(operations),
                             )
                         },
-                    )
+                    );
+                    if let Err(error) = &result {
+                        service.record_protocol_trace_replica_rejection(
+                            &index_uuid,
+                            shard_id,
+                            allocation_id,
+                            primary_term,
+                            &trace_seq_nos,
+                            Self::protocol_trace_replica_rejection_reason(error),
+                        )?;
+                    }
+                    result
                 }
                 #[cfg(not(feature = "protocol-trace"))]
                 service.shard_manager.apply_replica_operation(
@@ -3842,6 +3968,68 @@ impl InternalTransport for TransportService {
 }
 
 impl TransportService {
+    #[cfg(feature = "protocol-trace")]
+    fn record_protocol_trace_replica_rejection(
+        &self,
+        index_uuid: &str,
+        shard_id: u32,
+        allocation_id: u64,
+        primary_term: u64,
+        seq_nos: &[u64],
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        let copy = crate::protocol_trace::TraceCopy {
+            node: self.local_node_id.clone(),
+            index_uuid: index_uuid.to_string(),
+            shard: shard_id,
+            allocation: allocation_id,
+        };
+        let operations = seq_nos
+            .iter()
+            .map(|seq_no| {
+                crate::protocol_trace::OperationKey::new(
+                    index_uuid,
+                    shard_id,
+                    primary_term,
+                    *seq_no,
+                )
+            })
+            .collect::<Vec<_>>();
+        crate::protocol_trace::record_replica_rejected(&copy, &operations, reason)
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_replica_rejection_reason(error: &anyhow::Error) -> &'static str {
+        let message = format!("{error:#}");
+        if error.is::<crate::shard::CollisionQuarantinedShardCopy>()
+            || message.contains("collision quarantine")
+        {
+            "quarantined"
+        } else if message.contains("below local fence")
+            || message.contains("below the current primary term")
+        {
+            "term_fence"
+        } else if message.contains("installing a peer recovery snapshot")
+            || message.contains("peer recovery")
+        {
+            "recovery_gate"
+        } else if message.contains("UUID mismatch")
+            || message.contains("allocation mismatch")
+            || message.contains("no current allocation")
+            || message.contains("not an authoritative")
+        {
+            "identity_mismatch"
+        } else if ShardManager::is_sequence_collision_failure(error) {
+            "batch_rejected"
+        } else if message.contains("engine is not open")
+            || message.contains("failed to open replica copy")
+        {
+            "copy_unavailable"
+        } else {
+            "apply_failure"
+        }
+    }
+
     fn select_live_promotion_candidate(
         &self,
         state: &crate::cluster::state::ClusterState,

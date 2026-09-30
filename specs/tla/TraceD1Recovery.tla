@@ -153,6 +153,21 @@ ReplicaReceiveObservation(event) ==
     /\ event.transportMessage.to = event.node
     /\ UNCHANGED d1vars
 
+ReplicaRejectedEvent(event) ==
+    /\ event.writeId \in WriteIds
+    /\ event.hasTransportMessage
+    /\ event.transportMessage \in messages
+    /\ LET message == event.transportMessage
+       IN /\ message.kind = "Replicate"
+          /\ message.write = event.writeId
+          /\ message.to = event.node
+          /\ message.term = event.term
+          /\ message.seq = event.seq
+          /\ message.targetAllocation = event.allocation
+          /\ IF event.reason = "apply_failure"
+                THEN FenceChangingReplication(ReplicaApplyFailure(message))
+                ELSE StableReplication(ReplicaReject(message))
+
 ReplicaWalObservation(event) ==
     /\ event.writeId \in WriteIds
     /\ event.hasTransportMessage
@@ -296,6 +311,8 @@ RecoveryTraceEventCore(event) ==
             PrimaryReplicationObservation(event)
       [] event.kind = "replica_received" ->
             ReplicaReceiveObservation(event)
+      [] event.kind = "replica_rejected" ->
+            ReplicaRejectedEvent(event)
       [] event.kind = "replica_result" -> ReplicaResultEvent(event)
       [] event.kind = "client_result" -> ClientResultEvent(event)
       [] event.kind = "recovery_snapshot" -> SnapshotEvent(event)

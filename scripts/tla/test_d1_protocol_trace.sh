@@ -90,7 +90,7 @@ expect_checker_rejected "$arrival" 27
 expect_tla_rejected "$arrival" 27
 
 capture seq-only-redelivery "$seq_only"
-expect_checker_rejected "$seq_only" 106
-expect_tla_rejected "$seq_only" 106
+expect_checker_rejected "$seq_only" 117
+expect_tla_rejected "$seq_only" 117
 
 echo "D1 Rust trace validation passed (seed=$SEED)."

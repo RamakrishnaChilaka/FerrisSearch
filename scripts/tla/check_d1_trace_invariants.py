@@ -405,16 +405,54 @@ def check_trace(
                 request_status[request_id] = "replicating"
             apply_observed_operation(event, copy, wal_durable)
             if event["origin"] == "live_replication":
-                for message in messages.values():
-                    if (
-                        message["target"] == event["node"]
-                        and message["identity"] == observed
-                        and message["phase"] == "request"
-                    ):
-                        message["phase"] = (
-                            "nack" if event["outcome"] in {"collision", "apply_failed"} else "ack"
-                        )
-                        break
+                matching = [
+                    message
+                    for message in messages.values()
+                    if message["target"] == event["node"]
+                    and message["receipt_id"] == event["receipt_id"]
+                    and message["identity"] == observed
+                    and message["phase"] == "request"
+                ]
+                if len(matching) > 1:
+                    fail(event, "live operation matches multiple in-flight messages")
+                if matching:
+                    message = matching[0]
+                    if not message["received"]:
+                        fail(event, "live operation was processed before replica receipt")
+                    message["phase"] = (
+                        "nack"
+                        if event["outcome"] in {"collision", "apply_failed"}
+                        else "ack"
+                    )
+        elif kind in {"replica_received", "promotion_noop_received"}:
+            message = messages.get(event["message_id"])
+            if message is None:
+                fail(event, "replica receipt references an unknown message")
+            observed = message["identity"]
+            if (
+                message["phase"] != "request"
+                or message["received"]
+                or message["source"] != event["source_node"]
+                or message["target"] != event["node"]
+                or message["receipt_id"] != event["receipt_id"]
+                or observed.term != event["term"]
+                or observed.seq_no != event["seq_no"]
+            ):
+                fail(event, "replica receipt does not match its message")
+            message["received"] = True
+        elif kind == "replica_rejected":
+            message = messages.get(event["message_id"])
+            if message is None:
+                fail(event, "replica rejection references an unknown message")
+            observed = message["identity"]
+            if (
+                message["phase"] != "request"
+                or message["target"] != event["node"]
+                or observed.term != event["term"]
+                or observed.seq_no != event["seq_no"]
+            ):
+                fail(event, "replica rejection does not match its message")
+            message["phase"] = "nack"
         elif kind == "primary_replication_started":
             request_id = event["request_id"]
             required = set()
@@ -425,6 +463,7 @@ def check_trace(
                 messages[message_id] = {
                     "source": event["node"],
                     "target": target["node"],
+                    "receipt_id": event["receipt_id"],
                     "identity": Identity(
                         event["term"],
                         event["seq_no"],
@@ -433,6 +472,7 @@ def check_trace(
                         request_operations[request_id].content_hash,
                     ),
                     "phase": "request",
+                    "received": False,
                 }
                 required.add(message_id)
             required_messages[request_id] = required
@@ -505,8 +545,10 @@ def check_trace(
             messages[message_id] = {
                 "source": event["node"],
                 "target": event["replica"],
+                "receipt_id": event["receipt_id"],
                 "identity": observed,
                 "phase": "request",
+                "received": False,
             }
         elif kind == "promotion_noop_result":
             message_id = event["message_id"]

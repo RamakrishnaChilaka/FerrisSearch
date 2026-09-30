@@ -194,6 +194,47 @@ run_invalid \
     invalid-rust-faithful-omitted-wal.jsonl \
     19 \
     operation_processed
+run_valid \
+    rust-faithful-replica-rejected \
+    valid-rust-faithful-replica-rejected.jsonl
+run_invalid \
+    rust-faithful-missing-replica-rejected \
+    invalid-rust-faithful-missing-replica-rejected.jsonl \
+    120 \
+    promotion_noop_result
+run_valid \
+    r6-quarantined-replica-rejected \
+    valid-r6-quarantined-replica-rejected.jsonl
+run_invalid \
+    r6-quarantined-result-without-rejection \
+    invalid-r6-quarantined-result-without-rejection.jsonl \
+    197 \
+    replica_result
+run_invalid \
+    r6-ordinary-apply-without-receive \
+    invalid-r6-ordinary-apply-without-receive.jsonl \
+    169 \
+    operation_processed
+run_invalid \
+    r6-ordinary-receive-after-apply \
+    invalid-r6-ordinary-receive-after-apply.jsonl \
+    169 \
+    operation_processed
+run_invalid \
+    r6-noop-apply-without-receive \
+    invalid-r6-noop-apply-without-receive.jsonl \
+    185 \
+    operation_processed
+run_invalid \
+    r6-commit-term-state-contradicts-copy \
+    invalid-r6-commit-term-state-contradicts-copy.jsonl \
+    199 \
+    commit_captured
+run_invalid \
+    r6-commit-term-state-invalid-shape \
+    invalid-r6-commit-term-state-invalid-shape.jsonl \
+    199 \
+    commit_captured
 run_inconclusive \
     timeout \
     "trace validation exceeded 1s" \
