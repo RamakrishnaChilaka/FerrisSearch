@@ -49,6 +49,7 @@ enum ShardCopyIoOperation {
     Recovery,
     PendingMarker,
     InstallMarker,
+    CollisionMarker,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -803,6 +804,8 @@ pub struct ShardManager {
     assigned_open_io_failure: Mutex<Option<(i32, usize)>>,
     #[cfg(test)]
     assigned_open_attempts: AtomicUsize,
+    #[cfg(test)]
+    collision_quarantine_persist_failure: Mutex<Option<(i32, usize)>>,
     peer_recovery_targets: RwLock<HashMap<ShardKey, PeerRecoveryTargetState>>,
     source_recovery_cleanup: RwLock<Option<Arc<dyn SourceRecoverySessionCleanup>>>,
     /// ISR tracker for primary shards — tracks replica checkpoint lag.
@@ -867,6 +870,8 @@ impl ShardManager {
             assigned_open_io_failure: Mutex::new(None),
             #[cfg(test)]
             assigned_open_attempts: AtomicUsize::new(0),
+            #[cfg(test)]
+            collision_quarantine_persist_failure: Mutex::new(None),
             peer_recovery_targets: RwLock::new(HashMap::new()),
             source_recovery_cleanup: RwLock::new(None),
             isr_tracker: IsrTracker::new(1000),
@@ -1116,6 +1121,44 @@ impl ShardManager {
         }
         *remaining -= 1;
         Err(std::io::Error::from_raw_os_error(*raw_os_error).into())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_collision_quarantine_persist_failures(
+        &self,
+        raw_os_error: i32,
+        attempts: usize,
+    ) {
+        *self
+            .collision_quarantine_persist_failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some((raw_os_error, attempts));
+    }
+
+    #[cfg(test)]
+    fn maybe_inject_collision_quarantine_persist_failure(&self) -> Result<()> {
+        let mut injection = self
+            .collision_quarantine_persist_failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some((raw_os_error, remaining)) = injection.as_mut() else {
+            return Ok(());
+        };
+        if *remaining == 0 {
+            return Ok(());
+        }
+        *remaining -= 1;
+        Err(std::io::Error::from_raw_os_error(*raw_os_error).into())
+    }
+
+    fn persist_collision_quarantine_identity(
+        &self,
+        shard_dir: &std::path::Path,
+        identity: &ShardCopyIdentity,
+    ) -> Result<()> {
+        #[cfg(test)]
+        self.maybe_inject_collision_quarantine_persist_failure()?;
+        Self::persist_copy_identity(shard_dir, identity)
     }
 
     fn copy_identity_path(shard_dir: &std::path::Path) -> PathBuf {
@@ -1590,7 +1633,12 @@ impl ShardManager {
         error.chain().any(|cause| {
             cause
                 .downcast_ref::<PersistentShardCopyIoFailure>()
-                .is_some_and(|failure| failure.operation != ShardCopyIoOperation::Apply)
+                .is_some_and(|failure| {
+                    !matches!(
+                        failure.operation,
+                        ShardCopyIoOperation::Apply | ShardCopyIoOperation::CollisionMarker
+                    )
+                })
         })
     }
 
@@ -1720,21 +1768,31 @@ impl ShardManager {
             .map(Ok)
             .unwrap_or_else(|| Self::load_copy_identity(&shard_dir))?;
         identity.validate_binding(index_uuid, allocation_id)?;
-        let persist_result = if identity.collision_quarantined {
-            Ok(())
-        } else {
-            identity.collision_quarantined = true;
-            Self::persist_copy_identity(&shard_dir, &identity)
-        };
+        identity.collision_quarantined = true;
+        let persist_result = self
+            .persist_collision_quarantine_identity(&shard_dir, &identity)
+            .map_err(|source| {
+                anyhow::Error::new(PersistentShardCopyIoFailure {
+                    operation: ShardCopyIoOperation::CollisionMarker,
+                    attempts: 1,
+                    elapsed_ms: 0,
+                    source,
+                })
+            });
 
         self.shards
             .write()
             .unwrap_or_else(|error| error.into_inner())
             .remove(&key);
-        self.copy_identities
+        let mut identities = self
+            .copy_identities
             .write()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(&key);
+            .unwrap_or_else(|error| error.into_inner());
+        if persist_result.is_ok() {
+            identities.remove(&key);
+        } else {
+            identities.insert(key, identity);
+        }
         self.isr_tracker.remove_shard(index, shard_id);
         persist_result
     }
@@ -5030,6 +5088,63 @@ mod tests {
         let identity = restarted.copy_identity("idx", 0).unwrap();
         assert_eq!(identity.replica_fence, 5);
         assert_eq!(identity.fence_max_seq_no, Some(0));
+    }
+
+    #[tokio::test]
+    async fn collision_marker_persist_failure_keeps_in_memory_quarantine_reportable() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 2,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        manager.inject_collision_quarantine_persist_failures(28, 1);
+
+        let error = manager
+            .quarantine_sequence_collision("idx", 0, "uuid-1", 7)
+            .unwrap_err();
+
+        assert!(
+            ShardManager::should_report_copy_failure(&error),
+            "{error:#}"
+        );
+        assert!(
+            !ShardManager::should_quarantine_copy_failure(&error),
+            "the collision-specific in-memory marker must not be cleared by generic quarantine"
+        );
+        assert!(manager.get_shard("idx", 0).is_none());
+        let identity = manager
+            .copy_identity("idx", 0)
+            .expect("failed marker persistence must retain in-memory identity");
+        assert!(identity.collision_quarantined);
+        let durable = ShardManager::load_copy_identity(&dir.path().join("uuid-1/shard_0")).unwrap();
+        assert!(!durable.collision_quarantined);
+        let reopen = match manager.open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &IndexSettings::default(),
+            "uuid-1",
+            AssignedShardOpen {
+                allocation_id: 7,
+                primary_term: 2,
+                allow_empty_creation: false,
+            },
+        ) {
+            Ok(_) => panic!("in-memory collision quarantine must reject reopen"),
+            Err(error) => error,
+        };
+        assert!(reopen.is::<CollisionQuarantinedShardCopy>(), "{reopen:#}");
     }
 
     #[test]

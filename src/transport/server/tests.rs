@@ -5244,3 +5244,142 @@ async fn collision_quarantine_rejects_reopen_and_follow_up_replication() {
     assert!(error.to_string().contains("collision quarantine is active"));
     assert!(restarted.get_shard("idx", 0).is_none());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn collision_marker_persist_failure_keeps_transport_quarantined() {
+    let mut state = gap_test_state(0);
+    state
+        .indices
+        .get_mut("idx")
+        .unwrap()
+        .shard_routing
+        .get_mut(&0)
+        .unwrap()
+        .primary_term = 1;
+    state
+        .shard_allocations
+        .get_mut("idx")
+        .unwrap()
+        .get_mut(&0)
+        .unwrap()
+        .primary_initialized = true;
+    let allocation_id = state.shard_allocation_id("idx", 0, "replica").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let shards = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    {
+        let engine = shards
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &crate::cluster::state::IndexSettings::default(),
+                "uuid-1",
+                crate::shard::AssignedShardOpen {
+                    allocation_id,
+                    primary_term: 1,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        engine
+            .apply_replica_batch(
+                (0..=5)
+                    .map(|seq_no| crate::engine::SequencedOperation {
+                        seq_no,
+                        primary_term: 1,
+                        mutation: crate::engine::DocumentMutation::Index {
+                            doc_id: format!("doc-{seq_no}"),
+                            source: json!({"term": 1, "seq": seq_no}),
+                        },
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        engine.refresh().unwrap();
+    }
+    let manager = Arc::new(ClusterManager::new(state.cluster_name.clone()));
+    manager.update_state(state);
+    let service = TransportService {
+        cluster_manager: manager,
+        shard_manager: shards.clone(),
+        transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
+        raft: None,
+        local_node_id: "replica".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
+        join_lock: new_join_lock(),
+    };
+    let request = |seq_no: u64| ReplicateDocRequest {
+        index_name: "idx".into(),
+        shard_id: 0,
+        doc_id: format!("doc-{seq_no}"),
+        payload_json: serde_json::to_vec(&json!({"term": 2, "seq": seq_no})).unwrap(),
+        op: "index".into(),
+        seq_no,
+        index_uuid: "uuid-1".into(),
+        primary_term: Some(2),
+        target_allocation_id: Some(allocation_id),
+    };
+    shards.inject_collision_quarantine_persist_failures(28, 2);
+
+    let collision = service
+        .replicate_doc(Request::new(request(5)))
+        .await
+        .unwrap_err();
+    assert_eq!(collision.code(), tonic::Code::DataLoss);
+
+    let durable: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            dir.path()
+                .join("uuid-1/shard_0")
+                .join(crate::shard::SHARD_COPY_IDENTITY_FILE),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(durable["collision_quarantined"], false);
+    assert!(
+        shards
+            .copy_identity("idx", 0)
+            .is_some_and(|identity| identity.collision_quarantined)
+    );
+    assert!(shards.get_shard("idx", 0).is_none());
+
+    let follow_up = service
+        .replicate_doc(Request::new(request(6)))
+        .await
+        .unwrap_err();
+    assert_eq!(follow_up.code(), tonic::Code::DataLoss);
+    assert!(
+        follow_up
+            .message()
+            .contains("collision quarantine is active")
+    );
+    assert!(shards.get_shard("idx", 0).is_none());
+    let durable: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            dir.path()
+                .join("uuid-1/shard_0")
+                .join(crate::shard::SHARD_COPY_IDENTITY_FILE),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(durable["collision_quarantined"], false);
+
+    let read = service
+        .get_doc(Request::new(ShardGetRequest {
+            index_name: "idx".into(),
+            shard_id: 0,
+            doc_id: "doc-5".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!read.found);
+    assert!(read.error.contains("collision quarantine is active"));
+}

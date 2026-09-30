@@ -84,7 +84,11 @@ pub struct ShardManager {
   Definitive and open-level failures may quarantine only after the report
   throttle admits the attempt, except sequence/version collisions, which
   atomically persist collision quarantine before the engine is evicted and are
-  also reported by the primary.
+  also reported by the primary. If marker persistence fails, retain the marked
+  identity in memory, keep the engine evicted, and return a reportable
+  persistent-storage failure. Later collision handling may retry the atomic
+  marker write, but assigned open and replica apply must reject the cached
+  marker until persistence succeeds or the process exits.
 - Only an uninitialized CreateIndex primary allocation may create a fresh empty
   copy. Initial and later out-of-sync replicas receive identity through
   verified recovery install.

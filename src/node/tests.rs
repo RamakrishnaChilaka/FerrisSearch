@@ -1,6 +1,7 @@
 use super::*;
 use crate::cluster::state::{IndexMetadata, IndexSettings, IndexUuid, ShardRoutingEntry};
 use crate::consensus::types::ClusterResponse;
+use crate::transport::proto::internal_transport_server::InternalTransport;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -240,9 +241,9 @@ async fn collision_quarantine_keeps_lifecycle_failure_reportable_until_removal()
     );
 
     let dir = tempfile::tempdir().unwrap();
-    let shard_manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+    let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
     shard_manager.set_copy_retry_policy_for_test(3, Duration::ZERO, Duration::ZERO, Duration::ZERO);
-    shard_manager
+    let engine = shard_manager
         .open_assigned_shard_with_settings(
             "idx",
             0,
@@ -256,19 +257,63 @@ async fn collision_quarantine_keeps_lifecycle_failure_reportable_until_removal()
             },
         )
         .unwrap();
+    for seq_no in 0..=5 {
+        apply_index(
+            &engine,
+            &format!("doc-{seq_no}"),
+            serde_json::json!({"term": 2, "seq": seq_no}),
+            seq_no,
+            2,
+        );
+    }
+    engine.refresh().unwrap();
+
+    let cluster_manager = Arc::new(ClusterManager::with_shared_state(state_handle.clone()));
+    let remote_store_resources = crate::transport::server::RemoteStoreTransportResources {
+        storage_manager: Arc::new(crate::storage::StorageManager::new_in_path(dir.path()).unwrap()),
+        remote_store_reader_cache: Arc::new(
+            crate::engine::remote_store::RemoteSplitReaderCache::default(),
+        ),
+    };
+    let (_transport_server, transport_service) =
+        crate::transport::server::create_transport_service_with_raft_and_storage_handle(
+            cluster_manager.clone(),
+            shard_manager.clone(),
+            TransportClient::new(),
+            raft.clone(),
+            Arc::new(crate::tasks::TaskManager::new()),
+            remote_store_resources,
+            "node-2".into(),
+        );
+    let collision = transport_service
+        .replicate_doc(tonic::Request::new(
+            crate::transport::proto::ReplicateDocRequest {
+                index_name: "idx".into(),
+                shard_id: 0,
+                doc_id: "doc-5".into(),
+                payload_json: serde_json::to_vec(&serde_json::json!({
+                    "term": 3,
+                    "seq": 5
+                }))
+                .unwrap(),
+                op: "index".into(),
+                seq_no: 5,
+                index_uuid: "idx-uuid".into(),
+                primary_term: Some(3),
+                target_allocation_id: Some(allocation_id),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(collision.code(), tonic::Code::DataLoss);
+
     let identity_path = dir
         .path()
         .join("idx-uuid/shard_0")
         .join(crate::shard::SHARD_COPY_IDENTITY_FILE);
-    let mut identity: serde_json::Value =
+    let identity: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&identity_path).unwrap()).unwrap();
-    identity["collision_quarantined"] = serde_json::Value::Bool(true);
-    std::fs::write(&identity_path, serde_json::to_vec(&identity).unwrap()).unwrap();
-    std::fs::File::open(identity_path.parent().unwrap())
-        .unwrap()
-        .sync_all()
-        .unwrap();
-    shard_manager.quarantine_shard_copy("idx", 0);
+    assert_eq!(identity["collision_quarantined"], true);
 
     let mut lagging_state = state_handle.read().unwrap().clone();
     lagging_state
@@ -295,11 +340,10 @@ async fn collision_quarantine_keeps_lifecycle_failure_reportable_until_removal()
             .contains("collision quarantine is active")
     );
 
-    let cluster_manager = ClusterManager::with_shared_state(state_handle.clone());
     let mut recent_reports = std::collections::HashMap::new();
     report_failed_shard_copies(
         vec![stale_failure],
-        &cluster_manager,
+        cluster_manager.as_ref(),
         &shard_manager,
         &TransportClient::new(),
         raft.as_ref(),
@@ -329,7 +373,7 @@ async fn collision_quarantine_keeps_lifecycle_failure_reportable_until_removal()
     );
     report_failed_shard_copies(
         vec![current_failure],
-        &cluster_manager,
+        cluster_manager.as_ref(),
         &shard_manager,
         &TransportClient::new(),
         raft.as_ref(),

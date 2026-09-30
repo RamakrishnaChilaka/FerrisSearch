@@ -181,7 +181,9 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   replica's local routing view to start recovery. Quarantine is durable in the
   copy identity; later single or bulk replication to the marked allocation
   remains `DATA_LOSS` even during an existing open-I/O backoff window and
-  cannot reopen it.
+  cannot reopen it. If the marker write fails, the process-local identity stays
+  marked and the engine stays evicted, so later replication and reads still
+  fail closed while the persistent-storage error remains reportable.
 - Gap probes run concurrently under a two-second per-probe timeout. A copy that
   is assigned but still opening/replaying returns `UNAVAILABLE`. Only proven
   UUID/allocation/durable-identity mismatch (`FAILED_PRECONDITION`) or

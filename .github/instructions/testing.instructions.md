@@ -325,7 +325,12 @@ cargo test -- test_name                         # Single test by name
   `MarkPrimaryAvailable` report.
 - Collision quarantine regressions must assert repeated immediate single and
   bulk replication attempts remain `DATA_LOSS`; a definitive marker must never
-  be masked by copy-I/O backoff.
+  be masked by copy-I/O backoff. Inject collision-marker persistence failure
+  and prove the engine remains evicted, the in-memory allocation stays marked,
+  the storage error is reportable, and later replication and reads fail closed
+  even while the durable identity still has an unset marker. Lifecycle removal
+  coverage must create the marker through an actual colliding replica RPC, not
+  by editing the identity file, and assert the exact allocation is removed.
 - Round-6 storage regressions use a real Tantivy commit failure to prove the
   writer is removed, the persisted checkpoint does not advance, five later
   acknowledged writes survive the next commit and restart, and a failed
