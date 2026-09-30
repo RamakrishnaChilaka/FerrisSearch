@@ -191,8 +191,8 @@ enum CurrentVersion {
     Native(super::version_map::VersionValue),
 }
 
-struct PlannedOperation {
-    operation: super::SequencedOperation,
+struct PlannedOperation<'a> {
+    operation: &'a super::SequencedOperation,
     outcome: super::ApplyOutcome,
     complete: bool,
 }
@@ -718,27 +718,19 @@ fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
 
 fn sequenced_wal_entry(
     operation: &super::SequencedOperation,
-) -> Result<crate::wal::SequencedWalEntry> {
-    let (op, payload) = match &operation.mutation {
-        super::DocumentMutation::Index { doc_id, source } => (
-            crate::wal::WalOperation::Index,
-            serde_json::json!({ "_doc_id": doc_id, "_source": source }),
-        ),
-        super::DocumentMutation::Delete { doc_id } => (
-            crate::wal::WalOperation::Delete,
-            serde_json::json!({ "_doc_id": doc_id }),
-        ),
-        super::DocumentMutation::NoOp { reason } => (
-            crate::wal::WalOperation::NoOp,
-            serde_json::json!({ "_reason": reason }),
-        ),
+) -> crate::wal::BorrowedSequencedWalEntry<'_> {
+    let mutation = match &operation.mutation {
+        super::DocumentMutation::Index { doc_id, source } => {
+            WalDocumentOperation::Index { doc_id, source }
+        }
+        super::DocumentMutation::Delete { doc_id } => WalDocumentOperation::Delete { doc_id },
+        super::DocumentMutation::NoOp { reason } => WalDocumentOperation::NoOp { reason },
     };
-    Ok(crate::wal::SequencedWalEntry {
+    crate::wal::BorrowedSequencedWalEntry {
         seq_no: operation.seq_no,
         primary_term: operation.primary_term,
-        op,
-        payload,
-    })
+        operation: mutation,
+    }
 }
 
 fn wal_entry_matches_operation(
@@ -771,19 +763,29 @@ fn wal_entry_matches_operation(
 }
 
 fn sequenced_operation_from_entry(
-    entry: &crate::wal::TranslogEntry,
+    mut entry: crate::wal::TranslogEntry,
 ) -> Result<super::SequencedOperation> {
-    let mutation = match document_operation(entry)? {
-        WalDocumentOperation::Index { doc_id, source } => super::DocumentMutation::Index {
-            doc_id: doc_id.to_string(),
-            source: source.clone(),
-        },
-        WalDocumentOperation::Delete { doc_id } => super::DocumentMutation::Delete {
-            doc_id: doc_id.to_string(),
-        },
-        WalDocumentOperation::NoOp { reason } => super::DocumentMutation::NoOp {
-            reason: reason.to_string(),
-        },
+    document_operation(&entry)?;
+    let mutation = match entry.op {
+        crate::wal::WalOperation::Index | crate::wal::WalOperation::Delete => {
+            let serde_json::Value::String(doc_id) = entry.payload["_doc_id"].take() else {
+                unreachable!("validated WAL document ID is a string");
+            };
+            if entry.op == crate::wal::WalOperation::Index {
+                super::DocumentMutation::Index {
+                    doc_id,
+                    source: entry.payload["_source"].take(),
+                }
+            } else {
+                super::DocumentMutation::Delete { doc_id }
+            }
+        }
+        crate::wal::WalOperation::NoOp => {
+            let serde_json::Value::String(reason) = entry.payload["_reason"].take() else {
+                unreachable!("validated WAL no-op reason is a string");
+            };
+            super::DocumentMutation::NoOp { reason }
+        }
     };
     Ok(super::SequencedOperation {
         seq_no: entry.seq_no,
@@ -1339,7 +1341,7 @@ impl HotEngine {
     fn apply_sequenced_batch_locked<F>(
         &self,
         translog: &dyn WriteAheadLog,
-        operations: Vec<super::SequencedOperation>,
+        operations: &[super::SequencedOperation],
         wal_disposition: WalDisposition,
         mut writer_override: Option<&mut WriterState>,
         inject_apply_failure: bool,
@@ -1386,7 +1388,7 @@ impl HotEngine {
         let seq_only_redelivery = false;
         let planning_snapshot = state.planning_snapshot();
         let mut planned = Vec::with_capacity(operations.len());
-        let mut shadow_versions = HashMap::<String, CurrentVersion>::new();
+        let mut shadow_versions = HashMap::<&str, CurrentVersion>::with_capacity(operations.len());
         #[cfg(feature = "protocol-trace")]
         let mut collision_operation = None;
 
@@ -1408,18 +1410,18 @@ impl HotEngine {
                 {
                     #[cfg(feature = "protocol-trace")]
                     {
-                        collision_operation = Some(operation.clone());
+                        collision_operation = Some(operation);
                     }
                     return Err(error);
                 }
                 if already_processed {
                     if wal_disposition.validates_redelivery()
                         && !seq_only_redelivery
-                        && let Err(error) = self.validate_redelivery(translog, &operation)
+                        && let Err(error) = self.validate_redelivery(translog, operation)
                     {
                         #[cfg(feature = "protocol-trace")]
                         {
-                            collision_operation = Some(operation.clone());
+                            collision_operation = Some(operation);
                         }
                         return Err(error);
                     }
@@ -1444,11 +1446,12 @@ impl HotEngine {
                     super::DocumentMutation::NoOp { .. } => super::ApplyOutcome::NoOp,
                     super::DocumentMutation::Index { doc_id, .. }
                     | super::DocumentMutation::Delete { doc_id } => {
-                        let current = if let Some(current) = shadow_versions.get(doc_id).copied() {
-                            Some(current)
-                        } else {
-                            self.current_version(&state, doc_id)?
-                        };
+                        let current =
+                            if let Some(current) = shadow_versions.get(doc_id.as_str()).copied() {
+                                Some(current)
+                            } else {
+                                self.current_version(&state, doc_id)?
+                            };
                         let outcome = match current {
                             Some(CurrentVersion::Native(version))
                                 if version.seq_no() > operation.seq_no =>
@@ -1479,7 +1482,7 @@ impl HotEngine {
                                     } else {
                                         #[cfg(feature = "protocol-trace")]
                                         {
-                                            collision_operation = Some(operation.clone());
+                                            collision_operation = Some(operation);
                                         }
                                         return Err(SequenceOperationCollisionError {
                                             primary_term: operation.primary_term,
@@ -1491,11 +1494,11 @@ impl HotEngine {
                                     if wal_disposition.validates_redelivery()
                                         && !seq_only_redelivery
                                         && let Err(error) =
-                                            self.validate_redelivery(translog, &operation)
+                                            self.validate_redelivery(translog, operation)
                                     {
                                         #[cfg(feature = "protocol-trace")]
                                         {
-                                            collision_operation = Some(operation.clone());
+                                            collision_operation = Some(operation);
                                         }
                                         return Err(error);
                                     }
@@ -1525,7 +1528,7 @@ impl HotEngine {
                                 ),
                                 super::DocumentMutation::NoOp { .. } => unreachable!(),
                             };
-                            shadow_versions.insert(doc_id.clone(), version);
+                            shadow_versions.insert(doc_id.as_str(), version);
                         }
                         outcome
                     }
@@ -1563,29 +1566,17 @@ impl HotEngine {
             return Err(error);
         }
 
-        let wal_entries = match planned
-            .iter()
-            .filter(|planned| planned.outcome != super::ApplyOutcome::Redelivery)
-            .map(|planned| sequenced_wal_entry(&planned.operation))
-            .collect::<Result<Vec<_>>>()
-        {
-            Ok(entries) => entries,
-            Err(error) => {
-                state.restore_planning_snapshot(planning_snapshot);
-                if wal_disposition.is_already_in_local_wal() {
-                    if let Some(writer_state) = writer_override.as_deref_mut() {
-                        writer_state.fail(format!(
-                            "sequenced operation failed after WAL persistence: {error:#}"
-                        ));
-                    } else {
-                        self.fail_writer_after_wal(&error);
-                    }
-                }
-                return Err(error);
-            }
+        let wal_entries = if wal_disposition == WalDisposition::Append {
+            planned
+                .iter()
+                .filter(|planned| planned.outcome != super::ApplyOutcome::Redelivery)
+                .map(|planned| sequenced_wal_entry(planned.operation))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
         };
         let appended = wal_disposition == WalDisposition::Append && !wal_entries.is_empty();
-        if appended && let Err(error) = translog.append_batch_with_seq(&wal_entries) {
+        if appended && let Err(error) = translog.write_document_batch_with_seq(&wal_entries) {
             state.restore_planning_snapshot(planning_snapshot);
             return Err(error);
         }
@@ -1598,7 +1589,7 @@ impl HotEngine {
             {
                 crate::protocol_trace::record_wal_appended(
                     copy,
-                    &planned_operation.operation,
+                    planned_operation.operation,
                     durable,
                 )?;
             }
@@ -1656,7 +1647,7 @@ impl HotEngine {
                             planned_operation.operation.primary_term,
                         )?;
                         writer.add_document(doc)?;
-                        side_effect(&planned_operation.operation)?;
+                        side_effect(planned_operation.operation)?;
                         state.versions.apply_index(
                             doc_id,
                             planned_operation.operation.seq_no,
@@ -1674,7 +1665,7 @@ impl HotEngine {
                             .unwrap_or_else(|error| error.into_inner())
                             .id_field;
                         writer.delete_term(Term::from_field_text(id_field, doc_id));
-                        side_effect(&planned_operation.operation)?;
+                        side_effect(planned_operation.operation)?;
                         state.versions.apply_delete(
                             doc_id,
                             planned_operation.operation.seq_no,
@@ -1701,7 +1692,7 @@ impl HotEngine {
                 if let Some(copy) = trace_copy.as_ref() {
                     crate::protocol_trace::record_operation_processed(
                         copy,
-                        &planned_operation.operation,
+                        planned_operation.operation,
                         planned_operation.outcome,
                         state.checkpoints.stats(),
                     )?;
@@ -1742,21 +1733,24 @@ impl HotEngine {
 
     pub(crate) fn apply_sequenced_operation_with_side_effect<F>(
         &self,
-        operation: super::SequencedOperation,
+        operation: &super::SequencedOperation,
         side_effect: F,
     ) -> Result<super::ReplicaApplyReceipt>
     where
         F: FnOnce(&super::SequencedOperation) -> Result<()>,
     {
         let mut side_effect = Some(side_effect);
-        let bulk =
-            self.apply_sequenced_batch_with_side_effect(vec![operation], false, |operation| {
+        let bulk = self.apply_sequenced_batch_with_side_effect(
+            std::slice::from_ref(operation),
+            false,
+            |operation| {
                 side_effect
                     .take()
                     .expect("single operation side effect runs at most once")(
                     operation
                 )
-            })?;
+            },
+        )?;
         Ok(super::ReplicaApplyReceipt {
             outcome: bulk.outcomes[0],
             operation_processed: bulk.all_operations_processed,
@@ -1767,30 +1761,27 @@ impl HotEngine {
 
     pub(crate) fn apply_sequenced_batch_with_side_effect<F>(
         &self,
-        operations: Vec<super::SequencedOperation>,
+        operations: &[super::SequencedOperation],
         allow_oversized_bulk: bool,
-        mut side_effect: F,
+        side_effect: F,
     ) -> Result<super::ReplicaBulkApplyReceipt>
     where
         F: FnMut(&super::SequencedOperation) -> Result<()>,
     {
-        let doc_ids = operations
-            .iter()
-            .filter_map(|operation| operation.mutation.doc_id())
-            .map(str::to_string)
-            .collect::<Vec<_>>();
         self.with_version_map_capacity(
             "sequenced operation apply",
-            doc_ids.iter().map(String::as_str),
+            operations
+                .iter()
+                .filter_map(|operation| operation.mutation.doc_id()),
             allow_oversized_bulk,
             |translog| {
                 self.apply_sequenced_batch_locked(
                     translog,
-                    operations.clone(),
+                    operations,
                     WalDisposition::Append,
                     None,
                     true,
-                    &mut side_effect,
+                    side_effect,
                 )
             },
         )
@@ -1813,17 +1804,19 @@ impl HotEngine {
             self.with_version_map_capacity("document indexing", [doc_id], false, |translog| {
                 drop(self.writer_state_with_replay(translog, "document indexing")?);
                 self.prepare_primary_term_before_wal(primary_term)?;
-                let receipt = translog.append(
+                let seq_no = translog.write_document_with_receipt(
                     primary_term,
-                    crate::wal::WalOperation::Index,
-                    serde_json::json!({ "_doc_id": doc_id, "_source": payload }),
+                    WalDocumentOperation::Index {
+                        doc_id,
+                        source: &payload,
+                    },
                 )?;
                 let operation = super::SequencedOperation {
-                    seq_no: receipt.seq_no,
+                    seq_no,
                     primary_term,
                     mutation: super::DocumentMutation::Index {
-                        doc_id: doc_id_owned.clone(),
-                        source: payload.clone(),
+                        doc_id: doc_id_owned,
+                        source: payload,
                     },
                 };
                 #[cfg(feature = "protocol-trace")]
@@ -1836,7 +1829,7 @@ impl HotEngine {
                 }
                 self.apply_sequenced_batch_locked(
                     translog,
-                    vec![operation],
+                    std::slice::from_ref(&operation),
                     WalDisposition::AlreadyInLocalWal {
                         persisted: matches!(self.durability, TranslogDurability::Request),
                         validate_redelivery: true,
@@ -1845,7 +1838,7 @@ impl HotEngine {
                     true,
                     &mut side_effect,
                 )?;
-                Ok(receipt.seq_no)
+                Ok(seq_no)
             })?;
         Ok(super::IndexWriteReceipt {
             doc_id: doc_id.to_string(),
@@ -1865,15 +1858,6 @@ impl HotEngine {
     {
         self.validate_keyword_documents(docs.iter().map(|(_, payload)| payload))?;
         self.prepare_primary_term_before_wal(primary_term)?;
-        let wal_ops = docs
-            .iter()
-            .map(|(doc_id, payload)| {
-                (
-                    crate::wal::WalOperation::Index,
-                    serde_json::json!({ "_doc_id": doc_id, "_source": payload }),
-                )
-            })
-            .collect::<Vec<_>>();
         let doc_ids = docs
             .iter()
             .map(|(doc_id, _)| doc_id.clone())
@@ -1885,13 +1869,18 @@ impl HotEngine {
             |translog| {
                 drop(self.writer_state_with_replay(translog, "bulk indexing")?);
                 self.prepare_primary_term_before_wal(primary_term)?;
-                let Some(start_seq_no) =
-                    translog.write_bulk_with_receipt(primary_term, &wal_ops)?
-                else {
+                let start_seq_no = {
+                    let wal_ops = docs
+                        .iter()
+                        .map(|(doc_id, source)| WalDocumentOperation::Index { doc_id, source })
+                        .collect::<Vec<_>>();
+                    translog.write_document_bulk_with_receipt(primary_term, &wal_ops)?
+                };
+                let Some(start_seq_no) = start_seq_no else {
                     return Ok(None);
                 };
                 let operations = docs
-                    .iter()
+                    .into_iter()
                     .enumerate()
                     .map(|(offset, (doc_id, payload))| {
                         Ok(super::SequencedOperation {
@@ -1900,8 +1889,8 @@ impl HotEngine {
                             })?,
                             primary_term,
                             mutation: super::DocumentMutation::Index {
-                                doc_id: doc_id.clone(),
-                                source: payload.clone(),
+                                doc_id,
+                                source: payload,
                             },
                         })
                     })
@@ -1918,7 +1907,7 @@ impl HotEngine {
                 }
                 self.apply_sequenced_batch_locked(
                     translog,
-                    operations,
+                    &operations,
                     WalDisposition::AlreadyInLocalWal {
                         persisted: matches!(self.durability, TranslogDurability::Request),
                         validate_redelivery: true,
@@ -1952,16 +1941,15 @@ impl HotEngine {
             self.with_version_map_capacity("document delete", [doc_id], false, |translog| {
                 drop(self.writer_state_with_replay(translog, "document delete")?);
                 self.prepare_primary_term_before_wal(primary_term)?;
-                let receipt = translog.append(
+                let seq_no = translog.write_document_with_receipt(
                     primary_term,
-                    crate::wal::WalOperation::Delete,
-                    serde_json::json!({ "_doc_id": doc_id }),
+                    WalDocumentOperation::Delete { doc_id },
                 )?;
                 let operation = super::SequencedOperation {
-                    seq_no: receipt.seq_no,
+                    seq_no,
                     primary_term,
                     mutation: super::DocumentMutation::Delete {
-                        doc_id: doc_id_owned.clone(),
+                        doc_id: doc_id_owned,
                     },
                 };
                 #[cfg(feature = "protocol-trace")]
@@ -1974,7 +1962,7 @@ impl HotEngine {
                 }
                 self.apply_sequenced_batch_locked(
                     translog,
-                    vec![operation],
+                    std::slice::from_ref(&operation),
                     WalDisposition::AlreadyInLocalWal {
                         persisted: matches!(self.durability, TranslogDurability::Request),
                         validate_redelivery: true,
@@ -1983,7 +1971,7 @@ impl HotEngine {
                     true,
                     &mut side_effect,
                 )?;
-                Ok(receipt.seq_no)
+                Ok(seq_no)
             })?;
         Ok(super::DeleteWriteReceipt {
             deleted: 1,
@@ -2006,11 +1994,11 @@ impl HotEngine {
         context: &'static str,
         doc_ids: I,
         allow_oversized_bulk: bool,
-        mut operation: F,
+        operation: F,
     ) -> Result<T>
     where
         I: IntoIterator<Item = &'a str>,
-        F: FnMut(&dyn WriteAheadLog) -> Result<T>,
+        F: FnOnce(&dyn WriteAheadLog) -> Result<T>,
     {
         let reservation_bytes = LiveVersionMap::estimate_reservation(doc_ids);
         let mut refreshed = false;
@@ -2189,7 +2177,7 @@ impl HotEngine {
                     || {
                         self.apply_sequenced_batch_locked(
                             translog,
-                            operations,
+                            &operations,
                             WalDisposition::AlreadyInLocalWal {
                                 persisted: true,
                                 validate_redelivery: false,
@@ -2203,7 +2191,7 @@ impl HotEngine {
             } else {
                 self.apply_sequenced_batch_locked(
                     translog,
-                    operations,
+                    &operations,
                     WalDisposition::AlreadyInLocalWal {
                         persisted: true,
                         validate_redelivery: false,
@@ -2216,7 +2204,7 @@ impl HotEngine {
             #[cfg(not(feature = "protocol-trace"))]
             let result = self.apply_sequenced_batch_locked(
                 translog,
-                operations,
+                &operations,
                 WalDisposition::AlreadyInLocalWal {
                     persisted: true,
                     validate_redelivery: false,
@@ -2239,7 +2227,7 @@ impl HotEngine {
             {
                 #[cfg(feature = "protocol-trace")]
                 if trace_replay && let Some(copy) = trace_copy.as_ref() {
-                    let operation = sequenced_operation_from_entry(&entry)?;
+                    let operation = sequenced_operation_from_entry(entry)?;
                     crate::protocol_trace::record_replay_skip(
                         copy,
                         &operation,
@@ -2251,7 +2239,7 @@ impl HotEngine {
             if replayed == 0 {
                 tracing::warn!("Replaying translog entries during {context}...");
             }
-            batch.push(sequenced_operation_from_entry(&entry)?);
+            batch.push(sequenced_operation_from_entry(entry)?);
             replayed += 1;
             if batch.len() >= TRANSLOG_REPLAY_BATCH_SIZE as usize {
                 flush_batch(&mut batch)?;
@@ -3907,7 +3895,7 @@ impl HotEngine {
                 .read_all()?
                 .into_iter()
                 .map(|entry| {
-                    let operation = sequenced_operation_from_entry(&entry)?;
+                    let operation = sequenced_operation_from_entry(entry)?;
                     let (doc, op, content_hash) =
                         crate::protocol_trace::operation_parts(&operation);
                     Ok(crate::protocol_trace::TraceWalEntry {
@@ -7534,7 +7522,7 @@ impl super::SearchEngine for HotEngine {
         if let super::DocumentMutation::Index { source, .. } = &operation.mutation {
             self.validate_keyword_documents(std::iter::once(source))?;
         }
-        self.apply_sequenced_operation_with_side_effect(operation, |_| Ok(()))
+        self.apply_sequenced_operation_with_side_effect(&operation, |_| Ok(()))
     }
 
     fn apply_replica_batch(
@@ -7548,7 +7536,7 @@ impl super::SearchEngine for HotEngine {
                 None
             }
         }))?;
-        self.apply_sequenced_batch_with_side_effect(operations, true, |_| Ok(()))
+        self.apply_sequenced_batch_with_side_effect(&operations, true, |_| Ok(()))
     }
 
     fn get_document(&self, doc_id: &str) -> Result<Option<serde_json::Value>> {
@@ -8211,7 +8199,7 @@ impl super::SearchEngine for HotEngine {
                 || {
                     self.apply_sequenced_batch_locked(
                         translog,
-                        operations.clone(),
+                        &operations,
                         WalDisposition::Append,
                         None,
                         false,
@@ -8222,7 +8210,7 @@ impl super::SearchEngine for HotEngine {
             #[cfg(not(feature = "protocol-trace"))]
             self.apply_sequenced_batch_locked(
                 translog,
-                operations.clone(),
+                &operations,
                 WalDisposition::Append,
                 None,
                 false,
