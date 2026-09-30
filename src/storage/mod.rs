@@ -48,6 +48,8 @@ pub const REMOTE_STORE_STAGING_DIR_NAME: &str = "_remote_store_staging";
 /// `FSBND` + version byte. Bumping the version byte reserves room for a
 /// future format change without needing a separate checksum scheme.
 const BUNDLE_MAGIC: &[u8; 6] = b"FSBND\x01";
+pub const REMOTE_MANIFEST_FORMAT_VERSION: u32 = 2;
+pub const REMOTE_MANIFEST_POINTER_FORMAT_VERSION: u32 = 2;
 
 /// Backend behind a `StorageManager`. Remote backends have no local root.
 #[derive(Debug, Clone)]
@@ -697,8 +699,22 @@ impl StorageManager {
         match self.object_store().get(&location).await {
             Ok(result) => {
                 let bytes = result.bytes().await?;
-                let pointer: RemoteManifestPointer = serde_json::from_slice(&bytes)
-                    .with_context(|| format!("failed to parse manifest pointer at {location}"))?;
+                let pointer: RemoteManifestPointer =
+                    serde_json::from_slice(&bytes).map_err(|error| {
+                        crate::common::unsupported_index_format(
+                            "remote manifest pointer",
+                            format!("cannot decode current format at {location}: {error}"),
+                        )
+                    })?;
+                if pointer.version != REMOTE_MANIFEST_POINTER_FORMAT_VERSION {
+                    return Err(crate::common::unsupported_index_format(
+                        "remote manifest pointer",
+                        format!(
+                            "version {} is not supported; expected {}",
+                            pointer.version, REMOTE_MANIFEST_POINTER_FORMAT_VERSION
+                        ),
+                    ));
+                }
                 Ok(Some(pointer))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
@@ -724,8 +740,30 @@ impl StorageManager {
             .await
             .with_context(|| format!("manifest generation {generation} not found"))?;
         let bytes = result.bytes().await?;
-        let manifest: RemoteStoreManifest = serde_json::from_slice(&bytes)
-            .with_context(|| format!("failed to parse manifest at {location}"))?;
+        let manifest: RemoteStoreManifest = serde_json::from_slice(&bytes).map_err(|error| {
+            crate::common::unsupported_index_format(
+                "remote store manifest",
+                format!("cannot decode current format at {location}: {error}"),
+            )
+        })?;
+        if manifest.version != REMOTE_MANIFEST_FORMAT_VERSION {
+            return Err(crate::common::unsupported_index_format(
+                "remote store manifest",
+                format!(
+                    "version {} is not supported; expected {}",
+                    manifest.version, REMOTE_MANIFEST_FORMAT_VERSION
+                ),
+            ));
+        }
+        if let Some(split) = manifest
+            .published_splits()
+            .find(|split| split.checksum.starts_with("sha256:pending:"))
+        {
+            return Err(crate::common::unsupported_index_format(
+                "remote store manifest",
+                format!("split '{}' contains a placeholder checksum", split.split_id),
+            ));
+        }
 
         if manifest.generation != generation {
             anyhow::bail!(
@@ -830,7 +868,7 @@ impl StorageManager {
         splits.push(new_split);
 
         let manifest = RemoteStoreManifest {
-            version: 1,
+            version: REMOTE_MANIFEST_FORMAT_VERSION,
             engine: crate::cluster::state::IndexEngine::RemoteStore,
             index_uuid: index_uuid.to_string(),
             index_name: index_name.to_string(),
@@ -870,6 +908,15 @@ impl StorageManager {
         &self,
         manifest: &RemoteStoreManifest,
     ) -> Result<RemoteManifestPointer> {
+        if manifest.version != REMOTE_MANIFEST_FORMAT_VERSION {
+            return Err(crate::common::unsupported_index_format(
+                "remote store manifest",
+                format!(
+                    "version {} is not supported for publication; expected {}",
+                    manifest.version, REMOTE_MANIFEST_FORMAT_VERSION
+                ),
+            ));
+        }
         let generation_key = manifest_generation_key(&manifest.index_uuid, manifest.generation);
         let generation_path = self.object_path(&generation_key)?;
         let manifest_bytes = serde_json::to_vec_pretty(manifest)
@@ -877,7 +924,7 @@ impl StorageManager {
         self.put(&generation_path, manifest_bytes).await?;
 
         let pointer = RemoteManifestPointer {
-            version: 1,
+            version: REMOTE_MANIFEST_POINTER_FORMAT_VERSION,
             current_generation: manifest.generation,
             manifest_path: generation_key,
             manifest_etag: None,
@@ -1291,7 +1338,7 @@ mod tests {
     #[test]
     fn remote_manifest_pointer_roundtrip() {
         let pointer = RemoteManifestPointer {
-            version: 1,
+            version: REMOTE_MANIFEST_POINTER_FORMAT_VERSION,
             current_generation: 42,
             manifest_path: "manifests/42.json".into(),
             manifest_etag: Some("etag-42".into()),
@@ -1305,7 +1352,7 @@ mod tests {
     #[test]
     fn remote_store_manifest_roundtrip_preserves_published_splits() {
         let manifest = RemoteStoreManifest {
-            version: 1,
+            version: REMOTE_MANIFEST_FORMAT_VERSION,
             engine: crate::cluster::state::IndexEngine::RemoteStore,
             index_uuid: "idx-uuid".into(),
             index_name: "events".into(),
@@ -1479,7 +1526,7 @@ mod tests {
         schema_hash: &str,
     ) -> RemoteStoreManifest {
         RemoteStoreManifest {
-            version: 1,
+            version: REMOTE_MANIFEST_FORMAT_VERSION,
             engine: crate::cluster::state::IndexEngine::RemoteStore,
             index_uuid: index_uuid.into(),
             index_name: "events".into(),
@@ -1513,6 +1560,30 @@ mod tests {
 
         let pointer = manager.load_manifest_pointer("idx-1").await.unwrap();
         assert!(pointer.is_none());
+    }
+
+    #[tokio::test]
+    async fn no_compat_old_manifest_pointer_requires_recreate() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = StorageManager::new_in_path(temp_dir.path()).unwrap();
+        let path = manager.object_path(&manifest_pointer_key("idx-1")).unwrap();
+        manager
+            .put(
+                &path,
+                serde_json::to_vec(&RemoteManifestPointer {
+                    version: 1,
+                    current_generation: 1,
+                    manifest_path: "idx-1/manifests/000000000001.json".into(),
+                    manifest_etag: None,
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let error = manager.load_manifest_pointer("idx-1").await.unwrap_err();
+        assert!(error.is::<crate::common::UnsupportedIndexFormatError>());
+        assert!(error.to_string().contains("recreate the index"));
     }
 
     #[tokio::test]
@@ -1591,9 +1662,29 @@ mod tests {
 
         let error = manager.load_manifest("idx-1", 1, None).await.unwrap_err();
         assert!(
-            error.to_string().contains("failed to parse manifest"),
+            error.is::<crate::common::UnsupportedIndexFormatError>()
+                && error.to_string().contains("recreate the index"),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn no_compat_old_remote_manifest_requires_recreate() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = StorageManager::new_in_path(temp_dir.path()).unwrap();
+        let mut manifest = sample_manifest("idx-1", 1, "sha256:v1");
+        manifest.version = 1;
+        let path = manager
+            .object_path(&manifest_generation_key("idx-1", 1))
+            .unwrap();
+        manager
+            .put(&path, serde_json::to_vec(&manifest).unwrap())
+            .await
+            .unwrap();
+
+        let error = manager.load_manifest("idx-1", 1, None).await.unwrap_err();
+        assert!(error.is::<crate::common::UnsupportedIndexFormatError>());
+        assert!(error.to_string().contains("recreate the index"));
     }
 
     #[tokio::test]

@@ -1,15 +1,17 @@
 # Shard Replication And Recovery Protocol
 
-> **Status: Proposed design, not implemented.**
+> **Status: Partially implemented.**
 >
-> **Date:** September 24, 2026.
+> **Updated:** September 29, 2026.
 >
-> **Source baseline:** `e805f70ff5dba0be9077b9bc32fcd488e837e6d1` (PR #141).
+> **Historical design baseline:** `e805f70ff5dba0be9077b9bc32fcd488e837e6d1`
+> (PR #141).
 >
-> This document specifies a target for `local_shards`. It does not establish
-> production readiness, completed roadmap tasks, or OpenSearch/Elasticsearch
+> D1 sequencing, fencing, checkpoint, and bounded peer-recovery foundations are
+> implemented. Later RP and D10 sections remain target design. This document
+> does not establish production readiness or OpenSearch/Elasticsearch
 > compatibility. The [acceptance matrix](recovery-acceptance-matrix.md) defines
-> the evidence required before making those claims.
+> the evidence required before making broader claims.
 
 ## 1. Scope And Roadmap Alignment
 
@@ -40,26 +42,76 @@ to implement every package in one PR. See the
 [roadmap](architecture-roadmap.md#9-roadmap-gates) and
 [backlog](next-50-tasks.md).
 
-## 2. Current Behavior And Verified Gaps
+## 2. Implemented Baseline And Remaining Gaps
 
-The table describes the source baseline, not the proposed protocol.
+The table reflects the implemented branch as of September 29, 2026. Later
+sections still describe the broader target protocol; they are not all shipped.
 
 | Surface | Current behavior | Required change |
 |---|---|---|
-| [Node lifecycle](../src/node/mod.rs) | Elects a Raft leader and promotes replicas. Promotion uses the leader's local checkpoint observations or the first replica. | Promotion must use authoritative copy membership and validated history, not a lag heuristic or list order. |
-| [Replica allocation](../src/node/mod.rs) | Lost replica slots are counted only when an index has no orphaned primary in that dead-node pass. | Account for primary and replica loss independently per shard; reconcile desired redundancy. |
-| [Replication](../src/replication/mod.rs) | Sends to configured replicas; a replication failure fails the request after the primary may already have mutated. | Separate desired copies from acknowledged in-sync copies, while preserving explicit ambiguous/failure outcomes. |
-| [Transport](../proto/transport.proto) | Carries primary sequence numbers, but no primary term, history identity, allocation identity, or recovery session. | Validate those identities at every mutation and recovery boundary. |
-| [Checkpoint tracking](../src/engine/composite.rs) | Uses maximum observed sequence numbers; initializes trackers to zero on open. | Reconstruct and persist contiguous processed/durable boundaries without overloading sequence zero. |
-| [Automatic recovery](../src/node/mod.rs) | Runs for replicas whose checkpoint is zero, only on the follower branch. | Reconcile all assigned copies independently of the metadata-leader role and recover nonzero lag. |
-| [WAL suffix](../src/wal/mod.rs) | `read_from(0)` excludes sequence zero; responses materialize the suffix. | An unambiguous start position, retained-history checks, bounded streaming, and snapshot fallback. |
-| [Recovery apply](../src/node/lifecycle.rs) | Logs some apply failures, silently skips malformed index payloads, and returns no terminal result. | The first invalid operation stops that session; no successful completion or in-sync admission. |
-| [Vector rebuild](../src/engine/composite.rs) | Rebuild reads a capped document set. | Snapshot vectors or rebuild all vectors from the same logical snapshot; failures keep the copy unavailable. |
+| [Node lifecycle](../src/node/mod.rs) | Promotes only Raft-authoritative in-sync copies, activates restarted/promoted primaries proactively, replays local WAL, and fills local sequence gaps with durable NoOps. | General rollback-to-global-checkpoint and full D10 resync remain unimplemented. |
+| [Replica allocation](../src/node/mod.rs) | Accounts for primary and replica loss independently and conditionally removes exact failed allocations. | Failed-allocation exclusion and configurable allocation retry limits remain deferred. |
+| [Replication](../src/replication/mod.rs) | Synchronously sends exact operation identities only to Raft-authoritative in-sync replicas; any required replica failure fails the request after the primary may already have mutated. | Client retry identity and explicit ambiguous outcomes remain unimplemented. |
+| [Transport](../proto/transport.proto) | Carries term/sequence identity, exact allocation IDs, optional processed/persisted checkpoints, recovery sessions, and physical WAL cursors. | Client-facing idempotency and optimistic concurrency remain separate work. |
+| [Checkpoint tracking](../src/engine/sequence.rs) | Persists contiguous processed/persisted prefixes plus above-gap intervals and maximum sequence identity. | Cross-copy rollback/trimming above the global checkpoint remains out of scope. |
+| [Automatic recovery](../src/node/mod.rs) | Every node reconciles assigned out-of-sync replicas through bounded file recovery and conditional admission. | Source sessions and pins are still process-local. |
+| [WAL suffix](../src/wal/mod.rs) | Streams retained generations in physical order with generation/byte cursors; sequence filtering never drives pagination. | Recovery compression and resumable file chunks are not implemented. |
+| [Recovery apply](../src/node/peer_recovery.rs) | Decoding or apply failure stops the session; operations use the common term/sequence-aware planner and admission requires the exact processed barrier. | General divergence rollback and repair above the global checkpoint remain D10 work. |
+| [Vector rebuild](../src/engine/composite.rs) | A post-WAL text failure durably marks vectors stale. Rebuild scans every live Tantivy document in bounded batches, fsyncs a replacement vector index before swapping it into memory, and runs before startup, recovery, activation, or dynamic-mapping replacement publishes an engine. | Snapshotting vector state at the exact logical boundary remains future work; rebuild failures keep the copy unavailable. |
 
 Existing [promotion tests](../tests/consensus_integration.rs) exercise metadata
 changes. The [restart regression](../tests/restart_regression.rs) restarts the
 cluster and checks data preservation. These do not establish a complete
 partition, stale-primary, divergent-history, and interrupted-recovery contract.
+
+> **Implementation note — September 29, 2026:** D1 now stores term-aware WAL v2
+> entries and versioned committed boundaries, distinguishes empty checkpoints
+> from sequence zero, tracks processed and persisted contiguous prefixes across
+> gaps, returns real `_seq_no`/`_primary_term` receipts, and computes the global
+> checkpoint from persisted authoritative copies. Peer recovery installs the
+> source's exact gap-free committed boundary, streams the WAL by physical
+> generation/byte cursor without advancing past a source-unapplied frame, and
+> uses the final replaying barrier to resume from that cursor before admission.
+> Promotion persists its fence, fills local gaps with NoOps, and replicates
+> those NoOps in bounded batches. Failed batches remain best-effort for local
+> activation. They are retried by later lifecycle or request activation at the
+> same UUID, allocation, and term only while the process-local pending entry
+> survives. Restart, or an activation error after the NoOps were applied
+> locally but before retry state was retained, loses that intent; it is not
+> reconstructed from the WAL. The replica then follows the fixed gap deadline
+> and peer-recovery fallback. Activation and retry locks are scoped to the exact
+> UUID, shard, and allocation, so a slow fan-out cannot serialize unrelated
+> shards. A term/sequence collision durably marks the
+> exact allocation as quarantined before closing it; the copy cannot reopen or
+> accept replication until Raft removes it and fresh peer recovery installs a
+> new allocation identity. The marker is checked before open-I/O backoff, so
+> every later single or bulk replication attempt remains `DATA_LOSS`. If the
+> marker write fails, the allocation remains quarantined in process memory, the
+> engine remains evicted, and the storage failure is reported while later opens,
+> reads, and replication fail closed.
+> Text-only writer replay durably marks vector state
+> stale; write, maintenance, recovery-snapshot, barrier, activation, startup,
+> and recovery-finalization paths rebuild and fsync vectors before clearing the
+> marker. Rebuilds scan every live Tantivy document segment-by-segment in
+> bounded batches rather than through a capped search result. Intermediate
+> replay commits may persist a committed maximum below the
+> durable term-start fence maximum until later WAL batches are replayed; this is
+> valid sequence state, not corruption. A stalled empty catch-up response at an
+> unchanged physical cursor returns to the exclusive finalize path, including
+> after finalization asks for another catch-up. Bulk replication resolves
+> authoritative targets before payload serialization; zero-replica bulks avoid
+> that work, and non-empty fan-out shares one serialized operation slice across
+> replica tasks. Replica receivers decode and source-validate each index
+> payload once, then reuse the parsed value while retaining whole-batch
+> validation before fence or engine mutation. Dynamic mapping never persists
+> the built-in `body` catch-all;
+> a plain explicit text mapping reuses its existing Tantivy field. Reserved
+> authoritative mapping names or incompatible `body` metadata fail shard open
+> as unsupported index formats with recreate-index guidance rather than
+> reaching schema construction.
+> Earlier build formats are unsupported and require index/cluster recreation
+> and reindexing. This does not implement D10 rollback/resync, client retry
+> tokens, or full OCC.
 
 > **Implementation note — September 24, 2026:** the first in-sync tracking
 > package now stores replica eligibility in Raft routing metadata, targets live
@@ -81,10 +133,10 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > snapshot manifest contains the existing committed components plus
 > `meta.json` and `.managed.json`.
 >
-> This is not full RP-3/RP-5: checkpoints remain high-water marks rather than
-> contiguous prefixes; there are no history/allocation IDs, replica-side term
-> fencing, operation-only path selection, resumable chunks, compression, or
-> complete vector transfer (the existing rebuild cap remains). Source sessions
+> This is not full RP-3/RP-5: allocation IDs, durable term fencing, contiguous
+> checkpoints, exact snapshot boundaries, and physical WAL cursors are now
+> implemented, but there is no general operation-only path selection,
+> resumable chunks, compression, or D10 rollback/resync. Source sessions
 > and pins are process-local; only pre-finalize idle setups/sessions expire
 > after ten minutes, while admitting/settling sessions are resolved by
 > settlement rather than idle reaping. The
@@ -136,26 +188,19 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > closed. Retryable forwarded `ABORTED` writes map to HTTP 503.
 >
 > **Round-5 corrections — September 26, 2026:** the 32 MiB total-frame ceiling
-> remains the limit for new WAL writes and transferred recovery operations,
-> while restart scan, replay, and recovery skips accept complete legacy frames
-> up to a separate 65 MiB decode ceiling. The concurrent-append exception
-> applies only to the final captured generation at or beyond its captured file
-> size. On restart, an incomplete active-generation tail is truncated to the
-> last fully decoded frame and both file and directory are fsynced before
-> append; complete or middle corruption still fails closed.
->
-> **Round-6 correction — September 26, 2026:** legacy `RecoverReplica` now
-> reads through the live engine's captured generation state. It never creates
-> a second `HotTranslog` on a live shard, so it cannot run startup tail repair
-> or unreferenced-generation deletion against an active writer. Test-only live
-> WAL inspections use the same non-mutating engine path.
+> applies uniformly to writes, restart scan, replay, and recovery. The
+> concurrent-append exception applies only to the final captured generation at
+> or beyond its captured file size. On restart, an incomplete
+> active-generation tail is truncated to the last fully decoded frame and both
+> file and directory are fsynced before append; complete or middle corruption
+> still fails closed.
 >
 > **Round-7 corrections — September 27, 2026:** WAL replay now validates the
 > internal `_doc_id` and operation payload, deletes that ID for every
 > operation, and adds a document back only for an index operation. Startup,
-> failed-writer reconstruction, peer-recovery catch-up, and legacy
-> `RecoverReplica` therefore preserve deletes and fail closed on malformed
-> operation envelopes. Blocking maintenance and snapshot preparation acquire
+> failed-writer reconstruction, and peer-recovery catch-up therefore preserve
+> deletes and fail closed on malformed operation envelopes. Blocking
+> maintenance and snapshot preparation acquire
 > the writer through the same rebuild-and-replay path as document writes, so
 > an idle repaired primary can recover and serve peer recovery without an
 > unrelated client mutation. Replay holds the shard translog lock for the
@@ -226,6 +271,15 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > verify the currently registered index UUID before touching disk, so a delayed
 > abort cannot recreate a deleted index incarnation.
 >
+> **D1 collision/gap correction — September 29, 2026:** definitive
+> sequence/version collisions are returned as `DATA_LOSS`, quarantined without
+> waiting for a lagging replica routing view, and reported by the primary with
+> the exact allocation and captured term. Gap probes are concurrent and
+> timeout-bounded; an assigned copy that is still opening is transient
+> `UNAVAILABLE`, while only proven identity/allocation mismatch or corruption
+> is definitive. Replicas may auto-flush only through their own committed
+> persisted prefix and never across a gap.
+>
 > **Availability-status and Apply corrections — September 27, 2026:** a
 > write-only failure no longer bypasses the local activation cache or causes
 > periodic primary-term bumps. `primary_unavailable` remains set for the exact
@@ -279,9 +333,8 @@ The current maximum document operation size is defined by the encoded WAL
 frame, not the raw HTTP body: one operation must fit within 32 MiB including
 the four-byte frame header, sequence and operation fields, JSON serialization,
 and the internal `_doc_id` / `_source` wrapper. The maximum usable `_source`
-therefore varies slightly with document ID and content. The 65 MiB decode-only
-ceiling exists solely so upgraded nodes can open and replay complete legacy
-frames; it does not permit new writes or peer-recovery transfer above 32 MiB.
+therefore varies slightly with document ID and content. The same limit applies
+to restart, replay, and peer-recovery transfer.
 
 **Known write-failure limit:** synchronous WAL/fsync/engine failures now fail
 the request and enter bounded escalation, but a WAL entry whose later engine
@@ -447,6 +500,11 @@ cancelled/drained under the shard permit before that position is resolved.
 A delayed attempt cannot subsequently replace the no-op. Once a real WAL record is durable,
 an engine failure cannot be hidden by replacing that record with a no-op: stop
 the copy, reconstruct its state, and preserve the ambiguous client outcome.
+In the implemented D1 subset, if this happens on the primary before fan-out,
+no replica receives that real record. After local replay and a later write
+expose the gap, the fixed-target timer normally removes every affected replica
+after about 60 seconds and peer recovery rebuilds it from the primary. Promotion
+NoOps do not repair this case; targeted live gap repair remains D10 work.
 
 ### Storage errors and recoverable crash tails
 
@@ -871,7 +929,7 @@ Admission decisions require evidence; metrics and log messages are not that
 evidence. Report excluded/stale copies and unmet minimum durability explicitly
 even when other copies continue serving.
 
-## 10. Persistence And Pre-1.0 Compatibility
+## 10. Persistence And Pre-1.0 Format Policy
 
 This protocol changes WAL records, snapshot metadata, and transport messages.
 Version them together. Unknown formats and corruption fail closed; only a proven
@@ -879,13 +937,15 @@ unsealed trailing attempt beyond the durability frontier can be discarded under
 the restart rule in Section 5.
 New fields are not silently defaulted into a valid epoch, allocation, or history.
 
-Existing old-format data can be opened only by a future deliberate
-conversion/export path and must not be labelled protocol-safe by assuming a
-term of zero or a complete prefix from a maximum sequence. The current pre-1.0
-implementation requires reindexing or a fresh cluster when routing snapshots or
-local copies lack allocation identity; no rolling mixed-protocol support or
-legacy adoption path is provided. Broader format/conversion details remain part
-of FS-005.
+There is no conversion/export path in the current pre-1.0 implementation.
+Earlier on-disk schemas, WAL entries/manifests, committed boundaries, copy
+identities, vector sidecars, Raft logs/snapshots, and cluster-state wire
+snapshots are unsupported. Shard and index data fails with recreate-the-index
+guidance. Unsupported or unreadable Raft log entries, vote/commit/purge
+metadata, and snapshots tell the operator to "wipe the node data directories
+and recreate the cluster". Incompatible wire formats fail the join. No
+role-specific migration, term-zero default, rolling mixed-protocol support, or
+compatibility shim is provided.
 
 Ordinary process restart and same-version recovery remain required. File
 deletion and old-generation cleanup must wait until atomic-install and retention

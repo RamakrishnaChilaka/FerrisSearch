@@ -45,7 +45,9 @@ ReportableStorageFailureModes ==
     ReportableOpenStorageFailureModes \cup {"ApplyFailed"}
 AllStorageFailureModes ==
     StorageRetryModes \cup ReportableStorageFailureModes
-MessageKinds == {"Replicate", "ReplicaAck", "ReplicaNack"}
+WriteMessageKinds == {"Replicate", "ReplicaAck", "ReplicaNack"}
+NoOpMessageKinds == {"ReplicateNoOp", "NoOpAck", "NoOpNack"}
+MessageKinds == WriteMessageKinds \cup NoOpMessageKinds
 IndexUuid == "INDEX_UUID"
 NoIndexUuid == "NO_INDEX_UUID"
 
@@ -175,6 +177,11 @@ AllAckedOn(node) ==
 ActiveWrites ==
     {w \in WriteIds :
         writeStatus[w] \in {"Routed", "Replicating"}}
+
+MaxConcurrentClientWrites ==
+    IF FaultMode \in {"D1Historical", "D1Fixed", "D1Async"}
+    THEN MaxWrites
+    ELSE 1
 
 WriteMessages(writeId) ==
     {m \in messages : m.write = writeId}
@@ -320,9 +327,10 @@ ClientWrite(coordinator, doc, kind) ==
     /\ alive[coordinator]
     /\ doc \in Docs
     /\ kind \in WriteKinds
-    \* One client operation may be in flight.  Writes still interleave with
-    \* every Raft, recovery, network, and fault action.
-    /\ ActiveWrites = {}
+    \* D1 configurations allow three writes to overlap so messages for the
+    \* same shard may reach a replica in any order. Other configurations retain
+    \* their historical one-write state-space bound.
+    /\ Cardinality(ActiveWrites) < MaxConcurrentClientWrites
     /\ writeStatus' = [writeStatus EXCEPT ![writeId] = "Routed"]
     /\ writeDoc' = [writeDoc EXCEPT ![writeId] = doc]
     /\ writeKind' = [writeKind EXCEPT ![writeId] = kind]
@@ -576,8 +584,7 @@ ReplicaReject(message) ==
     /\ copyExists[replica]
     /\ epoch[replica] = message.toEpoch
     /\ epoch[message.from] = message.fromEpoch
-    /\ \/ /\ BlocksLiveReplication(replica)
-          /\ ~ApplyMutationFails(replica)
+    /\ \/ BlocksLiveReplication(replica)
        \/ ~ReplicaMessageValid(message)
     /\ messages' = (messages \ {message}) \cup {response}
     /\ UNCHANGED
@@ -602,7 +609,6 @@ DeliverReplicaAck(message) ==
     /\ writeStatus[writeId] = "Replicating"
     /\ alive[primaryNode]
     /\ epoch[primaryNode] = message.toEpoch
-    /\ epoch[message.from] = message.fromEpoch
     /\ messages' = messages \ {message}
     /\ writeWait' =
           [writeWait EXCEPT ![writeId] = @ \ {message.from}]
@@ -1066,7 +1072,7 @@ ReplicationTypeOK ==
     /\ installMarker \in [Nodes -> BOOLEAN]
     /\ messages \subseteq
           [kind      : MessageKinds,
-           write     : WriteIds,
+           write     : WriteIds \cup {NoWrite},
            from      : Nodes,
            to        : Nodes,
            seq       : 0..MaxWrites,
@@ -1075,6 +1081,11 @@ ReplicationTypeOK ==
            term      : 0..MaxTerm,
            indexUuid : {IndexUuid, NoIndexUuid},
            targetAllocation : 0..MaxAllocationId]
+    /\ \A message \in messages :
+           /\ message.kind \in WriteMessageKinds =>
+                  message.write \in WriteIds
+           /\ message.kind \in NoOpMessageKinds =>
+                  message.write = NoWrite
     /\ sharedHolders \in [Nodes -> SUBSET WriteIds]
     /\ exclusiveHolder \in [Nodes -> Nodes \cup {NoNode}]
     /\ acked \subseteq WriteIds

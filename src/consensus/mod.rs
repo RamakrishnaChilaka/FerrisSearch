@@ -26,6 +26,24 @@ pub(crate) const RAFT_HEARTBEAT_INTERVAL_MS: u64 = 1_000;
 pub(crate) const RAFT_ELECTION_TIMEOUT_MIN_MS: u64 = 3_000;
 pub(crate) const RAFT_ELECTION_TIMEOUT_MAX_MS: u64 = 6_000;
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "unsupported {component} format: {detail}; FerrisSearch pre-1.0 does not support migrations; wipe the node data directories and recreate the cluster"
+)]
+pub(crate) struct UnsupportedRaftFormatError {
+    component: String,
+    detail: String,
+}
+
+impl UnsupportedRaftFormatError {
+    pub(crate) fn new(component: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            component: component.into(),
+            detail: detail.into(),
+        }
+    }
+}
+
 pub(crate) fn default_raft_config(cluster_name: String) -> Config {
     Config {
         cluster_name,

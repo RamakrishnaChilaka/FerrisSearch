@@ -108,14 +108,20 @@ pub fn direct_sql_input_schema(
                 false,
             )),
             other => {
-                let mapping = mappings.get(other).ok_or_else(|| {
-                    anyhow::anyhow!(
+                // The built-in catch-all `body` field is always text and is
+                // never persisted as a mapping.
+                let field_type = match mappings.get(other) {
+                    Some(mapping) => mapping.field_type.clone(),
+                    None if crate::common::is_builtin_body_field(other) => {
+                        crate::cluster::state::FieldType::Text
+                    }
+                    None => anyhow::bail!(
                         "direct SQL streaming requires mapped column [{other}] to derive the canonical schema"
-                    )
-                })?;
+                    ),
+                };
                 Ok(datafusion::arrow::datatypes::Field::new(
                     other,
-                    crate::hybrid::arrow_bridge::column_kind_from_field_type(&mapping.field_type)
+                    crate::hybrid::arrow_bridge::column_kind_from_field_type(&field_type)
                         .to_arrow_type(),
                     true,
                 ))

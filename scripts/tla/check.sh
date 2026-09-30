@@ -7,7 +7,21 @@ TLA_VERSION="1.7.4"
 TLA_SHA256="936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 TLA_URL="https://github.com/tlaplus/tlaplus/releases/download/v${TLA_VERSION}/tla2tools.jar"
 DEFAULT_JAR="${XDG_CACHE_HOME:-$HOME/.cache}/ferrissearch-tla/v${TLA_VERSION}/tla2tools.jar"
-WORKERS="${TLA_WORKERS:-8}"
+CPU_COUNT=$(nproc 2>/dev/null || echo 1)
+DEFAULT_WORKERS=$CPU_COUNT
+if ((DEFAULT_WORKERS > 12)); then
+    DEFAULT_WORKERS=12
+fi
+WORKERS="${TLA_WORKERS:-$DEFAULT_WORKERS}"
+CONFIG_JOBS="${TLA_CONFIG_JOBS:-$CPU_COUNT}"
+if [[ ! "$CONFIG_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "TLA_CONFIG_JOBS must be a positive integer" >&2
+    exit 2
+fi
+if ((CONFIG_JOBS > 4)); then
+    CONFIG_JOBS=4
+fi
+SMALL_CONFIG_HEAP="${TLA_SMALL_CONFIG_HEAP:-2g}"
 TIMEOUT_SECONDS="${TLA_TIMEOUT_SECONDS:-300}"
 LONG_TIMEOUT_SECONDS="${TLA_LONG_TIMEOUT_SECONDS:-1800}"
 SIMULATION_TRACES="${TLA_SIMULATION_TRACES:-10000}"
@@ -15,7 +29,11 @@ SIMULATION_DEPTH="${TLA_SIMULATION_DEPTH:-80}"
 SIMULATION_SEED="${TLA_SIMULATION_SEED:-20260926}"
 
 RUN_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/ferrissearch-tla.XXXXXX")
+RUN_OWNER_PID="${BASHPID:-$$}"
 cleanup() {
+    if [[ "${BASHPID:-$$}" -ne "$RUN_OWNER_PID" ]]; then
+        return
+    fi
     rm -rf -- "${RUN_ROOT:?}"
 }
 trap cleanup EXIT
@@ -99,6 +117,23 @@ default_configs=(
     s1-combined-primary
     s1-combined-liveness
     s1-combined-liveness-no-timeout
+    d1-order-historical
+    d1-order-fixed
+    d1-replay-historical
+    d1-replay-fixed
+    d1-no-durable-tombstone
+    d1-term-collision-seq-only
+    d1-term-collision-fixed
+    d1-gaps
+    d1-term-collision-restart-committed
+    d1-term-collision-restart-identity
+    d1-primary-gap-max
+    d1-primary-gap-processed
+    d1-promotion-replay-noop
+    d1-trace-actions
+    d1-failover-actions
+    d1-noop-collision-actions
+    trace-validator
     two-shard
 )
 
@@ -148,6 +183,24 @@ s1-combined-replica     pass: storage fault, crash/reset, repair, and recovery
 s1-combined-primary     pass: promote-only report across primary/leader crash
 s1-combined-liveness    pass: timeout, redetection, recovery, and resumed write
 s1-combined-liveness-no-timeout expected temporal failure: timeout assumption
+d1-order-historical     expected NoCopyBehindAcked: arrival-order replica apply
+d1-order-fixed          pass: concurrent writes converge under seq-aware apply
+d1-replay-historical    expected replay loss from highest committed sequence
+d1-replay-fixed         pass: processed-checkpoint replay through D1 planner
+d1-no-durable-tombstone pass: replayed delete fences a late older index
+d1-term-collision-seq-only expected B1NoCopyBehindAcked: term/seq collision
+d1-term-collision-fixed pass: newer-term collision fails and re-recovers copy
+d1-gaps                 pass: pull, recovery, and promotion NoOp close gaps
+d1-term-collision-restart-committed expected B1RNoCopyBehindAcked
+d1-term-collision-restart-identity pass: identity restores fence collision max
+d1-primary-gap-max      expected B3NoRecoveryLoop: max-based detector loops
+d1-primary-gap-processed pass: compare replica and primary processed checkpoints
+d1-promotion-replay-noop pass: replay, fill NoOp, activate despite replica gap
+d1-trace-actions        pass: captured commit, truncation, restart/in-place replay, failed replay
+d1-failover-actions     pass: physical NoOp fill, activation, send, redelivery, and collision
+d1-noop-collision-actions pass: physical NoOp fill, send, collision, NACK, and removal
+trace-validator         pass: strict JSONL conversion and D1 trace acceptance/rejection
+trace-validator-round4  pass: slow restart, truncation, NoOp, and late-message traces
 two-shard               pass: red sibling does not block failover/allocation
 fixed-crash             pass: exhaustive full fixed design with one crash
 fixed-partition         pass: exhaustive full fixed design with one partition
@@ -170,11 +223,25 @@ fi
 
 run_config() {
     local name=$1
+    local workers=${2:-$WORKERS}
+    local heap_size=${3:-}
     local module
     local cfg
     local expected
     local mode="check"
     local timeout_seconds=$TIMEOUT_SECONDS
+
+    if [[ "$name" == "trace-validator" ]]; then
+        echo "=== TLA+ trace-validator (pass) ==="
+        TLA2TOOLS_JAR="$JAR" "$ROOT_DIR/scripts/tla/test_trace_validator.sh"
+        return
+    fi
+    if [[ "$name" == "trace-validator-round4" ]]; then
+        echo "=== TLA+ trace-validator-round4 (pass) ==="
+        TLA2TOOLS_JAR="$JAR" \
+            "$ROOT_DIR/scripts/tla/test_trace_validator_round4.sh"
+        return
+    fi
 
     case "$name" in
         c1-fast|MC_C1_fast)
@@ -362,6 +429,86 @@ run_config() {
             cfg="MC_S1_CombinedLivenessNoTimeout.cfg"
             expected="temporal"
             ;;
+        d1-order-historical|MC_D1_OrderHistorical)
+            module="MC_D1_SeqNoApply.tla"
+            cfg="MC_D1_OrderHistorical.cfg"
+            expected="NoCopyBehindAcked"
+            ;;
+        d1-order-fixed|MC_D1_OrderFixed)
+            module="MC_D1_SeqNoApply.tla"
+            cfg="MC_D1_OrderFixed.cfg"
+            expected="pass"
+            ;;
+        d1-replay-historical|MC_D1_ReplayHistorical)
+            module="MC_D1_SeqNoApply.tla"
+            cfg="MC_D1_ReplayHistorical.cfg"
+            expected="D1ReplayPreservesAcknowledged"
+            ;;
+        d1-replay-fixed|MC_D1_ReplayFixed)
+            module="MC_D1_SeqNoApply.tla"
+            cfg="MC_D1_ReplayFixed.cfg"
+            expected="pass"
+            ;;
+        d1-no-durable-tombstone|MC_D1_NoDurableTombstone)
+            module="MC_D1_SeqNoApply.tla"
+            cfg="MC_D1_NoDurableTombstone.cfg"
+            expected="pass"
+            ;;
+        d1-term-collision-seq-only|MC_D1_TermCollisionSeqOnly)
+            module="MC_D1_TermCollision.tla"
+            cfg="MC_D1_TermCollisionSeqOnly.cfg"
+            expected="B1NoCopyBehindAcked"
+            ;;
+        d1-term-collision-fixed|MC_D1_TermCollisionFixed)
+            module="MC_D1_TermCollision.tla"
+            cfg="MC_D1_TermCollisionFixed.cfg"
+            expected="pass"
+            ;;
+        d1-gaps|MC_D1_Gaps)
+            module="MC_D1_Gaps.tla"
+            cfg="MC_D1_Gaps.cfg"
+            expected="pass"
+            ;;
+        d1-term-collision-restart-committed|MC_D1_TermCollisionRestartCommitted)
+            module="MC_D1_TermCollisionRestart.tla"
+            cfg="MC_D1_TermCollisionRestartCommitted.cfg"
+            expected="B1RNoCopyBehindAcked"
+            ;;
+        d1-term-collision-restart-identity|MC_D1_TermCollisionRestartIdentity)
+            module="MC_D1_TermCollisionRestart.tla"
+            cfg="MC_D1_TermCollisionRestartIdentity.cfg"
+            expected="pass"
+            ;;
+        d1-primary-gap-max|MC_D1_PrimaryGapMaxBased)
+            module="MC_D1_PrimaryGap.tla"
+            cfg="MC_D1_PrimaryGapMaxBased.cfg"
+            expected="B3NoRecoveryLoop"
+            ;;
+        d1-primary-gap-processed|MC_D1_PrimaryGapProcessed)
+            module="MC_D1_PrimaryGap.tla"
+            cfg="MC_D1_PrimaryGapProcessed.cfg"
+            expected="pass"
+            ;;
+        d1-promotion-replay-noop|MC_D1_PromotionReplayNoOp)
+            module="MC_D1_PromotionReplayNoOp.tla"
+            cfg="MC_D1_PromotionReplayNoOp.cfg"
+            expected="pass"
+            ;;
+        d1-trace-actions|MC_D1_TraceActions)
+            module="MC_D1_TraceActions.tla"
+            cfg="MC_D1_TraceActions.cfg"
+            expected="pass"
+            ;;
+        d1-failover-actions|MC_D1_FailoverActions)
+            module="MC_D1_FailoverActions.tla"
+            cfg="MC_D1_FailoverActions.cfg"
+            expected="pass"
+            ;;
+        d1-noop-collision-actions|MC_D1_NoOpCollisionActions)
+            module="MC_D1_NoOpCollisionActions.tla"
+            cfg="MC_D1_NoOpCollisionActions.cfg"
+            expected="pass"
+            ;;
         two-shard|MC_TwoShardIsolation)
             module="MC_TwoShardIsolation.tla"
             cfg="MC_TwoShardIsolation.cfg"
@@ -397,6 +544,16 @@ run_config() {
     local java_tmp="$run_dir/java-tmp"
     local states="$run_dir/states"
     local log="$LOG_DIR/tla-${name}.log"
+    local -a java_resource_args
+    if [[ -n "$heap_size" ]]; then
+        java_resource_args=(
+            -Xmx"$heap_size"
+            -XX:+UseSerialGC
+            -XX:ActiveProcessorCount=1
+        )
+    else
+        java_resource_args=(-XX:+UseParallelGC)
+    fi
     mkdir -p "$java_tmp" "$states"
 
     echo "=== TLA+ $name ($expected) ==="
@@ -407,7 +564,7 @@ run_config() {
             timeout "${timeout_seconds}s" \
                 java \
                 -Djava.io.tmpdir="$java_tmp" \
-                -XX:+UseParallelGC \
+                "${java_resource_args[@]}" \
                 -cp "$JAR" \
                 tlc2.TLC \
                 -deadlock \
@@ -421,12 +578,12 @@ run_config() {
             timeout "${timeout_seconds}s" \
                 java \
                 -Djava.io.tmpdir="$java_tmp" \
-                -XX:+UseParallelGC \
+                "${java_resource_args[@]}" \
                 -cp "$JAR" \
                 tlc2.TLC \
                 -deadlock \
                 -difftrace \
-                -workers "$WORKERS" \
+                -workers "$workers" \
                 -metadir "$states" \
                 -config "$cfg" \
                 "$module"
@@ -463,8 +620,84 @@ run_config() {
     fi
 }
 
+config_requires_isolation() {
+    case "$1" in
+        c1-aba|c1-aba-fixed|g2-replica|g2-primary|\
+            s1-combined-replica|s1-combined-primary|s1-combined-liveness|\
+            trace-validator|trace-validator-round4|\
+            fixed-crash|fixed-partition|fixed-simulation)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+run_parallel_batch() {
+    local -a batch=("$@")
+    local batch_root
+    local active=0
+    local failed=0
+    local index
+    local status
+    if ((${#batch[@]} == 0)); then
+        return
+    fi
+    if ((CONFIG_JOBS == 1 || ${#batch[@]} == 1)); then
+        for config in "${batch[@]}"; do
+            run_config "$config"
+        done
+        return
+    fi
+
+    batch_root=$(mktemp -d "$RUN_ROOT/config-batch.XXXXXX")
+    for index in "${!batch[@]}"; do
+        (
+            set +e
+            run_config "${batch[$index]}" 1 "$SMALL_CONFIG_HEAP"
+            status=$?
+            printf '%s\n' "$status" >"$batch_root/$index.status"
+            exit 0
+        ) >"$batch_root/$index.log" 2>&1 &
+        active=$((active + 1))
+        if ((active >= CONFIG_JOBS)); then
+            wait -n
+            active=$((active - 1))
+        fi
+    done
+    while ((active > 0)); do
+        wait -n
+        active=$((active - 1))
+    done
+
+    for index in "${!batch[@]}"; do
+        cat "$batch_root/$index.log"
+        if [[ ! -f "$batch_root/$index.status" ]]; then
+            echo "TLA+ configuration did not record a status: ${batch[$index]}" >&2
+            failed=1
+            continue
+        fi
+        status=$(<"$batch_root/$index.status")
+        if [[ $status -ne 0 ]]; then
+            failed=1
+        fi
+    done
+    if [[ $failed -ne 0 ]]; then
+        return 1
+    fi
+}
+
+pending_configs=()
 for config in "${configs[@]}"; do
-    run_config "$config"
+    if config_requires_isolation "$config"; then
+        run_parallel_batch "${pending_configs[@]}"
+        pending_configs=()
+        run_config "$config"
+    else
+        pending_configs+=("$config")
+    fi
 done
+run_parallel_batch "${pending_configs[@]}"
 
 echo "All requested TLA+ configurations matched their expected results."

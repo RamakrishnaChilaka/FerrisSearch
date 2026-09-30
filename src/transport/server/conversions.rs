@@ -3,6 +3,8 @@
 use crate::transport::proto::*;
 use tonic::Status;
 
+const CLUSTER_STATE_WIRE_FORMAT_VERSION: u32 = 1;
+
 pub(super) fn node_info_to_proto(n: &crate::cluster::state::NodeInfo) -> NodeInfo {
     NodeInfo {
         id: n.id.clone(),
@@ -124,16 +126,23 @@ fn proto_to_remote_store_settings(
 
 pub(super) fn proto_to_index_settings(
     settings: Option<&IndexSettings>,
-) -> Result<crate::cluster::state::IndexSettings, crate::cluster::state::ParseIndexEngineNameError>
-{
-    let Some(settings) = settings else {
-        return Ok(crate::cluster::state::IndexSettings::default());
-    };
-
-    let engine = match settings.engine.as_str() {
-        "" => crate::cluster::state::IndexEngine::LocalShards,
-        other => crate::cluster::state::IndexEngine::parse_name(other)?,
-    };
+) -> Result<crate::cluster::state::IndexSettings, Status> {
+    let settings = settings.ok_or_else(|| {
+        Status::invalid_argument(
+            "unsupported cluster-state wire format: index settings are missing; recreate the index",
+        )
+    })?;
+    if settings.engine.is_empty() {
+        return Err(Status::invalid_argument(
+            "unsupported cluster-state wire format: index engine is missing; recreate the index",
+        ));
+    }
+    let engine = crate::cluster::state::IndexEngine::parse_name(&settings.engine).map_err(|err| {
+        Status::invalid_argument(format!(
+            "unknown engine '{}' in cluster state snapshot; supported values are [local_shards, remote_store]",
+            err.name()
+        ))
+    })?;
 
     Ok(crate::cluster::state::IndexSettings {
         engine,
@@ -143,12 +152,16 @@ pub(super) fn proto_to_index_settings(
     })
 }
 
-pub(super) fn proto_to_dynamic_mapping(s: &str) -> crate::cluster::state::DynamicMapping {
+pub(super) fn proto_to_dynamic_mapping(
+    s: &str,
+) -> Result<crate::cluster::state::DynamicMapping, Status> {
     match s {
-        "true" => crate::cluster::state::DynamicMapping::True,
-        "strict" => crate::cluster::state::DynamicMapping::Strict,
-        // Empty string or "false" → default (backward compat with old snapshots)
-        _ => crate::cluster::state::DynamicMapping::False,
+        "false" => Ok(crate::cluster::state::DynamicMapping::False),
+        "true" => Ok(crate::cluster::state::DynamicMapping::True),
+        "strict" => Ok(crate::cluster::state::DynamicMapping::Strict),
+        _ => Err(Status::invalid_argument(format!(
+            "unsupported cluster-state wire format: dynamic mapping value '{s}' is invalid; recreate the index"
+        ))),
     }
 }
 
@@ -158,8 +171,12 @@ pub(super) fn validate_join_identity(
     node_id: &str,
     raft_node_id: u64,
 ) -> Result<(), Status> {
+    if raft_node_id == 0 {
+        return Err(Status::invalid_argument(
+            "join requires a nonzero raft_node_id",
+        ));
+    }
     if let Some(existing) = state.nodes.get(node_id)
-        && existing.raft_node_id > 0
         && existing.raft_node_id != raft_node_id
     {
         return Err(Status::already_exists(format!(
@@ -168,11 +185,10 @@ pub(super) fn validate_join_identity(
         )));
     }
 
-    if raft_node_id > 0
-        && let Some(existing) = state
-            .nodes
-            .values()
-            .find(|existing| existing.raft_node_id == raft_node_id && existing.id != node_id)
+    if let Some(existing) = state
+        .nodes
+        .values()
+        .find(|existing| existing.raft_node_id == raft_node_id && existing.id != node_id)
     {
         return Err(Status::already_exists(format!(
             "raft_node_id {} is already registered to node [{}]",
@@ -254,6 +270,7 @@ pub fn cluster_state_to_proto(s: &crate::cluster::state::ClusterState) -> Cluste
             .values()
             .filter_map(|role| serde_json::to_string(role).ok())
             .collect(),
+        format_version: CLUSTER_STATE_WIRE_FORMAT_VERSION,
     }
 }
 
@@ -261,6 +278,12 @@ pub fn cluster_state_to_proto(s: &crate::cluster::state::ClusterState) -> Cluste
 pub fn proto_to_cluster_state(
     p: &ClusterState,
 ) -> Result<crate::cluster::state::ClusterState, Status> {
+    if p.format_version != CLUSTER_STATE_WIRE_FORMAT_VERSION {
+        return Err(Status::invalid_argument(format!(
+            "unsupported cluster-state wire format version {}; expected {}; recreate the index",
+            p.format_version, CLUSTER_STATE_WIRE_FORMAT_VERSION
+        )));
+    }
     let mut state = crate::cluster::state::ClusterState::new(p.cluster_name.clone());
     state.version = p.version;
     state.master_node = p.master_node.clone();
@@ -272,6 +295,12 @@ pub fn proto_to_cluster_state(
         let mut shard_routing = std::collections::HashMap::new();
         let mut shard_allocations = std::collections::HashMap::new();
         for sa in &idx.shards {
+            if sa.primary_term == 0 {
+                return Err(Status::invalid_argument(format!(
+                    "unsupported cluster-state wire format: index '{}' shard {} has no primary term; recreate the index",
+                    idx.name, sa.shard_id
+                )));
+            }
             let routing = crate::cluster::state::ShardRoutingEntry {
                 primary: sa.node_id.clone(),
                 primary_term: sa.primary_term,
@@ -366,13 +395,8 @@ pub fn proto_to_cluster_state(
                 number_of_replicas: idx.number_of_replicas,
                 shard_routing,
                 mappings,
-                dynamic: proto_to_dynamic_mapping(&idx.dynamic),
-                settings: proto_to_index_settings(idx.settings.as_ref()).map_err(|err| {
-                    Status::invalid_argument(format!(
-                        "unknown engine '{}' in cluster state snapshot; supported values are [local_shards, remote_store]",
-                        err.name()
-                    ))
-                })?,
+                dynamic: proto_to_dynamic_mapping(&idx.dynamic)?,
+                settings: proto_to_index_settings(idx.settings.as_ref())?,
             },
         );
         state

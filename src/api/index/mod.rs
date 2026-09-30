@@ -25,10 +25,20 @@ fn forwarded_write_error_classification(error: &anyhow::Error) -> (StatusCode, &
     if is_document_validation_error(error) {
         return (StatusCode::BAD_REQUEST, "mapper_parsing_exception");
     }
-    match error
-        .downcast_ref::<tonic::Status>()
-        .map(tonic::Status::code)
-    {
+    let status = error.downcast_ref::<tonic::Status>();
+    match status.map(tonic::Status::code) {
+        Some(tonic::Code::ResourceExhausted)
+            if status.is_some_and(|status| {
+                status
+                    .message()
+                    .starts_with(crate::engine::version_map::VERSION_MAP_CAPACITY_STATUS_PREFIX)
+            }) =>
+        {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "version_map_capacity_exceeded",
+            )
+        }
         Some(tonic::Code::Aborted) => (
             StatusCode::SERVICE_UNAVAILABLE,
             "shard_not_available_exception",
@@ -43,6 +53,14 @@ fn document_write_error_response(
 ) -> (StatusCode, Json<Value>) {
     let (status, error_type) = forwarded_write_error_classification(&error);
     crate::api::error_response(status, error_type, format!("{operation} failed: {error}"))
+}
+
+fn mapper_parsing_error_response(error: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+    crate::api::error_response(StatusCode::BAD_REQUEST, "mapper_parsing_exception", error)
+}
+
+fn validate_document_source_for_api(source: &Value) -> Result<(), (StatusCode, Json<Value>)> {
+    crate::common::validate_document_source(source).map_err(mapper_parsing_error_response)
 }
 
 mod bulk;
@@ -154,22 +172,37 @@ pub(crate) async fn ensure_local_index_shards_open(
             continue;
         }
 
-        if let Err(e) = state
-            .shard_manager
-            .open_assigned_shard_with_settings_blocking(
-                index_name.to_string(),
-                *shard_id,
-                metadata.mappings.clone(),
-                metadata.settings.clone(),
-                metadata.uuid.clone(),
-                crate::shard::AssignedShardOpen {
-                    allocation_id,
-                    primary_term: routing.primary_term,
-                    allow_empty_creation: false,
-                },
-            )
-            .await
-        {
+        let assignment = crate::shard::AssignedShardOpen {
+            allocation_id,
+            primary_term: routing.primary_term,
+            allow_empty_creation: false,
+        };
+        let open_result = if routing.primary == state.local_node_id {
+            state
+                .shard_manager
+                .open_primary_assigned_shard_with_settings_blocking(
+                    index_name.to_string(),
+                    *shard_id,
+                    metadata.mappings.clone(),
+                    metadata.settings.clone(),
+                    metadata.uuid.clone(),
+                    assignment,
+                )
+                .await
+        } else {
+            state
+                .shard_manager
+                .open_assigned_shard_with_settings_blocking(
+                    index_name.to_string(),
+                    *shard_id,
+                    metadata.mappings.clone(),
+                    metadata.settings.clone(),
+                    metadata.uuid.clone(),
+                    assignment,
+                )
+                .await
+        };
+        if let Err(e) = open_result {
             tracing::error!(
                 "{}: failed to open shard {}/{}: {}",
                 context,
@@ -312,7 +345,7 @@ async fn auto_create_index(
             committed_state.shard_allocation_id(index_name, 0, &state.local_node_id)
         && let Err(e) = state
             .shard_manager
-            .open_assigned_shard_with_settings_blocking(
+            .open_primary_assigned_shard_with_settings_blocking(
                 created_metadata.name.clone(),
                 0,
                 created_metadata.mappings.clone(),
@@ -391,6 +424,7 @@ fn create_index_error_response(error: CreateIndexMetadataError) -> (StatusCode, 
             "illegal_argument_exception",
             message,
         ),
+        CreateIndexMetadataError::MapperParsing(message) => mapper_parsing_error_response(message),
         CreateIndexMetadataError::UnimplementedEngine(engine) => crate::api::error_response(
             StatusCode::NOT_IMPLEMENTED,
             "illegal_argument_exception",
@@ -407,11 +441,18 @@ fn forwarded_create_index_error_response(
         .find_map(|cause| cause.downcast_ref::<tonic::Status>())?;
 
     match status.code() {
-        tonic::Code::InvalidArgument => Some(crate::api::error_response(
-            StatusCode::BAD_REQUEST,
-            "illegal_argument_exception",
-            status.message(),
-        )),
+        tonic::Code::InvalidArgument => {
+            let error_type = if crate::common::is_mapping_parsing_error_message(status.message()) {
+                "mapper_parsing_exception"
+            } else {
+                "illegal_argument_exception"
+            };
+            Some(crate::api::error_response(
+                StatusCode::BAD_REQUEST,
+                error_type,
+                status.message(),
+            ))
+        }
         tonic::Code::Unimplemented => Some(crate::api::error_response(
             StatusCode::NOT_IMPLEMENTED,
             "illegal_argument_exception",
@@ -516,7 +557,7 @@ pub async fn create_index(
             )
             && let Err(e) = state
                 .shard_manager
-                .open_assigned_shard_with_settings_blocking(
+                .open_primary_assigned_shard_with_settings_blocking(
                     index_name.to_string(),
                     *shard_id,
                     committed_metadata.mappings.clone(),
@@ -566,22 +607,16 @@ pub async fn index_document(
     State(state): State<AppState>,
     Path(index_name): Path<crate::common::IndexName>,
     Query(refresh_param): Query<RefreshParam>,
-    Json(mut payload): Json<Value>,
+    Json(payload): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     let _timer = crate::metrics::INDEX_LATENCY_SECONDS.start_timer();
 
     // IndexName is validated at extraction time
 
-    // Extract or generate _id, then strip it from the document body
-    let doc_id = if let Some(id) = payload.get("_id").and_then(|v| v.as_str()) {
-        id.to_string()
-    } else {
-        uuid::Uuid::new_v4().to_string()
-    };
-    // Remove _id from the stored payload — it's metadata, not part of the document source
-    if let Some(obj) = payload.as_object_mut() {
-        obj.remove("_id");
+    if let Err(response) = validate_document_source_for_api(&payload) {
+        return response;
     }
+    let doc_id = uuid::Uuid::new_v4().to_string();
 
     let cluster_state = state.cluster_manager.get_state();
 
@@ -652,15 +687,14 @@ pub async fn index_document_with_id(
     State(state): State<AppState>,
     Path((index_name, doc_id)): Path<(crate::common::IndexName, String)>,
     Query(refresh_param): Query<RefreshParam>,
-    Json(mut payload): Json<Value>,
+    Json(payload): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     let _timer = crate::metrics::INDEX_LATENCY_SECONDS.start_timer();
 
     // IndexName is validated at extraction time
 
-    // Remove _id from stored payload if present — it's metadata, not document source
-    if let Some(obj) = payload.as_object_mut() {
-        obj.remove("_id");
+    if let Err(response) = validate_document_source_for_api(&payload) {
+        return response;
     }
 
     let cluster_state = state.cluster_manager.get_state();
@@ -1158,6 +1192,17 @@ pub async fn update_document(
 ) -> (StatusCode, Json<Value>) {
     // IndexName is validated at extraction time
 
+    if let Some(doc) = body.get("doc")
+        && let Err(response) = validate_document_source_for_api(doc)
+    {
+        return response;
+    }
+    if let Some(upsert) = body.get("upsert")
+        && let Err(response) = validate_document_source_for_api(upsert)
+    {
+        return response;
+    }
+
     let partial = match body.get("doc") {
         Some(d) if d.is_object() => d.clone(),
         _ => {
@@ -1242,6 +1287,9 @@ pub async fn update_document(
     } else {
         partial
     };
+    if let Err(response) = validate_document_source_for_api(&merged) {
+        return response;
+    }
 
     // 3. Re-index the merged document
     match state

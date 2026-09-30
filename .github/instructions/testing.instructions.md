@@ -40,6 +40,11 @@ cargo test -- test_name                         # Single test by name
 ./scripts/tla/check.sh storage-replica storage-primary storage-primary-no-replica
 ./scripts/tla/check.sh storage-apply-replica storage-apply-primary storage-apply-primary-no-replica
 ./scripts/tla/check.sh s1-combined-replica s1-combined-primary s1-combined-liveness
+./scripts/tla/check.sh trace-validator          # Converter and trace acceptance/rejection
+./scripts/tla/validate_trace.sh path/to/trace.jsonl
+./scripts/tla/check_d1_trace_invariants.py path/to/trace.jsonl
+./scripts/tla/test_d1_protocol_trace.sh
+./scripts/tla/test_trace_validator.sh
 ./scripts/tla/check.sh fixed-crash               # Long exhaustive local run
 ./scripts/tla/check.sh fixed-simulation          # Seeded depth simulation
 ```
@@ -55,16 +60,26 @@ cargo test -- test_name                         # Single test by name
   `pending-restart-legacy` stops violating its named invariant, or if
   `l2-primary-no-trigger`, `storage-apply-no-escalation`, or
   `s1-combined-liveness-no-timeout` stops producing its temporal liveness
-  violation. The S1 no-timeout case is a modeling-assumption regression, not a
-  historical Rust defect.
+  violation. `d1-order-historical` must retain `NoCopyBehindAcked`, and
+  `d1-replay-historical` must retain its acknowledged replay-loss violation.
+  `d1-term-collision-seq-only` must retain `B1NoCopyBehindAcked`.
+  `d1-term-collision-restart-committed` must retain
+  `B1RNoCopyBehindAcked`, and `d1-primary-gap-max` must retain
+  `B3NoRecoveryLoop`.
+  The S1 no-timeout case is a modeling-assumption regression, not a historical
+  Rust defect.
 - `c2-fixed`, `fence-durable`, `g1-empty-store`, `g2-replica`, `g2-primary`,
   `g2-primary-no-replica`, `g2-liveness`, `pending-restart-fixed`, `l1-bump`,
   `l2-primary-idle`, `l2-promotion`, `storage-replica`, `storage-primary`,
   `storage-primary-no-replica`, `storage-apply-replica`,
   `storage-apply-primary`, `storage-apply-primary-no-replica`,
   `s1-combined-replica`, `s1-combined-primary`, `s1-combined-liveness`,
-  `two-shard`, `fixed-crash`, and `fixed-partition` are expected-pass
-  configurations.
+  `d1-order-fixed`, `d1-replay-fixed`, `d1-no-durable-tombstone`,
+  `d1-term-collision-fixed`, `d1-gaps`,
+  `d1-term-collision-restart-identity`, `d1-primary-gap-processed`,
+  `d1-promotion-replay-noop`, `d1-trace-actions`, `trace-validator`,
+  `two-shard`, `fixed-crash`, and
+  `fixed-partition` are expected-pass configurations.
 - An expected-pass failure stops the modeling task. Preserve the raw trace,
   decide whether the model or implementation is wrong, and do not weaken an
   invariant or transition merely to obtain green output.
@@ -72,6 +87,12 @@ cargo test -- test_name                         # Single test by name
   exhausted Raft/message/term/allocation/recovery bound, preserve the trace,
   and record the old and new values. Safety failures and non-bound liveness
   failures still stop immediately.
+- A property comparing non-semantic internal retention/cache/bookkeeping state
+  may be refined when logical state and every safety property already agree.
+  Preserve and document the over-strong-property trace before continuing.
+- A property applied to a copy that is not available under the Rust contract
+  may be availability-scoped. Promotion candidates still replaying and
+  recovery targets not yet admitted are not available copies.
 - Safety runs may use a documented state constraint and valid node symmetry.
   Liveness runs use neither; declare the exact fairness assumptions instead.
 - When you add a model variable, add it to every action's `UNCHANGED` tuple,
@@ -108,6 +129,97 @@ cargo test -- test_name                         # Single test by name
   acknowledged write. Timeout fairness is permitted only when a required
   target is down, has restarted past the request epoch, or its transport
   message was dropped.
+- ADR D1 configurations must allow at least two same-shard client writes in
+  flight and arbitrary replica delivery order. Check `NoCopyBehindAcked`
+  during concurrency and logical-only convergence at quiescence when every
+  primary-WAL operation was acknowledged. Replay checks cover gap-aware
+  processed checkpoints, redelivery, tombstone pruning, crash/restart, and a
+  late older index after delete.
+- D1 term-collision checks distinguish operation identity by primary term and
+  sequence. A newer-term collision at an already processed sequence must fail
+  the copy and require recovery. Gap checks cover missing-operation pull,
+  timeout/re-recovery, and promotion-time NoOp fill before checkpoint advance.
+- Restart collision checks restore fence term and fence maximum from durable
+  copy identity rather than commit metadata. Primary-gap detection compares
+  processed checkpoints, not maximum sequence. Promotion checks replay all
+  local WAL entries before NoOp fill; failed NoOp replication may leave a
+  replica gap but cannot block local activation.
+- D1 implementation traces follow `specs/tla/trace/SCHEMA.md`. The converter
+  must accept only schema v4 and reject unknown versions, events, outcomes,
+  fields, non-consecutive steps, invalid durability, required-replica/view
+  mismatch, stale/reused message IDs, incorrect crash-lost sets, incomplete
+  NoOp fan-out, or invented copy state before invoking TLC.
+- The validator infers the composition from the event vocabulary; the emitter
+  does not choose a profile or hidden-step bound. The inferred compositions
+  use the owning actions:
+  `TraceD1` with `MC_D1_SeqNoApply`, `TraceD1Authority` with Raft/activation,
+  `TraceD1Collision` with the B1 slice, and `TraceD1Recovery` with
+  `PeerRecovery`. Do not replace these with a deterministic replay machine or
+  duplicate planner/routing rules in the trace module.
+- One trace uses exactly one inferred composition. The combined composition
+  permits core replication followed by crash/restart, failover, activation,
+  collision removal, and later-term writes. The full composition adds
+  fresh-allocation peer recovery and admission to that same real D1 relation;
+  isolated recovery fixtures retain the recovery-only composition. Keep the
+  exact event vocabularies synchronized with `SCHEMA.md`.
+- TLC trace acceptance is existential witness search with a validator-owned
+  hidden-action bound. A pass means only that the finite observation can be
+  embedded in the selected bounded model; it is not an implementation proof.
+- `validate_trace.sh` returns `0` for acceptance, `1` for rejection, and `3`
+  with `INCONCLUSIVE` for timeout, memory exhaustion, or an incomplete TLC
+  run. CI must never count exit `3` as an expected rejection. A standalone
+  fixture defaults to 120 seconds and a 4 GiB Java heap. Self-test fixtures
+  use at most `min(4,nproc)` concurrent 2 GiB JVMs, with isolated logs printed
+  in declaration order; the deliberate OOM fixture retains its explicit small
+  heap.
+- The review mutation matrix must retain rejection for m1, m2, m3, m4, m5,
+  m6, m6b, m7, m8, m8b, m9, m9b, m15, m18, and m19, while m13 and m14 remain
+  accepted. Also retain the replay-stage invalid trace whose commit boundary is
+  valid but replay behavior is not.
+- Round-2 traces must reject n1, n3, n4, n7, n9, and n10; accept n1c, n2, n5,
+  n6, n8, n11, n12, n13, n14, and n15; and keep the dedicated
+  `d1-trace-actions` configuration green.
+- `copy_state` is the final event even for non-quiescent traces, and is
+  mandatory for every available copy at quiescence and after replay/admission.
+  Refresh before taking it. Deleted-state identity is trace-owned and must not
+  depend on the 60-second tombstone-retention cache.
+- Bulk traces may append every item before any item processing event. A bulk
+  replica response may carry the batch-final persisted checkpoint; require
+  item-local persisted <= response persisted <= current replica persisted.
+- Retain the 219-event schema-v4 combined witness and its invalid arrival-order,
+  collision-redelivery, and post-promotion rollback variants. The valid
+  witness must include a real missing sequence filled by a durable promotion
+  NoOp plus exact sequence-target fan-out, not only an empty gap-fill stage.
+  It does not itself contain a promoted-copy restart; retain v6c for
+  replay-before-fill ordering. Retain the exact 500-event restart/failover
+  performance fixture and keep every fixture under 120 seconds.
+- Retain the slow round-4 restart matrix:
+  m7 empty replay after committed truncation, a retained-entry
+  `skip_committed` control and invalid re-apply, m10 replay of an uncommitted
+  promotion NoOp and m10c omission, m8 activation without gap fill, m6b fill
+  before replay completion, and m4c/m9 late request/ack delivery. Run it with
+  `./scripts/tla/check.sh trace-validator-round4`.
+- Keep `d1-failover-actions` and `d1-noop-collision-actions` green. They are
+  scripted action-coverage paths, not exhaustive model checking. Together
+  they exercise model-owned durable fence, NoOp fill/fan-out/apply/redelivery,
+  activation, NoOp collision/NACK, exact removal, and D1 safety invariants.
+- Retain accepted promotion-NoOp apply and collision/removal fixtures plus
+  rejected mutations for an omitted apply, collision mislabeled as
+  redelivery, and reviewer p7b's omitted fan-out. Reviewer p7a must remain
+  accepted.
+- Recovery catch-up ordering assumes an activated-primary source scanning the
+  pinned physical WAL with one exclusive cursor. Do not claim support for
+  duplicate or out-of-order catch-up traces.
+- Protocol trace events must be synchronously ordered by the process-global
+  trace sink and emitted after the named effect but before releasing its
+  linearizing lock. Every mutable field in one event comes from that same lock;
+  split commit capture/persistence and other cross-lock effects. Do not
+  validate normal asynchronous tracing output.
+- The `protocol-trace` feature is test-only. Its seeded three-node real-gRPC
+  suite must accept the unmodified implementation and reject both
+  `arrival-order` and `seq-only-redelivery` at the causal
+  `operation_processed` event in both the independent invariant checker and
+  TLC. Keep the seed in failure output so the run is reproducible.
 - Pending-target liveness must cover the settlement deadline, source-primary
   restart/reactivation, promotion of a different replica, and target restart
   with durable marker restoration. `RecoveryConverges` means one attempt
@@ -130,6 +242,10 @@ cargo test -- test_name                         # Single test by name
 - The current multi-node REST harness uses isolated in-memory Raft instances, so any `remote_store` regression that depends on leaf-side index metadata lookups needs a direct transport-level test in addition to any REST harness fan-out assertion.
 - For WAL generation/manifest changes, add regressions for manifest creation on new shards, manifest-required reopen, active-generation-only reopen, and ignored non-generation side files in the WAL directory.
 - For WAL corruption hardening, add regressions that an unknown operation tag in the active generation returns `Err` on reopen instead of panicking, and that an internal active-generation mismatch fails before append writes bytes.
+- For persistent Raft format errors, independently corrupt vote, committed-log,
+  and last-purged metadata through their public storage reads. Each error must
+  be `InvalidData`, name the component, use the exact wipe-node-data/recreate-
+  cluster remedy, and never use recreate-index guidance.
 - For primary sequence ownership changes, cover sequence zero versus missing
   optional wire fields, empty/non-empty bulk receipt consistency, document-ID
   order, concurrent single/bulk/delete identities across primary and replica
@@ -162,8 +278,8 @@ cargo test -- test_name                         # Single test by name
 - For restart/rejoin data-loss fixes that depend on real process startup order, add or extend a process-backed `restart_regression` test that runs real `ferrissearch` binaries through create -> ingest -> flush -> restart -> verify count/UUID-dir invariants.
 - For authoritative in-sync membership changes, cover creation-time admission,
   later allocation staying out of sync, removal, in-sync-only targeted and
-  fallback promotion, out-of-sync-first replica reduction, legacy serde
-  fail-closed behavior, strict proto roundtrip/rejection, and live replication
+  fallback promotion, out-of-sync-first replica reduction, strict persisted
+  format rejection, strict proto roundtrip/rejection, and live replication
   targeting. Add a real three-process flush -> allocate replica -> primary loss
   -> red shard -> original-primary rejoin regression that verifies exact
   acknowledged values.
@@ -220,6 +336,14 @@ cargo test -- test_name                         # Single test by name
   rebuild failure remaining reportable under the Apply budget, and successful
   write responses remaining independent of a blocked or slow
   `MarkPrimaryAvailable` report.
+- Collision quarantine regressions must assert repeated immediate single and
+  bulk replication attempts remain `DATA_LOSS`; a definitive marker must never
+  be masked by copy-I/O backoff. Inject collision-marker persistence failure
+  and prove the engine remains evicted, the in-memory allocation stays marked,
+  the storage error is reportable, and later replication and reads fail closed
+  even while the durable identity still has an unset marker. Lifecycle removal
+  coverage must create the marker through an actual colliding replica RPC, not
+  by editing the identity file, and assert the exact allocation is removed.
 - Round-6 storage regressions use a real Tantivy commit failure to prove the
   writer is removed, the persisted checkpoint does not advance, five later
   acknowledged writes survive the next commit and restart, and a failed
@@ -227,8 +351,44 @@ cargo test -- test_name                         # Single test by name
 - Round-7 storage regressions cover delete-preserving startup and failed-writer
   replay, malformed WAL document envelopes, idempotent replay with deletes,
   replica delete survival through promotion, idle refresh/snapshot healing,
-  full transport recovery after a transient source refresh-commit failure, and
-  operation-correct legacy `RecoverReplica` encoding.
+  and full transport recovery after a transient source refresh-commit failure.
+- D1 vector recovery regressions must cover a failed post-WAL text apply
+  followed by refresh or primary activation before the next write, plus
+  restart persistence and successful clearing of `vectors.stale`.
+- Vector rebuild coverage must include a test-only small batch size crossing
+  multiple batch boundaries with a deleted document, plus an explicit
+  greater-than-100,000-document activation regression proving vector count,
+  last-document version state, text visibility, and kNN visibility.
+- Dynamic-mapping reopen coverage must prove kNN results remain value-identical
+  immediately after replacement and after a later refresh. A replacement
+  engine with an unloaded or empty vector index is a failure even when text
+  documents remain visible.
+- Promotion NoOp coverage must include a real source activation, an initial
+  failed gRPC fan-out, a later lifecycle activation, and value-level proof that
+  the replica durably received the original term/sequence NoOp and closed its
+  checkpoint gap. Also hold one shard's retry RPC open on a black-hole replica
+  and prove a write to another shard completes within a small bound.
+- Keep result-level round-6 coverage that a post-snapshot source apply failure
+  stalls catch-up at the physical cursor and is served during finalize, and
+  that 1,030 non-contiguous promotion NoOps reach a live replica in exactly two
+  bounded bulk RPCs.
+- Retry-catch-up coverage must preserve an empty incomplete response at the
+  unchanged physical cursor as a return-to-finalize signal, not a
+  no-progress failure. Drive that shape through `run_peer_recovery` with a real
+  source session, gRPC transport, target install, finalize, and admission;
+  assert the same session uses one setup and reaches finalize rather than only
+  testing the cursor helper.
+- Zero-replica bulk replication coverage must prove target resolution happens
+  before sequence-range construction or JSON serialization. Performance
+  changes require equivalent release-mode before/after measurements.
+- Replica JSON decode coverage must exercise the real single and bulk
+  transport handlers and prove one decode per index operation. Keep the
+  engine's independent source validation as defense in depth, and use an
+  equivalent release-mode workload for performance claims.
+- R6 replay regressions cover more than one 1,000-operation replay batch after
+  a fence raise, visibility of every pre-promotion document plus a later write,
+  clean assigned-copy reopen, and restart from an intermediate commit whose
+  term-start maximum is ahead of its committed maximum.
 - Round-2 recovery regressions cover lock-free large-generation WAL scans,
   one-shot setup error polling, stale-target replacement, cancelled reopen
   during hashing, Notify lost-wakeup ordering, Tokio-safe cleanup, and primary
@@ -241,18 +401,14 @@ cargo test -- test_name                         # Single test by name
   missing existing Tantivy metadata, same-term index UUID replacement,
   partially visible post-head WAL appends, the 32 MiB frame boundary on every
   WAL write API, and HTTP 503 mapping with attributable bulk failures.
-- Round-5 WAL regressions cover legacy 40 MiB frame open/replay/skip
-  compatibility, the retained 32 MiB recovery-transfer ceiling, exact
+- Round-5 WAL regressions cover the uniform 32 MiB persisted/recovery frame
+  ceiling, exact
   final-generation/captured-size handling for in-progress appends, durable
   active-tail truncation before append, and fail-closed middle corruption.
-- Round-6 recovery coverage pauses a real live WAL append mid-frame and calls
-  legacy `RecoverReplica`; the RPC must wait for and read through the live
-  engine, never truncate/delete files through a second `HotTranslog::open`, and
-  a subsequent engine reopen must replay every acknowledged frame.
 - For CLI parser fixes, add multiline regressions when behavior depends on SQL statement structure (`EXPLAIN`, table extraction, quoted identifiers), not just single-line happy paths.
 - For global SQL routing fixes, add both helper-level coverage and a `POST /_sql/stream` regression using a quoted hyphenated index name with keyword-casing variants, including the aliasless `count(*)` fast path.
 - For index-engine metadata changes, add unit coverage for create-body parsing and transport/proto roundtrips, plus REST coverage for `PUT /{index}` and `GET /{index}/_settings` so immutable engine selection is exercised end to end.
-- For any new Raft control-plane mutation (new `ClusterCommand`, new `ClusterState` config field, new forwarded write RPC — see `control-plane.instructions.md`), add all three layers: (1) unit — `types.rs` serde JSON roundtrip per variant, `state_machine.rs` apply test asserting the map changed AND `version` bumped, `cluster/state.rs` `ClusterState` snapshot roundtrip plus an old-snapshot literal missing the field deserializing via `#[serde(default)]`; (2) transport — a direct gRPC test of each RPC (leader applies, non-leader returns `failed_precondition`); (3) coordinator/multi-node — a follower's API handler forwards the write to the leader and the change is observable on the leader (preserve real `raft_node_id`s, route through a non-master node).
+- For any new Raft control-plane mutation (new `ClusterCommand`, new `ClusterState` config field, new forwarded write RPC — see `control-plane.instructions.md`), add all three layers: (1) unit — `types.rs` serde JSON roundtrip per variant, `state_machine.rs` apply test asserting the map changed AND `version` bumped, `cluster/state.rs` current-shape snapshot roundtrip plus a missing-field fixture that is rejected; (2) transport — a direct gRPC test of each RPC (leader applies, non-leader returns `failed_precondition`); (3) coordinator/multi-node — a follower's API handler forwards the write to the leader and the change is observable on the leader (preserve real `raft_node_id`s, route through a non-master node).
 - For the dynamic security control plane specifically, also assert: create→authenticate→revoke→denied, custom-role authz grants only mapped actions, static + dynamic keys coexist, `GET /_security/*` never leaks `hash_sha256`, and a non-admin principal gets 403 on `/_security/*`. Security-enabled REST harnesses must treat HTTP 401 on `GET /` as "server up" during readiness polling (auth rejects the probe).
 - For SQL identifier case-sensitivity fixes, add helper-level canonicalization coverage plus REST regressions for both buffered and streamed SQL endpoints using real mixed-case mapping fields, and cover both unquoted source references and quoted exact-identifier preservation on the residual/DataFusion path.
 - For `ferris-cli` interactive features, test command parsing and completion token boundaries in pure helpers; keep watch-mode behavior factored so the logic is covered without relying on terminal I/O in tests.

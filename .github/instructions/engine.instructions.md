@@ -16,13 +16,12 @@ pub trait SearchEngine: Send + Sync {
     // Document operations
     fn add_document(&self, doc_id: &str, payload: Value) -> Result<String>;
     fn add_document_with_receipt(&self, doc_id: &str, payload: Value) -> Result<IndexWriteReceipt>;
-    fn add_document_with_seq(&self, doc_id: &str, payload: Value, seq_no: u64) -> Result<String>;
     fn bulk_add_documents(&self, docs: Vec<(String, Value)>) -> Result<Vec<String>>;
     fn bulk_add_documents_with_receipt(&self, docs: Vec<(String, Value)>) -> Result<BulkWriteReceipt>;
-    fn bulk_add_documents_with_start_seq(&self, docs: Vec<(String, Value)>, start_seq_no: u64) -> Result<Vec<String>>;
     fn delete_document(&self, doc_id: &str) -> Result<u64>;
     fn delete_document_with_receipt(&self, doc_id: &str) -> Result<DeleteWriteReceipt>;
-    fn delete_document_with_seq(&self, doc_id: &str, seq_no: u64) -> Result<u64>;
+    fn apply_replica_operation(&self, op: SequencedOperation) -> Result<ReplicaApplyReceipt>;
+    fn apply_replica_batch(&self, ops: Vec<SequencedOperation>) -> Result<ReplicaBulkApplyReceipt>;
     fn get_document(&self, doc_id: &str) -> Result<Option<Value>>;
 
     // Engine lifecycle
@@ -39,9 +38,9 @@ pub trait SearchEngine: Send + Sync {
     fn search_knn_filtered(&self, field: &str, vector: &[f32], k: usize, filter: Option<&QueryClause>) -> Result<Vec<Value>>;
 
     // Checkpoint tracking (replication)
-    fn local_checkpoint(&self) -> u64;
+    fn local_checkpoint(&self) -> Option<u64>;
     fn update_local_checkpoint(&self, seq_no: u64);
-    fn global_checkpoint(&self) -> u64;
+    fn global_checkpoint(&self) -> Option<u64>;
     fn update_global_checkpoint(&self, checkpoint: u64);
 }
 ```
@@ -55,16 +54,18 @@ pub trait SearchEngine: Send + Sync {
 
 ### Seq Ownership Rule
 - `add_document()` / `bulk_add_documents()` / `delete_document()` are for local primary-originated writes that allocate new WAL seq_nos
-- `*_with_seq` methods are for replica apply and recovery replay only
+- `apply_replica_operation` / `apply_replica_batch` are the only production
+  replica/recovery entry points and require explicit sequence and primary term
 - Replica/recovery code MUST preserve the primary-assigned seq_no when writing to WAL; do not route replicated operations through the local-allocation methods
-- Primary transport handlers must use the receipt-returning methods. The legacy
-  ID/count methods delegate to them and intentionally discard only the receipt.
+- Primary transport handlers must use the receipt-returning methods. The
+  convenience ID/count methods delegate to them and intentionally discard only
+  the receipt.
 - A receipt belongs to its operation, even if another write advances a checkpoint
   before replication. Never reconstruct its sequence from `last_seq_no()` or
   `local_checkpoint()`.
 - A non-empty bulk receipt has a contiguous WAL-reserved start; an empty batch
-  has no assigned sequence. Explicit-sequence methods are required implementations,
-  not defaults that allocate new primary sequences.
+  has no assigned sequence. Replica/recovery apply methods are required
+  implementations, not defaults that allocate new primary sequences.
 - Every primary, replica, recovery, and delete operation must encode to a WAL
   frame no larger than `MAX_WAL_FRAME_BYTES` (32 MiB including the frame
   header). Reject larger operations as validation errors before WAL or engine
@@ -76,15 +77,13 @@ pub struct CompositeEngine {
     text: HotEngine,
     vector: RwLock<Option<VectorIndex>>,
     data_dir: PathBuf,
-    checkpoint: AtomicU64,   // local checkpoint (seq_no)
-    global_cp: AtomicU64,    // global checkpoint (primary only)
+    global_cp: Mutex<Option<u64>>, // persisted global checkpoint, primary only
+    vector_recovery: Mutex<()>,    // serializes text replay with vector rebuild
 }
 ```
-- `CompositeEngine` updates its local checkpoint from explicit replica/recovery
-  sequences or primary write receipts. Global-checkpoint updates are atomic and
-  monotonic so late acknowledgements cannot regress progress.
-- Local checkpoints remain highest-observed sequence watermarks; receipt
-  attribution does not add gap tracking, retry deduplication, or primary fencing.
+- `HotEngine` owns gap-aware processed/persisted interval tracking.
+  `CompositeEngine` delegates sequence stats and keeps the global persisted
+  checkpoint monotonic so late acknowledgements cannot regress progress.
 
 ### Constructors
 - `HotEngine::open_existing_with_mappings()` /
@@ -109,13 +108,54 @@ tokio::select! {
 - Subscribes to `SettingsManager::watch_flush_threshold()` for WAL auto-flush
 - Reacts to dynamic `refresh_interval_ms` and `flush_threshold_bytes` settings changes without restart
 - Each refresh/auto-flush tick must run on Tokio's blocking pool (`spawn_blocking`) because `refresh()`, checkpoint-aware truncation, and vector persistence all perform blocking I/O; never run shard maintenance inline on async runtime workers or Raft heartbeats can stall during multi-shard compaction bursts
-- Auto-flush must use `flush_with_global_checkpoint()` and skip the operation entirely when `global_checkpoint == 0`; `flush_with_global_checkpoint(0)` falls back to full WAL truncation
+- Primary auto-flush must use the global checkpoint and skip when it is
+  `None`; sequence zero is a valid safe checkpoint.
+- Replica apply tracks a separate monotonic local persisted prefix. When no
+  primary global checkpoint exists, replica auto-flush may truncate only
+  through that prefix. Clear this replica-only bound before primary activation.
 - Background auto-flush should use best-effort helpers so maintenance ticks defer instead of blocking active ingestion or vector persistence
 
 ### Vector Auto-detection
 - On `add_document()`: scans payload for arrays of numbers
 - Auto-creates VectorIndex if a `knn_vector` field is encountered
-- `rebuild_vectors()` — recovers USearch index from Tantivy docs on startup (crash recovery)
+- `rebuild_vectors()` constructs a replacement USearch index from the
+  authoritative Tantivy document view, persists and fsyncs it, atomically swaps
+  it into memory, and only then clears `vectors.stale`.
+- Vector rebuild enumerates every live document directly from each Tantivy
+  segment and feeds the replacement index in bounded batches. Never use
+  `TopDocs` or a search-result limit for rebuild input; deleted documents must
+  remain excluded and shards above 100,000 live documents must rebuild fully.
+- A text apply failure after WAL persistence durably creates `vectors.stale`.
+  Its temporary file also means stale on restart. Primary writes, replica
+  apply, refresh, flush, force merge, peer-snapshot preparation, recovery
+  barriers, primary activation, startup open, dynamic-mapping reopen, and
+  peer-recovery finalization must rebuild vectors before clearing that state or
+  publishing a replacement engine.
+- `vector_recovery` serializes those rebuild paths with vector mutations so a
+  later failed text operation cannot be hidden by an earlier rebuild clearing
+  the marker.
+- Background refresh must call the composite `refresh()` path, not
+  `HotEngine::refresh()` directly, or it bypasses vector recovery.
+
+### Reserved Document Metadata
+
+- Every primary, replica, recovery, and direct engine index source uses
+  `common::validate_document_source()` before WAL or engine mutation.
+- The shared reserved list contains `_id`, `_doc_id`, `_source`, `_seq_no`,
+  `_primary_term`, `_version`, `_index`, and `_routing`.
+- `FieldRegistry.fields` excludes every reserved name even when it exists in
+  the authoritative Tantivy schema, so a validation bypass cannot append a
+  second internal sequence or term value.
+- Dynamic mapping ignores reserved names, and engine construction rejects
+  reserved explicit mappings before Tantivy schema creation or evolution.
+- `body` remains the non-reserved built-in catch-all text field. Dynamic and
+  strict mapping discovery ignore it. A plain explicit text mapping reuses the
+  existing schema field rather than adding a duplicate.
+- Engine creation and reopen validate authoritative mappings before Tantivy
+  schema construction. Reserved names, a non-text or parameterized `body`
+  mapping, and an invalid built-in body schema fail as
+  `UnsupportedIndexFormatError` with recreate-index guidance; they must never
+  reach a schema-builder panic.
 
 ## RemoteStore Engine (src/engine/remote_store.rs)
 - `remote_store` is a shardless read path. Root nodes load the published manifest for an index, query per-leaf cache/load status over gRPC, and batch split assignments to data-node leaves.
@@ -145,6 +185,11 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
 - Replay holds the translog lock for the entire retained suffix so no new WAL
   entry can be appended before reconstruction is complete. This blocks writes
   to that shard and can be a long critical section when refresh is disabled.
+- The durable term-start maximum comes from the copy fence and may be ahead of
+  `CommittedBoundaryRecord.max_seq_no` at an intermediate replay commit. This is
+  valid because WAL-only operations have not reached that batch yet. Validation
+  still requires every recorded current-term processed interval to stay at or
+  below both the committed maximum and the term-start maximum.
 - `translog_size_bytes()` exposes the current WAL size for the auto-flush loop
 - The Tantivy `IndexWriter` heap budget is intentionally capped at 64 MiB per shard. Multi-shard restart/open paths must not reserve the old 512 MiB-per-shard budget or nodes with many local shards can OOM before recovery completes.
 - Force merge is serialized only within one `HotEngine`. It temporarily installs
@@ -173,16 +218,30 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
   `Ok(false)` instead of rebuilding.
 - `force_merge(0)` is invalid. Successful force merge must verify the final
   searchable segment count is at most the requested positive bound while
-  preserving document values, deletes, and the committed WAL watermark.
-- `rebuild_vectors()` is only called when the index has `KnnVector` fields in its mappings. The shard manager gates this check; the composite engine's `rebuild_vectors()` itself is still a 100K-doc MatchAll scan, so never call it unconditionally.
-- Even the legacy `HotEngine::start_refresh_loop()` path must offload `refresh()` through Tokio's blocking pool if it is used directly; never run Tantivy commit/reload inline on an async interval task
-- Replica/recovery writes use `append_with_seq()` / `write_bulk_with_start_seq()` under the hood so persisted WAL seq_nos match the primary's numbering
+  preserving document values, deletes, and the committed WAL boundary.
+- `rebuild_vectors()` is only called when the index has `KnnVector` fields in
+  its mappings. The shard manager gates this check because the full
+  segment/alive-document scan is proportional to shard size; never call it
+  unconditionally.
+- Even the direct `HotEngine::start_refresh_loop()` path must offload `refresh()` through Tokio's blocking pool if it is used; never run Tantivy commit/reload inline on an async interval task
+- Replica/recovery writes use explicit-sequence append APIs, including
+  arbitrary ordered batches, so persisted WAL operation identities match the
+  primary even when delivery order differs from sequence order.
 - Peer snapshot creation holds maintenance then translog then writer locks,
-  commits exactly through `B = next_seq_no`, durably persists
-  `translog.committed`, registers the WAL pin before releasing the translog
-  lock, and hard-links the existing committed segment components plus
+  captures an exact committed boundary and physical WAL end, durably persists
+  `translog.committed`, registers the WAL pin at the first sequence above the
+  processed prefix before releasing the translog lock, and hard-links the
+  existing committed segment components plus
   `meta.json`/`.managed.json`. Tantivy's `SegmentMeta::list_files()` can name
   optional absent components; transfer only files that actually exist.
+- Snapshot installation does not transfer the live processed interval set above
+  a gap. Source snapshot creation therefore requires
+  `processed_checkpoint == max_seq_no`; the target retries after source
+  replay/activation closes the gap instead of accepting a lossy boundary.
+- Catch-up scanning stops the physical cursor before the first WAL frame not
+  yet processed by the source. The target then enters finalization, whose
+  exclusive barrier rebuilds/replays a failed source writer before serving the
+  remaining suffix from that same cursor.
 - A persisted committed checkpoint and any WAL truncation must be derived from
   a successful Tantivy commit boundary. Never advance or prune past operations
   that the corresponding commit did not make durable.
@@ -227,8 +286,8 @@ With FAST, Tantivy reads a columnar structure - orders of magnitude faster for r
 - Validate keyword objects before any WAL append or writer mutation, including
   the entire shard batch and explicit-sequence paths. Replay must surface invalid
   values rather than silently omit indexed data.
-- Numeric keyword arrays are not vector fields. Keep them out of the legacy
-  automatic vector-detection path.
+- Numeric keyword arrays are not vector fields. Keep them out of automatic
+  vector detection.
 - Query DSL terms buckets count matching documents once per keyword value.
   SQL's direct columnar readers remain scalar-first; this does not introduce
   SQL array expressions or `UNNEST` semantics.
@@ -403,10 +462,12 @@ Falls back to per-doc stored-doc reading when any column requires `SourceFallbac
 - `route_document(doc_id, metadata) -> Option<NodeId>` — returns primary node for doc
 
 ## Checkpoint Semantics
-- **Local checkpoint**: highest observed seq_no applied on this replica/primary
-- **Global checkpoint**: monotonic minimum of the primary and acknowledged
-  replica high-water marks
-- These are currently watermarks, not gap-aware contiguous-prefix proofs.
-  Receipt propagation does not add retry deduplication, primary epochs, or
-  failover fencing.
+- **Processed checkpoint**: highest contiguous processed prefix; `None` means
+  nothing processed and differs from `Some(0)`.
+- **Persisted checkpoint**: highest contiguous prefix that is both processed
+  and WAL-durable.
+- **Global checkpoint**: monotonic minimum persisted checkpoint across the
+  primary and every authoritative in-sync replica.
+- Above-gap interval sets retain exact processed/persisted identities; maximum
+  sequence is tracked separately and must never substitute for a checkpoint.
 - `flush_with_global_checkpoint()`: retains WAL entries above global_cp for replica recovery

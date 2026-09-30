@@ -687,11 +687,10 @@ impl RemoteSplitReaderCache {
                 move || -> anyhow::Result<Arc<crate::engine::tantivy::HotEngine>> {
                     let column_cache =
                         Arc::new(crate::engine::column_cache::ColumnCache::new(0, 0));
-                    let engine = crate::engine::tantivy::HotEngine::new_with_mappings(
+                    let engine = crate::engine::tantivy::HotEngine::new_remote_split_with_mappings(
                         &split_dir,
                         Duration::from_secs(60),
                         &mappings,
-                        crate::wal::TranslogDurability::Request,
                         column_cache,
                     )?;
                     Ok(Arc::new(engine))
@@ -1342,6 +1341,24 @@ pub(crate) async fn publish_docs(
         ));
     }
 
+    for doc in &docs {
+        let Some(object) = doc.as_object() else {
+            continue;
+        };
+        if let Err(error) = crate::common::validate_mapping_field_names(
+            object
+                .keys()
+                .map(String::as_str)
+                .filter(|field| *field != "_id"),
+        ) {
+            return Err(crate::api::error_response(
+                StatusCode::BAD_REQUEST,
+                "mapper_parsing_exception",
+                error,
+            ));
+        }
+    }
+
     let (field_ranges, field_terms) = match build_split_field_summaries(&docs, &metadata.mappings) {
         Ok(summaries) => summaries,
         Err(error) => {
@@ -1386,11 +1403,10 @@ pub(crate) async fn publish_docs(
             }
             std::fs::create_dir_all(&staging_for_build)?;
             let column_cache = Arc::new(crate::engine::column_cache::ColumnCache::new(0, 0));
-            let engine = crate::engine::tantivy::HotEngine::new_with_mappings(
+            let engine = crate::engine::tantivy::HotEngine::new_remote_split_with_mappings(
                 &staging_for_build,
                 Duration::from_secs(60),
                 mappings_for_build.as_ref(),
-                crate::wal::TranslogDurability::Request,
                 column_cache,
             )?;
             use crate::engine::SearchEngine;
@@ -1407,7 +1423,8 @@ pub(crate) async fn publish_docs(
         Err(join_err) => Err(anyhow::anyhow!(join_err)),
     } {
         let _ = std::fs::remove_dir_all(&staging_dir);
-        if e.is::<DocumentValidationError>() {
+        if e.is::<DocumentValidationError>() || e.is::<crate::common::ReservedDocumentFieldError>()
+        {
             return Err(crate::api::error_response(
                 StatusCode::BAD_REQUEST,
                 "mapper_parsing_exception",
@@ -1616,26 +1633,11 @@ pub(crate) async fn verify_splits(
     let mut ok_count = 0u32;
     let mut mismatch_count = 0u32;
     let mut missing_count = 0u32;
-    let mut unsupported_count = 0u32;
     let mut split_reports: Vec<Value> = Vec::with_capacity(splits.len());
 
     for split in splits {
         let split_id = split.split_id.clone();
         let expected = split.checksum.clone();
-
-        // Legacy placeholder from an earlier build of this feature. Surface
-        // it so operators know which splits cannot be verified until they
-        // are republished, without failing the whole request.
-        if expected.starts_with("sha256:pending:") {
-            unsupported_count += 1;
-            split_reports.push(serde_json::json!({
-                "split_id": split_id,
-                "status": "unsupported",
-                "reason": "legacy placeholder checksum; republish to get a real hash",
-                "expected": expected,
-            }));
-            continue;
-        }
 
         // Stream-download the bundle and hash it without materializing to disk.
         // This works uniformly against both the local and S3 backends.
@@ -1687,7 +1689,7 @@ pub(crate) async fn verify_splits(
         "ok_count": ok_count,
         "mismatch_count": mismatch_count,
         "missing_count": missing_count,
-        "unsupported_count": unsupported_count,
+        "unsupported_count": 0,
     }))
 }
 
@@ -1700,7 +1702,6 @@ mod tests {
     };
     use crate::engine::tantivy::HotEngine;
     use crate::storage::{RemoteSplitManifest, RemoteSplitState, StorageManager};
-    use crate::wal::TranslogDurability;
     use std::collections::BTreeMap;
     use std::sync::mpsc;
     use tempfile::TempDir;
@@ -1778,11 +1779,10 @@ mod tests {
         let stage = manager.staging_dir(metadata.uuid.as_str(), "split-a");
         std::fs::create_dir_all(&stage).unwrap();
         let column_cache = Arc::new(crate::engine::column_cache::ColumnCache::new(0, 0));
-        let engine = HotEngine::new_with_mappings(
+        let engine = HotEngine::new_remote_split_with_mappings(
             &stage,
             Duration::from_secs(60),
             &mappings,
-            TranslogDurability::Request,
             column_cache,
         )
         .unwrap();

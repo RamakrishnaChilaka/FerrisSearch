@@ -10,6 +10,7 @@ pub(super) struct ShardCopyFailure {
     pub shard_id: u32,
     pub node_id: String,
     pub allocation_id: u64,
+    pub primary_term: u64,
     pub promote_only: bool,
     pub quarantine: bool,
     pub reason: String,
@@ -322,6 +323,7 @@ pub(super) fn open_local_assigned_shards(
                                 shard_id: *shard_id,
                                 node_id: local_node_id.to_string(),
                                 allocation_id,
+                                primary_term: routing.primary_term,
                                 promote_only: false,
                                 quarantine: ShardManager::should_quarantine_copy_failure(&error),
                                 reason: error.to_string(),
@@ -343,6 +345,7 @@ pub(super) fn open_local_assigned_shards(
                             shard_id: *shard_id,
                             node_id: local_node_id.to_string(),
                             allocation_id,
+                            primary_term: routing.primary_term,
                             promote_only: false,
                             quarantine: true,
                             reason: "peer recovery install marker remains after target failure"
@@ -364,6 +367,7 @@ pub(super) fn open_local_assigned_shards(
                                     shard_id: *shard_id,
                                     node_id: local_node_id.to_string(),
                                     allocation_id,
+                                    primary_term: routing.primary_term,
                                     promote_only: false,
                                     quarantine: ShardManager::should_quarantine_copy_failure(
                                         &error,
@@ -390,6 +394,7 @@ pub(super) fn open_local_assigned_shards(
                             shard_id: *shard_id,
                             node_id: local_node_id.to_string(),
                             allocation_id,
+                            primary_term: routing.primary_term,
                             promote_only: routing.primary == local_node_id,
                             quarantine: ShardManager::should_quarantine_copy_failure(&error),
                             reason: error.to_string(),
@@ -430,6 +435,7 @@ pub(super) fn open_local_assigned_shards(
                         shard_id: *shard_id,
                         node_id: local_node_id.to_string(),
                         allocation_id,
+                        primary_term: routing.primary_term,
                         promote_only: routing.primary == local_node_id,
                         quarantine: true,
                         reason: format!("expected shard directory {shard_dir:?} is missing"),
@@ -438,18 +444,31 @@ pub(super) fn open_local_assigned_shards(
                 continue;
             }
 
-            if let Err(error) = shard_manager.open_assigned_shard_with_settings(
-                index_name,
-                *shard_id,
-                &metadata.mappings,
-                &metadata.settings,
-                &metadata.uuid,
-                crate::shard::AssignedShardOpen {
-                    allocation_id,
-                    primary_term: routing.primary_term,
-                    allow_empty_creation,
-                },
-            ) {
+            let assignment = crate::shard::AssignedShardOpen {
+                allocation_id,
+                primary_term: routing.primary_term,
+                allow_empty_creation,
+            };
+            let open_result = if routing.primary == local_node_id {
+                shard_manager.open_primary_assigned_shard_with_settings(
+                    index_name,
+                    *shard_id,
+                    &metadata.mappings,
+                    &metadata.settings,
+                    &metadata.uuid,
+                    assignment,
+                )
+            } else {
+                shard_manager.open_assigned_shard_with_settings(
+                    index_name,
+                    *shard_id,
+                    &metadata.mappings,
+                    &metadata.settings,
+                    &metadata.uuid,
+                    assignment,
+                )
+            };
+            if let Err(error) = open_result {
                 tracing::warn!(
                     "Failed to reopen local shard {}/{} during lifecycle reconciliation: {}",
                     index_name,
@@ -463,6 +482,7 @@ pub(super) fn open_local_assigned_shards(
                         shard_id: *shard_id,
                         node_id: local_node_id.to_string(),
                         allocation_id,
+                        primary_term: routing.primary_term,
                         promote_only: routing.primary == local_node_id,
                         quarantine: ShardManager::should_quarantine_copy_failure(&error),
                         reason: error.to_string(),

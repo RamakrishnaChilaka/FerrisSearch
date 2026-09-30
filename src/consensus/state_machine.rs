@@ -39,6 +39,24 @@ impl ClusterStateMachine {
         self.state.clone()
     }
 
+    #[cfg(feature = "protocol-trace")]
+    pub fn from_state_for_protocol_trace_test(state: ClusterState) -> Self {
+        Self {
+            state: Arc::new(RwLock::new(state)),
+            last_applied: None,
+            last_membership: StoredMembership::default(),
+        }
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    pub fn apply_command_for_protocol_trace_test(
+        &self,
+        command: &ClusterCommand,
+        raft_log_index: u64,
+    ) -> ClusterResponse {
+        self.apply_command_at(command, raft_log_index)
+    }
+
     fn apply_command_at(&self, cmd: &ClusterCommand, raft_log_index: u64) -> ClusterResponse {
         let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
         match cmd {
@@ -483,6 +501,7 @@ impl ClusterStateMachine {
                 shard_id,
                 node,
                 allocation_id,
+                expected_primary_term,
                 promote_only,
                 promotion_candidate,
             } => {
@@ -512,6 +531,17 @@ impl ClusterStateMachine {
                         "index '{index_name}' has no shard {shard_id}"
                     ));
                 };
+                if *expected_primary_term == 0 {
+                    return ClusterResponse::Error(format!(
+                        "failed-copy primary term must be greater than zero for index '{index_name}' shard {shard_id}"
+                    ));
+                }
+                if current_routing.primary_term != *expected_primary_term {
+                    return ClusterResponse::Error(format!(
+                        "primary term mismatch for failed copy of index '{index_name}' shard {shard_id}: expected {}, got {}",
+                        current_routing.primary_term, expected_primary_term
+                    ));
+                }
                 if !current_allocations.primary_initialized {
                     return ClusterResponse::Error(format!(
                         "cannot fail shard copy for uninitialized index '{index_name}' shard {shard_id}"
@@ -621,6 +651,17 @@ impl ClusterStateMachine {
                         "invalid allocation metadata after failing copy for index '{index_name}' shard {shard_id}: {reason}"
                     ));
                 }
+                #[cfg(feature = "protocol-trace")]
+                let promoted_trace = is_primary.then(|| {
+                    (
+                        routing.primary.clone(),
+                        routing.primary_term,
+                        routing.in_sync_replicas.clone(),
+                    )
+                });
+                #[cfg(feature = "protocol-trace")]
+                let removed_trace = (!is_primary)
+                    .then(|| (routing.primary.clone(), routing.in_sync_replicas.clone()));
                 state.indices.insert(index_name.clone(), metadata);
                 state
                     .shard_allocations
@@ -628,6 +669,28 @@ impl ClusterStateMachine {
                     .expect("validated allocation map exists")
                     .insert(*shard_id, allocations);
                 state.version += 1;
+                #[cfg(feature = "protocol-trace")]
+                if let Some((new_primary, term, in_sync)) = promoted_trace {
+                    crate::protocol_trace::record_routing_promoted(
+                        &new_primary,
+                        index_uuid,
+                        *shard_id,
+                        &new_primary,
+                        term,
+                        &in_sync,
+                    );
+                }
+                #[cfg(feature = "protocol-trace")]
+                if let Some((emitter, in_sync)) = removed_trace {
+                    crate::protocol_trace::record_in_sync_removed(
+                        &emitter,
+                        index_uuid,
+                        *shard_id,
+                        node,
+                        *allocation_id,
+                        &in_sync,
+                    );
+                }
                 ClusterResponse::Ok
             }
             ClusterCommand::AddMappings {
@@ -745,8 +808,28 @@ impl RaftStateMachine<TypeConfig> for ClusterStateMachine {
         snapshot: Cursor<Vec<u8>>,
     ) -> Result<(), io::Error> {
         let data = snapshot.into_inner();
-        let new_state: ClusterState = serde_json::from_slice(&data)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let new_state: ClusterState = serde_json::from_slice(&data).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                crate::consensus::UnsupportedRaftFormatError::new(
+                    "Raft cluster-state snapshot",
+                    format!("cannot decode current snapshot format: {error}"),
+                ),
+            )
+        })?;
+        if new_state.format_version != crate::cluster::state::CLUSTER_STATE_FORMAT_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                crate::consensus::UnsupportedRaftFormatError::new(
+                    "Raft cluster-state snapshot",
+                    format!(
+                        "version {} is not supported; expected {}",
+                        new_state.format_version,
+                        crate::cluster::state::CLUSTER_STATE_FORMAT_VERSION
+                    ),
+                ),
+            ));
+        }
 
         {
             let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
@@ -1437,6 +1520,7 @@ mod tests {
                     shard_id: 0,
                     node: "node-2".into(),
                     allocation_id: 9,
+                    expected_primary_term: 2,
                     promote_only: false,
                     promotion_candidate: None,
                 },
@@ -1452,6 +1536,7 @@ mod tests {
                     shard_id: 0,
                     node: "node-2".into(),
                     allocation_id: 10,
+                    expected_primary_term: 2,
                     promote_only: false,
                     promotion_candidate: None,
                 },
@@ -1494,6 +1579,7 @@ mod tests {
                     shard_id: 0,
                     node: "node-2".into(),
                     allocation_id: 10,
+                    expected_primary_term: 2,
                     promote_only: false,
                     promotion_candidate: None,
                 },
@@ -1508,6 +1594,73 @@ mod tests {
                 .shard_allocation_id("idx", 0, "node-2"),
             Some(14)
         );
+    }
+
+    #[test]
+    fn delayed_old_term_failure_cannot_remove_replica() {
+        let sm = ClusterStateMachine::new("test".into());
+        let mut metadata = make_index("idx");
+        metadata.number_of_replicas = 1;
+        {
+            let routing = metadata.shard_routing.get_mut(&0).unwrap();
+            routing.replicas = vec!["node-2".into()];
+            routing.in_sync_replicas = vec!["node-2".into()];
+        }
+        let index_uuid = metadata.uuid.to_string();
+        assert_eq!(
+            sm.apply_command_at(&ClusterCommand::CreateIndex { metadata }, 10),
+            ClusterResponse::Ok
+        );
+        assert_eq!(
+            sm.apply_command_at(
+                &ClusterCommand::ActivatePrimary {
+                    index_name: "idx".into(),
+                    index_uuid: index_uuid.clone(),
+                    shard_id: 0,
+                    primary: "node-1".into(),
+                    allocation_id: 10,
+                    expected_term: 1,
+                },
+                11,
+            ),
+            ClusterResponse::Ok
+        );
+        assert_eq!(
+            sm.apply_command_at(
+                &ClusterCommand::ActivatePrimary {
+                    index_name: "idx".into(),
+                    index_uuid: index_uuid.clone(),
+                    shard_id: 0,
+                    primary: "node-1".into(),
+                    allocation_id: 10,
+                    expected_term: 2,
+                },
+                12,
+            ),
+            ClusterResponse::Ok
+        );
+        let version_before = sm.state_handle().read().unwrap().version;
+
+        assert!(matches!(
+            sm.apply_command_at(
+                &ClusterCommand::FailShardCopy {
+                    index_name: "idx".into(),
+                    index_uuid,
+                    shard_id: 0,
+                    node: "node-2".into(),
+                    allocation_id: 10,
+                    expected_primary_term: 2,
+                    promote_only: false,
+                    promotion_candidate: None,
+                },
+                13,
+            ),
+            ClusterResponse::Error(error) if error.contains("primary term mismatch")
+        ));
+        let state = sm.state_handle();
+        let state = state.read().unwrap();
+        assert_eq!(state.version, version_before);
+        assert_eq!(state.shard_allocation_id("idx", 0, "node-2"), Some(10));
     }
 
     #[test]
@@ -1529,6 +1682,7 @@ mod tests {
                     shard_id: 0,
                     node: "node-1".into(),
                     allocation_id: 10,
+                    expected_primary_term: 1,
                     promote_only: false,
                     promotion_candidate: None,
                 },
@@ -1580,6 +1734,7 @@ mod tests {
                     shard_id: 0,
                     node: "node-1".into(),
                     allocation_id: 10,
+                    expected_primary_term: 2,
                     promote_only: true,
                     promotion_candidate: Some("node-2".into()),
                 },
@@ -1631,6 +1786,7 @@ mod tests {
                     shard_id: 0,
                     node: "node-1".into(),
                     allocation_id: 10,
+                    expected_primary_term: 2,
                     promote_only: false,
                     promotion_candidate: None,
                 },
@@ -1646,6 +1802,7 @@ mod tests {
                     shard_id: 0,
                     node: "node-1".into(),
                     allocation_id: 10,
+                    expected_primary_term: 2,
                     promote_only: true,
                     promotion_candidate: None,
                 },
@@ -1885,6 +2042,7 @@ mod tests {
                     shard_id: 0,
                     node: "node-1".into(),
                     allocation_id: 10,
+                    expected_primary_term: 2,
                     promote_only: true,
                     promotion_candidate: Some("node-3".into()),
                 },
@@ -1900,6 +2058,7 @@ mod tests {
                     shard_id: 0,
                     node: "node-1".into(),
                     allocation_id: 10,
+                    expected_primary_term: 2,
                     promote_only: true,
                     promotion_candidate: Some("node-2".into()),
                 },
@@ -2162,6 +2321,59 @@ mod tests {
             assert_eq!(state.cluster_name, "replaced");
             assert!(state.nodes.contains_key("new-node"));
             assert!(!state.nodes.contains_key("old"));
+        });
+    }
+
+    #[test]
+    fn no_compat_old_raft_snapshot_requires_recreate() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut sm = ClusterStateMachine::new("original".into());
+            let mut old_state = ClusterState::new("old".into());
+            old_state.format_version = 0;
+            let snap_data = serde_json::to_vec(&old_state).unwrap();
+            let meta = SnapshotMeta {
+                last_log_id: None,
+                last_membership: StoredMembership::default(),
+                snapshot_id: "old-format".into(),
+            };
+
+            let error = sm
+                .install_snapshot(&meta, Cursor::new(snap_data))
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                error
+                    .to_string()
+                    .contains("wipe the node data directories and recreate the cluster")
+            );
+            assert!(!error.to_string().contains("recreate the index"));
+        });
+    }
+
+    #[test]
+    fn malformed_raft_snapshot_requires_cluster_recreation() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut sm = ClusterStateMachine::new("original".into());
+            let meta = SnapshotMeta {
+                last_log_id: None,
+                last_membership: StoredMembership::default(),
+                snapshot_id: "malformed".into(),
+            };
+
+            let error = sm
+                .install_snapshot(&meta, Cursor::new(b"{not-json".to_vec()))
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                error
+                    .to_string()
+                    .contains("wipe the node data directories and recreate the cluster")
+            );
+            assert!(!error.to_string().contains("recreate the index"));
         });
     }
 

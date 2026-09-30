@@ -160,10 +160,16 @@ By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `
 
 `create_index()`, `get_index_settings()`, and `update_index_settings()` must keep `refresh_interval_ms` and `flush_threshold_bytes` in sync end-to-end across HTTP parsing, gRPC forwarding, and Raft state updates. `GET /{index}/_settings` must return both fields when set. `flush_threshold_bytes: 0` is a valid disable value and must not be treated as "missing".
 `engine` is a create-time immutable selector. `create_index()` accepts `engine: "local_shards"` (or an object form with `type`) and persists it through Raft/transport metadata. `GET /{index}/_settings` must expose the engine. `PUT /{index}/_settings` must reject engine changes. `remote_store` reads must route through the dedicated manifest + split execution path, while write-style `_doc` / `_bulk` / `_update` / `_delete` requests still fail with `501 Not Implemented` instead of falling through shard-routing code.
+Create-index requests must reject `settings.engine` with HTTP 400 and direct
+callers to the supported top-level `engine` field; never silently create a
+`local_shards` index from the ignored nested selector.
 `publish_remote_store_documents()` applies the same mapped-keyword validation as
 normal CRUD before publishing any bundle or manifest. Keyword object values
 return a field-specific `400 mapper_parsing_exception`; they are not build
-failures and must not publish partial data.
+failures and must not publish partial data. Document `_id` remains publish
+request metadata and is stripped from `_source`; every other shared reserved
+document key returns `400 mapper_parsing_exception` before staging or manifest
+publication.
 `AppState.raft` is `Arc<RaftInstance>`, not `Option` — Raft is always present. Index-management handlers use `state.raft` directly without unwrapping.
 `POST /{index}/_forcemerge` keeps its asynchronous `202 Accepted` task
 lifecycle. `max_num_segments` defaults to `1` and must parse as an integer in
@@ -203,11 +209,14 @@ Oversized single/delete writes return a validation error before mutation;
 oversized bulk documents remain attributable item failures.
 Retryable gRPC `ABORTED` write failures map to HTTP 503
 `shard_not_available_exception` with the underlying cause preserved.
+Only `RESOURCE_EXHAUSTED` statuses carrying the stable version-map-capacity
+marker map to HTTP 429 `version_map_capacity_exceeded`; unrelated resource
+exhaustion remains a 500 forwarding failure.
 
 This does not implement full OpenSearch write concurrency semantics.
-`_version` / `_primary_term` values that appear in compatibility response shapes
-remain placeholders, and `if_seq_no` / `if_primary_term`, primary epochs,
-idempotent retries, and complete optimistic concurrency control are not yet
+`_seq_no` and `_primary_term` are real primary-assigned operation receipts.
+`_version` remains a placeholder, and `if_seq_no` / `if_primary_term`, client
+retry identity, and complete optimistic concurrency control are not yet
 implemented.
 
 Declared keyword fields accept nested arrays of string/number/boolean scalars,
@@ -215,6 +224,20 @@ flatten and coerce them to text for indexing, ignore nulls, and deduplicate a
 value within one document while preserving `_source`. Object values fail as
 `400 mapper_parsing_exception`; validate the whole shard batch before any WAL
 or writer mutation.
+
+Document sources must reject the shared reserved metadata keys `_id`,
+`_doc_id`, `_source`, `_seq_no`, `_primary_term`, `_version`, `_index`, and
+`_routing`. Single index and update requests return
+`400 mapper_parsing_exception`; update validation covers `doc`, `upsert`, and
+the merged source. Bulk `index`, `create`, and `update` items fail independently
+with item-level 400 responses so valid neighboring items still run. Action-line
+`_id` and `_index` remain request metadata; only document-source keys are
+rejected. Create-index mapping `properties` uses the same reserved-name check.
+FerrisSearch does not currently expose a public `PUT /{index}/_mapping` route;
+the internal `AddMappings` path enforces the same rule. `body` is the built-in
+catch-all text field: create-index accepts only a plain `{"type":"text"}`
+mapping for it and rejects every other type or parameter as
+`400 mapper_parsing_exception`.
 
 ### Search — src/api/search/mod.rs
 | HTTP | Path | Handler |
@@ -313,9 +336,9 @@ write itself remains on the dedicated write pool.
 ## Bulk Index Parsing
 `parse_bulk_ndjson(text)` supports:
 - **OpenSearch format**: action line `{"index": {"_index": "idx", "_id": "1"}}` + document line
-- **Legacy format**: `_id` or `_doc_id` in document body
-- **`_source` wrapper**: unwrapped before storage
 - **Missing IDs**: UUID auto-generated
+- Document bodies are stored as supplied. Do not infer IDs from `_id` /
+  `_doc_id` source fields or unwrap a source-level `_source` object.
 
 ## Auto-Create Index (Coordinator Pattern)
 Document and bulk handlers auto-create missing indices via `auto_create_index()`. This helper:

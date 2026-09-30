@@ -52,10 +52,15 @@ pub struct ShardManager {
 ### Durable Copy Identity
 - Every served assigned copy has `<data_dir>/<uuid>/shard_<id>/SHARD_COPY_IDENTITY.json`.
 - The versioned JSON contains index UUID, allocation ID, and durable replica
-  fence. Updates use temp write, file fsync, rename, and directory fsync.
+  fence plus an allocation-bound collision-quarantine flag. Updates use temp
+  write, file fsync, rename, and directory fsync.
 - Assigned opens load and validate the file before publishing an engine.
   Missing, malformed, or mismatched identity fails closed.
 - Identity, marker, WAL, and Tantivy decode/validation failures are definitive.
+  Sequence-state corruption, including disagreement between the durable
+  identity fence maximum and the committed term-start maximum, is also
+  definitive and must fail the exact copy instead of consuming the I/O retry
+  window.
   Other filesystem/engine I/O uses a shared per-copy retry budget: exponential
   1–5 second backoff, at least three failed attempts, and a 60-second minimum
   window before persistent-I/O escalation.
@@ -71,14 +76,34 @@ pub struct ShardManager {
   outcome. In production it means the Tantivy writer was killed, so the next
   commit fails and rebuild or restart replay applies the entry on this copy.
   On a primary, replicas never receive it, so copies can diverge; peer
-  recovery from this copy can ship the retained entry to a new copy.
-  Definitive and open-level failures may quarantine, but only after the report
-  throttle admits the attempt.
+  recovery from this copy can ship the retained entry to a new copy. When a
+  later write exposes that missing sequence, every affected replica normally
+  reaches the fixed gap deadline (about 60 seconds), is removed, and is
+  peer-recovered. This is intentionally conservative until D10 adds targeted
+  repair.
+  Definitive and open-level failures may quarantine only after the report
+  throttle admits the attempt, except sequence/version collisions, which
+  atomically persist collision quarantine before the engine is evicted and are
+  also reported by the primary. If marker persistence fails, retain the marked
+  identity in memory, keep the engine evicted, and return a reportable
+  persistent-storage failure. Later collision handling may retry the atomic
+  marker write, but assigned open and replica apply must reject the cached
+  marker until persistence succeeds or the process exits.
 - Only an uninitialized CreateIndex primary allocation may create a fresh empty
   copy. Initial and later out-of-sync replicas receive identity through
   verified recovery install.
-- Pre-1.0 copies without this file are not adopted; clusters must be recreated
-  or reindexed.
+- Pre-1.0 or unknown copy identity versions are never adopted or upgraded.
+  They use the shared unsupported-format error and require index recreation.
+- A collision-quarantined identity cannot open or accept replica apply for the
+  same allocation. The marker remains until routing removes that allocation
+  and peer recovery installs a fresh identity for a new allocation.
+- Assigned open checks cached and durable collision quarantine under the
+  shard-open lock before consulting I/O retry backoff. Definitive errors,
+  including active collision quarantine, never arm or retain copy-I/O retry
+  state.
+- `fence_max_seq_no` is captured and persisted only when a copy fence advances
+  (or when peer recovery creates a new identity). Ordinary assigned-copy open
+  validates and reconciles that value but never rewrites it.
 - A stale exact `SHARD_COPY_IDENTITY.json.tmp` is removed before the
   initial-primary empty-directory check. Local/test helpers load and preserve
   an existing durable identity rather than overwriting it with allocation `1`.
@@ -97,7 +122,9 @@ pub struct ShardManager {
 2. Create SettingsManager (one per index) with watch channels
 3. Create directory at `<data_dir>/<uuid>/shard_<id>`
 4. Start `CompositeEngine::start_refresh_loop_reactive()` — responds to setting changes
-5. Call `engine.rebuild_vectors()` only when `mappings` contains `KnnVector` fields — skip the expensive 100K-doc MatchAll query for non-vector indices to prevent OOM during multi-shard restart
+5. Call `engine.rebuild_vectors()` only when `mappings` contains `KnnVector`
+   fields. Rebuild scans every live Tantivy document in bounded batches; skip
+   that scan entirely for non-vector indices.
 6. Handle schema mismatch by wiping orphaned directories and retrying
 
 Peer-recovery install is the exception to step 6: while
@@ -129,7 +156,9 @@ Reopen is replacement-only: after acquiring that lifecycle lock and again
 under the per-shard open lock, the registered UUID must still match and the
 exact shard engine/directory must still exist. A detached reopen must never
 register an old UUID, recreate a deleted directory, or create a missing engine.
-Its existing-only engine open also requires `index/meta.json`.
+Its existing-only engine open also requires `index/meta.json`. When mappings
+contain vector fields, rebuild and persist the complete vector index on the
+blocking pool before starting maintenance or publishing the replacement engine.
 Async index deletion acquires every lifecycle lock registered for the UUID and
 every per-shard open lock registered for the index, including shards temporarily
 absent from the engine map during reopen, before removing engines or storage.
@@ -159,16 +188,18 @@ pub struct IsrTracker {
 }
 
 pub struct ReplicaCheckpoint {
-    pub checkpoint: u64,
+    pub allocation_id: u64,
+    pub processed_checkpoint: Option<u64>,
+    pub persisted_checkpoint: Option<u64>,
     pub last_updated: Instant,
 }
 ```
 
 ### Key Methods
-- `update_replica_checkpoint(index, shard_id, replica_node_id, checkpoint)`
-- `update_replica_checkpoints(index, shard_id, checkpoints: &[(String, u64)])`
+- `update_replica_checkpoint(...)` / `update_replica_checkpoints(...)` take
+  exact-allocation typed checkpoint responses plus the captured primary prefix
 - `in_sync_replicas(index, shard_id, primary_checkpoint) -> Vec<String>`
-  - Returns a legacy lag-based diagnostic view only; it does not grant
+  - Returns a lag-based diagnostic view only; it does not grant
     authoritative in-sync membership
 - `replica_checkpoints(index, shard_id) -> Vec<(String, u64)>`
 - `remove_shard(index, shard_id)`, `remove_index(index)`
@@ -176,14 +207,16 @@ pub struct ReplicaCheckpoint {
 ### How Checkpoint Observations Are Used
 1. Primary writes to WAL + engine → replicates to the Raft-authoritative
    `ShardRoutingEntry.in_sync_replicas`
-2. Each replica returns its `local_checkpoint` after applying
-3. Primary calls `update_replica_checkpoints()` with returned values
+2. Each replica proves the exact operation processed and returns optional
+   contiguous processed/persisted checkpoints
+3. Primary updates a monotonic maximum per exact allocation; reordered lower
+   responses cannot regress it
 4. A leader that also hosts the primary may use `replica_checkpoints()` to
    prefer the highest observed candidate within the authoritative in-sync set;
    otherwise it chooses a live in-sync cluster member without checkpoint
    ranking
 
-The current checkpoint values are highest-observed sequence watermarks, not
-proof that every lower sequence was applied. Do not describe ISR tracking,
-global checkpoint updates, or recovery as gap-aware until an explicit
-contiguous-prefix protocol exists.
+Checkpoint observations are contiguous-prefix proofs, not maximum sequence
+numbers. `ReplicaGapObservation` fixes its target at first observation and the
+lifecycle performs an exact-allocation sequence-state probe before removal.
+The tracker remains diagnostic/ranking state and never grants membership.

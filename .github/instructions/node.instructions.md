@@ -67,7 +67,10 @@ pub struct Node {
    reports remove the exact allocation; primary reports are promote-only and
    are submitted only with an in-sync candidate. Duplicate reports are
    throttled per allocation. Definitive/open-level quarantine occurs only
-   after that throttle; Apply escalation leaves the copy open for reads.
+   after that throttle except for sequence/version collisions, which
+   persist allocation-bound collision quarantine immediately; Apply escalation
+   leaves the copy open for reads. Lifecycle reopen keeps rediscovering and
+   reporting a collision marker until Raft removes the exact allocation.
 5. Proactively invoke the shared primary-activation path for each local primary
    after startup or promotion. The activation cache is keyed by
    UUID/shard/allocation/term so lifecycle ticks and request handlers do not
@@ -110,6 +113,13 @@ pub struct Node {
 - Source snapshot preparation can rebuild a failed Tantivy writer and replay
   the retained WAL suffix while the shard is idle. A transient source commit
   failure must not leave replica recovery dependent on a later client write.
+- If catch-up reaches a WAL frame the source has not processed, the physical
+  cursor remains at that frame and the target advances to finalization. The
+  exclusive finalize barrier rebuilds/replays the source writer and serves the
+  remaining suffix without discarding the session's transferred snapshot.
+  Apply the same rule when `PrepareFinalizeRecovery` requests another catch-up:
+  an empty incomplete response at the unchanged cursor returns to finalize
+  rather than failing the recovery for lack of physical progress.
 - A failed target retains `PEER_RECOVERY_IN_PROGRESS` and stays unavailable.
   An inactive marker whose embedded allocation ID matches the current
   out-of-sync assignment is reported through `FailShardCopy`; an active target,
@@ -173,6 +183,28 @@ pub struct Node {
 
 Promotion changes increment the state-machine-owned shard term. A promoted or
 restarted primary still activates once per process before its first write.
+Activation persists the durable fence, replays retained WAL state, fills every
+missing local sequence through the fenced maximum with durable current-term
+NoOps, and only then enables writes. Best-effort NoOp replication may leave a
+bounded replica gap for normal probe/removal handling; it must not weaken local
+activation. Lifecycle ticks retry failed promotion NoOp batches for the same
+active UUID/allocation/term only while the process-local pending entry remains.
+Restart or an activation failure after local NoOp application can lose that
+entry; current code does not rebuild it from the WAL. The replica then remains
+gapful until the fixed deadline removes the allocation and peer recovery
+rebuilds it.
+Activation and retry serialization is allocation-local, so a slow or
+unreachable replica for one shard does not delay client writes on another
+shard. Lifecycle ticks still activate shards one at a time: a retry that waits
+on an unreachable replica, for up to its 30 s timeout, delays activation of the
+shards after it in the same tick.
+These promotion NoOps fill gaps on the promoted copy only; they do not repair
+replicas that missed a real post-WAL primary operation. Such copies follow the
+gap deadline and peer-recovery path until D10 exists.
+
+Earlier shard schemas, committed boundaries, manifests, WAL entries, and copy
+identities never migrate in place. Every role fails closed through the same
+typed unsupported-format error and directs the operator to recreate the index.
 Whole-index `UpdateIndex` races beyond the enforced routing rules remain future
 work.
 

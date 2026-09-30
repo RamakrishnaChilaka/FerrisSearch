@@ -1,0 +1,82 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 130 and seed -3278041627581660576 with 12 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 75133] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/MC_D1_TermCollision.tla
+Parsing file /tmp/d1-b1-h/Naturals.tla
+Parsing file /tmp/d1-b1-h/FiniteSets.tla
+Parsing file /tmp/d1-b1-h/TLC.tla
+Parsing file /tmp/d1-b1-h/Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module MC_D1_TermCollision
+Starting... (2026-09-28 05:22:11)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-09-28 05:22:12.
+Error: Invariant B1NoCopyBehindAcked is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ docTerm = (p :> 1 @@ r1 :> 1 @@ r2 :> 1)
+/\ fenceTerm = (p :> 1 @@ r1 :> 1 @@ r2 :> 1)
+/\ primary = p
+/\ docSeq = (p :> 10 @@ r1 :> 10 @@ r2 :> 10)
+/\ inSync = {r1, r2}
+/\ docOp = (p :> "NONE" @@ r1 :> "NONE" @@ r2 :> "NONE")
+/\ maxSeqNo = (p :> 10 @@ r1 :> 10 @@ r2 :> 10)
+/\ durableMaxSeqNo = (p :> 10 @@ r1 :> 10 @@ r2 :> 10)
+/\ phase = 0
+/\ primaryTerm = 1
+/\ newAcknowledged = FALSE
+/\ recovered = FALSE
+/\ failed = {}
+
+State 2: <B1OldWritePartiallyReplicated line 67, col 5 to line 77, col 23 of module MC_D1_TermCollision>
+/\ docSeq = (p :> 11 @@ r1 :> 10 @@ r2 :> 11)
+/\ docOp = (p :> "OLD_TERM_1_SEQ_11" @@ r1 :> "NONE" @@ r2 :> "OLD_TERM_1_SEQ_11")
+/\ maxSeqNo = (p :> 11 @@ r1 :> 10 @@ r2 :> 11)
+/\ durableMaxSeqNo = (p :> 11 @@ r1 :> 10 @@ r2 :> 11)
+/\ phase = 1
+
+State 3: <B1PromoteR1 line 82, col 5 to line 92, col 23 of module MC_D1_TermCollision>
+/\ fenceTerm = (p :> 1 @@ r1 :> 2 @@ r2 :> 1)
+/\ primary = r1
+/\ inSync = {r2}
+/\ phase = 2
+/\ primaryTerm = 2
+
+State 4: <B1SeqOnlyNewWrite line 98, col 5 to line 108, col 68 of module MC_D1_TermCollision>
+/\ docTerm = (p :> 1 @@ r1 :> 2 @@ r2 :> 1)
+/\ fenceTerm = (p :> 1 @@ r1 :> 2 @@ r2 :> 2)
+/\ docSeq = (p :> 11 @@ r1 :> 11 @@ r2 :> 11)
+/\ docOp = ( p :> "OLD_TERM_1_SEQ_11" @@
+  r1 :> "NEW_TERM_2_SEQ_11" @@
+  r2 :> "OLD_TERM_1_SEQ_11" )
+/\ maxSeqNo = (p :> 11 @@ r1 :> 11 @@ r2 :> 11)
+/\ durableMaxSeqNo = (p :> 11 @@ r1 :> 11 @@ r2 :> 11)
+/\ phase = 3
+/\ newAcknowledged = TRUE
+
+State 5: <B1SeqOnlyReadyForPromotion line 130, col 5 to line 136, col 23 of module MC_D1_TermCollision>
+/\ phase = 4
+
+State 6: <B1PromoteR2 line 156, col 5 to line 162, col 67 of module MC_D1_TermCollision>
+/\ docTerm = (p :> 1 @@ r1 :> 2 @@ r2 :> 1)
+/\ fenceTerm = (p :> 1 @@ r1 :> 2 @@ r2 :> 2)
+/\ primary = r2
+/\ docSeq = (p :> 11 @@ r1 :> 11 @@ r2 :> 11)
+/\ inSync = {r2}
+/\ docOp = ( p :> "OLD_TERM_1_SEQ_11" @@
+  r1 :> "NEW_TERM_2_SEQ_11" @@
+  r2 :> "OLD_TERM_1_SEQ_11" )
+/\ maxSeqNo = (p :> 11 @@ r1 :> 11 @@ r2 :> 11)
+/\ durableMaxSeqNo = (p :> 11 @@ r1 :> 11 @@ r2 :> 11)
+/\ phase = 5
+/\ primaryTerm = 2
+/\ newAcknowledged = TRUE
+/\ recovered = FALSE
+/\ failed = {}
+
+6 states generated, 6 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 6.
+The average outdegree of the complete state graph is 1 (minimum is 1, the maximum 1 and the 95th percentile is 1).
+Finished in 01s at (2026-09-28 05:22:12)

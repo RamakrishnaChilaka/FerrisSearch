@@ -8,7 +8,7 @@ use crate::shard::{
 use crate::transport::TransportClient;
 use crate::transport::proto::{
     CompleteFinalizeRecoveryRequest, FetchRecoveryFileChunkRequest, FetchRecoveryOpsRequest,
-    PrepareFinalizeRecoveryRequest, RecoverReplicaOp, RecoveryFileMetadata,
+    PrepareFinalizeRecoveryRequest, RecoveryFileMetadata, RecoveryOperation,
     StartPeerRecoveryRequest,
 };
 use anyhow::{Context, Result};
@@ -454,8 +454,38 @@ struct CompletionSettlementContext<'a> {
     transport_client: &'a TransportClient,
     session_id: &'a str,
     pending: &'a PeerRecoveryAwaitingMembership,
-    applied_next_seq_no: u64,
+    applied_cursor: crate::wal::WalCursor,
+    processed_checkpoint: Option<u64>,
     retry_timeout: Duration,
+}
+
+#[cfg_attr(not(feature = "protocol-trace"), allow(dead_code))]
+#[derive(Clone)]
+struct RecoveryApplyContext {
+    node: String,
+    index_uuid: String,
+    shard: u32,
+    allocation: u64,
+}
+
+fn require_recovery_cursor(
+    cursor: Option<crate::transport::proto::RecoveryWalCursor>,
+    label: &'static str,
+) -> Result<crate::wal::WalCursor> {
+    let cursor = cursor.ok_or_else(|| anyhow::anyhow!("{label} is missing"))?;
+    Ok(crate::wal::WalCursor {
+        generation_id: cursor.generation_id,
+        byte_offset: cursor.byte_offset,
+    })
+}
+
+fn recovery_cursor_proto(
+    cursor: crate::wal::WalCursor,
+) -> crate::transport::proto::RecoveryWalCursor {
+    crate::transport::proto::RecoveryWalCursor {
+        generation_id: cursor.generation_id,
+        byte_offset: cursor.byte_offset,
+    }
 }
 
 async fn run_peer_recovery(
@@ -489,7 +519,36 @@ async fn run_peer_recovery(
     if start.target_allocation_id != Some(candidate.allocation_id) {
         anyhow::bail!("peer recovery source returned a different target allocation ID");
     }
+    let snapshot_cursor = require_recovery_cursor(start.snapshot_cursor, "snapshot WAL cursor")?;
+    let committed_boundary: crate::engine::sequence::CommittedBoundaryRecord =
+        serde_json::from_slice(&start.committed_boundary_json)
+            .context("decode peer recovery committed boundary")?;
+    committed_boundary.validate()?;
+    if committed_boundary.processed_checkpoint != start.snapshot_processed_checkpoint
+        || committed_boundary.persisted_checkpoint != start.snapshot_persisted_checkpoint
+        || committed_boundary.max_seq_no != start.snapshot_max_seq_no
+    {
+        anyhow::bail!("peer recovery committed boundary summary mismatch");
+    }
+    if committed_boundary.term_sequence_state.current_term != start.primary_term {
+        anyhow::bail!("peer recovery committed boundary term mismatch");
+    }
     validate_file_manifest(&start.files)?;
+    #[cfg(feature = "protocol-trace")]
+    let snapshot_next_seq_no = committed_boundary
+        .max_seq_no
+        .and_then(|seq_no| seq_no.checked_add(1))
+        .unwrap_or(0);
+    #[cfg(feature = "protocol-trace")]
+    let trace_context = crate::protocol_trace::RecoveryTraceContext {
+        source_node: candidate.primary.id.clone(),
+        target_node: local_node_id.to_string(),
+        index_uuid: candidate.metadata.uuid.to_string(),
+        shard: candidate.shard_id,
+        allocation: candidate.allocation_id,
+        session_id: start.session_id.clone(),
+        snapshot_next_seq_no,
+    };
 
     if !shard_manager
         .begin_peer_recovery_target_blocking(
@@ -503,6 +562,18 @@ async fn run_peer_recovery(
         anyhow::bail!("peer recovery target is already active");
     }
     destructive_started.store(true, Ordering::Release);
+    #[cfg(feature = "protocol-trace")]
+    let shard_dir = shard_manager
+        .prepare_peer_recovery_target_blocking_traced(
+            candidate.index_name.clone(),
+            candidate.shard_id,
+            candidate.metadata.uuid.to_string(),
+            candidate.allocation_id,
+            trace_context.clone(),
+        )
+        .await
+        .map_err(ShardManager::local_storage_failure)?;
+    #[cfg(not(feature = "protocol-trace"))]
     let shard_dir = shard_manager
         .prepare_peer_recovery_target_blocking(
             candidate.index_name.clone(),
@@ -534,24 +605,35 @@ async fn run_peer_recovery(
         .map_err(|error| anyhow::anyhow!("index directory sync task failed: {error}"))?
         .map_err(ShardManager::local_storage_failure)?;
 
+    let install = PeerRecoveryTargetInstall {
+        index: candidate.index_name.clone(),
+        shard_id: candidate.shard_id,
+        mappings: candidate.metadata.mappings.clone(),
+        settings: candidate.metadata.settings.clone(),
+        index_uuid: candidate.metadata.uuid.to_string(),
+        allocation_id: candidate.allocation_id,
+        primary_term: start.primary_term,
+        shard_dir,
+        committed_boundary: committed_boundary.clone(),
+        expected_files: start.files.iter().map(|file| file.name.clone()).collect(),
+    };
+    #[cfg(feature = "protocol-trace")]
     let engine = shard_manager
-        .finalize_peer_recovery_target_blocking(PeerRecoveryTargetInstall {
-            index: candidate.index_name.clone(),
-            shard_id: candidate.shard_id,
-            mappings: candidate.metadata.mappings.clone(),
-            settings: candidate.metadata.settings.clone(),
-            index_uuid: candidate.metadata.uuid.to_string(),
-            allocation_id: candidate.allocation_id,
-            primary_term: start.primary_term,
-            shard_dir,
-            snapshot_next_seq_no: start.snapshot_next_seq_no,
-            expected_files: start.files.iter().map(|file| file.name.clone()).collect(),
-        })
+        .finalize_peer_recovery_target_blocking_traced(install, trace_context.clone())
         .await
         .map_err(ShardManager::local_storage_failure)?;
-    set_checkpoint_from_next(&engine, start.snapshot_next_seq_no);
-
-    let mut next_seq_no = start.snapshot_next_seq_no;
+    #[cfg(not(feature = "protocol-trace"))]
+    let engine = shard_manager
+        .finalize_peer_recovery_target_blocking(install)
+        .await
+        .map_err(ShardManager::local_storage_failure)?;
+    let recovery_apply = RecoveryApplyContext {
+        node: local_node_id.to_string(),
+        index_uuid: candidate.metadata.uuid.to_string(),
+        shard: candidate.shard_id,
+        allocation: candidate.allocation_id,
+    };
+    let mut cursor = snapshot_cursor;
     let mut operations = 0u64;
     loop {
         let response = transport_client
@@ -559,23 +641,35 @@ async fn run_peer_recovery(
                 &candidate.primary,
                 FetchRecoveryOpsRequest {
                     session_id: start.session_id.clone(),
-                    from_seq_no: next_seq_no,
+                    cursor: Some(recovery_cursor_proto(cursor)),
                     max_ops: crate::transport::server::MAX_RECOVERY_OPS as u32,
+                    snapshot_processed_checkpoint: committed_boundary.processed_checkpoint,
                 },
             )
             .await
             .context("fetch peer recovery operations")?;
-        let (new_next, applied) = apply_recovery_operations(
+        let next_cursor =
+            require_recovery_cursor(response.next_cursor, "peer recovery next cursor")?;
+        if !response.complete && next_cursor == cursor && response.operations.is_empty() {
+            // The source encountered a durable WAL entry that its engine has not
+            // applied yet. Finalization takes the exclusive barrier and rebuilds
+            // the source writer before serving the remaining suffix.
+            break;
+        }
+        let (new_cursor, applied) = apply_recovery_operations_cursor(
             engine.clone(),
-            next_seq_no,
-            response.primary_next_seq_no,
+            Some(recovery_apply.clone()),
+            cursor,
+            next_cursor,
+            committed_boundary.processed_checkpoint,
+            response.source_max_seq_no,
             response.complete,
             response.operations,
         )
         .await?;
         operations += applied;
-        next_seq_no = new_next;
-        if response.complete && next_seq_no == response.primary_next_seq_no {
+        cursor = new_cursor;
+        if response.complete {
             break;
         }
     }
@@ -586,7 +680,8 @@ async fn run_peer_recovery(
                 &candidate.primary,
                 PrepareFinalizeRecoveryRequest {
                     session_id: start.session_id.clone(),
-                    applied_next_seq_no: next_seq_no,
+                    cursor: Some(recovery_cursor_proto(cursor)),
+                    processed_checkpoint: engine.sequence_stats().processed_checkpoint,
                 },
             )
             .await
@@ -597,39 +692,70 @@ async fn run_peer_recovery(
                     &candidate.primary,
                     FetchRecoveryOpsRequest {
                         session_id: start.session_id.clone(),
-                        from_seq_no: next_seq_no,
+                        cursor: Some(recovery_cursor_proto(cursor)),
                         max_ops: crate::transport::server::MAX_RECOVERY_OPS as u32,
+                        snapshot_processed_checkpoint: committed_boundary.processed_checkpoint,
                     },
                 )
                 .await?;
-            let (new_next, applied) = apply_recovery_operations(
+            let next_cursor =
+                require_recovery_cursor(response.next_cursor, "peer recovery next cursor")?;
+            let (new_cursor, applied) = apply_recovery_operations_cursor(
                 engine.clone(),
-                next_seq_no,
-                response.primary_next_seq_no,
+                Some(recovery_apply.clone()),
+                cursor,
+                next_cursor,
+                committed_boundary.processed_checkpoint,
+                response.source_max_seq_no,
                 response.complete,
                 response.operations,
             )
             .await?;
-            next_seq_no = new_next;
+            cursor = new_cursor;
             operations += applied;
             continue;
         }
         if !prepared.complete {
             anyhow::bail!("peer recovery finalize response was incomplete");
         }
-        let (new_next, applied) = apply_recovery_operations(
+        let next_cursor = require_recovery_cursor(prepared.next_cursor, "finalize next cursor")?;
+        let barrier_wal_end =
+            require_recovery_cursor(prepared.barrier_wal_end, "finalize barrier WAL end")?;
+        let (new_cursor, applied) = apply_recovery_operations_cursor(
             engine.clone(),
-            next_seq_no,
-            prepared.barrier_next_seq_no,
+            Some(recovery_apply.clone()),
+            cursor,
+            next_cursor,
+            committed_boundary.processed_checkpoint,
+            prepared.barrier_max_seq_no,
             true,
             prepared.operations,
         )
         .await?;
-        next_seq_no = new_next;
+        cursor = new_cursor;
         operations += applied;
-        if next_seq_no != prepared.barrier_next_seq_no {
-            anyhow::bail!("peer recovery target did not reach the barrier head");
+        if cursor != barrier_wal_end {
+            anyhow::bail!("peer recovery target did not reach the physical barrier");
         }
+        if engine.sequence_stats().processed_checkpoint != prepared.barrier_processed_checkpoint {
+            anyhow::bail!(
+                "peer recovery target processed checkpoint does not match the source barrier"
+            );
+        }
+        #[cfg(feature = "protocol-trace")]
+        crate::protocol_trace::record_recovery_barrier(
+            &candidate.primary.id,
+            local_node_id,
+            candidate.metadata.uuid.as_str(),
+            candidate.shard_id,
+            candidate.allocation_id,
+            &start.session_id,
+            prepared
+                .barrier_max_seq_no
+                .and_then(|seq_no| seq_no.checked_add(1))
+                .unwrap_or(0),
+            engine.protocol_trace_processed_sequences()?,
+        );
         break;
     }
 
@@ -656,14 +782,27 @@ async fn run_peer_recovery(
     let observation = complete_with_observed_settlement(CompletionSettlementContext {
         candidate,
         local_node_id,
-        cluster_manager,
+        cluster_manager: cluster_manager.clone(),
         transport_client: &transport_client,
         session_id: &start.session_id,
         pending: &pending,
-        applied_next_seq_no: next_seq_no,
+        applied_cursor: cursor,
+        processed_checkpoint: engine.sequence_stats().processed_checkpoint,
         retry_timeout: COMPLETE_RETRY_TIMEOUT,
     })
     .await;
+    #[cfg(feature = "protocol-trace")]
+    if observation == TargetMembershipObservation::Unknown {
+        crate::protocol_trace::record_recovery_membership(
+            &candidate.primary.id,
+            local_node_id,
+            candidate.metadata.uuid.as_str(),
+            candidate.shard_id,
+            candidate.allocation_id,
+            &start.session_id,
+            "unknown",
+        );
+    }
 
     let stats = RecoveryStats {
         session_id: start.session_id,
@@ -813,97 +952,137 @@ async fn download_recovery_file(
     Ok(offset)
 }
 
-enum TargetOperation {
-    Index {
-        seq_no: u64,
-        doc_id: String,
-        payload: serde_json::Value,
-    },
-    Delete {
-        seq_no: u64,
-        doc_id: String,
-    },
+#[allow(clippy::too_many_arguments)]
+async fn apply_recovery_operations_cursor(
+    engine: Arc<dyn SearchEngine>,
+    trace: Option<RecoveryApplyContext>,
+    cursor: crate::wal::WalCursor,
+    next_cursor: crate::wal::WalCursor,
+    snapshot_processed_checkpoint: Option<u64>,
+    source_max_seq_no: Option<u64>,
+    complete: bool,
+    operations: Vec<RecoveryOperation>,
+) -> Result<(crate::wal::WalCursor, u64)> {
+    if next_cursor.position() < cursor.position() {
+        anyhow::bail!("peer recovery physical cursor regressed");
+    }
+    if !complete && next_cursor == cursor {
+        if operations.is_empty() {
+            return Ok((cursor, 0));
+        }
+        anyhow::bail!(
+            "bounded peer recovery response returned operations without physical progress"
+        );
+    }
+    let mut decoded = Vec::with_capacity(operations.len());
+    for operation in operations {
+        if operation.primary_term == 0 {
+            anyhow::bail!("peer recovery operation has a zero primary term");
+        }
+        if source_max_seq_no.is_none_or(|maximum| operation.seq_no > maximum) {
+            anyhow::bail!("peer recovery operation exceeds the captured source maximum");
+        }
+        if snapshot_processed_checkpoint.is_some_and(|checkpoint| operation.seq_no <= checkpoint) {
+            continue;
+        }
+        let mutation = match operation.op.as_str() {
+            "index" => crate::engine::DocumentMutation::Index {
+                doc_id: operation.doc_id,
+                source: serde_json::from_slice(&operation.payload_json)
+                    .context("decode peer recovery index payload")?,
+            },
+            "delete" => crate::engine::DocumentMutation::Delete {
+                doc_id: operation.doc_id,
+            },
+            "noop" => {
+                let payload: serde_json::Value = serde_json::from_slice(&operation.payload_json)
+                    .context("decode peer recovery no-op payload")?;
+                let reason = payload
+                    .get("_reason")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("peer recovery no-op has no _reason"))?
+                    .to_string();
+                crate::engine::DocumentMutation::NoOp { reason }
+            }
+            other => anyhow::bail!("unknown peer recovery operation '{other}'"),
+        };
+        decoded.push(crate::engine::SequencedOperation {
+            seq_no: operation.seq_no,
+            primary_term: operation.primary_term,
+            mutation,
+        });
+    }
+
+    let applied = decoded.len() as u64;
+    let engine_for_apply = engine.clone();
+    #[cfg(feature = "protocol-trace")]
+    let trace_copy = trace
+        .as_ref()
+        .map(|trace| crate::protocol_trace::TraceCopy {
+            node: trace.node.clone(),
+            index_uuid: trace.index_uuid.clone(),
+            shard: trace.shard,
+            allocation: trace.allocation,
+        });
+    tokio::task::spawn_blocking(move || {
+        #[cfg(feature = "protocol-trace")]
+        let result = match trace_copy {
+            Some(trace_copy) => crate::protocol_trace::with_open_copy(trace_copy, || {
+                crate::protocol_trace::with_apply_scope(
+                    crate::protocol_trace::ApplyOrigin::Recovery,
+                    decoded.clone(),
+                    || {
+                        engine_for_apply
+                            .apply_replica_batch(decoded)
+                            .map_err(ShardManager::local_storage_failure)
+                    },
+                )
+            }),
+            None => engine_for_apply
+                .apply_replica_batch(decoded)
+                .map_err(ShardManager::local_storage_failure),
+        };
+        #[cfg(not(feature = "protocol-trace"))]
+        let result = {
+            let _ = trace;
+            engine_for_apply
+                .apply_replica_batch(decoded)
+                .map_err(ShardManager::local_storage_failure)
+        };
+        result?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("peer recovery apply task failed: {error}"))??;
+    Ok((next_cursor, applied))
 }
 
+#[cfg(test)]
 async fn apply_recovery_operations(
     engine: Arc<dyn SearchEngine>,
     from_seq_no: u64,
     primary_next_seq_no: u64,
     complete: bool,
-    operations: Vec<RecoverReplicaOp>,
+    operations: Vec<RecoveryOperation>,
 ) -> Result<(u64, u64)> {
-    let mut decoded = Vec::with_capacity(operations.len());
-    let mut previous = None;
-    for operation in operations {
-        if operation.seq_no < from_seq_no || operation.seq_no >= primary_next_seq_no {
-            anyhow::bail!("peer recovery operation is outside the requested range");
-        }
-        if previous.is_some_and(|previous| operation.seq_no <= previous) {
-            anyhow::bail!("peer recovery operations are not strictly increasing");
-        }
-        previous = Some(operation.seq_no);
-        match operation.op.as_str() {
-            "index" => decoded.push(TargetOperation::Index {
-                seq_no: operation.seq_no,
-                doc_id: operation.doc_id,
-                payload: serde_json::from_slice(&operation.payload_json)
-                    .context("decode peer recovery index payload")?,
-            }),
-            "delete" => decoded.push(TargetOperation::Delete {
-                seq_no: operation.seq_no,
-                doc_id: operation.doc_id,
-            }),
-            other => anyhow::bail!("unknown peer recovery operation '{other}'"),
-        }
-    }
-    if !complete && decoded.is_empty() {
-        anyhow::bail!("bounded peer recovery response made no progress");
-    }
-    let applied = decoded.len() as u64;
-    let last_next = previous
-        .and_then(|seq_no| seq_no.checked_add(1))
-        .unwrap_or(from_seq_no);
-    let new_next = if complete {
-        primary_next_seq_no
-    } else {
-        last_next
-    };
-    if new_next < from_seq_no {
-        anyhow::bail!("peer recovery cursor regressed");
-    }
-
-    let engine_for_apply = engine.clone();
-    tokio::task::spawn_blocking(move || {
-        for operation in decoded {
-            match operation {
-                TargetOperation::Index {
-                    seq_no,
-                    doc_id,
-                    payload,
-                } => {
-                    engine_for_apply
-                        .add_document_with_seq(&doc_id, payload, seq_no)
-                        .map_err(ShardManager::local_storage_failure)?;
-                }
-                TargetOperation::Delete { seq_no, doc_id } => {
-                    engine_for_apply
-                        .delete_document_with_seq(&doc_id, seq_no)
-                        .map_err(ShardManager::local_storage_failure)?;
-                }
-            }
-        }
-        Ok::<(), anyhow::Error>(())
-    })
-    .await
-    .map_err(|error| anyhow::anyhow!("peer recovery apply task failed: {error}"))??;
-    set_checkpoint_from_next(&engine, new_next);
-    Ok((new_next, applied))
-}
-
-fn set_checkpoint_from_next(engine: &Arc<dyn SearchEngine>, next_seq_no: u64) {
-    if let Some(last_seq_no) = next_seq_no.checked_sub(1) {
-        engine.update_local_checkpoint(last_seq_no);
-    }
+    let (_, applied) = apply_recovery_operations_cursor(
+        engine,
+        None,
+        crate::wal::WalCursor {
+            generation_id: 0,
+            byte_offset: from_seq_no,
+        },
+        crate::wal::WalCursor {
+            generation_id: 0,
+            byte_offset: primary_next_seq_no,
+        },
+        None,
+        primary_next_seq_no.checked_sub(1),
+        complete,
+        operations,
+    )
+    .await?;
+    Ok((primary_next_seq_no, applied))
 }
 
 async fn complete_with_observed_settlement(
@@ -918,7 +1097,8 @@ async fn complete_with_observed_settlement(
                 &context.candidate.primary,
                 CompleteFinalizeRecoveryRequest {
                     session_id: context.session_id.to_string(),
-                    applied_next_seq_no: context.applied_next_seq_no,
+                    applied_cursor: Some(recovery_cursor_proto(context.applied_cursor)),
+                    processed_checkpoint: context.processed_checkpoint,
                 },
             )
             .await
@@ -960,9 +1140,29 @@ mod tests {
         FetchRecoveryOpsRequest, ReplicateDocRequest, ShardDeleteRequest, ShardDocRequest,
     };
     use crate::transport::server::{
-        create_transport_service_for_test, create_transport_service_with_raft,
+        RemoteStoreTransportResources, create_transport_service_for_test,
+        create_transport_service_with_raft, create_transport_service_with_raft_and_storage_handle,
     };
     use std::collections::HashMap;
+
+    fn apply_index(
+        engine: &Arc<dyn SearchEngine>,
+        doc_id: &str,
+        source: serde_json::Value,
+        seq_no: u64,
+        primary_term: u64,
+    ) {
+        engine
+            .apply_replica_operation(crate::engine::SequencedOperation {
+                seq_no,
+                primary_term,
+                mutation: crate::engine::DocumentMutation::Index {
+                    doc_id: doc_id.to_string(),
+                    source,
+                },
+            })
+            .unwrap();
+    }
 
     async fn wait_for_leader(raft: &crate::consensus::types::RaftInstance) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -1031,7 +1231,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_operation_validation_allows_gaps_but_rejects_reordering() {
+    async fn recovery_operation_validation_allows_gaps_and_reordering() {
         let dir = tempfile::tempdir().unwrap();
         let engine: Arc<dyn SearchEngine> = Arc::new(
             crate::engine::CompositeEngine::new(dir.path(), Duration::from_secs(60)).unwrap(),
@@ -1042,14 +1242,16 @@ mod tests {
             9,
             true,
             vec![
-                RecoverReplicaOp {
+                RecoveryOperation {
                     seq_no: 5,
+                    primary_term: 2,
                     op: "index".into(),
                     doc_id: "a".into(),
                     payload_json: serde_json::to_vec(&serde_json::json!({"value": 1})).unwrap(),
                 },
-                RecoverReplicaOp {
+                RecoveryOperation {
                     seq_no: 8,
+                    primary_term: 2,
                     op: "delete".into(),
                     doc_id: "b".into(),
                     payload_json: Vec::new(),
@@ -1061,20 +1263,22 @@ mod tests {
         assert_eq!(next, 9);
         assert_eq!(applied, 2);
 
-        let error = apply_recovery_operations(
+        let (next, applied) = apply_recovery_operations(
             engine,
             9,
             12,
             true,
             vec![
-                RecoverReplicaOp {
+                RecoveryOperation {
                     seq_no: 11,
+                    primary_term: 2,
                     op: "delete".into(),
                     doc_id: "a".into(),
                     payload_json: Vec::new(),
                 },
-                RecoverReplicaOp {
+                RecoveryOperation {
                     seq_no: 10,
+                    primary_term: 2,
                     op: "delete".into(),
                     doc_id: "b".into(),
                     payload_json: Vec::new(),
@@ -1082,8 +1286,211 @@ mod tests {
             ],
         )
         .await
-        .unwrap_err();
-        assert!(error.to_string().contains("strictly increasing"));
+        .unwrap();
+        assert_eq!(next, 12);
+        assert_eq!(applied, 2);
+    }
+
+    #[tokio::test]
+    async fn stalled_retry_catch_up_batch_returns_to_finalize() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine: Arc<dyn SearchEngine> = Arc::new(
+            crate::engine::CompositeEngine::new(dir.path(), Duration::from_secs(60)).unwrap(),
+        );
+        let cursor = crate::wal::WalCursor {
+            generation_id: 4,
+            byte_offset: 128,
+        };
+
+        let (next_cursor, applied) = apply_recovery_operations_cursor(
+            engine,
+            None,
+            cursor,
+            cursor,
+            Some(7),
+            Some(8),
+            false,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(next_cursor, cursor);
+        assert_eq!(applied, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn retry_catch_up_stall_returns_to_finalize_in_real_session() {
+        let (raft, state_handle) =
+            consensus::create_raft_instance_mem(1, "retry-catch-up-it".into())
+                .await
+                .unwrap();
+        consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:0".into())
+            .await
+            .unwrap();
+        wait_for_leader(&raft).await;
+
+        let source_dir = tempfile::tempdir().unwrap();
+        let source_shards = Arc::new(ShardManager::new(
+            source_dir.path(),
+            Duration::from_secs(60),
+        ));
+        let source_manager = Arc::new(ClusterManager::with_shared_state(state_handle.clone()));
+        let resources = RemoteStoreTransportResources {
+            storage_manager: Arc::new(
+                crate::storage::StorageManager::new_in_path(source_dir.path()).unwrap(),
+            ),
+            remote_store_reader_cache: Arc::new(
+                crate::engine::remote_store::RemoteSplitReaderCache::default(),
+            ),
+        };
+        let (source_service, source_handle) = create_transport_service_with_raft_and_storage_handle(
+            source_manager.clone(),
+            source_shards.clone(),
+            TransportClient::new(),
+            raft.clone(),
+            Arc::new(TaskManager::new()),
+            resources,
+            "primary-node".into(),
+        );
+        let (source_address, source_server) = serve(source_service).await;
+
+        for node in [
+            NodeInfo {
+                id: "primary-node".into(),
+                name: "primary-node".into(),
+                host: "127.0.0.1".into(),
+                transport_port: source_address.port(),
+                http_port: 0,
+                roles: vec![NodeRole::Master, NodeRole::Data],
+                raft_node_id: 1,
+            },
+            NodeInfo {
+                id: "replica-node".into(),
+                name: "replica-node".into(),
+                host: "127.0.0.1".into(),
+                transport_port: 1,
+                http_port: 0,
+                roles: vec![NodeRole::Data],
+                raft_node_id: 0,
+            },
+        ] {
+            assert_eq!(
+                raft.client_write(ClusterCommand::AddNode { node })
+                    .await
+                    .unwrap()
+                    .data,
+                ClusterResponse::Ok
+            );
+        }
+        assert_eq!(
+            raft.client_write(ClusterCommand::SetMaster {
+                node_id: "primary-node".into(),
+            })
+            .await
+            .unwrap()
+            .data,
+            ClusterResponse::Ok
+        );
+        assert_eq!(
+            raft.client_write(ClusterCommand::CreateIndex {
+                metadata: IndexMetadata {
+                    name: "docs".into(),
+                    uuid: IndexUuid::new("docs-uuid"),
+                    number_of_shards: 1,
+                    number_of_replicas: 1,
+                    shard_routing: HashMap::from([(
+                        0,
+                        ShardRoutingEntry {
+                            primary: "primary-node".into(),
+                            primary_term: 1,
+                            replicas: vec!["replica-node".into()],
+                            in_sync_replicas: Vec::new(),
+                            unassigned_replicas: 0,
+                        },
+                    )]),
+                    mappings: HashMap::new(),
+                    dynamic: Default::default(),
+                    settings: IndexSettings::default(),
+                },
+            })
+            .await
+            .unwrap()
+            .data,
+            ClusterResponse::Ok
+        );
+
+        let mut source_client = connect(source_address).await;
+        let write = source_client
+            .index_doc(tonic::Request::new(ShardDocRequest {
+                index_name: "docs".into(),
+                shard_id: 0,
+                doc_id: "snapshot-doc".into(),
+                payload_json: serde_json::to_vec(&serde_json::json!({"value": 1})).unwrap(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(write.success, "{}", write.error);
+        let source_engine = source_shards.get_shard("docs", 0).unwrap();
+        source_engine.flush().unwrap();
+
+        source_handle.inject_retry_catch_up_stall_once();
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_shards = Arc::new(ShardManager::new(
+            target_dir.path(),
+            Duration::from_secs(60),
+        ));
+        let candidate = RecoveryCandidate {
+            index_name: "docs".into(),
+            metadata: state_handle.read().unwrap().indices["docs"].clone(),
+            shard_id: 0,
+            allocation_id: state_handle
+                .read()
+                .unwrap()
+                .shard_allocation_id("docs", 0, "replica-node")
+                .unwrap(),
+            primary: state_handle.read().unwrap().nodes["primary-node"].clone(),
+        };
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            run_peer_recovery(
+                &candidate,
+                "replica-node",
+                source_manager,
+                target_shards.clone(),
+                TransportClient::new(),
+                Arc::new(AtomicBool::new(false)),
+            ),
+        )
+        .await
+        .expect("peer recovery did not return to finalize")
+        .unwrap();
+        let stats = match outcome {
+            RecoveryRunOutcome::Admitted(stats) => stats,
+            RecoveryRunOutcome::AwaitingMembership(_) => {
+                panic!("the real recovery session did not observe committed admission")
+            }
+        };
+
+        assert!(!stats.session_id.is_empty());
+        assert_eq!(stats.operations, 0);
+        assert_eq!(source_handle.retry_catch_up_stall_counts(), (1, 1, 1));
+        let target_engine = target_shards.get_shard("docs", 0).unwrap();
+        target_engine.refresh().unwrap();
+        assert_eq!(
+            target_engine.get_document("snapshot-doc").unwrap().unwrap()["value"],
+            serde_json::json!(1)
+        );
+        assert!(
+            state_handle.read().unwrap().indices["docs"].shard_routing[&0]
+                .in_sync_replicas
+                .contains(&"replica-node".to_string())
+        );
+        assert!(!target_shards.is_peer_recovery_target("docs", 0));
+
+        source_server.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1233,8 +1640,9 @@ mod tests {
         let stale_fetch = client
             .fetch_recovery_ops(tonic::Request::new(FetchRecoveryOpsRequest {
                 session_id: session.session_id,
-                from_seq_no: session.snapshot_next_seq_no,
+                cursor: session.snapshot_cursor,
                 max_ops: 1,
+                snapshot_processed_checkpoint: session.snapshot_processed_checkpoint,
             }))
             .await
             .unwrap_err();
@@ -1349,9 +1757,13 @@ mod tests {
                 "lagged-uuid",
             )
             .unwrap();
-        target_engine
-            .add_document_with_seq("acked", serde_json::json!({"value": 1}), 0)
-            .unwrap();
+        apply_index(
+            &target_engine,
+            "acked",
+            serde_json::json!({"value": 1}),
+            0,
+            1,
+        );
         target_engine.refresh().unwrap();
 
         let driver = PeerRecoveryDriver::new(2);
@@ -1598,9 +2010,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-            engine
-                .add_document_with_seq("doc", serde_json::json!({"value": 1}), 0)
-                .unwrap();
+            apply_index(&engine, "doc", serde_json::json!({"value": 1}), 0, 1);
             engine.refresh().unwrap();
             engine.flush().unwrap();
             assert!(first.begin_peer_recovery_target("docs", 0));
@@ -1720,9 +2130,13 @@ mod tests {
                 },
             )
             .unwrap();
-        source_engine
-            .add_document_with_seq("source-copy", serde_json::json!({"value": "source"}), 0)
-            .unwrap();
+        apply_index(
+            &source_engine,
+            "source-copy",
+            serde_json::json!({"value": "source"}),
+            0,
+            7,
+        );
         source_engine.refresh().unwrap();
         source_engine.flush().unwrap();
         let source_manager = Arc::new(ClusterManager::new(state.cluster_name.clone()));
@@ -1757,9 +2171,13 @@ mod tests {
                     },
                 )
                 .unwrap();
-            target_engine
-                .add_document_with_seq("pending-copy", serde_json::json!({"value": "pending"}), 0)
-                .unwrap();
+            apply_index(
+                &target_engine,
+                "pending-copy",
+                serde_json::json!({"value": "pending"}),
+                0,
+                7,
+            );
             target_engine.refresh().unwrap();
             target_engine.flush().unwrap();
             assert!(first_target.begin_peer_recovery_target("docs", 0));
@@ -1925,9 +2343,13 @@ mod tests {
                 },
             )
             .unwrap();
-        target_engine
-            .add_document_with_seq("base", serde_json::json!({"value": 0}), 0)
-            .unwrap();
+        apply_index(
+            &target_engine,
+            "base",
+            serde_json::json!({"value": 0}),
+            0,
+            2,
+        );
         target_engine.refresh().unwrap();
         assert!(target_shards.begin_peer_recovery_target("pending", 0));
         let pending = PeerRecoveryAwaitingMembership {
@@ -1967,7 +2389,11 @@ mod tests {
             transport_client: &transport_client,
             session_id: "lost-response",
             pending: &pending,
-            applied_next_seq_no: 1,
+            applied_cursor: crate::wal::WalCursor {
+                generation_id: 0,
+                byte_offset: 1,
+            },
+            processed_checkpoint: Some(0),
             retry_timeout: Duration::from_millis(50),
         })
         .await;
@@ -2057,9 +2483,7 @@ mod tests {
                 "promoted-uuid",
             )
             .unwrap();
-        engine
-            .add_document_with_seq("doc", serde_json::json!({"value": 1}), 0)
-            .unwrap();
+        apply_index(&engine, "doc", serde_json::json!({"value": 1}), 0, 1);
         engine.refresh().unwrap();
         assert!(first_manager.begin_peer_recovery_target("promoted", 0));
         first_manager
@@ -2537,8 +2961,12 @@ mod tests {
         let stale_session = source_client
             .fetch_recovery_ops(tonic::Request::new(FetchRecoveryOpsRequest {
                 session_id: stats.session_id,
-                from_seq_no: 0,
+                cursor: Some(crate::transport::proto::RecoveryWalCursor {
+                    generation_id: 0,
+                    byte_offset: 0,
+                }),
                 max_ops: 1,
+                snapshot_processed_checkpoint: None,
             }))
             .await
             .unwrap_err();

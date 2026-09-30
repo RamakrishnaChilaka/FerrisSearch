@@ -64,7 +64,7 @@ message IndexMetadata {
     string uuid = 5;
     repeated FieldMappingEntry mappings = 6;
     IndexSettings settings = 7;
-    // Dynamic mapping mode: \"true\", \"false\", \"strict\" (empty = \"false\" for backward compat)
+    // Dynamic mapping mode: \"true\", \"false\", or \"strict\".
     string dynamic = 8;
 }
 
@@ -80,6 +80,7 @@ message ClusterState {
     // never a plaintext secret).
     repeated string api_keys_json = 6;
     repeated string roles_json = 7;
+    uint32 format_version = 8;
 }
 
 message JoinRequest {
@@ -115,6 +116,7 @@ message ShardDocResponse {
     string doc_id = 2;
     string error = 3;         // empty on success
     optional uint64 seq_no = 4;
+    optional uint64 primary_term = 5;
 }
 
 message ShardDeleteRequest {
@@ -128,6 +130,7 @@ message ShardDeleteResponse {
     uint64 deleted = 2;
     string error = 3;
     optional uint64 seq_no = 4;
+    optional uint64 primary_term = 5;
 }
 
 message ShardGetRequest {
@@ -153,6 +156,7 @@ message ShardBulkResponse {
     repeated string doc_ids = 2;
     string error = 3;
     optional uint64 start_seq_no = 4; // absent for an empty batch
+    optional uint64 primary_term = 5;
 }
 
 message ShardSearchRequest {
@@ -244,7 +248,10 @@ message ReplicateDocRequest {
 message ReplicateDocResponse {
     bool success = 1;
     string error = 2;
-    uint64 local_checkpoint = 3;  // replica's highest contiguous seq_no after apply
+    optional uint64 processed_checkpoint = 3;
+    optional uint64 persisted_checkpoint = 4;
+    bool operation_processed = 5;
+    bool operation_persisted = 6;
 }
 
 message ReplicateBulkRequest {
@@ -259,37 +266,48 @@ message ReplicateBulkRequest {
 message ReplicateBulkResponse {
     bool success = 1;
     string error = 2;
-    uint64 local_checkpoint = 3;  // replica's highest contiguous seq_no after bulk apply
+    optional uint64 processed_checkpoint = 3;
+    optional uint64 persisted_checkpoint = 4;
+    bool all_operations_processed = 5;
+    bool all_operations_persisted = 6;
+}
+
+message GetShardSequenceStateRequest {
+    string index_name = 1;
+    string index_uuid = 2;
+    uint32 shard_id = 3;
+    optional uint64 allocation_id = 4;
+    uint64 expected_primary_term = 5;
+}
+
+message GetShardSequenceStateResponse {
+    optional uint64 processed_checkpoint = 1;
+    optional uint64 persisted_checkpoint = 2;
+    optional uint64 max_seq_no = 3;
+    uint32 sequence_format_version = 4;
+    bool active_primary = 5;
 }
 
 // ─── Replica Recovery ───────────────────────────────────────────────────────
 
-message RecoverReplicaRequest {
-    string index_name = 1;
-    uint32 shard_id = 2;
-    uint64 local_checkpoint = 3;  // replica's highest seq_no — primary replays from here
-}
-
-message RecoverReplicaResponse {
-    bool success = 1;
-    string error = 2;
-    uint64 ops_replayed = 3;      // number of operations sent to the replica
-    uint64 primary_checkpoint = 4; // primary's current seq_no after replay
-    repeated RecoverReplicaOp operations = 5; // the actual translog entries for replay
-}
-
 // A single operation in a recovery response (matches translog entry).
-message RecoverReplicaOp {
+message RecoveryOperation {
     uint64 seq_no = 1;
-    string op = 2;           // "index" or "delete"
+    string op = 2;           // "index", "delete", or "noop"
     string doc_id = 3;
-    bytes payload_json = 4;  // document body
+    bytes payload_json = 4;  // document body or no-op metadata
+    uint64 primary_term = 5;
 }
 
 message RecoveryFileMetadata {
     string name = 1;
     uint64 length = 2;
     string sha256 = 3;
+}
+
+message RecoveryWalCursor {
+    uint64 generation_id = 1;
+    uint64 byte_offset = 2;
 }
 
 message StartPeerRecoveryRequest {
@@ -303,11 +321,15 @@ message StartPeerRecoveryRequest {
 message StartPeerRecoveryResponse {
     string session_id = 1;
     uint64 primary_term = 2;
-    uint64 snapshot_next_seq_no = 3;
+    RecoveryWalCursor snapshot_cursor = 3;
     repeated RecoveryFileMetadata files = 4;
     string error = 5;
     bool preparing = 6;
     optional uint64 target_allocation_id = 7;
+    optional uint64 snapshot_processed_checkpoint = 8;
+    optional uint64 snapshot_persisted_checkpoint = 9;
+    optional uint64 snapshot_max_seq_no = 10;
+    bytes committed_boundary_json = 11;
 }
 
 message FetchRecoveryFileChunkRequest {
@@ -325,33 +347,40 @@ message FetchRecoveryFileChunkResponse {
 
 message FetchRecoveryOpsRequest {
     string session_id = 1;
-    uint64 from_seq_no = 2;
+    RecoveryWalCursor cursor = 2;
     uint32 max_ops = 3;
+    optional uint64 snapshot_processed_checkpoint = 4;
 }
 
 message FetchRecoveryOpsResponse {
-    repeated RecoverReplicaOp operations = 1;
-    uint64 primary_next_seq_no = 2;
-    bool complete = 3;
-    string error = 4;
-}
-
-message PrepareFinalizeRecoveryRequest {
-    string session_id = 1;
-    uint64 applied_next_seq_no = 2;
-}
-
-message PrepareFinalizeRecoveryResponse {
-    repeated RecoverReplicaOp operations = 1;
-    uint64 barrier_next_seq_no = 2;
-    bool retry_catch_up = 3;
+    repeated RecoveryOperation operations = 1;
+    RecoveryWalCursor next_cursor = 2;
+    optional uint64 source_max_seq_no = 3;
     bool complete = 4;
     string error = 5;
 }
 
+message PrepareFinalizeRecoveryRequest {
+    string session_id = 1;
+    RecoveryWalCursor cursor = 2;
+    optional uint64 processed_checkpoint = 3;
+}
+
+message PrepareFinalizeRecoveryResponse {
+    repeated RecoveryOperation operations = 1;
+    RecoveryWalCursor next_cursor = 2;
+    RecoveryWalCursor barrier_wal_end = 3;
+    optional uint64 barrier_processed_checkpoint = 4;
+    bool retry_catch_up = 5;
+    bool complete = 6;
+    string error = 7;
+    optional uint64 barrier_max_seq_no = 8;
+}
+
 message CompleteFinalizeRecoveryRequest {
     string session_id = 1;
-    uint64 applied_next_seq_no = 2;
+    RecoveryWalCursor applied_cursor = 2;
+    optional uint64 processed_checkpoint = 3;
 }
 
 message CompleteFinalizeRecoveryResponse {
@@ -421,6 +450,7 @@ message FailShardCopyRequest {
     string node_id = 4;
     optional uint64 allocation_id = 5;
     bool promote_only = 6;  // required for primary-copy failure reports
+    uint64 expected_primary_term = 7;
 }
 
 message FailShardCopyResponse {
@@ -632,7 +662,7 @@ message GetTaskStatusResponse {
 // ─── Service Definition ─────────────────────────────────────────────────────
 
 service InternalTransport {
-    // Cluster coordination (legacy — kept for backward compat during migration)
+    // Cluster coordination
     rpc JoinCluster(JoinRequest) returns (JoinResponse);
     rpc PublishState(PublishStateRequest) returns (Empty);
     rpc Ping(PingRequest) returns (Empty);
@@ -656,9 +686,8 @@ service InternalTransport {
     // Primary-to-replica replication
     rpc ReplicateDoc(ReplicateDocRequest) returns (ReplicateDocResponse);
     rpc ReplicateBulk(ReplicateBulkRequest) returns (ReplicateBulkResponse);
+    rpc GetShardSequenceState(GetShardSequenceStateRequest) returns (GetShardSequenceStateResponse);
 
-    // Replica recovery: replica sends its checkpoint, primary replays translog
-    rpc RecoverReplica(RecoverReplicaRequest) returns (RecoverReplicaResponse);
     rpc StartPeerRecovery(StartPeerRecoveryRequest) returns (StartPeerRecoveryResponse);
     rpc FetchRecoveryFileChunk(FetchRecoveryFileChunkRequest) returns (FetchRecoveryFileChunkResponse);
     rpc FetchRecoveryOps(FetchRecoveryOpsRequest) returns (FetchRecoveryOpsResponse);

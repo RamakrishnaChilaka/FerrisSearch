@@ -38,9 +38,14 @@ WritesOwnedBy(node) ==
         /\ writeStatus[w] \in {"Routed", "Replicating"}}
 
 DropNodeMessages(node) ==
-    {m \in messages : m.from = node \/ m.to = node}
+    \* Requests or responses already handed to the transport may arrive after
+    \* the sender crashes. Only messages addressed to the crashed process are
+    \* lost immediately.
+    {m \in messages : m.to = node}
 
-\* src/node process lifecycle + src/wal/mod.rs::open.
+\* src/node process lifecycle + src/wal/mod.rs::open. Transport requests and
+\* responses already emitted by the crashing process stay in flight; only
+\* traffic addressed to that stopped incarnation is dropped immediately.
 Crash(node) ==
     LET lostWrites == WritesOwnedBy(node)
         survivingOps ==

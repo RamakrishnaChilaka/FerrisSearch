@@ -1,6 +1,6 @@
 # ADR 0001: Write Consistency And Retry Contract
 
-- **Status:** Proposed
+- **Status:** Proposed. D1 is accepted and implemented; see its status line.
 - **Date:** 2026-09-27
 - **Backlog:** [FS-001](../next-50-tasks.md#fs-001--decide-the-write-consistency-and-retry-contract)
 - **Roadmap:** Gate 0 deliverable "accepted write acknowledgement, retry, OCC,
@@ -10,9 +10,9 @@
   bulk), and the reads writes depend on (GET by ID and refresh). Remote-store
   publication is FS-002.
 
-This record is proposed. It defines the intended contract. Section 1.1
-describes the code at 6dbf9dc; everything else is future behavior until the
-implementing tasks land.
+D1 is accepted and implemented. The other decisions are proposed: they define
+the intended contract and describe future behavior until their implementing
+tasks land. Section 1.1 describes the code at 6dbf9dc, before D1.
 
 ## 1. Context
 
@@ -125,6 +125,24 @@ source and the Elasticsearch 7.10 reference, the fork point.
 ## 2. Decision
 
 ### D1. Operation identity and replica apply
+
+**Status:** Accepted and implemented for `local_shards` (FS-012). The
+implemented behavior and its limits are in
+[`recovery-protocol.md`](../recovery-protocol.md). Evidence: the
+`d1_*_regression` integration suites in `tests/`, and bounded model checking in
+[`specs/tla/README.md`](../../specs/tla/README.md#d1-sequence-aware-replica-apply).
+
+Known limitations of the implementation:
+
+- History convergence after failover (D10) is not implemented. A replica that
+  misses an operation the primary wrote to its WAL is removed at the gap
+  deadline and rebuilt by peer recovery.
+- Pending promotion NoOp retries live only in process memory. A restart loses
+  them, and the replica falls back to the gap deadline.
+- A collision marker that could not be persisted is lost on restart.
+- Every primary activation rebuilds the vector index.
+- D2, D5, and D14 remain proposed.
+- The model-checking evidence is bounded, not a proof.
 
 - **Identity:** each write is identified by
   `(index UUID, shard, primary term, seq_no)`. The primary assigns `seq_no` at
@@ -331,6 +349,10 @@ In-sync copies must not keep divergent operations after a failover:
   single-document rules or are rejected per item with 400 until implemented.
 - **Shard-group failures:** every item in the group receives that group's
   outcome class.
+- **Metadata keys in sources:** a top-level source key that names a metadata
+  field, such as `_id`, `_source`, `_seq_no`, or `_primary_term`, is rejected
+  per item with 400 `mapper_parsing_exception`. This rule is implemented with
+  D1.
 
 ### D13. Unimplemented parameters fail loudly
 
@@ -422,13 +444,18 @@ Each parameter moves to "honored" when its task lands. Two can be honored early:
 
 ## 6. Migration impact
 
-FerrisSearch is pre-1.0 and supports no mixed-version clusters, so wire changes
-need no rolling-upgrade path. D1 and D10 change the WAL entry format and need a
-WAL format version bump. Nodes fail closed on logs they cannot read, as FS-005
-requires. `_flush` keeps entries above the global checkpoint and under
-recovery pins, so operators should stop writes, let replicas catch up, and
-then flush before upgrading. The new version must read an empty old-format
-WAL. Response-field changes follow the compatibility matrix (FS-006).
+FerrisSearch is pre-1.0. It provides no migration path and no backward
+compatibility for on-disk, WAL, Raft-log, or wire formats, and it does not
+support mixed-version clusters. D1 changes the WAL entry format, the Tantivy
+schema, and the durable per-copy sequence state. D10 may change them again.
+
+- A node that finds index data in an older format fails closed. The typed
+  error names the component and tells the operator to recreate the index.
+- A node that finds a Raft log or snapshot in an older format fails closed. The
+  error tells the operator to wipe the node data directories and recreate the
+  cluster.
+
+Response-field changes follow the compatibility matrix (FS-006).
 
 ## 7. Affected gates and tasks
 
@@ -457,8 +484,8 @@ also depends on FS-002.
   retry budget, or for operation-based recovery before D2.
 - Waiting for the Raft commit that removes a replica exceeds the write latency
   target. That would argue for batching removal commits.
-- A TLA+ model of D1, D2, D5, and D10 finds an acknowledged-loss trace. Before
-  implementation, `specs/tla` must be extended to allow at least two concurrent
-  client writes.
+- A TLA+ model of D1, D2, D5, and D10 finds an acknowledged-loss trace. The D1
+  model allows up to three overlapping client writes. D2, D5, and D10 need
+  model coverage of concurrent writes before they are implemented.
 - Live-version-map memory cannot be bounded under a supported workload without
   refreshes that break the latency target.

@@ -2,12 +2,13 @@ use anyhow::{Context, Result};
 use datafusion::arrow::record_batch::RecordBatch;
 use std::any::Any;
 use std::borrow::Cow;
+#[cfg(feature = "protocol-trace")]
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fmt;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tantivy::collector::{Count, TopDocs};
 use tantivy::merge_policy::{MergeCandidate, MergePolicy, NoMergePolicy};
 use tantivy::query::QueryParser;
@@ -15,6 +16,13 @@ use tantivy::schema::{FAST, Field, STORED, STRING, Schema, TEXT, Value};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, SegmentMeta, TantivyDocument, Term};
 
 use super::SearchEngine;
+use super::sequence::{
+    CommittedBoundaryRecord, LocalCheckpointTracker, PrimaryTermSequenceState, SequenceStats,
+    initialize_term_sequence_state,
+};
+#[cfg(feature = "protocol-trace")]
+use super::version_map::VersionValue;
+use super::version_map::{DEFAULT_VERSION_MAP_MAX_BYTES, LiveVersionMap, PrunedTombstone};
 use crate::wal::{
     HotTranslog, TranslogDurability, WalDocumentOperation, WriteAheadLog, document_operation,
 };
@@ -46,9 +54,147 @@ pub(crate) struct TantivyCommitFailureError {
     source: tantivy::TantivyError,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct CommittedTantivyBoundary {
-    next_seq_no: u64,
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "sequence operation collision at ({primary_term}, {seq_no}): existing operation differs from the incoming operation"
+)]
+pub(crate) struct SequenceOperationCollisionError {
+    primary_term: u64,
+    seq_no: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("internal sequence field validation failed: {message}")]
+pub(crate) struct InternalSequenceFieldError {
+    message: String,
+}
+
+struct ApplyState {
+    checkpoints: LocalCheckpointTracker,
+    term_sequences: PrimaryTermSequenceState,
+    versions: LiveVersionMap,
+    max_seq_no_of_updates_or_deletes: Option<u64>,
+}
+
+#[derive(Clone)]
+struct SequencePlanningSnapshot {
+    checkpoints: LocalCheckpointTracker,
+    term_sequences: PrimaryTermSequenceState,
+    max_seq_no_of_updates_or_deletes: Option<u64>,
+}
+
+impl ApplyState {
+    fn new(committed: CommittedBoundaryRecord) -> Result<Self> {
+        let term_sequences = initialize_term_sequence_state(
+            committed.term_sequence_state.current_term,
+            committed.term_sequence_state.max_seq_no_at_term_start,
+            &committed,
+        )?;
+        Ok(Self {
+            checkpoints: LocalCheckpointTracker::new(committed.clone())?,
+            term_sequences,
+            versions: LiveVersionMap::new(DEFAULT_VERSION_MAP_MAX_BYTES),
+            max_seq_no_of_updates_or_deletes: committed.max_seq_no_of_updates_or_deletes,
+        })
+    }
+
+    fn reset_to_commit(&mut self, committed: CommittedBoundaryRecord) -> Result<()> {
+        self.checkpoints.reset_to_commit(committed.clone())?;
+        self.term_sequences = initialize_term_sequence_state(
+            committed.term_sequence_state.current_term,
+            committed.term_sequence_state.max_seq_no_at_term_start,
+            &committed,
+        )?;
+        self.versions.reset();
+        self.max_seq_no_of_updates_or_deletes = committed.max_seq_no_of_updates_or_deletes;
+        Ok(())
+    }
+
+    fn complete_operation(
+        &mut self,
+        primary_term: u64,
+        seq_no: u64,
+        durability: TranslogDurability,
+    ) -> Result<()> {
+        self.term_sequences.mark_processed(primary_term, seq_no)?;
+        self.checkpoints.mark_processed(seq_no);
+        if matches!(durability, TranslogDurability::Request) {
+            self.checkpoints.mark_persisted(seq_no);
+        }
+        Ok(())
+    }
+
+    fn committed_boundary(&self) -> CommittedBoundaryRecord {
+        CommittedBoundaryRecord {
+            version: super::sequence::COMMITTED_BOUNDARY_FORMAT_VERSION,
+            processed_checkpoint: self.checkpoints.processed_checkpoint(),
+            persisted_checkpoint: self.checkpoints.persisted_checkpoint(),
+            max_seq_no: self.checkpoints.max_seq_no(),
+            max_seq_no_of_updates_or_deletes: self.max_seq_no_of_updates_or_deletes,
+            term_sequence_state: self.term_sequences.to_record(),
+        }
+    }
+
+    fn planning_snapshot(&self) -> SequencePlanningSnapshot {
+        SequencePlanningSnapshot {
+            checkpoints: self.checkpoints.clone(),
+            term_sequences: self.term_sequences.clone(),
+            max_seq_no_of_updates_or_deletes: self.max_seq_no_of_updates_or_deletes,
+        }
+    }
+
+    fn restore_planning_snapshot(&mut self, snapshot: SequencePlanningSnapshot) {
+        self.checkpoints = snapshot.checkpoints;
+        self.term_sequences = snapshot.term_sequences;
+        self.max_seq_no_of_updates_or_deletes = snapshot.max_seq_no_of_updates_or_deletes;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalDisposition {
+    Append,
+    AlreadyInLocalWal {
+        persisted: bool,
+        validate_redelivery: bool,
+    },
+}
+
+impl WalDisposition {
+    fn is_already_in_local_wal(self) -> bool {
+        matches!(self, Self::AlreadyInLocalWal { .. })
+    }
+
+    fn is_persisted(self) -> bool {
+        matches!(
+            self,
+            Self::AlreadyInLocalWal {
+                persisted: true,
+                ..
+            }
+        )
+    }
+
+    fn validates_redelivery(self) -> bool {
+        matches!(
+            self,
+            Self::Append
+                | Self::AlreadyInLocalWal {
+                    validate_redelivery: true,
+                    ..
+                }
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CurrentVersion {
+    Native(super::version_map::VersionValue),
+}
+
+struct PlannedOperation {
+    operation: super::SequencedOperation,
+    outcome: super::ApplyOutcome,
+    complete: bool,
 }
 
 /// Dynamic field registry — maps user-facing field names to Tantivy Field handles.
@@ -58,6 +204,8 @@ struct FieldRegistry {
     id_field: Field,
     /// _source: stores the raw JSON document (STORED only, not indexed)
     source_field: Field,
+    seq_no_field: Option<Field>,
+    primary_term_field: Option<Field>,
     /// Named text fields created dynamically from document keys
     fields: HashMap<String, Field>,
     /// Logical field mappings so Date remains distinct from Integer even
@@ -65,6 +213,64 @@ struct FieldRegistry {
     field_types: HashMap<String, crate::cluster::state::FieldType>,
     /// Mapped Date field names for targeted source normalization on ingest/read.
     date_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HotEnginePurpose {
+    LocalShard,
+    RemoteSplit,
+}
+
+impl HotEnginePurpose {
+    fn requires_sequence_fields(self) -> bool {
+        matches!(self, Self::LocalShard)
+    }
+}
+
+const SEQ_NO_FIELD_NAME: &str = "_seq_no";
+const PRIMARY_TERM_FIELD_NAME: &str = "_primary_term";
+const VECTOR_REBUILD_BATCH_SIZE: usize = 1_024;
+
+#[cfg(test)]
+thread_local! {
+    static VECTOR_REBUILD_BATCH_SIZE_OVERRIDE: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+fn vector_rebuild_batch_size() -> usize {
+    #[cfg(test)]
+    if let Some(batch_size) = VECTOR_REBUILD_BATCH_SIZE_OVERRIDE.with(|value| {
+        let value = value.get();
+        (value > 0).then_some(value)
+    }) {
+        return batch_size;
+    }
+    VECTOR_REBUILD_BATCH_SIZE
+}
+
+#[cfg(test)]
+pub(crate) struct VectorRebuildBatchSizeGuard {
+    previous: usize,
+}
+
+#[cfg(test)]
+impl Drop for VectorRebuildBatchSizeGuard {
+    fn drop(&mut self) {
+        VECTOR_REBUILD_BATCH_SIZE_OVERRIDE.with(|value| value.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn override_vector_rebuild_batch_size_for_test(
+    batch_size: usize,
+) -> VectorRebuildBatchSizeGuard {
+    assert!(batch_size > 0);
+    let previous = VECTOR_REBUILD_BATCH_SIZE_OVERRIDE.with(|value| {
+        let previous = value.get();
+        value.set(batch_size);
+        previous
+    });
+    VectorRebuildBatchSizeGuard { previous }
 }
 
 struct WriterState {
@@ -150,20 +356,29 @@ pub struct HotEngine {
     #[cfg(test)]
     engine_apply_failure: Mutex<Option<(i32, usize)>>,
     #[cfg(test)]
+    refresh_commit_failures: Mutex<usize>,
+    #[cfg(test)]
+    post_apply_refresh_failures: Mutex<usize>,
+    #[cfg(test)]
     refresh_before_writer_sender: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    #[cfg(test)]
+    refresh_after_commit_sender: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    #[cfg(test)]
+    refresh_after_commit_release_receiver: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     #[cfg(test)]
     peer_recovery_snapshot_ready_sender: Mutex<Option<std::sync::mpsc::Sender<u64>>>,
     #[cfg(test)]
     peer_recovery_snapshot_release_receiver: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
-    #[cfg(test)]
-    peer_recovery_read_started_sender: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     field_registry: RwLock<FieldRegistry>,
     /// The per-index refresh interval (e.g. 5s default, matches OpenSearch's index.refresh_interval)
     pub refresh_interval: Duration,
     /// Write-ahead log for crash durability
     translog: Arc<Mutex<dyn WriteAheadLog>>,
-    /// Highest committed translog seq_no, stored as the next seq_no after commit.
-    committed_seq_no_path: PathBuf,
+    apply_state: Mutex<ApplyState>,
+    identity_term_state: Mutex<Option<(u64, Option<u64>)>>,
+    committed_boundary_path: PathBuf,
+    durability: TranslogDurability,
+    delete_tombstone_retention: Duration,
     /// Shared column cache for fast-field Arrow arrays and grouped-partials
     /// full-segment decoded columns.
     column_cache: Arc<super::column_cache::ColumnCache>,
@@ -269,8 +484,12 @@ fn add_mapping_field_to_schema(
     builder: &mut tantivy::schema::SchemaBuilder,
     name: &str,
     mapping: &crate::cluster::state::FieldMapping,
-) -> Option<Field> {
+) -> Result<Option<Field>> {
     use crate::cluster::state::FieldType;
+    validate_authoritative_mapping_entry(name, mapping)?;
+    if crate::common::is_builtin_body_field(name) {
+        return Ok(None);
+    }
     let field = match mapping.field_type {
         FieldType::Text => builder.add_text_field(name, TEXT | STORED),
         FieldType::Keyword => builder.add_text_field(name, (STRING | STORED).set_fast(None)),
@@ -278,9 +497,30 @@ fn add_mapping_field_to_schema(
         FieldType::Float => builder.add_f64_field(name, tantivy::schema::INDEXED | STORED | FAST),
         FieldType::Boolean => builder.add_text_field(name, (STRING | STORED).set_fast(None)),
         FieldType::Date => builder.add_i64_field(name, tantivy::schema::INDEXED | STORED | FAST),
-        FieldType::KnnVector => return None, // vectors in USearch, not Tantivy
+        FieldType::KnnVector => return Ok(None), // vectors in USearch, not Tantivy
     };
-    Some(field)
+    Ok(Some(field))
+}
+
+fn validate_authoritative_mapping_entry(
+    name: &str,
+    mapping: &crate::cluster::state::FieldMapping,
+) -> Result<()> {
+    crate::common::validate_mapping_field_names([name]).map_err(|error| {
+        crate::common::unsupported_index_format("index mapping metadata", error.to_string())
+    })?;
+    crate::common::validate_builtin_body_field_mapping(name, mapping).map_err(|error| {
+        crate::common::unsupported_index_format("index mapping metadata", error.to_string())
+    })
+}
+
+fn validate_authoritative_mappings(
+    mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+) -> Result<()> {
+    for (name, mapping) in mappings {
+        validate_authoritative_mapping_entry(name, mapping)?;
+    }
+    Ok(())
 }
 
 /// Evolve an existing Tantivy meta.json to include new mapped fields.
@@ -293,6 +533,7 @@ fn evolve_meta_json_schema(
     meta_json_path: &Path,
     mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
 ) -> Result<()> {
+    validate_authoritative_mappings(mappings)?;
     let raw = std::fs::read_to_string(meta_json_path)?;
     let mut meta: serde_json::Value = serde_json::from_str(&raw)?;
 
@@ -323,7 +564,7 @@ fn evolve_meta_json_schema(
     for name in &new_names {
         let mapping = &mappings[name];
         let mut tmp_builder = Schema::builder();
-        let Some(_) = add_mapping_field_to_schema(&mut tmp_builder, name, mapping) else {
+        let Some(_) = add_mapping_field_to_schema(&mut tmp_builder, name, mapping)? else {
             continue; // knn_vector → skip
         };
         let tmp_schema = tmp_builder.build();
@@ -347,6 +588,69 @@ fn evolve_meta_json_schema(
         new_names.len(),
         new_names
     );
+    Ok(())
+}
+
+fn validate_builtin_schema_fields(
+    schema: &Schema,
+    purpose: HotEnginePurpose,
+) -> Result<(Field, Field)> {
+    let component = match purpose {
+        HotEnginePurpose::LocalShard => "local shard Tantivy schema",
+        HotEnginePurpose::RemoteSplit => "remote split Tantivy schema",
+    };
+    let required_field = |name: &str| {
+        schema.get_field(name).map_err(|_| {
+            crate::common::unsupported_index_format(
+                component,
+                format!("required internal field {name} is missing"),
+            )
+        })
+    };
+    let id_field = required_field("_id")?;
+    let source_field = required_field("_source")?;
+    let body_field = required_field(crate::common::BUILTIN_BODY_FIELD)?;
+    let valid_body = matches!(
+        schema.get_field_entry(body_field).field_type(),
+        tantivy::schema::FieldType::Str(options)
+            if options.is_stored()
+                && options
+                    .get_indexing_options()
+                    .is_some_and(|indexing| indexing.tokenizer() != "raw")
+    );
+    if !valid_body {
+        return Err(crate::common::unsupported_index_format(
+            component,
+            "built-in body field is not a stored analyzed text field",
+        ));
+    }
+    Ok((id_field, source_field))
+}
+
+fn validate_internal_sequence_fields(schema: &Schema, purpose: HotEnginePurpose) -> Result<()> {
+    if !purpose.requires_sequence_fields() {
+        return Ok(());
+    }
+    for name in [SEQ_NO_FIELD_NAME, PRIMARY_TERM_FIELD_NAME] {
+        let field = schema.get_field(name).map_err(|_| {
+            crate::common::unsupported_index_format(
+                "local shard Tantivy schema",
+                format!("required internal field {name} is missing"),
+            )
+        })?;
+        let entry = schema.get_field_entry(field);
+        let valid = matches!(
+            entry.field_type(),
+            tantivy::schema::FieldType::U64(options)
+                if options.is_fast() && options.is_stored()
+        );
+        if !valid {
+            return Err(crate::common::unsupported_index_format(
+                "local shard Tantivy schema",
+                format!("internal field {name} is not a stored u64 fast field"),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -412,6 +716,82 @@ fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
     }
 }
 
+fn sequenced_wal_entry(
+    operation: &super::SequencedOperation,
+) -> Result<crate::wal::SequencedWalEntry> {
+    let (op, payload) = match &operation.mutation {
+        super::DocumentMutation::Index { doc_id, source } => (
+            crate::wal::WalOperation::Index,
+            serde_json::json!({ "_doc_id": doc_id, "_source": source }),
+        ),
+        super::DocumentMutation::Delete { doc_id } => (
+            crate::wal::WalOperation::Delete,
+            serde_json::json!({ "_doc_id": doc_id }),
+        ),
+        super::DocumentMutation::NoOp { reason } => (
+            crate::wal::WalOperation::NoOp,
+            serde_json::json!({ "_reason": reason }),
+        ),
+    };
+    Ok(crate::wal::SequencedWalEntry {
+        seq_no: operation.seq_no,
+        primary_term: operation.primary_term,
+        op,
+        payload,
+    })
+}
+
+fn wal_entry_matches_operation(
+    entry: &crate::wal::TranslogEntry,
+    operation: &super::SequencedOperation,
+) -> Result<bool> {
+    let decoded = document_operation(entry)?;
+    Ok(match (decoded, &operation.mutation) {
+        (
+            WalDocumentOperation::Index { doc_id, source },
+            super::DocumentMutation::Index {
+                doc_id: incoming_id,
+                source: incoming_source,
+            },
+        ) => doc_id == incoming_id && source == incoming_source,
+        (
+            WalDocumentOperation::Delete { doc_id },
+            super::DocumentMutation::Delete {
+                doc_id: incoming_id,
+            },
+        ) => doc_id == incoming_id,
+        (
+            WalDocumentOperation::NoOp { reason },
+            super::DocumentMutation::NoOp {
+                reason: incoming_reason,
+            },
+        ) => reason == incoming_reason,
+        _ => false,
+    })
+}
+
+fn sequenced_operation_from_entry(
+    entry: &crate::wal::TranslogEntry,
+) -> Result<super::SequencedOperation> {
+    let mutation = match document_operation(entry)? {
+        WalDocumentOperation::Index { doc_id, source } => super::DocumentMutation::Index {
+            doc_id: doc_id.to_string(),
+            source: source.clone(),
+        },
+        WalDocumentOperation::Delete { doc_id } => super::DocumentMutation::Delete {
+            doc_id: doc_id.to_string(),
+        },
+        WalDocumentOperation::NoOp { reason } => super::DocumentMutation::NoOp {
+            reason: reason.to_string(),
+        },
+    };
+    Ok(super::SequencedOperation {
+        seq_no: entry.seq_no,
+        primary_term: entry.primary_term,
+        mutation,
+    })
+}
+
 fn join_scoped_handles<'scope, T>(
     handles: Vec<std::thread::ScopedJoinHandle<'scope, T>>,
     context: &'static str,
@@ -440,7 +820,7 @@ impl HotEngine {
 
     /// Create a new HotEngine with explicit field mappings.
     /// When mappings are provided, named Tantivy fields are created for each mapped field.
-    /// The "body" catch-all is always created for backward compatibility with `?q=` queries.
+    /// The "body" catch-all is always created for `?q=` queries.
     ///
     /// **Schema evolution**: If the on-disk index already exists but the provided
     /// mappings contain fields not yet in the stored schema, the meta.json is
@@ -460,6 +840,24 @@ impl HotEngine {
             durability,
             column_cache,
             false,
+            HotEnginePurpose::LocalShard,
+        )
+    }
+
+    pub(crate) fn new_remote_split_with_mappings<P: AsRef<Path>>(
+        data_dir: P,
+        refresh_interval: Duration,
+        mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+        column_cache: Arc<super::column_cache::ColumnCache>,
+    ) -> Result<Self> {
+        Self::new_with_mappings_mode(
+            data_dir,
+            refresh_interval,
+            mappings,
+            TranslogDurability::Request,
+            column_cache,
+            false,
+            HotEnginePurpose::RemoteSplit,
         )
     }
 
@@ -477,6 +875,7 @@ impl HotEngine {
             durability,
             column_cache,
             true,
+            HotEnginePurpose::LocalShard,
         )
     }
 
@@ -487,8 +886,10 @@ impl HotEngine {
         durability: TranslogDurability,
         column_cache: Arc<super::column_cache::ColumnCache>,
         existing_only: bool,
+        purpose: HotEnginePurpose,
     ) -> Result<Self> {
         let data_dir = data_dir.as_ref();
+        validate_authoritative_mappings(mappings)?;
         let index_path = data_dir.join("index");
         let meta_json_path = index_path.join("meta.json");
         if existing_only && !meta_json_path.is_file() {
@@ -516,13 +917,17 @@ impl HotEngine {
             let mut schema_builder = Schema::builder();
             schema_builder.add_text_field("_id", (STRING | STORED).set_fast(None));
             schema_builder.add_text_field("_source", STORED);
+            if purpose.requires_sequence_fields() {
+                schema_builder.add_u64_field(SEQ_NO_FIELD_NAME, FAST | STORED);
+                schema_builder.add_u64_field(PRIMARY_TERM_FIELD_NAME, FAST | STORED);
+            }
             schema_builder.add_text_field("body", TEXT | STORED);
 
             let mut mapping_names: Vec<_> = mappings.keys().cloned().collect();
             mapping_names.sort();
             for name in mapping_names {
                 let mapping = &mappings[&name];
-                add_mapping_field_to_schema(&mut schema_builder, &name, mapping);
+                add_mapping_field_to_schema(&mut schema_builder, &name, mapping)?;
             }
 
             let schema = schema_builder.build();
@@ -531,19 +936,19 @@ impl HotEngine {
         };
 
         let schema = index.schema();
+        let (id_field, source_field) = validate_builtin_schema_fields(&schema, purpose)?;
+        validate_internal_sequence_fields(&schema, purpose)?;
 
         // Build the FieldRegistry from the opened schema (authoritative).
-        let id_field = schema.get_field("_id").expect("_id must exist in schema");
-        let source_field = schema
-            .get_field("_source")
-            .expect("_source must exist in schema");
+        let seq_no_field = schema.get_field(SEQ_NO_FIELD_NAME).ok();
+        let primary_term_field = schema.get_field(PRIMARY_TERM_FIELD_NAME).ok();
 
         let mut fields = HashMap::new();
         let mut field_types = HashMap::new();
         let mut date_fields = Vec::new();
         for (field, entry) in schema.fields() {
             let name: String = entry.name().to_string();
-            if name == "_source" || name == "_id" {
+            if crate::common::is_reserved_document_key(&name) {
                 continue;
             }
             fields.insert(name.clone(), field);
@@ -575,16 +980,23 @@ impl HotEngine {
         if matches!(durability, TranslogDurability::Async { .. }) {
             translog.start_sync_task();
         }
+        let committed_boundary_path = data_dir.join("translog.committed");
+        let committed_boundary = CommittedBoundaryRecord::load_or_initialize_empty(
+            &committed_boundary_path,
+            0,
+            translog.max_seq_no(),
+        )?;
+        let apply_state = ApplyState::new(committed_boundary)?;
 
         let field_registry = FieldRegistry {
             id_field,
             source_field,
+            seq_no_field,
+            primary_term_field,
             fields,
             field_types,
             date_fields,
         };
-
-        let committed_seq_no_path = data_dir.join("translog.committed");
 
         let engine = Self {
             index,
@@ -601,19 +1013,34 @@ impl HotEngine {
             #[cfg(test)]
             engine_apply_failure: Mutex::new(None),
             #[cfg(test)]
+            refresh_commit_failures: Mutex::new(0),
+            #[cfg(test)]
+            post_apply_refresh_failures: Mutex::new(0),
+            #[cfg(test)]
             refresh_before_writer_sender: Mutex::new(None),
+            #[cfg(test)]
+            refresh_after_commit_sender: Mutex::new(None),
+            #[cfg(test)]
+            refresh_after_commit_release_receiver: Mutex::new(None),
             #[cfg(test)]
             peer_recovery_snapshot_ready_sender: Mutex::new(None),
             #[cfg(test)]
             peer_recovery_snapshot_release_receiver: Mutex::new(None),
-            #[cfg(test)]
-            peer_recovery_read_started_sender: Mutex::new(None),
             field_registry: RwLock::new(field_registry),
             refresh_interval,
             translog: Arc::new(Mutex::new(translog)),
-            committed_seq_no_path,
+            apply_state: Mutex::new(apply_state),
+            identity_term_state: Mutex::new(None),
+            committed_boundary_path,
+            durability,
+            delete_tombstone_retention: Duration::from_secs(60),
             column_cache,
         };
+
+        #[cfg(feature = "protocol-trace")]
+        if let Some(copy) = crate::protocol_trace::current_open_copy() {
+            crate::protocol_trace::record_node_restarted(&copy, engine.sequence_stats());
+        }
 
         // Replay any uncommitted translog entries from before a crash
         engine.replay_translog()?;
@@ -678,14 +1105,57 @@ impl HotEngine {
         &self,
         writer_state: &mut WriterState,
         context: &str,
-        next_seq_no: u64,
-    ) -> Result<CommittedTantivyBoundary> {
+        _boundary: CommittedBoundaryRecord,
+    ) -> Result<CommittedBoundaryRecord> {
+        #[cfg(test)]
+        if context == "refresh" {
+            let mut remaining = self
+                .refresh_commit_failures
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if *remaining > 0 {
+                *remaining -= 1;
+                writer_state.fail("injected refresh commit failure");
+                anyhow::bail!("injected refresh commit failure");
+            }
+        }
         let commit_result = {
             let writer = writer_state.writer_mut(context)?;
             writer.commit()
         };
         match commit_result {
-            Ok(_) => Ok(CommittedTantivyBoundary { next_seq_no }),
+            Ok(_) => {
+                let mut state = self
+                    .apply_state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+                let processed_checkpoint = state.checkpoints.processed_checkpoint();
+                state
+                    .checkpoints
+                    .mark_persisted_through(processed_checkpoint);
+                let boundary = state.committed_boundary();
+                boundary.validate()?;
+                #[cfg(feature = "protocol-trace")]
+                if let Some(copy) = crate::protocol_trace::current_open_copy() {
+                    crate::protocol_trace::record_commit_captured(
+                        &copy,
+                        super::SequenceStats {
+                            processed_checkpoint: boundary.processed_checkpoint,
+                            persisted_checkpoint: boundary.persisted_checkpoint,
+                            max_seq_no: boundary.max_seq_no,
+                        },
+                        boundary.term_sequence_state.current_term,
+                        boundary.term_sequence_state.max_seq_no_at_term_start,
+                        boundary
+                            .term_sequence_state
+                            .processed_in_current_term_below_start_max
+                            .iter()
+                            .map(|range| (range.start, range.end))
+                            .collect(),
+                    );
+                }
+                Ok(boundary)
+            }
             Err(source) => {
                 let failure = TantivyCommitFailureError {
                     context: context.to_string(),
@@ -700,23 +1170,972 @@ impl HotEngine {
     fn validate_truncation_boundary(
         &self,
         translog: &dyn WriteAheadLog,
-        boundary: CommittedTantivyBoundary,
+        boundary: &CommittedBoundaryRecord,
     ) -> Result<()> {
-        let persisted = self.load_committed_next_seq_no()?;
-        if persisted != boundary.next_seq_no {
+        let persisted = self.load_committed_boundary()?;
+        if persisted != *boundary {
             anyhow::bail!(
-                "refusing WAL truncation: persisted committed checkpoint {persisted} does not match successful Tantivy commit boundary {}",
-                boundary.next_seq_no
+                "refusing WAL truncation: persisted committed boundary does not match the successful Tantivy commit boundary"
             );
         }
-        let wal_next_seq_no = translog.next_seq_no();
-        if boundary.next_seq_no != wal_next_seq_no {
+        if boundary.max_seq_no != translog.max_seq_no() {
             anyhow::bail!(
-                "refusing WAL truncation: successful Tantivy commit boundary {} does not match WAL next sequence {wal_next_seq_no}",
-                boundary.next_seq_no
+                "refusing WAL truncation: successful Tantivy maximum sequence {:?} does not match WAL maximum sequence {:?}",
+                boundary.max_seq_no,
+                translog.max_seq_no()
             );
         }
         Ok(())
+    }
+
+    fn load_committed_boundary(&self) -> Result<CommittedBoundaryRecord> {
+        CommittedBoundaryRecord::load(&self.committed_boundary_path)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "committed boundary {:?} disappeared after engine initialization",
+                self.committed_boundary_path
+            )
+        })
+    }
+
+    fn current_committed_boundary(&self) -> Result<CommittedBoundaryRecord> {
+        let state = self
+            .apply_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+        let boundary = state.committed_boundary();
+        boundary.validate()?;
+        Ok(boundary)
+    }
+
+    fn reset_apply_state_to_commit(&self, committed: CommittedBoundaryRecord) -> Result<()> {
+        let identity_term_state = *self
+            .identity_term_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("identity term state lock poisoned"))?;
+        let mut state = self
+            .apply_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+        state.reset_to_commit(committed.clone())?;
+        if let Some((identity_fence, identity_fence_max_seq_no)) = identity_term_state {
+            state.term_sequences = initialize_term_sequence_state(
+                identity_fence,
+                identity_fence_max_seq_no,
+                &committed,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn prepare_primary_term_before_wal(&self, primary_term: u64) -> Result<()> {
+        let mut state = self
+            .apply_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+        state.term_sequences.ensure_not_stale(primary_term)?;
+        if primary_term > state.term_sequences.current_term() {
+            let max_seq_no = state.checkpoints.max_seq_no();
+            state.term_sequences.raise_term(primary_term, max_seq_no)?;
+        }
+        Ok(())
+    }
+
+    fn current_version(&self, state: &ApplyState, doc_id: &str) -> Result<Option<CurrentVersion>> {
+        if let Some(version) = state.versions.lookup(doc_id)? {
+            return Ok(Some(CurrentVersion::Native(version)));
+        }
+
+        let registry = self
+            .field_registry
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let searcher = self.reader.searcher();
+        let query = tantivy::query::TermQuery::new(
+            Term::from_field_text(registry.id_field, doc_id),
+            tantivy::schema::IndexRecordOption::Basic,
+        );
+        let Some((_, address)) = searcher
+            .search(&query, &TopDocs::with_limit(1))?
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+        let segment = &searcher.segment_readers()[address.segment_ord as usize];
+        let seq_column = segment.fast_fields().u64(SEQ_NO_FIELD_NAME);
+        let term_column = segment.fast_fields().u64(PRIMARY_TERM_FIELD_NAME);
+        let (seq_column, term_column) = match (seq_column, term_column) {
+            (Ok(seq_column), Ok(term_column)) => (seq_column, term_column),
+            _ => {
+                return Err(crate::common::unsupported_index_format(
+                    "local shard Tantivy segment",
+                    format!("document [{doc_id}] is missing _seq_no or _primary_term"),
+                ));
+            }
+        };
+        let mut seq_values = seq_column.values_for_doc(address.doc_id);
+        let Some(seq_no) = seq_values.next() else {
+            return Err(crate::common::unsupported_index_format(
+                "local shard Tantivy segment",
+                format!("document [{doc_id}] has no {SEQ_NO_FIELD_NAME} value"),
+            ));
+        };
+        if seq_values.next().is_some() {
+            return Err(InternalSequenceFieldError {
+                message: format!("document [{doc_id}] has multiple {SEQ_NO_FIELD_NAME} values"),
+            }
+            .into());
+        }
+        let mut term_values = term_column.values_for_doc(address.doc_id);
+        let Some(primary_term) = term_values.next() else {
+            return Err(crate::common::unsupported_index_format(
+                "local shard Tantivy segment",
+                format!("document [{doc_id}] has no {PRIMARY_TERM_FIELD_NAME} value"),
+            ));
+        };
+        if term_values.next().is_some() {
+            return Err(InternalSequenceFieldError {
+                message: format!(
+                    "document [{doc_id}] has multiple {PRIMARY_TERM_FIELD_NAME} values"
+                ),
+            }
+            .into());
+        }
+        if primary_term == 0 {
+            return Err(InternalSequenceFieldError {
+                message: format!("document [{doc_id}] has a zero _primary_term"),
+            }
+            .into());
+        }
+        Ok(Some(CurrentVersion::Native(
+            super::version_map::VersionValue::Index(super::version_map::IndexVersionValue {
+                seq_no,
+                primary_term,
+            }),
+        )))
+    }
+
+    fn validate_redelivery(
+        &self,
+        translog: &dyn WriteAheadLog,
+        operation: &super::SequencedOperation,
+    ) -> Result<bool> {
+        let Some(entry) = translog.find_entry(operation.seq_no)? else {
+            return Ok(false);
+        };
+        if entry.primary_term != operation.primary_term {
+            return Ok(false);
+        }
+        if !wal_entry_matches_operation(&entry, operation)? {
+            return Err(SequenceOperationCollisionError {
+                primary_term: operation.primary_term,
+                seq_no: operation.seq_no,
+            }
+            .into());
+        }
+        Ok(true)
+    }
+
+    fn apply_sequenced_batch_locked<F>(
+        &self,
+        translog: &dyn WriteAheadLog,
+        operations: Vec<super::SequencedOperation>,
+        wal_disposition: WalDisposition,
+        mut writer_override: Option<&mut WriterState>,
+        inject_apply_failure: bool,
+        mut side_effect: F,
+    ) -> Result<super::ReplicaBulkApplyReceipt>
+    where
+        F: FnMut(&super::SequencedOperation) -> Result<()>,
+    {
+        #[cfg(not(test))]
+        let _ = inject_apply_failure;
+        if operations.is_empty() {
+            return Ok(super::ReplicaBulkApplyReceipt {
+                outcomes: Vec::new(),
+                all_operations_processed: true,
+                all_operations_persisted: true,
+                sequence: self.sequence_stats(),
+            });
+        }
+
+        if writer_override.is_none() {
+            drop(self.writer_state_with_replay(translog, "sequenced operation apply")?);
+        }
+        let mut state = self
+            .apply_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+        #[cfg(feature = "protocol-trace")]
+        let trace_copy = crate::protocol_trace::current_open_copy();
+        #[cfg(feature = "protocol-trace")]
+        let arrival_order_apply = crate::protocol_trace::current_apply_origin()
+            == Some(crate::protocol_trace::ApplyOrigin::LiveReplication)
+            && crate::protocol_trace::mutation_enabled(
+                crate::protocol_trace::MutationMode::ArrivalOrderApply,
+            );
+        #[cfg(not(feature = "protocol-trace"))]
+        let arrival_order_apply = false;
+        #[cfg(feature = "protocol-trace")]
+        let seq_only_redelivery = crate::protocol_trace::current_apply_origin()
+            == Some(crate::protocol_trace::ApplyOrigin::LiveReplication)
+            && crate::protocol_trace::mutation_enabled(
+                crate::protocol_trace::MutationMode::SeqOnlyRedelivery,
+            );
+        #[cfg(not(feature = "protocol-trace"))]
+        let seq_only_redelivery = false;
+        let planning_snapshot = state.planning_snapshot();
+        let mut planned = Vec::with_capacity(operations.len());
+        let mut shadow_versions = HashMap::<String, CurrentVersion>::new();
+        #[cfg(feature = "protocol-trace")]
+        let mut collision_operation = None;
+
+        let planning_result = (|| {
+            for operation in operations {
+                if operation.primary_term > state.term_sequences.current_term() {
+                    let max_seq_no = state.checkpoints.max_seq_no();
+                    state
+                        .term_sequences
+                        .raise_term(operation.primary_term, max_seq_no)?;
+                }
+                let already_processed = state.checkpoints.has_processed(operation.seq_no);
+                if !seq_only_redelivery
+                    && let Err(error) = state.term_sequences.check_before_redelivery(
+                        operation.primary_term,
+                        operation.seq_no,
+                        already_processed,
+                    )
+                {
+                    #[cfg(feature = "protocol-trace")]
+                    {
+                        collision_operation = Some(operation.clone());
+                    }
+                    return Err(error);
+                }
+                if already_processed {
+                    if wal_disposition.validates_redelivery()
+                        && !seq_only_redelivery
+                        && let Err(error) = self.validate_redelivery(translog, &operation)
+                    {
+                        #[cfg(feature = "protocol-trace")]
+                        {
+                            collision_operation = Some(operation.clone());
+                        }
+                        return Err(error);
+                    }
+                    planned.push(PlannedOperation {
+                        operation,
+                        outcome: super::ApplyOutcome::Redelivery,
+                        complete: false,
+                    });
+                    continue;
+                }
+
+                state.checkpoints.advance_max_seq_no(operation.seq_no);
+                if !matches!(operation.mutation, super::DocumentMutation::NoOp { .. }) {
+                    state.max_seq_no_of_updates_or_deletes = Some(
+                        state
+                            .max_seq_no_of_updates_or_deletes
+                            .map_or(operation.seq_no, |current| current.max(operation.seq_no)),
+                    );
+                }
+
+                let outcome = match &operation.mutation {
+                    super::DocumentMutation::NoOp { .. } => super::ApplyOutcome::NoOp,
+                    super::DocumentMutation::Index { doc_id, .. }
+                    | super::DocumentMutation::Delete { doc_id } => {
+                        let current = if let Some(current) = shadow_versions.get(doc_id).copied() {
+                            Some(current)
+                        } else {
+                            self.current_version(&state, doc_id)?
+                        };
+                        let outcome = match current {
+                            Some(CurrentVersion::Native(version))
+                                if version.seq_no() > operation.seq_no =>
+                            {
+                                if arrival_order_apply {
+                                    super::ApplyOutcome::Applied
+                                } else {
+                                    super::ApplyOutcome::Stale
+                                }
+                            }
+                            Some(CurrentVersion::Native(version))
+                                if version.seq_no() == operation.seq_no =>
+                            {
+                                let kind_matches = matches!(
+                                    (&operation.mutation, version),
+                                    (
+                                        super::DocumentMutation::Index { .. },
+                                        super::version_map::VersionValue::Index(_)
+                                    ) | (
+                                        super::DocumentMutation::Delete { .. },
+                                        super::version_map::VersionValue::Delete(_)
+                                    )
+                                );
+                                if version.primary_term() != operation.primary_term || !kind_matches
+                                {
+                                    if seq_only_redelivery {
+                                        super::ApplyOutcome::Redelivery
+                                    } else {
+                                        #[cfg(feature = "protocol-trace")]
+                                        {
+                                            collision_operation = Some(operation.clone());
+                                        }
+                                        return Err(SequenceOperationCollisionError {
+                                            primary_term: operation.primary_term,
+                                            seq_no: operation.seq_no,
+                                        }
+                                        .into());
+                                    }
+                                } else {
+                                    if wal_disposition.validates_redelivery()
+                                        && !seq_only_redelivery
+                                        && let Err(error) =
+                                            self.validate_redelivery(translog, &operation)
+                                    {
+                                        #[cfg(feature = "protocol-trace")]
+                                        {
+                                            collision_operation = Some(operation.clone());
+                                        }
+                                        return Err(error);
+                                    }
+                                    super::ApplyOutcome::Redelivery
+                                }
+                            }
+                            _ => super::ApplyOutcome::Applied,
+                        };
+                        if outcome == super::ApplyOutcome::Applied {
+                            let version = match &operation.mutation {
+                                super::DocumentMutation::Index { .. } => {
+                                    CurrentVersion::Native(super::version_map::VersionValue::Index(
+                                        super::version_map::IndexVersionValue {
+                                            seq_no: operation.seq_no,
+                                            primary_term: operation.primary_term,
+                                        },
+                                    ))
+                                }
+                                super::DocumentMutation::Delete { .. } => CurrentVersion::Native(
+                                    super::version_map::VersionValue::Delete(
+                                        super::version_map::DeleteVersionValue {
+                                            seq_no: operation.seq_no,
+                                            primary_term: operation.primary_term,
+                                            deleted_at: Instant::now(),
+                                        },
+                                    ),
+                                ),
+                                super::DocumentMutation::NoOp { .. } => unreachable!(),
+                            };
+                            shadow_versions.insert(doc_id.clone(), version);
+                        }
+                        outcome
+                    }
+                };
+                planned.push(PlannedOperation {
+                    operation,
+                    outcome,
+                    complete: true,
+                });
+            }
+            Ok::<(), anyhow::Error>(())
+        })();
+        if let Err(error) = planning_result {
+            state.restore_planning_snapshot(planning_snapshot);
+            #[cfg(feature = "protocol-trace")]
+            let trace_collision_result = match (trace_copy.as_ref(), collision_operation.as_ref()) {
+                (Some(copy), Some(operation)) => crate::protocol_trace::record_operation_collision(
+                    copy,
+                    operation,
+                    state.checkpoints.stats(),
+                ),
+                _ => Ok(()),
+            };
+            #[cfg(feature = "protocol-trace")]
+            trace_collision_result.context("record protocol trace operation collision")?;
+            if wal_disposition.is_already_in_local_wal() {
+                if let Some(writer_state) = writer_override.as_deref_mut() {
+                    writer_state.fail(format!(
+                        "sequenced operation failed after WAL persistence: {error:#}"
+                    ));
+                } else {
+                    self.fail_writer_after_wal(&error);
+                }
+            }
+            return Err(error);
+        }
+
+        let wal_entries = match planned
+            .iter()
+            .filter(|planned| planned.outcome != super::ApplyOutcome::Redelivery)
+            .map(|planned| sequenced_wal_entry(&planned.operation))
+            .collect::<Result<Vec<_>>>()
+        {
+            Ok(entries) => entries,
+            Err(error) => {
+                state.restore_planning_snapshot(planning_snapshot);
+                if wal_disposition.is_already_in_local_wal() {
+                    if let Some(writer_state) = writer_override.as_deref_mut() {
+                        writer_state.fail(format!(
+                            "sequenced operation failed after WAL persistence: {error:#}"
+                        ));
+                    } else {
+                        self.fail_writer_after_wal(&error);
+                    }
+                }
+                return Err(error);
+            }
+        };
+        let appended = wal_disposition == WalDisposition::Append && !wal_entries.is_empty();
+        if appended && let Err(error) = translog.append_batch_with_seq(&wal_entries) {
+            state.restore_planning_snapshot(planning_snapshot);
+            return Err(error);
+        }
+        #[cfg(feature = "protocol-trace")]
+        if appended && let Some(copy) = trace_copy.as_ref() {
+            let durable = matches!(self.durability, TranslogDurability::Request);
+            for planned_operation in planned
+                .iter()
+                .filter(|planned| planned.outcome != super::ApplyOutcome::Redelivery)
+            {
+                crate::protocol_trace::record_wal_appended(
+                    copy,
+                    &planned_operation.operation,
+                    durable,
+                )?;
+            }
+        }
+
+        let has_applied = planned
+            .iter()
+            .any(|planned| planned.outcome == super::ApplyOutcome::Applied);
+        let mut owned_writer_state = if has_applied && writer_override.is_none() {
+            Some(
+                self.writer
+                    .write()
+                    .unwrap_or_else(|error| error.into_inner()),
+            )
+        } else {
+            None
+        };
+        let mut writer_state = if has_applied {
+            if let Some(writer_state) = &mut writer_override {
+                Some(&mut **writer_state)
+            } else {
+                owned_writer_state.as_deref_mut()
+            }
+        } else {
+            None
+        };
+        let execution_result = (|| {
+            #[cfg(test)]
+            if inject_apply_failure {
+                self.maybe_fail_engine_apply_for_test()?;
+            }
+            for planned_operation in &planned {
+                match (
+                    &planned_operation.operation.mutation,
+                    planned_operation.outcome,
+                ) {
+                    (
+                        super::DocumentMutation::Index { doc_id, source },
+                        super::ApplyOutcome::Applied,
+                    ) => {
+                        let writer = writer_state
+                            .as_mut()
+                            .expect("applied operation requires a writer")
+                            .writer_mut("sequenced index apply")?;
+                        let id_field = self
+                            .field_registry
+                            .read()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .id_field;
+                        writer.delete_term(Term::from_field_text(id_field, doc_id));
+                        let doc = self.build_tantivy_doc(
+                            doc_id,
+                            source,
+                            planned_operation.operation.seq_no,
+                            planned_operation.operation.primary_term,
+                        )?;
+                        writer.add_document(doc)?;
+                        side_effect(&planned_operation.operation)?;
+                        state.versions.apply_index(
+                            doc_id,
+                            planned_operation.operation.seq_no,
+                            planned_operation.operation.primary_term,
+                        );
+                    }
+                    (super::DocumentMutation::Delete { doc_id }, super::ApplyOutcome::Applied) => {
+                        let writer = writer_state
+                            .as_mut()
+                            .expect("applied operation requires a writer")
+                            .writer_mut("sequenced delete apply")?;
+                        let id_field = self
+                            .field_registry
+                            .read()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .id_field;
+                        writer.delete_term(Term::from_field_text(id_field, doc_id));
+                        side_effect(&planned_operation.operation)?;
+                        state.versions.apply_delete(
+                            doc_id,
+                            planned_operation.operation.seq_no,
+                            planned_operation.operation.primary_term,
+                        );
+                    }
+                    (_, super::ApplyOutcome::Applied) => unreachable!(),
+                    _ => {}
+                }
+
+                if planned_operation.complete {
+                    state.complete_operation(
+                        planned_operation.operation.primary_term,
+                        planned_operation.operation.seq_no,
+                        self.durability,
+                    )?;
+                    if wal_disposition.is_persisted() {
+                        state
+                            .checkpoints
+                            .mark_persisted(planned_operation.operation.seq_no);
+                    }
+                }
+                #[cfg(feature = "protocol-trace")]
+                if let Some(copy) = trace_copy.as_ref() {
+                    crate::protocol_trace::record_operation_processed(
+                        copy,
+                        &planned_operation.operation,
+                        planned_operation.outcome,
+                        state.checkpoints.stats(),
+                    )?;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        })();
+        if let Err(error) = execution_result {
+            if appended || wal_disposition.is_already_in_local_wal() {
+                if let Some(writer_state) = writer_state.as_mut() {
+                    (*writer_state).fail(format!(
+                        "sequenced operation failed after WAL persistence: {error:#}"
+                    ));
+                } else {
+                    self.fail_writer_after_wal(&error);
+                }
+            }
+            return Err(error);
+        }
+
+        let outcomes = planned
+            .iter()
+            .map(|planned| planned.outcome)
+            .collect::<Vec<_>>();
+        let all_operations_processed = planned
+            .iter()
+            .all(|planned| state.checkpoints.has_processed(planned.operation.seq_no));
+        let all_operations_persisted = planned
+            .iter()
+            .all(|planned| state.checkpoints.has_persisted(planned.operation.seq_no));
+        Ok(super::ReplicaBulkApplyReceipt {
+            outcomes,
+            all_operations_processed,
+            all_operations_persisted,
+            sequence: state.checkpoints.stats(),
+        })
+    }
+
+    pub(crate) fn apply_sequenced_operation_with_side_effect<F>(
+        &self,
+        operation: super::SequencedOperation,
+        side_effect: F,
+    ) -> Result<super::ReplicaApplyReceipt>
+    where
+        F: FnOnce(&super::SequencedOperation) -> Result<()>,
+    {
+        let mut side_effect = Some(side_effect);
+        let bulk =
+            self.apply_sequenced_batch_with_side_effect(vec![operation], false, |operation| {
+                side_effect
+                    .take()
+                    .expect("single operation side effect runs at most once")(
+                    operation
+                )
+            })?;
+        Ok(super::ReplicaApplyReceipt {
+            outcome: bulk.outcomes[0],
+            operation_processed: bulk.all_operations_processed,
+            operation_persisted: bulk.all_operations_persisted,
+            sequence: bulk.sequence,
+        })
+    }
+
+    pub(crate) fn apply_sequenced_batch_with_side_effect<F>(
+        &self,
+        operations: Vec<super::SequencedOperation>,
+        allow_oversized_bulk: bool,
+        mut side_effect: F,
+    ) -> Result<super::ReplicaBulkApplyReceipt>
+    where
+        F: FnMut(&super::SequencedOperation) -> Result<()>,
+    {
+        let doc_ids = operations
+            .iter()
+            .filter_map(|operation| operation.mutation.doc_id())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        self.with_version_map_capacity(
+            "sequenced operation apply",
+            doc_ids.iter().map(String::as_str),
+            allow_oversized_bulk,
+            |translog| {
+                self.apply_sequenced_batch_locked(
+                    translog,
+                    operations.clone(),
+                    WalDisposition::Append,
+                    None,
+                    true,
+                    &mut side_effect,
+                )
+            },
+        )
+    }
+
+    pub(crate) fn add_primary_index_with_side_effect<F>(
+        &self,
+        doc_id: &str,
+        payload: serde_json::Value,
+        primary_term: u64,
+        mut side_effect: F,
+    ) -> Result<super::IndexWriteReceipt>
+    where
+        F: FnMut(&super::SequencedOperation) -> Result<()>,
+    {
+        self.validate_keyword_documents(std::iter::once(&payload))?;
+        self.prepare_primary_term_before_wal(primary_term)?;
+        let doc_id_owned = doc_id.to_string();
+        let seq_no =
+            self.with_version_map_capacity("document indexing", [doc_id], false, |translog| {
+                drop(self.writer_state_with_replay(translog, "document indexing")?);
+                self.prepare_primary_term_before_wal(primary_term)?;
+                let receipt = translog.append(
+                    primary_term,
+                    crate::wal::WalOperation::Index,
+                    serde_json::json!({ "_doc_id": doc_id, "_source": payload }),
+                )?;
+                let operation = super::SequencedOperation {
+                    seq_no: receipt.seq_no,
+                    primary_term,
+                    mutation: super::DocumentMutation::Index {
+                        doc_id: doc_id_owned.clone(),
+                        source: payload.clone(),
+                    },
+                };
+                #[cfg(feature = "protocol-trace")]
+                if let Some(copy) = crate::protocol_trace::current_open_copy() {
+                    crate::protocol_trace::record_wal_appended(
+                        &copy,
+                        &operation,
+                        matches!(self.durability, TranslogDurability::Request),
+                    )?;
+                }
+                self.apply_sequenced_batch_locked(
+                    translog,
+                    vec![operation],
+                    WalDisposition::AlreadyInLocalWal {
+                        persisted: matches!(self.durability, TranslogDurability::Request),
+                        validate_redelivery: true,
+                    },
+                    None,
+                    true,
+                    &mut side_effect,
+                )?;
+                Ok(receipt.seq_no)
+            })?;
+        Ok(super::IndexWriteReceipt {
+            doc_id: doc_id.to_string(),
+            seq_no,
+            primary_term,
+        })
+    }
+
+    pub(crate) fn add_primary_bulk_with_side_effect<F>(
+        &self,
+        docs: Vec<(String, serde_json::Value)>,
+        primary_term: u64,
+        mut side_effect: F,
+    ) -> Result<super::BulkWriteReceipt>
+    where
+        F: FnMut(&super::SequencedOperation) -> Result<()>,
+    {
+        self.validate_keyword_documents(docs.iter().map(|(_, payload)| payload))?;
+        self.prepare_primary_term_before_wal(primary_term)?;
+        let wal_ops = docs
+            .iter()
+            .map(|(doc_id, payload)| {
+                (
+                    crate::wal::WalOperation::Index,
+                    serde_json::json!({ "_doc_id": doc_id, "_source": payload }),
+                )
+            })
+            .collect::<Vec<_>>();
+        let doc_ids = docs
+            .iter()
+            .map(|(doc_id, _)| doc_id.clone())
+            .collect::<Vec<_>>();
+        let start_seq_no = self.with_version_map_capacity(
+            "bulk indexing",
+            doc_ids.iter().map(String::as_str),
+            true,
+            |translog| {
+                drop(self.writer_state_with_replay(translog, "bulk indexing")?);
+                self.prepare_primary_term_before_wal(primary_term)?;
+                let Some(start_seq_no) =
+                    translog.write_bulk_with_receipt(primary_term, &wal_ops)?
+                else {
+                    return Ok(None);
+                };
+                let operations = docs
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, (doc_id, payload))| {
+                        Ok(super::SequencedOperation {
+                            seq_no: start_seq_no.checked_add(offset as u64).ok_or_else(|| {
+                                anyhow::anyhow!("bulk write sequence range overflows")
+                            })?,
+                            primary_term,
+                            mutation: super::DocumentMutation::Index {
+                                doc_id: doc_id.clone(),
+                                source: payload.clone(),
+                            },
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                #[cfg(feature = "protocol-trace")]
+                if let Some(copy) = crate::protocol_trace::current_open_copy() {
+                    for operation in &operations {
+                        crate::protocol_trace::record_wal_appended(
+                            &copy,
+                            operation,
+                            matches!(self.durability, TranslogDurability::Request),
+                        )?;
+                    }
+                }
+                self.apply_sequenced_batch_locked(
+                    translog,
+                    operations,
+                    WalDisposition::AlreadyInLocalWal {
+                        persisted: matches!(self.durability, TranslogDurability::Request),
+                        validate_redelivery: true,
+                    },
+                    None,
+                    true,
+                    &mut side_effect,
+                )?;
+                Ok(Some(start_seq_no))
+            },
+        )?;
+        Ok(super::BulkWriteReceipt {
+            doc_ids,
+            start_seq_no,
+            primary_term,
+        })
+    }
+
+    pub(crate) fn delete_primary_with_side_effect<F>(
+        &self,
+        doc_id: &str,
+        primary_term: u64,
+        mut side_effect: F,
+    ) -> Result<super::DeleteWriteReceipt>
+    where
+        F: FnMut(&super::SequencedOperation) -> Result<()>,
+    {
+        self.prepare_primary_term_before_wal(primary_term)?;
+        let doc_id_owned = doc_id.to_string();
+        let seq_no =
+            self.with_version_map_capacity("document delete", [doc_id], false, |translog| {
+                drop(self.writer_state_with_replay(translog, "document delete")?);
+                self.prepare_primary_term_before_wal(primary_term)?;
+                let receipt = translog.append(
+                    primary_term,
+                    crate::wal::WalOperation::Delete,
+                    serde_json::json!({ "_doc_id": doc_id }),
+                )?;
+                let operation = super::SequencedOperation {
+                    seq_no: receipt.seq_no,
+                    primary_term,
+                    mutation: super::DocumentMutation::Delete {
+                        doc_id: doc_id_owned.clone(),
+                    },
+                };
+                #[cfg(feature = "protocol-trace")]
+                if let Some(copy) = crate::protocol_trace::current_open_copy() {
+                    crate::protocol_trace::record_wal_appended(
+                        &copy,
+                        &operation,
+                        matches!(self.durability, TranslogDurability::Request),
+                    )?;
+                }
+                self.apply_sequenced_batch_locked(
+                    translog,
+                    vec![operation],
+                    WalDisposition::AlreadyInLocalWal {
+                        persisted: matches!(self.durability, TranslogDurability::Request),
+                        validate_redelivery: true,
+                    },
+                    None,
+                    true,
+                    &mut side_effect,
+                )?;
+                Ok(receipt.seq_no)
+            })?;
+        Ok(super::DeleteWriteReceipt {
+            deleted: 1,
+            seq_no,
+            primary_term,
+        })
+    }
+
+    fn fail_writer_after_wal(&self, error: &anyhow::Error) {
+        self.writer
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .fail(format!(
+                "sequenced operation failed after WAL persistence: {error:#}"
+            ));
+    }
+
+    fn with_version_map_capacity<'a, T, I, F>(
+        &self,
+        context: &'static str,
+        doc_ids: I,
+        allow_oversized_bulk: bool,
+        mut operation: F,
+    ) -> Result<T>
+    where
+        I: IntoIterator<Item = &'a str>,
+        F: FnMut(&dyn WriteAheadLog) -> Result<T>,
+    {
+        let reservation_bytes = LiveVersionMap::estimate_reservation(doc_ids);
+        let mut refreshed = false;
+        loop {
+            let translog = self
+                .translog
+                .lock()
+                .map_err(|_| anyhow::anyhow!("translog lock poisoned during {context}"))?;
+            let (can_reserve, current_old_empty, estimated_bytes, max_bytes) = {
+                let state = self
+                    .apply_state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+                (
+                    state.versions.can_reserve(reservation_bytes),
+                    state.versions.current_and_old_are_empty(),
+                    state.versions.estimated_bytes(),
+                    state.versions.max_bytes(),
+                )
+            };
+            let oversized_bulk = reservation_bytes > max_bytes;
+            if can_reserve
+                || (allow_oversized_bulk && oversized_bulk && refreshed && current_old_empty)
+            {
+                let result = operation(&*translog);
+                drop(translog);
+                if result.is_ok()
+                    && allow_oversized_bulk
+                    && oversized_bulk
+                    && let Err(error) = self.post_apply_refresh()
+                {
+                    tracing::warn!(
+                        "post-apply refresh failed after an oversized version-map bulk: {error:#}"
+                    );
+                }
+                return result;
+            }
+            drop(translog);
+
+            if refreshed {
+                return Err(super::version_map::VersionMapCapacityError {
+                    estimated_bytes,
+                    reservation_bytes,
+                    max_bytes,
+                }
+                .into());
+            }
+            self.refresh()?;
+            refreshed = true;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_version_map_max_bytes_for_test(&self, max_bytes: usize) {
+        self.apply_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .versions
+            .set_max_bytes_for_test(max_bytes);
+    }
+
+    pub(crate) fn refresh_with_pruned_tombstones(&self) -> Result<Vec<PrunedTombstone>> {
+        let _maintenance = self.maintenance_guard("refresh")?;
+        let committed_boundary = self.with_translog("refresh", |translog| {
+            #[cfg(test)]
+            if let Some(sender) = self
+                .refresh_before_writer_sender
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+            {
+                let _ = sender.send(());
+            }
+            let mut writer_state = self.writer_state_with_replay(translog, "refresh")?;
+            {
+                let mut state = self
+                    .apply_state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+                state.versions.rotate_current_into_old()?;
+            }
+            let boundary = self.current_committed_boundary()?;
+            match self.commit_writer_at_boundary(&mut writer_state, "refresh", boundary) {
+                Ok(boundary) => Ok(boundary),
+                Err(error) => {
+                    self.apply_state
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
+                        .versions
+                        .rollback_refresh()?;
+                    Err(error)
+                }
+            }
+        })?;
+        self.persist_committed_boundary(&committed_boundary)?;
+
+        #[cfg(test)]
+        if let Some(sender) = self
+            .refresh_after_commit_sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            let _ = sender.send(());
+            if let Some(release) = self
+                .refresh_after_commit_release_receiver
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+            {
+                let _ = release.recv();
+            }
+        }
+
+        self.reader.reload()?;
+        let pruned = self
+            .apply_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
+            .versions
+            .complete_reader_reload(
+                committed_boundary.processed_checkpoint,
+                self.delete_tombstone_retention,
+            );
+        Ok(pruned)
     }
 
     fn replay_translog_suffix_locked(
@@ -725,7 +2144,21 @@ impl HotEngine {
         writer_state: &mut WriterState,
         context: &str,
     ) -> Result<u64> {
-        let committed_next_seq = self.load_committed_next_seq_no()?;
+        let committed = self.load_committed_boundary()?;
+        self.reset_apply_state_to_commit(committed.clone())?;
+        #[cfg(feature = "protocol-trace")]
+        let trace_copy = crate::protocol_trace::current_open_copy();
+        #[cfg(feature = "protocol-trace")]
+        let trace_replay = match trace_copy.as_ref() {
+            Some(copy) => {
+                crate::protocol_trace::record_replay_started(copy, self.sequence_stats())?.is_some()
+            }
+            None => false,
+        };
+        let committed_next_seq = committed
+            .processed_checkpoint
+            .and_then(|checkpoint| checkpoint.checked_add(1))
+            .unwrap_or(0);
         let wal_next_seq = translog.next_seq_no();
         if committed_next_seq > wal_next_seq {
             anyhow::bail!(
@@ -733,86 +2166,154 @@ impl HotEngine {
             );
         }
         if committed_next_seq == wal_next_seq {
+            #[cfg(feature = "protocol-trace")]
+            if trace_replay && let Some(copy) = trace_copy.as_ref() {
+                crate::protocol_trace::record_replay_finished(copy, "completed")?;
+            }
             return Ok(0);
         }
 
         let mut replayed: u64 = 0;
-        let mut last_seq: u64 = committed_next_seq;
-        let mut batch_count: u64 = 0;
         let mut last_committed_boundary = None;
-        let id_field = self
-            .field_registry
-            .read()
-            .unwrap_or_else(|error| error.into_inner())
-            .id_field;
-        let replay_result = translog.for_each_from(committed_next_seq, &mut |entry| {
-            if replayed == 0 {
-                tracing::warn!(
-                    "Replaying translog entries from seq_no {} during {}...",
-                    committed_next_seq,
-                    context
-                );
+        let mut batch = Vec::with_capacity(TRANSLOG_REPLAY_BATCH_SIZE as usize);
+        let mut flush_batch = |batch: &mut Vec<super::SequencedOperation>| -> Result<()> {
+            if batch.is_empty() {
+                return Ok(());
             }
-
-            let operation = document_operation(&entry)?;
-            let doc_id = operation.doc_id();
-
+            let operations = std::mem::take(batch);
+            #[cfg(feature = "protocol-trace")]
+            let result = if trace_replay {
+                crate::protocol_trace::with_apply_scope(
+                    crate::protocol_trace::ApplyOrigin::Replay,
+                    operations.clone(),
+                    || {
+                        self.apply_sequenced_batch_locked(
+                            translog,
+                            operations,
+                            WalDisposition::AlreadyInLocalWal {
+                                persisted: true,
+                                validate_redelivery: false,
+                            },
+                            Some(writer_state),
+                            false,
+                            |_| Ok(()),
+                        )
+                    },
+                )
+            } else {
+                self.apply_sequenced_batch_locked(
+                    translog,
+                    operations,
+                    WalDisposition::AlreadyInLocalWal {
+                        persisted: true,
+                        validate_redelivery: false,
+                    },
+                    Some(writer_state),
+                    false,
+                    |_| Ok(()),
+                )
+            };
+            #[cfg(not(feature = "protocol-trace"))]
+            let result = self.apply_sequenced_batch_locked(
+                translog,
+                operations,
+                WalDisposition::AlreadyInLocalWal {
+                    persisted: true,
+                    validate_redelivery: false,
+                },
+                Some(writer_state),
+                false,
+                |_| Ok(()),
+            );
+            result?;
+            let boundary = self.current_committed_boundary()?;
+            let boundary = self.commit_writer_at_boundary(writer_state, context, boundary)?;
+            self.persist_committed_boundary(&boundary)?;
+            last_committed_boundary = Some(boundary);
+            Ok(())
+        };
+        let replay_result = translog.for_each_from(0, &mut |entry| {
+            if committed
+                .processed_checkpoint
+                .is_some_and(|checkpoint| entry.seq_no <= checkpoint)
             {
-                let writer = writer_state.writer_mut(context)?;
-                writer.delete_term(Term::from_field_text(id_field, doc_id));
-                if let WalDocumentOperation::Index { source, .. } = operation {
-                    let doc = self.build_tantivy_doc(doc_id, source)?;
-                    writer.add_document(doc)?;
+                #[cfg(feature = "protocol-trace")]
+                if trace_replay && let Some(copy) = trace_copy.as_ref() {
+                    let operation = sequenced_operation_from_entry(&entry)?;
+                    crate::protocol_trace::record_replay_skip(
+                        copy,
+                        &operation,
+                        self.sequence_stats(),
+                    )?;
                 }
+                return Ok(());
             }
-
-            last_seq = entry.seq_no;
+            if replayed == 0 {
+                tracing::warn!("Replaying translog entries during {context}...");
+            }
+            batch.push(sequenced_operation_from_entry(&entry)?);
             replayed += 1;
-            batch_count += 1;
-            if batch_count >= TRANSLOG_REPLAY_BATCH_SIZE {
-                let boundary =
-                    self.commit_writer_at_boundary(writer_state, context, last_seq + 1)?;
-                self.persist_committed_boundary(boundary)?;
-                last_committed_boundary = Some(boundary);
-                batch_count = 0;
+            if batch.len() >= TRANSLOG_REPLAY_BATCH_SIZE as usize {
+                flush_batch(&mut batch)?;
             }
             Ok(())
         });
         if let Err(error) = replay_result {
             let message = format!("translog replay failed during {context}: {error}");
             writer_state.fail(format!("{message}: {error:#}"));
+            #[cfg(feature = "protocol-trace")]
+            if trace_replay && let Some(copy) = trace_copy.as_ref() {
+                crate::protocol_trace::record_replay_finished(copy, "failed")?;
+            }
             return Err(error).context(message);
         }
-        if replayed == 0 || last_seq.checked_add(1) != Some(wal_next_seq) {
-            let message = format!(
-                "translog replay during {context} did not reach WAL head {wal_next_seq} from committed checkpoint {committed_next_seq}"
-            );
-            writer_state.fail(message.clone());
-            anyhow::bail!(message);
+        if replayed == 0 {
+            #[cfg(feature = "protocol-trace")]
+            if trace_replay && let Some(copy) = trace_copy.as_ref() {
+                crate::protocol_trace::record_replay_finished(copy, "completed")?;
+            }
+            return Ok(0);
         }
-        if batch_count > 0 {
-            last_committed_boundary =
-                Some(self.commit_writer_at_boundary(writer_state, context, last_seq + 1)?);
-        }
+        flush_batch(&mut batch)?;
         if let Err(error) = self.reader.reload() {
             writer_state.fail(format!("reader reload failed after {context}: {error}"));
+            #[cfg(feature = "protocol-trace")]
+            if trace_replay && let Some(copy) = trace_copy.as_ref() {
+                crate::protocol_trace::record_replay_finished(copy, "failed")?;
+            }
             return Err(error).with_context(|| format!("reader reload failed after {context}"));
         }
         let committed_boundary = last_committed_boundary
             .expect("a non-empty successful replay has a committed boundary");
-        if let Err(error) = self.persist_committed_boundary(committed_boundary) {
+        if let Err(error) = self.persist_committed_boundary(&committed_boundary) {
             writer_state.fail(format!(
                 "committed checkpoint persistence failed after {context}: {error:#}"
             ));
+            #[cfg(feature = "protocol-trace")]
+            if trace_replay && let Some(copy) = trace_copy.as_ref() {
+                crate::protocol_trace::record_replay_finished(copy, "failed")?;
+            }
             return Err(error).with_context(|| {
                 format!("committed checkpoint persistence failed after {context}")
             });
         }
+        self.apply_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
+            .versions
+            .complete_reader_reload(
+                committed_boundary.processed_checkpoint,
+                self.delete_tombstone_retention,
+            );
         tracing::info!(
             "Translog replay during {} recovered {} operations.",
             context,
             replayed
         );
+        #[cfg(feature = "protocol-trace")]
+        if trace_replay && let Some(copy) = trace_copy.as_ref() {
+            crate::protocol_trace::record_replay_finished(copy, "completed")?;
+        }
         Ok(replayed)
     }
 
@@ -866,8 +2367,7 @@ impl HotEngine {
     fn pause_and_drain_automatic_merges(
         &self,
         translog: &dyn WriteAheadLog,
-        committed_next_seq: u64,
-    ) -> Result<CommittedTantivyBoundary> {
+    ) -> Result<CommittedBoundaryRecord> {
         let automatic_policy = self
             .automatic_merge_policy
             .read()
@@ -879,11 +2379,9 @@ impl HotEngine {
         writer_state
             .writer_mut("force-merge preparation")?
             .set_merge_policy(Box::new(NoMergePolicy));
-        let committed_boundary = self.commit_writer_at_boundary(
-            &mut writer_state,
-            "force-merge preparation",
-            committed_next_seq,
-        )?;
+        let boundary = self.current_committed_boundary()?;
+        let committed_boundary =
+            self.commit_writer_at_boundary(&mut writer_state, "force-merge preparation", boundary)?;
 
         let writer = writer_state.take("force-merge merge-thread drain")?;
         #[cfg(test)]
@@ -1010,8 +2508,7 @@ impl HotEngine {
         text: &str,
     ) -> Option<serde_json::Value> {
         let mut json_val = serde_json::from_str::<serde_json::Value>(text).ok()?;
-        // Mixed-version compatibility: older segments may still store mapped
-        // Date values as offsets or raw epoch millis in _source.
+        // Keep stored date fields in the public JSON representation.
         Self::normalize_result_source_with_registry(registry, &mut json_val);
         Some(json_val)
     }
@@ -1617,6 +3114,7 @@ impl HotEngine {
             .read()
             .unwrap_or_else(|e| e.into_inner());
         for document in documents {
+            crate::common::validate_document_source(document)?;
             if let Some(object) = document.as_object() {
                 for (field_name, value) in object {
                     if matches!(
@@ -1638,12 +3136,21 @@ impl HotEngine {
         &self,
         doc_id: &str,
         payload: &serde_json::Value,
+        seq_no: u64,
+        primary_term: u64,
     ) -> Result<TantivyDocument> {
         let registry = self
             .field_registry
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        Self::build_tantivy_doc_inner(&registry, &self.index.schema(), doc_id, payload)
+        Self::build_tantivy_doc_inner(
+            &registry,
+            &self.index.schema(),
+            doc_id,
+            payload,
+            seq_no,
+            primary_term,
+        )
     }
 
     /// Build a Tantivy document using an already-acquired registry reference.
@@ -1653,11 +3160,20 @@ impl HotEngine {
         schema: &Schema,
         doc_id: &str,
         payload: &serde_json::Value,
+        seq_no: u64,
+        primary_term: u64,
     ) -> Result<TantivyDocument> {
+        crate::common::validate_document_source(payload)?;
         let mut doc = TantivyDocument::new();
 
         // Store the document ID
         doc.add_text(registry.id_field, doc_id);
+        if let Some(field) = registry.seq_no_field {
+            doc.add_u64(field, seq_no);
+        }
+        if let Some(field) = registry.primary_term_field {
+            doc.add_u64(field, primary_term);
+        }
 
         // Canonicalize mapped Date fields before persisting _source so every read path
         // sees the same UTC ISO 8601 representation.
@@ -1810,42 +3326,31 @@ impl HotEngine {
         })
     }
 
+    #[cfg(test)]
     fn load_committed_next_seq_no(&self) -> Result<u64> {
-        if !self.committed_seq_no_path.exists() {
-            return Ok(0);
+        Ok(self
+            .load_committed_boundary()?
+            .processed_checkpoint
+            .and_then(|checkpoint| checkpoint.checked_add(1))
+            .unwrap_or(0))
+    }
+
+    fn persist_committed_boundary(&self, boundary: &CommittedBoundaryRecord) -> Result<()> {
+        boundary.persist(&self.committed_boundary_path)?;
+        #[cfg(feature = "protocol-trace")]
+        if let Some(copy) = crate::protocol_trace::current_open_copy() {
+            crate::protocol_trace::record_commit_persisted(&copy)?;
         }
-        let s = std::fs::read_to_string(&self.committed_seq_no_path)?;
-        s.trim().parse::<u64>().map_err(|error| {
-            anyhow::anyhow!(
-                "invalid committed translog checkpoint {:?}: {}",
-                self.committed_seq_no_path,
-                error
-            )
-        })
-    }
-
-    fn persist_committed_boundary(&self, boundary: CommittedTantivyBoundary) -> Result<()> {
-        std::fs::write(
-            &self.committed_seq_no_path,
-            boundary.next_seq_no.to_string(),
-        )?;
         Ok(())
     }
 
-    fn persist_committed_boundary_durable(&self, boundary: CommittedTantivyBoundary) -> Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&self.committed_seq_no_path)?;
-        write!(file, "{}", boundary.next_seq_no)?;
-        file.sync_all()?;
-        Ok(())
+    fn persist_committed_boundary_durable(&self, boundary: &CommittedBoundaryRecord) -> Result<()> {
+        self.persist_committed_boundary(boundary)
     }
 
     fn peer_recovery_file_names(&self) -> Result<Vec<String>> {
         let index_path = self
-            .committed_seq_no_path
+            .committed_boundary_path
             .parent()
             .expect("committed checkpoint path has a parent")
             .join("index");
@@ -1915,6 +3420,14 @@ impl HotEngine {
             .is_none()
     }
 
+    pub(crate) fn writer_requires_rebuild(&self) -> bool {
+        self.writer
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .writer
+            .is_none()
+    }
+
     #[cfg(test)]
     pub(crate) fn notify_before_refresh_writer_for_test(
         &self,
@@ -1927,21 +3440,28 @@ impl HotEngine {
     }
 
     #[cfg(test)]
+    pub(crate) fn pause_after_refresh_commit_for_test(
+        &self,
+        sender: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self
+            .refresh_after_commit_sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(sender);
+        *self
+            .refresh_after_commit_release_receiver
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(release);
+    }
+
+    #[cfg(test)]
     fn set_peer_recovery_scan_barrier_for_test(&self, barrier: Arc<std::sync::Barrier>) {
         self.with_translog("set recovery scan barrier", |translog| {
             translog.set_recovery_scan_barrier(Some(barrier));
             Ok(())
         })
         .expect("set recovery scan barrier");
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_wal_append_barrier_for_test(&self, barrier: Arc<std::sync::Barrier>) {
-        self.with_translog("set append frame barrier", |translog| {
-            translog.set_append_frame_barrier(Some(barrier));
-            Ok(())
-        })
-        .expect("set append frame barrier");
     }
 
     #[cfg(test)]
@@ -1974,6 +3494,37 @@ impl HotEngine {
     }
 
     #[cfg(test)]
+    pub(crate) fn inject_refresh_commit_failures_for_test(&self, attempts: usize) {
+        *self
+            .refresh_commit_failures
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = attempts;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_post_apply_refresh_failures_for_test(&self, attempts: usize) {
+        *self
+            .post_apply_refresh_failures
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = attempts;
+    }
+
+    fn post_apply_refresh(&self) -> Result<()> {
+        #[cfg(test)]
+        {
+            let mut remaining = self
+                .post_apply_refresh_failures
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if *remaining > 0 {
+                *remaining -= 1;
+                anyhow::bail!("injected post-apply refresh failure");
+            }
+        }
+        self.refresh()
+    }
+
+    #[cfg(test)]
     fn maybe_fail_writer_replacement_for_test(&self) -> Option<anyhow::Error> {
         let mut failure = self
             .writer_replacement_failure
@@ -2003,17 +3554,6 @@ impl HotEngine {
         }
         *remaining -= 1;
         Err(std::io::Error::from_raw_os_error(*raw_os_error).into())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_peer_recovery_read_started_sender_for_test(
-        &self,
-        sender: tokio::sync::oneshot::Sender<()>,
-    ) {
-        *self
-            .peer_recovery_read_started_sender
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(sender);
     }
 
     /// Shared search execution helper — returns _id + _source from each hit.
@@ -2264,6 +3804,250 @@ impl HotEngine {
     /// only up to the given global checkpoint. Entries above the checkpoint
     /// are retained for replica recovery via translog replay.
     /// Returns the highest seq_no written to the WAL.
+    pub fn sequence_stats(&self) -> SequenceStats {
+        self.apply_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .checkpoints
+            .stats()
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    pub(crate) fn protocol_trace_processed_sequences(&self) -> Result<Vec<u64>> {
+        let state = self
+            .apply_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+        let Some(max_seq_no) = state.checkpoints.max_seq_no() else {
+            return Ok(Vec::new());
+        };
+        Ok((0..=max_seq_no)
+            .filter(|seq_no| state.checkpoints.has_processed(*seq_no))
+            .collect())
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    pub(crate) fn protocol_trace_documents_snapshot(
+        &self,
+    ) -> Result<Vec<(String, serde_json::Value, u64, u64)>> {
+        let mut documents = Vec::new();
+        self.for_each_vector_rebuild_batch(|batch| {
+            documents.extend(batch);
+            Ok(())
+        })?;
+        Ok(documents)
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    pub(crate) fn protocol_trace_copy_evidence(&self) -> Result<super::ProtocolTraceCopyEvidence> {
+        let live_documents = self.protocol_trace_documents_snapshot()?;
+        let versions = self
+            .apply_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
+            .versions
+            .protocol_trace_versions()?;
+        let mut actual = BTreeMap::new();
+        for (doc, source, seq_no, term) in &live_documents {
+            actual.insert(
+                doc.clone(),
+                crate::protocol_trace::TraceActualDocument {
+                    doc: doc.clone(),
+                    state: "live",
+                    seq_no: Some(*seq_no),
+                    term: Some(*term),
+                    content_hash: Some(crate::protocol_trace::content_hash(
+                        &super::DocumentMutation::Index {
+                            doc_id: doc.clone(),
+                            source: source.clone(),
+                        },
+                    )),
+                },
+            );
+        }
+        for (doc, version) in versions {
+            match version {
+                VersionValue::Index(version) => {
+                    let observed = actual.get(&doc).with_context(|| {
+                        format!(
+                            "version map records live document [{doc}] that is absent from the refreshed reader"
+                        )
+                    })?;
+                    if observed.seq_no != Some(version.seq_no)
+                        || observed.term != Some(version.primary_term)
+                    {
+                        anyhow::bail!(
+                            "version map identity for live document [{doc}] differs from the refreshed reader"
+                        );
+                    }
+                }
+                VersionValue::Delete(version) => {
+                    if actual.contains_key(&doc) {
+                        anyhow::bail!(
+                            "version map records deleted document [{doc}] that remains in the refreshed reader"
+                        );
+                    }
+                    actual.insert(
+                        doc.clone(),
+                        crate::protocol_trace::TraceActualDocument {
+                            doc: doc.clone(),
+                            state: "deleted",
+                            seq_no: Some(version.seq_no),
+                            term: Some(version.primary_term),
+                            content_hash: Some(crate::protocol_trace::content_hash(
+                                &super::DocumentMutation::Delete { doc_id: doc },
+                            )),
+                        },
+                    );
+                }
+            }
+        }
+        let wal_entries = self.with_translog("protocol trace WAL evidence", |translog| {
+            translog
+                .read_all()?
+                .into_iter()
+                .map(|entry| {
+                    let operation = sequenced_operation_from_entry(&entry)?;
+                    let (doc, op, content_hash) =
+                        crate::protocol_trace::operation_parts(&operation);
+                    Ok(crate::protocol_trace::TraceWalEntry {
+                        seq_no: operation.seq_no,
+                        term: operation.primary_term,
+                        doc,
+                        op,
+                        content_hash,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        Ok((live_documents, actual.into_values().collect(), wal_entries))
+    }
+
+    pub fn current_primary_term(&self) -> u64 {
+        self.apply_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .term_sequences
+            .current_term()
+            .max(1)
+    }
+
+    pub(crate) fn for_each_vector_rebuild_batch(
+        &self,
+        mut consume: impl FnMut(Vec<(String, serde_json::Value, u64, u64)>) -> Result<()>,
+    ) -> Result<()> {
+        let searcher = self.reader.searcher();
+        let registry = self
+            .field_registry
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let batch_size = vector_rebuild_batch_size();
+        let mut batch = Vec::with_capacity(batch_size);
+        for (segment_ord, segment) in searcher.segment_readers().iter().enumerate() {
+            let seq_column = segment.fast_fields().u64(SEQ_NO_FIELD_NAME).ok();
+            let term_column = segment.fast_fields().u64(PRIMARY_TERM_FIELD_NAME).ok();
+            for doc_id in segment.doc_ids_alive() {
+                let address = tantivy::DocAddress::new(segment_ord as u32, doc_id);
+                let stored = searcher.doc::<TantivyDocument>(address)?;
+                let document_id = stored
+                    .get_all(registry.id_field)
+                    .next()
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("vector rebuild document has no _id"))?
+                    .to_string();
+                let source = stored
+                    .get_all(registry.source_field)
+                    .next()
+                    .and_then(|value| value.as_str())
+                    .and_then(|source| Self::decode_stored_source_with_registry(&registry, source))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("vector rebuild document has no valid _source")
+                    })?;
+                let (Some(seq_column), Some(term_column)) = (&seq_column, &term_column) else {
+                    return Err(crate::common::unsupported_index_format(
+                        "local shard Tantivy segment",
+                        format!("document [{document_id}] is missing vector version fields"),
+                    ));
+                };
+                let seq_no = seq_column.first(doc_id).ok_or_else(|| {
+                    anyhow::Error::new(InternalSequenceFieldError {
+                        message: format!("document [{document_id}] has no {SEQ_NO_FIELD_NAME}"),
+                    })
+                })?;
+                let primary_term = term_column.first(doc_id).ok_or_else(|| {
+                    anyhow::Error::new(InternalSequenceFieldError {
+                        message: format!(
+                            "document [{document_id}] has no {PRIMARY_TERM_FIELD_NAME}"
+                        ),
+                    })
+                })?;
+                batch.push((document_id, source, seq_no, primary_term));
+                if batch.len() == batch_size {
+                    consume(std::mem::replace(
+                        &mut batch,
+                        Vec::with_capacity(batch_size),
+                    ))?;
+                }
+            }
+        }
+        if !batch.is_empty() {
+            consume(batch)?;
+        }
+        Ok(())
+    }
+
+    pub fn missing_sequence_intervals_through(
+        &self,
+        end: u64,
+    ) -> Vec<std::ops::RangeInclusive<u64>> {
+        self.apply_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .checkpoints
+            .missing_intervals_through(end)
+    }
+
+    pub(crate) fn update_local_checkpoint_compat(&self, seq_no: u64) {
+        let mut state = self
+            .apply_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.checkpoints.advance_max_seq_no(seq_no);
+        state.checkpoints.mark_processed(seq_no);
+    }
+
+    pub fn wal_max_seq_no(&self) -> Option<u64> {
+        self.with_translog_recover("wal_max_seq_no", |translog| translog.max_seq_no())
+    }
+
+    pub fn reconcile_term_sequence_state(
+        &self,
+        identity_fence: u64,
+        identity_fence_max_seq_no: Option<u64>,
+    ) -> Result<()> {
+        let committed = self.load_committed_boundary()?;
+        let mut state = self
+            .apply_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+        let current = state.term_sequences.to_record();
+        if current.current_term != identity_fence
+            || current.max_seq_no_at_term_start != identity_fence_max_seq_no
+        {
+            state.term_sequences = initialize_term_sequence_state(
+                identity_fence,
+                identity_fence_max_seq_no,
+                &committed,
+            )?;
+        }
+        *self
+            .identity_term_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("identity term state lock poisoned"))? =
+            Some((identity_fence, identity_fence_max_seq_no));
+        Ok(())
+    }
+
     pub fn last_seq_no(&self) -> u64 {
         self.with_translog_recover("last_seq_no", |tl| tl.last_seq_no())
     }
@@ -2291,7 +4075,6 @@ impl HotEngine {
                 anyhow::bail!("translog lock poisoned during checkpoint-aware flush")
             }
         };
-        let committed_next_seq = tl.next_seq_no();
         // Keep the existing writer-lock recovery policy here. A poisoned
         // translog lock makes the WAL retention boundary ambiguous; a poisoned
         // writer lock does not.
@@ -2303,19 +4086,15 @@ impl HotEngine {
         if writer_state.writer.is_none() {
             return Ok(false);
         }
-        let committed_boundary = self.commit_writer_at_boundary(
-            &mut writer_state,
-            "checkpoint-aware flush",
-            committed_next_seq,
-        )?;
+        let boundary = self.current_committed_boundary()?;
+        let committed_boundary =
+            self.commit_writer_at_boundary(&mut writer_state, "checkpoint-aware flush", boundary)?;
         drop(writer_state);
         self.reader.reload()?;
-        self.persist_committed_boundary(committed_boundary)?;
-        self.validate_truncation_boundary(&*tl, committed_boundary)?;
-        if global_checkpoint > 0 {
-            tl.truncate_below(global_checkpoint)?;
-        } else {
-            tl.truncate()?;
+        self.persist_committed_boundary(&committed_boundary)?;
+        self.validate_truncation_boundary(&*tl, &committed_boundary)?;
+        if let Some(processed_checkpoint) = committed_boundary.processed_checkpoint {
+            tl.truncate_below(global_checkpoint.min(processed_checkpoint))?;
         }
         Ok(true)
     }
@@ -2323,23 +4102,38 @@ impl HotEngine {
     pub fn flush_with_global_checkpoint(&self, global_checkpoint: u64) -> Result<()> {
         let _maintenance = self.maintenance_guard("checkpoint-aware flush")?;
         self.with_translog("checkpoint-aware flush", |tl| {
-            let committed_next_seq = tl.next_seq_no();
             let mut writer_state = self.writer_state_with_replay(tl, "checkpoint-aware flush")?;
+            let boundary = self.current_committed_boundary()?;
             let committed_boundary = self.commit_writer_at_boundary(
                 &mut writer_state,
                 "checkpoint-aware flush",
-                committed_next_seq,
+                boundary,
             )?;
             drop(writer_state);
             self.reader.reload()?;
-            self.persist_committed_boundary(committed_boundary)?;
-            self.validate_truncation_boundary(tl, committed_boundary)?;
-            if global_checkpoint > 0 {
-                tl.truncate_below(global_checkpoint)?;
-            } else {
-                tl.truncate()?;
+            self.persist_committed_boundary(&committed_boundary)?;
+            self.validate_truncation_boundary(tl, &committed_boundary)?;
+            if let Some(processed_checkpoint) = committed_boundary.processed_checkpoint {
+                tl.truncate_below(global_checkpoint.min(processed_checkpoint))?;
             }
             Ok(())
+        })
+    }
+
+    pub fn flush_without_truncation(&self) -> Result<()> {
+        let _maintenance = self.maintenance_guard("flush without truncation")?;
+        self.with_translog("flush without truncation", |tl| {
+            let mut writer_state = self.writer_state_with_replay(tl, "flush without truncation")?;
+            let boundary = self.current_committed_boundary()?;
+            let committed_boundary = self.commit_writer_at_boundary(
+                &mut writer_state,
+                "flush without truncation",
+                boundary,
+            )?;
+            drop(writer_state);
+            self.reader.reload()?;
+            self.persist_committed_boundary(&committed_boundary)?;
+            self.validate_truncation_boundary(tl, &committed_boundary)
         })
     }
 
@@ -5708,218 +7502,53 @@ impl super::SearchEngine for HotEngine {
         HotEngine::writer_is_failed_for_test(self)
     }
 
-    fn add_document_with_receipt(
+    fn add_document_with_receipt_at_term(
         &self,
         doc_id: &str,
         payload: serde_json::Value,
+        primary_term: u64,
     ) -> Result<super::IndexWriteReceipt> {
-        self.validate_keyword_documents(std::iter::once(&payload))?;
-        // Keep WAL append and the corresponding writer mutation in one critical
-        // section so refresh/flush cannot commit past a translog entry that has
-        // not yet been applied to the Tantivy writer.
-        let seq_no = self.with_translog("document indexing", |tl| {
-            let mut writer_state = self.writer_state_with_replay(tl, "document indexing")?;
-            let writer = writer_state.writer_mut("document indexing")?;
-            let wal_entry = serde_json::json!({
-                "_doc_id": doc_id,
-                "_source": payload
-            });
-            let receipt = tl.append(crate::wal::WalOperation::Index, wal_entry)?;
-            #[cfg(test)]
-            self.maybe_fail_engine_apply_for_test()?;
-
-            // 2. Delete any existing doc with same _id (upsert semantics)
-            let id_field = self
-                .field_registry
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .id_field;
-            writer.delete_term(Term::from_field_text(id_field, doc_id));
-
-            // 3. Write to Tantivy in-memory buffer
-            let doc = self.build_tantivy_doc(doc_id, &payload)?;
-            writer.add_document(doc)?;
-            Ok(receipt.seq_no)
-        })?;
-
-        Ok(super::IndexWriteReceipt {
-            doc_id: doc_id.to_string(),
-            seq_no,
-        })
+        self.add_primary_index_with_side_effect(doc_id, payload, primary_term, |_| Ok(()))
     }
 
-    fn add_document_with_seq(
+    fn bulk_add_documents_with_receipt_at_term(
+        &self,
+        docs: Vec<(String, serde_json::Value)>,
+        primary_term: u64,
+    ) -> Result<super::BulkWriteReceipt> {
+        self.add_primary_bulk_with_side_effect(docs, primary_term, |_| Ok(()))
+    }
+
+    fn delete_document_with_receipt_at_term(
         &self,
         doc_id: &str,
-        payload: serde_json::Value,
-        seq_no: u64,
-    ) -> Result<String> {
-        self.validate_keyword_documents(std::iter::once(&payload))?;
-        self.with_translog("replica document indexing", |tl| {
-            let mut writer_state =
-                self.writer_state_with_replay(tl, "replica document indexing")?;
-            let writer = writer_state.writer_mut("replica document indexing")?;
-            let wal_entry = serde_json::json!({
-                "_doc_id": doc_id,
-                "_source": payload
-            });
-            tl.append_with_seq(seq_no, crate::wal::WalOperation::Index, wal_entry)?;
-            #[cfg(test)]
-            self.maybe_fail_engine_apply_for_test()?;
-
-            let id_field = self
-                .field_registry
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .id_field;
-            writer.delete_term(Term::from_field_text(id_field, doc_id));
-
-            let doc = self.build_tantivy_doc(doc_id, &payload)?;
-            writer.add_document(doc)?;
-            Ok(())
-        })?;
-
-        Ok(doc_id.to_string())
+        primary_term: u64,
+    ) -> Result<super::DeleteWriteReceipt> {
+        self.delete_primary_with_side_effect(doc_id, primary_term, |_| Ok(()))
     }
 
-    fn bulk_add_documents_with_receipt(
+    fn apply_replica_operation(
         &self,
-        docs: Vec<(String, serde_json::Value)>,
-    ) -> Result<super::BulkWriteReceipt> {
-        self.validate_keyword_documents(docs.iter().map(|(_, payload)| payload))?;
-        // Keep WAL persistence and writer mutation serialized with refresh/flush.
-        let ops: Vec<(crate::wal::WalOperation, serde_json::Value)> = docs
-            .iter()
-            .map(|(id, p)| {
-                (
-                    crate::wal::WalOperation::Index,
-                    serde_json::json!({ "_doc_id": id, "_source": p }),
-                )
-            })
-            .collect();
-        let mut doc_ids = Vec::with_capacity(docs.len());
-        let start_seq_no = self.with_translog("bulk indexing", |tl| {
-            // 2. Write all docs to Tantivy in-memory buffer under one lock
-            // Acquire registry once for the entire batch (not per-doc)
-            let registry = self
-                .field_registry
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            let mut writer_state = self.writer_state_with_replay(tl, "bulk indexing")?;
-            let writer = writer_state.writer_mut("bulk indexing")?;
-            let start_seq_no = tl.write_bulk_with_receipt(&ops)?;
-            #[cfg(test)]
-            self.maybe_fail_engine_apply_for_test()?;
-            for (doc_id, payload) in &docs {
-                writer.delete_term(Term::from_field_text(registry.id_field, doc_id));
-                let doc = Self::build_tantivy_doc_inner(
-                    &registry,
-                    &self.index.schema(),
-                    doc_id,
-                    payload,
-                )?;
-                writer.add_document(doc)?;
-                doc_ids.push(doc_id.clone());
-            }
-            Ok(start_seq_no)
-        })?;
-
-        Ok(super::BulkWriteReceipt {
-            doc_ids,
-            start_seq_no,
-        })
+        operation: super::SequencedOperation,
+    ) -> Result<super::ReplicaApplyReceipt> {
+        if let super::DocumentMutation::Index { source, .. } = &operation.mutation {
+            self.validate_keyword_documents(std::iter::once(source))?;
+        }
+        self.apply_sequenced_operation_with_side_effect(operation, |_| Ok(()))
     }
 
-    fn bulk_add_documents_with_start_seq(
+    fn apply_replica_batch(
         &self,
-        docs: Vec<(String, serde_json::Value)>,
-        start_seq_no: u64,
-    ) -> Result<Vec<String>> {
-        self.validate_keyword_documents(docs.iter().map(|(_, payload)| payload))?;
-        let ops: Vec<(crate::wal::WalOperation, serde_json::Value)> = docs
-            .iter()
-            .map(|(id, p)| {
-                (
-                    crate::wal::WalOperation::Index,
-                    serde_json::json!({ "_doc_id": id, "_source": p }),
-                )
-            })
-            .collect();
-        let mut doc_ids = Vec::with_capacity(docs.len());
-        self.with_translog("replica bulk indexing", |tl| {
-            let registry = self
-                .field_registry
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            let mut writer_state = self.writer_state_with_replay(tl, "replica bulk indexing")?;
-            let writer = writer_state.writer_mut("replica bulk indexing")?;
-            tl.write_bulk_with_start_seq(start_seq_no, &ops)?;
-            #[cfg(test)]
-            self.maybe_fail_engine_apply_for_test()?;
-            for (doc_id, payload) in &docs {
-                writer.delete_term(Term::from_field_text(registry.id_field, doc_id));
-                let doc = Self::build_tantivy_doc_inner(
-                    &registry,
-                    &self.index.schema(),
-                    doc_id,
-                    payload,
-                )?;
-                writer.add_document(doc)?;
-                doc_ids.push(doc_id.clone());
+        operations: Vec<super::SequencedOperation>,
+    ) -> Result<super::ReplicaBulkApplyReceipt> {
+        self.validate_keyword_documents(operations.iter().filter_map(|operation| {
+            if let super::DocumentMutation::Index { source, .. } = &operation.mutation {
+                Some(source)
+            } else {
+                None
             }
-            Ok(())
-        })?;
-
-        Ok(doc_ids)
-    }
-
-    fn delete_document_with_receipt(&self, doc_id: &str) -> Result<super::DeleteWriteReceipt> {
-        let seq_no = self.with_translog("document delete", |tl| {
-            let mut writer_state = self.writer_state_with_replay(tl, "document delete")?;
-            let writer = writer_state.writer_mut("document delete")?;
-            let receipt = tl.append(
-                crate::wal::WalOperation::Delete,
-                serde_json::json!({ "_doc_id": doc_id }),
-            )?;
-            #[cfg(test)]
-            self.maybe_fail_engine_apply_for_test()?;
-
-            // 2. Delete from Tantivy
-            let id_field = self
-                .field_registry
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .id_field;
-            let opstamp = writer.delete_term(Term::from_field_text(id_field, doc_id));
-            // delete_term returns an OpStamp, not a count — we report 1 optimistically
-            let _ = opstamp;
-            Ok(receipt.seq_no)
-        })?;
-        Ok(super::DeleteWriteReceipt { deleted: 1, seq_no })
-    }
-
-    fn delete_document_with_seq(&self, doc_id: &str, seq_no: u64) -> Result<u64> {
-        self.with_translog("replica document delete", |tl| {
-            let mut writer_state = self.writer_state_with_replay(tl, "replica document delete")?;
-            let writer = writer_state.writer_mut("replica document delete")?;
-            tl.append_with_seq(
-                seq_no,
-                crate::wal::WalOperation::Delete,
-                serde_json::json!({ "_doc_id": doc_id }),
-            )?;
-            #[cfg(test)]
-            self.maybe_fail_engine_apply_for_test()?;
-
-            let id_field = self
-                .field_registry
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .id_field;
-            let opstamp = writer.delete_term(Term::from_field_text(id_field, doc_id));
-            let _ = opstamp;
-            Ok(())
-        })?;
-        Ok(1)
+        }))?;
+        self.apply_sequenced_batch_with_side_effect(operations, true, |_| Ok(()))
     }
 
     fn get_document(&self, doc_id: &str) -> Result<Option<serde_json::Value>> {
@@ -5945,39 +7574,39 @@ impl super::SearchEngine for HotEngine {
         Ok(None)
     }
 
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_documents(&self) -> Result<Vec<(String, serde_json::Value, u64, u64)>> {
+        self.protocol_trace_documents_snapshot()
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_processed_sequences(&self) -> Result<Vec<u64>> {
+        HotEngine::protocol_trace_processed_sequences(self)
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_copy_evidence(&self) -> Result<super::ProtocolTraceCopyEvidence> {
+        HotEngine::protocol_trace_copy_evidence(self)
+    }
+
     fn refresh(&self) -> Result<()> {
-        let _maintenance = self.maintenance_guard("refresh")?;
-        let committed_boundary = self.with_translog("refresh", |tl| {
-            let next_seq = tl.next_seq_no();
-            #[cfg(test)]
-            if let Some(sender) = self
-                .refresh_before_writer_sender
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take()
-            {
-                let _ = sender.send(());
-            }
-            let mut writer_state = self.writer_state_with_replay(tl, "refresh")?;
-            self.commit_writer_at_boundary(&mut writer_state, "refresh", next_seq)
-        })?;
-        self.persist_committed_boundary(committed_boundary)?;
-        self.reader.reload()?;
-        Ok(())
+        self.refresh_with_pruned_tombstones().map(|_| ())
     }
 
     fn flush(&self) -> Result<()> {
         let _maintenance = self.maintenance_guard("flush")?;
         self.with_translog("flush", |tl| {
-            let committed_next_seq = tl.next_seq_no();
             let mut writer_state = self.writer_state_with_replay(tl, "flush")?;
+            let boundary = self.current_committed_boundary()?;
             let committed_boundary =
-                self.commit_writer_at_boundary(&mut writer_state, "flush", committed_next_seq)?;
+                self.commit_writer_at_boundary(&mut writer_state, "flush", boundary)?;
             drop(writer_state); // release lock before reader reload
             self.reader.reload()?;
-            self.persist_committed_boundary(committed_boundary)?;
-            self.validate_truncation_boundary(tl, committed_boundary)?;
-            tl.truncate()?;
+            self.persist_committed_boundary(&committed_boundary)?;
+            self.validate_truncation_boundary(tl, &committed_boundary)?;
+            if let Some(processed_checkpoint) = committed_boundary.processed_checkpoint {
+                tl.truncate_below(processed_checkpoint)?;
+            }
             Ok(())
         })
     }
@@ -5999,8 +7628,7 @@ impl super::SearchEngine for HotEngine {
 
         let _maintenance = self.maintenance_guard("force merge")?;
         let committed_boundary = self.with_translog("force merge", |translog| {
-            let next_seq = translog.next_seq_no();
-            self.pause_and_drain_automatic_merges(translog, next_seq)
+            self.pause_and_drain_automatic_merges(translog)
         })?;
         let restore_policy = AutomaticMergePolicyRestore {
             engine: self,
@@ -6008,7 +7636,7 @@ impl super::SearchEngine for HotEngine {
         };
 
         let merge_result = (|| {
-            self.persist_committed_boundary(committed_boundary)?;
+            self.persist_committed_boundary(&committed_boundary)?;
             self.reader.reload()?;
 
             loop {
@@ -6278,7 +7906,12 @@ impl super::SearchEngine for HotEngine {
             .unwrap_or_else(|error| error.into_inner())
             .take()
         {
-            let _ = sender.send(prepared.snapshot_next_seq_no);
+            let snapshot_next_seq_no = prepared
+                .committed_boundary
+                .max_seq_no
+                .and_then(|seq_no| seq_no.checked_add(1))
+                .unwrap_or(0);
+            let _ = sender.send(snapshot_next_seq_no);
         }
         #[cfg(test)]
         if let Some(receiver) = self
@@ -6298,7 +7931,14 @@ impl super::SearchEngine for HotEngine {
             }
         };
         Ok(super::PeerRecoverySnapshot {
+            snapshot_cursor: prepared.snapshot_cursor,
+            #[cfg(test)]
             snapshot_next_seq_no: prepared.snapshot_next_seq_no,
+            #[cfg(feature = "protocol-trace")]
+            trace_processed_seqs: prepared.trace_processed_seqs,
+            #[cfg(feature = "protocol-trace")]
+            trace_documents: prepared.trace_documents,
+            committed_boundary: prepared.committed_boundary,
             retention_pin_id: prepared.retention_pin.into_pin_id(),
             files: prepared.files,
         })
@@ -6315,22 +7955,34 @@ impl super::SearchEngine for HotEngine {
 
         let _maintenance = self.maintenance_guard("peer recovery snapshot")?;
         let preparation = self.with_translog("peer recovery snapshot", |translog| {
-            let snapshot_next_seq_no = translog.next_seq_no();
             let mut writer_state =
                 self.writer_state_with_replay(translog, "peer recovery snapshot")?;
+            let boundary = self.current_committed_boundary()?;
+            if boundary.processed_checkpoint != boundary.max_seq_no {
+                anyhow::bail!(
+                    "peer recovery snapshot requires a gap-free source: processed checkpoint {:?} does not equal maximum sequence {:?}",
+                    boundary.processed_checkpoint,
+                    boundary.max_seq_no
+                );
+            }
             let committed_boundary = self.commit_writer_at_boundary(
                 &mut writer_state,
                 "peer recovery snapshot",
-                snapshot_next_seq_no,
+                boundary,
             )?;
             drop(writer_state);
-            self.persist_committed_boundary_durable(committed_boundary)?;
-            let retention_pin_id = translog.register_retention_pin(snapshot_next_seq_no)?;
+            self.persist_committed_boundary_durable(&committed_boundary)?;
+            let snapshot_cursor = translog.recovery_read_snapshot()?.end_cursor();
+            let retention_floor = committed_boundary
+                .processed_checkpoint
+                .and_then(|checkpoint| checkpoint.checked_add(1))
+                .unwrap_or(0);
+            let retention_pin_id = translog.register_retention_pin(retention_floor)?;
 
             let result = (|| {
                 let file_names = self.peer_recovery_file_names()?;
                 let index_path = self
-                    .committed_seq_no_path
+                    .committed_boundary_path
                     .parent()
                     .expect("committed checkpoint path has a parent")
                     .join("index");
@@ -6344,11 +7996,41 @@ impl super::SearchEngine for HotEngine {
                     })?;
                 }
                 std::fs::File::open(snapshot_dir)?.sync_all()?;
+                #[cfg(feature = "protocol-trace")]
+                {
+                    self.reader.reload()?;
+                    let processed_seqs = self.protocol_trace_processed_sequences()?;
+                    let documents = self.protocol_trace_documents_snapshot()?;
+                    Ok((file_names, processed_seqs, documents))
+                }
+                #[cfg(not(feature = "protocol-trace"))]
                 Ok(file_names)
             })();
 
+            #[cfg(feature = "protocol-trace")]
             match result {
-                Ok(file_names) => Ok((snapshot_next_seq_no, retention_pin_id, file_names)),
+                Ok((file_names, processed_seqs, documents)) => Ok((
+                    snapshot_cursor,
+                    committed_boundary,
+                    retention_pin_id,
+                    file_names,
+                    processed_seqs,
+                    documents,
+                )),
+                Err(error) => {
+                    let _ = translog.release_retention_pin(retention_pin_id);
+                    let _ = std::fs::remove_dir_all(snapshot_dir);
+                    Err(error)
+                }
+            }
+            #[cfg(not(feature = "protocol-trace"))]
+            match result {
+                Ok(file_names) => Ok((
+                    snapshot_cursor,
+                    committed_boundary,
+                    retention_pin_id,
+                    file_names,
+                )),
                 Err(error) => {
                     let _ = translog.release_retention_pin(retention_pin_id);
                     let _ = std::fs::remove_dir_all(snapshot_dir);
@@ -6356,7 +8038,24 @@ impl super::SearchEngine for HotEngine {
                 }
             }
         });
-        let (snapshot_next_seq_no, retention_pin_id, file_names) = match preparation {
+        #[cfg(feature = "protocol-trace")]
+        let (
+            snapshot_cursor,
+            committed_boundary,
+            retention_pin_id,
+            file_names,
+            trace_processed_seqs,
+            trace_documents,
+        ) = match preparation {
+            Ok(preparation) => preparation,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(snapshot_dir);
+                return Err(error);
+            }
+        };
+        #[cfg(not(feature = "protocol-trace"))]
+        let (snapshot_cursor, committed_boundary, retention_pin_id, file_names) = match preparation
+        {
             Ok(preparation) => preparation,
             Err(error) => {
                 let _ = std::fs::remove_dir_all(snapshot_dir);
@@ -6365,7 +8064,17 @@ impl super::SearchEngine for HotEngine {
         };
         drop(_maintenance);
         Ok(super::PeerRecoverySnapshotPreparation {
-            snapshot_next_seq_no,
+            snapshot_cursor,
+            #[cfg(test)]
+            snapshot_next_seq_no: committed_boundary
+                .max_seq_no
+                .and_then(|seq_no| seq_no.checked_add(1))
+                .unwrap_or(0),
+            #[cfg(feature = "protocol-trace")]
+            trace_processed_seqs,
+            #[cfg(feature = "protocol-trace")]
+            trace_documents,
+            committed_boundary,
             retention_pin: super::PeerRecoveryRetentionPin::new(
                 self.translog.clone(),
                 retention_pin_id,
@@ -6382,28 +8091,161 @@ impl super::SearchEngine for HotEngine {
 
     fn peer_recovery_ops(
         &self,
+        cursor: crate::wal::WalCursor,
+        end_cursor: Option<crate::wal::WalCursor>,
+        max_ops: usize,
+        max_bytes: usize,
+    ) -> Result<super::PeerRecoveryOpsBatch> {
+        let snapshot = self.with_translog("peer recovery operation snapshot", |translog| {
+            translog.recovery_read_snapshot()
+        })?;
+        let end_cursor = end_cursor.unwrap_or_else(|| snapshot.end_cursor());
+        if end_cursor.position() > snapshot.end_cursor().position() {
+            anyhow::bail!("peer recovery end cursor exceeds the captured WAL end");
+        }
+        let checkpoints = self
+            .apply_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
+            .checkpoints
+            .clone();
+        let batch = snapshot.read_bounded_cursor_while(
+            cursor,
+            end_cursor,
+            max_ops,
+            max_bytes,
+            |seq_no| checkpoints.has_processed(seq_no),
+        )?;
+        Ok(super::PeerRecoveryOpsBatch {
+            operations: batch.entries,
+            next_cursor: batch.next_cursor,
+            source_max_seq_no: checkpoints.stats().max_seq_no,
+            complete: batch.complete,
+        })
+    }
+
+    fn retained_recovery_ops(
+        &self,
         min_seq_no: u64,
         max_ops: usize,
         max_bytes: usize,
     ) -> Result<super::PeerRecoveryOpsBatch> {
-        #[cfg(test)]
-        if let Some(sender) = self
-            .peer_recovery_read_started_sender
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take()
-        {
-            let _ = sender.send(());
-        }
-        let snapshot = self.with_translog("peer recovery operation snapshot", |translog| {
+        let snapshot = self.with_translog("retained recovery operation snapshot", |translog| {
             translog.recovery_read_snapshot()
         })?;
-        let primary_next_seq_no = snapshot.next_seq_no();
         let (operations, complete) = snapshot.read_bounded_range(min_seq_no, max_ops, max_bytes)?;
+        let checkpoints = self
+            .apply_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
+            .checkpoints
+            .clone();
         Ok(super::PeerRecoveryOpsBatch {
-            operations,
-            primary_next_seq_no,
+            operations: operations
+                .into_iter()
+                .filter(|entry| checkpoints.has_processed(entry.seq_no))
+                .collect(),
+            next_cursor: snapshot.end_cursor(),
+            source_max_seq_no: checkpoints.stats().max_seq_no,
             complete,
+        })
+    }
+
+    fn peer_recovery_barrier(&self) -> Result<super::PeerRecoveryBarrier> {
+        self.with_translog("peer recovery barrier", |translog| {
+            drop(self.writer_state_with_replay(translog, "peer recovery barrier")?);
+            let wal_end = translog.recovery_read_snapshot()?.end_cursor();
+            let sequence = self
+                .apply_state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
+                .checkpoints
+                .stats();
+            Ok(super::PeerRecoveryBarrier { wal_end, sequence })
+        })
+    }
+
+    fn prepare_primary_activation(
+        &self,
+        primary_term: u64,
+    ) -> Result<Vec<super::SequencedOperation>> {
+        let _maintenance = self.maintenance_guard("primary activation")?;
+        self.with_translog("primary activation", |translog| {
+            {
+                let mut writer_state = self
+                    .writer
+                    .write()
+                    .unwrap_or_else(|error| error.into_inner());
+                writer_state.fail("primary activation requires full local WAL replay");
+            }
+            drop(self.writer_state_with_replay(translog, "primary activation")?);
+
+            let max_seq_no = self
+                .sequence_stats()
+                .max_seq_no
+                .into_iter()
+                .chain(translog.max_seq_no())
+                .max();
+            let Some(max_seq_no) = max_seq_no else {
+                return Ok(Vec::new());
+            };
+            let missing = self.missing_sequence_intervals_through(max_seq_no);
+            let operations = missing
+                .into_iter()
+                .flat_map(|range| range.map(|seq_no| (seq_no, primary_term)))
+                .map(|(seq_no, primary_term)| super::SequencedOperation {
+                    seq_no,
+                    primary_term,
+                    mutation: super::DocumentMutation::NoOp {
+                        reason: "promotion gap".to_string(),
+                    },
+                })
+                .collect::<Vec<_>>();
+            if operations.is_empty() {
+                return Ok(operations);
+            }
+            #[cfg(feature = "protocol-trace")]
+            crate::protocol_trace::with_apply_scope(
+                crate::protocol_trace::ApplyOrigin::Promotion,
+                operations.clone(),
+                || {
+                    self.apply_sequenced_batch_locked(
+                        translog,
+                        operations.clone(),
+                        WalDisposition::Append,
+                        None,
+                        false,
+                        |_| Ok(()),
+                    )
+                },
+            )?;
+            #[cfg(not(feature = "protocol-trace"))]
+            self.apply_sequenced_batch_locked(
+                translog,
+                operations.clone(),
+                WalDisposition::Append,
+                None,
+                false,
+                |_| Ok(()),
+            )?;
+            translog.sync()?;
+            let mut state = self
+                .apply_state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+            for operation in &operations {
+                state.checkpoints.mark_persisted(operation.seq_no);
+            }
+            #[cfg(feature = "protocol-trace")]
+            if let Some(copy) = crate::protocol_trace::current_open_copy() {
+                crate::protocol_trace::record_promotion_noop_fill(
+                    &copy,
+                    primary_term,
+                    &operations,
+                    state.checkpoints.stats(),
+                )?;
+            }
+            Ok(operations)
         })
     }
 
@@ -6413,6 +8255,26 @@ impl super::SearchEngine for HotEngine {
 
     fn doc_count(&self) -> u64 {
         self.reader.searcher().num_docs()
+    }
+
+    fn sequence_stats(&self) -> SequenceStats {
+        HotEngine::sequence_stats(self)
+    }
+
+    fn wal_max_seq_no(&self) -> Option<u64> {
+        HotEngine::wal_max_seq_no(self)
+    }
+
+    fn reconcile_term_sequence_state(
+        &self,
+        identity_fence: u64,
+        identity_fence_max_seq_no: Option<u64>,
+    ) -> Result<()> {
+        HotEngine::reconcile_term_sequence_state(self, identity_fence, identity_fence_max_seq_no)
+    }
+
+    fn current_primary_term(&self) -> u64 {
+        HotEngine::current_primary_term(self)
     }
 }
 
@@ -7095,6 +8957,77 @@ mod tests {
         (dir, engine)
     }
 
+    #[test]
+    fn field_registry_excludes_reserved_internal_metadata_fields() {
+        let (_dir, engine) = create_engine();
+        let registry = engine.field_registry.read().unwrap();
+
+        for field in [
+            "_id",
+            "_doc_id",
+            "_source",
+            "_seq_no",
+            "_primary_term",
+            "_version",
+            "_index",
+            "_routing",
+        ] {
+            assert!(
+                !registry.fields.contains_key(field),
+                "reserved field {field} must not be source-addressable"
+            );
+        }
+        assert!(registry.fields.contains_key("body"));
+    }
+
+    fn apply_index(
+        engine: &dyn SearchEngine,
+        doc_id: &str,
+        source: serde_json::Value,
+        seq_no: u64,
+        primary_term: u64,
+    ) -> super::super::ReplicaApplyReceipt {
+        engine
+            .apply_replica_operation(super::super::SequencedOperation {
+                seq_no,
+                primary_term,
+                mutation: super::super::DocumentMutation::Index {
+                    doc_id: doc_id.to_string(),
+                    source,
+                },
+            })
+            .unwrap()
+    }
+
+    fn persist_empty_committed_boundary(path: &Path) {
+        CommittedBoundaryRecord::empty(0)
+            .persist(&path.join("translog.committed"))
+            .unwrap();
+    }
+
+    fn create_pre_d1_schema_fixture(path: &Path) {
+        let index_path = path.join("index");
+        std::fs::create_dir_all(&index_path).unwrap();
+        let mut schema = Schema::builder();
+        let id = schema.add_text_field("_id", (STRING | STORED).set_fast(None));
+        let source = schema.add_text_field("_source", STORED);
+        let body = schema.add_text_field("body", TEXT | STORED);
+        let index = Index::open_or_create(
+            tantivy::directory::MmapDirectory::open(&index_path).unwrap(),
+            schema.build(),
+        )
+        .unwrap();
+        let mut writer = index.writer(TANTIVY_WRITER_HEAP_BYTES).unwrap();
+        let mut document = TantivyDocument::new();
+        document.add_text(id, "legacy");
+        document.add_text(source, r#"{"value":"legacy"}"#);
+        document.add_text(body, "legacy");
+        writer.add_document(document).unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+        drop(index);
+    }
+
     struct MergeWriteGate {
         armed: AtomicBool,
         entered_sender: Sender<()>,
@@ -7209,11 +9142,15 @@ mod tests {
         let mut schema_builder = Schema::builder();
         schema_builder.add_text_field("_id", (STRING | STORED).set_fast(None));
         schema_builder.add_text_field("_source", STORED);
+        schema_builder.add_u64_field(SEQ_NO_FIELD_NAME, FAST | STORED);
+        schema_builder.add_u64_field(PRIMARY_TERM_FIELD_NAME, FAST | STORED);
         schema_builder.add_text_field("body", TEXT | STORED);
         let index = Index::open_or_create(directory, schema_builder.build()).unwrap();
         let schema = index.schema();
         let id_field = schema.get_field("_id").unwrap();
         let source_field = schema.get_field("_source").unwrap();
+        let seq_no_field = schema.get_field(SEQ_NO_FIELD_NAME).unwrap();
+        let primary_term_field = schema.get_field(PRIMARY_TERM_FIELD_NAME).unwrap();
         let body_field = schema.get_field("body").unwrap();
         let writer = index.writer(TANTIVY_WRITER_HEAP_BYTES).unwrap();
         let automatic_merge_policy = writer.get_merge_policy();
@@ -7224,7 +9161,11 @@ mod tests {
             .unwrap();
         let translog =
             HotTranslog::open_with_durability(dir.path(), TranslogDurability::Request).unwrap();
-        let committed_seq_no_path = dir.path().join("translog.committed");
+        let committed_boundary_path = dir.path().join("translog.committed");
+        let committed_boundary = CommittedBoundaryRecord::empty(0);
+        committed_boundary
+            .persist(&committed_boundary_path)
+            .unwrap();
 
         let engine = HotEngine {
             index,
@@ -7236,20 +9177,29 @@ mod tests {
             force_merge_before_wait_sender: Mutex::new(None),
             writer_replacement_failure: Mutex::new(None),
             engine_apply_failure: Mutex::new(None),
+            refresh_commit_failures: Mutex::new(0),
+            post_apply_refresh_failures: Mutex::new(0),
             refresh_before_writer_sender: Mutex::new(None),
+            refresh_after_commit_sender: Mutex::new(None),
+            refresh_after_commit_release_receiver: Mutex::new(None),
             peer_recovery_snapshot_ready_sender: Mutex::new(None),
             peer_recovery_snapshot_release_receiver: Mutex::new(None),
-            peer_recovery_read_started_sender: Mutex::new(None),
             field_registry: RwLock::new(FieldRegistry {
                 id_field,
                 source_field,
+                seq_no_field: Some(seq_no_field),
+                primary_term_field: Some(primary_term_field),
                 fields: HashMap::from([("body".to_string(), body_field)]),
                 field_types: HashMap::new(),
                 date_fields: Vec::new(),
             }),
             refresh_interval: Duration::from_secs(60),
             translog: Arc::new(Mutex::new(translog)),
-            committed_seq_no_path,
+            apply_state: Mutex::new(ApplyState::new(committed_boundary).unwrap()),
+            identity_term_state: Mutex::new(None),
+            committed_boundary_path,
+            durability: TranslogDurability::Request,
+            delete_tombstone_retention: Duration::from_secs(60),
             column_cache: Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
         };
 
@@ -7350,6 +9300,187 @@ mod tests {
 
         // File should be unchanged — no rewrite needed.
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn explicit_text_body_mapping_reuses_builtin_schema_field() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mappings = HashMap::from([(
+            "body".to_string(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        )]);
+        let engine = HotEngine::new_with_mappings(
+            dir.path(),
+            Duration::from_secs(60),
+            &mappings,
+            TranslogDurability::Request,
+            Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            engine
+                .index
+                .schema()
+                .fields()
+                .filter(|(_, entry)| entry.name() == "body")
+                .count(),
+            1
+        );
+        apply_index(&engine, "doc", json!({"body": 42}), 0, 1);
+        engine.refresh().unwrap();
+        assert_eq!(engine.get_document("doc").unwrap().unwrap()["body"], 42);
+    }
+
+    #[test]
+    fn invalid_authoritative_builtin_mappings_require_recreate_on_open() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+
+        for (field_name, mapping) in [
+            (
+                "body",
+                FieldMapping {
+                    field_type: FieldType::Integer,
+                    dimension: None,
+                },
+            ),
+            (
+                "_routing",
+                FieldMapping {
+                    field_type: FieldType::Keyword,
+                    dimension: None,
+                },
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            drop(HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap());
+            let mappings = HashMap::from([(field_name.to_string(), mapping)]);
+
+            let error = match HotEngine::open_existing_with_mappings(
+                dir.path(),
+                Duration::from_secs(60),
+                &mappings,
+                TranslogDurability::Request,
+                Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
+            ) {
+                Ok(_) => panic!("invalid authoritative mapping unexpectedly opened"),
+                Err(error) => error,
+            };
+            assert!(
+                error.is::<crate::common::UnsupportedIndexFormatError>(),
+                "{field_name}: {error:#}"
+            );
+            assert!(
+                error.to_string().contains("recreate the index"),
+                "{field_name}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_compat_missing_sequence_schema_requires_recreate() {
+        let dir = tempfile::tempdir().unwrap();
+        create_pre_d1_schema_fixture(dir.path());
+
+        let error = match HotEngine::open_existing_with_mappings(
+            dir.path(),
+            Duration::from_secs(60),
+            &HashMap::new(),
+            TranslogDurability::Request,
+            Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
+        ) {
+            Ok(_) => panic!("pre-D1 schema unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert!(error.is::<crate::common::UnsupportedIndexFormatError>());
+        assert!(error.to_string().contains("recreate the index"));
+    }
+
+    #[test]
+    fn indexed_document_stores_exact_sequence_identity_fast_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+        apply_index(&engine, "doc", json!({"value": 1}), 7, 3);
+        engine.refresh().unwrap();
+        let registry = engine.field_registry.read().unwrap();
+        let searcher = engine.reader.searcher();
+        let query = tantivy::query::TermQuery::new(
+            Term::from_field_text(registry.id_field, "doc"),
+            tantivy::schema::IndexRecordOption::Basic,
+        );
+        let (_, address) = searcher
+            .search(&query, &TopDocs::with_limit(1))
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let segment = &searcher.segment_readers()[address.segment_ord as usize];
+        assert_eq!(
+            segment
+                .fast_fields()
+                .u64(SEQ_NO_FIELD_NAME)
+                .unwrap()
+                .first(address.doc_id),
+            Some(7)
+        );
+        assert_eq!(
+            segment
+                .fast_fields()
+                .u64(PRIMARY_TERM_FIELD_NAME)
+                .unwrap()
+                .first(address.doc_id),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn malformed_internal_sequence_field_options_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_path = dir.path().join("index");
+        std::fs::create_dir_all(&index_path).unwrap();
+        let mut schema = Schema::builder();
+        schema.add_text_field("_id", (STRING | STORED).set_fast(None));
+        schema.add_text_field("_source", STORED);
+        schema.add_u64_field(SEQ_NO_FIELD_NAME, STORED);
+        schema.add_u64_field(PRIMARY_TERM_FIELD_NAME, FAST | STORED);
+        schema.add_text_field("body", TEXT | STORED);
+        Index::open_or_create(
+            tantivy::directory::MmapDirectory::open(&index_path).unwrap(),
+            schema.build(),
+        )
+        .unwrap();
+        HotTranslog::open(dir.path()).unwrap();
+        persist_empty_committed_boundary(dir.path());
+
+        let error = match HotEngine::new(dir.path(), Duration::from_secs(60)) {
+            Ok(_) => panic!("malformed internal field unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert!(error.is::<crate::common::UnsupportedIndexFormatError>());
+        assert!(error.to_string().contains("recreate the index"));
+    }
+
+    #[test]
+    fn remote_split_purpose_does_not_require_sequence_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HotEngine::new_remote_split_with_mappings(
+            dir.path(),
+            Duration::from_secs(60),
+            &HashMap::new(),
+            Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
+        )
+        .unwrap();
+        engine.add_document("doc", json!({"value": 1})).unwrap();
+        engine.refresh().unwrap();
+        assert_eq!(engine.get_document("doc").unwrap().unwrap()["value"], 1);
+        let schema = engine.index.schema();
+        assert!(schema.get_field(SEQ_NO_FIELD_NAME).is_err());
+        assert!(schema.get_field(PRIMARY_TERM_FIELD_NAME).is_err());
     }
 
     #[test]
@@ -7765,7 +9896,14 @@ mod tests {
         );
         assert!(
             engine
-                .add_document_with_seq("replica", invalid, 42)
+                .apply_replica_operation(super::super::SequencedOperation {
+                    seq_no: 42,
+                    primary_term: 1,
+                    mutation: super::super::DocumentMutation::Index {
+                        doc_id: "replica".into(),
+                        source: invalid,
+                    },
+                })
                 .is_err()
         );
         assert_eq!(
@@ -8114,6 +10252,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let wal = HotTranslog::open(dir.path()).unwrap();
         wal.append(
+            1,
             crate::wal::WalOperation::Index,
             json!({
                 "_doc_id": "invalid",
@@ -8122,6 +10261,7 @@ mod tests {
         )
         .unwrap();
         drop(wal);
+        persist_empty_committed_boundary(dir.path());
 
         let mappings = HashMap::from([(
             "tags".to_string(),
@@ -8186,6 +10326,86 @@ mod tests {
         };
         let (_hits, total, _) = engine2.search_query(&req).unwrap();
         assert_eq!(total, 1, "refresh-committed docs must not replay twice");
+    }
+
+    #[test]
+    fn stale_apply_during_commit_to_reload_window_uses_old_version_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap());
+        apply_index(engine.as_ref(), "doc", json!({"value": 2}), 1, 1);
+        let (committed_tx, committed_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        engine.pause_after_refresh_commit_for_test(committed_tx, release_rx);
+
+        let refresh_engine = engine.clone();
+        let refresh = std::thread::spawn(move || refresh_engine.refresh());
+        committed_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        apply_index(engine.as_ref(), "doc", json!({"value": 1}), 0, 1);
+        release_tx.send(()).unwrap();
+        refresh.join().unwrap().unwrap();
+
+        assert_eq!(engine.get_document("doc").unwrap().unwrap()["value"], 2);
+    }
+
+    #[test]
+    fn map_cap_refresh_failure_rejects_before_sequence_or_wal_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+        engine.set_version_map_max_bytes_for_test(LiveVersionMap::estimate_reservation(["a"]));
+        let first = engine
+            .add_document_with_receipt("a", json!({"value": 1}))
+            .unwrap();
+        assert_eq!(first.seq_no, 0);
+        let before_next = engine
+            .with_translog("map cap test", |translog| Ok(translog.next_seq_no()))
+            .unwrap();
+        let before_size = engine.translog_size_bytes();
+        let before_stats = engine.sequence_stats();
+
+        engine.inject_refresh_commit_failures_for_test(1);
+        let error = engine
+            .add_document_with_receipt("b", json!({"value": 2}))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected refresh commit failure")
+        );
+        assert_eq!(
+            engine
+                .with_translog("map cap test", |translog| Ok(translog.next_seq_no()))
+                .unwrap(),
+            before_next
+        );
+        assert_eq!(engine.translog_size_bytes(), before_size);
+        assert_eq!(engine.sequence_stats(), before_stats);
+        assert!(engine.get_document("b").unwrap().is_none());
+    }
+
+    #[test]
+    fn oversized_bulk_success_is_independent_of_post_apply_refresh_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+        engine.set_version_map_max_bytes_for_test(1);
+        engine.inject_post_apply_refresh_failures_for_test(1);
+
+        let receipt = engine
+            .bulk_add_documents_with_receipt(vec![("oversized".to_string(), json!({"value": 1}))])
+            .unwrap();
+        assert_eq!(receipt.start_seq_no, Some(0));
+        assert_eq!(
+            engine
+                .retained_recovery_ops(0, usize::MAX, usize::MAX)
+                .unwrap()
+                .operations
+                .len(),
+            1
+        );
+        engine.refresh().unwrap();
+        assert_eq!(
+            engine.get_document("oversized").unwrap().unwrap()["value"],
+            1
+        );
     }
 
     #[test]
@@ -8344,6 +10564,72 @@ mod tests {
     }
 
     #[test]
+    fn reopen_resumes_from_intermediate_replay_commit_below_fence_maximum() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine = HotEngine::new(dir.path(), Duration::from_secs(3600)).unwrap();
+            let docs = (0..TRANSLOG_REPLAY_BATCH_SIZE)
+                .map(|seq_no| (format!("d-{seq_no}"), json!({"n": seq_no})))
+                .collect();
+            engine
+                .bulk_add_documents_with_receipt_at_term(docs, 1)
+                .unwrap();
+            engine.refresh().unwrap();
+            engine
+                .with_translog("append final pre-promotion operation", |translog| {
+                    translog.append_with_seq(
+                        TRANSLOG_REPLAY_BATCH_SIZE,
+                        1,
+                        crate::wal::WalOperation::Index,
+                        json!({
+                            "_doc_id": format!("d-{}", TRANSLOG_REPLAY_BATCH_SIZE),
+                            "_source": {"n": TRANSLOG_REPLAY_BATCH_SIZE}
+                        }),
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            engine
+                .reconcile_term_sequence_state(2, Some(TRANSLOG_REPLAY_BATCH_SIZE))
+                .unwrap();
+
+            engine.refresh().unwrap();
+            let committed = CommittedBoundaryRecord::load(&dir.path().join("translog.committed"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                committed.processed_checkpoint,
+                Some(TRANSLOG_REPLAY_BATCH_SIZE - 1)
+            );
+            assert_eq!(committed.max_seq_no, Some(TRANSLOG_REPLAY_BATCH_SIZE - 1));
+            assert_eq!(
+                committed.term_sequence_state.max_seq_no_at_term_start,
+                Some(TRANSLOG_REPLAY_BATCH_SIZE)
+            );
+        }
+
+        let reopened = HotEngine::new(dir.path(), Duration::from_secs(3600)).unwrap();
+        reopened
+            .reconcile_term_sequence_state(2, Some(TRANSLOG_REPLAY_BATCH_SIZE))
+            .unwrap();
+        assert_eq!(
+            reopened.sequence_stats().processed_checkpoint,
+            Some(TRANSLOG_REPLAY_BATCH_SIZE)
+        );
+        assert_eq!(
+            reopened.sequence_stats().max_seq_no,
+            Some(TRANSLOG_REPLAY_BATCH_SIZE)
+        );
+        assert_eq!(
+            reopened
+                .get_document(&format!("d-{TRANSLOG_REPLAY_BATCH_SIZE}"))
+                .unwrap()
+                .unwrap()["n"],
+            json!(TRANSLOG_REPLAY_BATCH_SIZE)
+        );
+    }
+
+    #[test]
     fn replay_is_idempotent_when_a_batched_suffix_is_replayed_again() {
         // Simulate a crash after replay committed a batch to Tantivy segments but
         // before the final checkpoint was fully advanced. The next startup should
@@ -8369,11 +10655,13 @@ mod tests {
 
         // Simulate a stale checkpoint left behind by an interrupted replay after
         // the first batch checkpoint had already been persisted.
-        std::fs::write(
-            dir.path().join("translog.committed"),
-            TRANSLOG_REPLAY_BATCH_SIZE.to_string(),
-        )
-        .unwrap();
+        let checkpoint_path = dir.path().join("translog.committed");
+        let mut committed = CommittedBoundaryRecord::load(&checkpoint_path)
+            .unwrap()
+            .unwrap();
+        committed.processed_checkpoint = Some(TRANSLOG_REPLAY_BATCH_SIZE - 1);
+        committed.persisted_checkpoint = Some(TRANSLOG_REPLAY_BATCH_SIZE - 1);
+        committed.persist(&checkpoint_path).unwrap();
 
         // Second reopen replays the already-committed suffix again.
         let engine3 = HotEngine::new(dir.path(), Duration::from_secs(3600)).unwrap();
@@ -8436,8 +10724,9 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let translog =
                 HotTranslog::open_with_durability(dir.path(), TranslogDurability::Request).unwrap();
-            translog.append(operation, payload).unwrap();
+            translog.append(1, operation, payload).unwrap();
             drop(translog);
+            persist_empty_committed_boundary(dir.path());
 
             let error = match HotEngine::new(dir.path(), Duration::from_secs(3600)) {
                 Ok(_) => panic!("startup replay accepted malformed WAL operation"),
@@ -9758,86 +12047,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_stored_date_source_is_normalized_on_all_read_paths() {
-        use crate::cluster::state::{FieldMapping, FieldType};
-        use crate::search::{SortClause, SortDirection, SortOrder};
-
-        let mut mappings = HashMap::new();
-        mappings.insert(
-            "created_at".to_string(),
-            FieldMapping {
-                field_type: FieldType::Date,
-                dimension: None,
-            },
-        );
-
-        let (_dir, engine) = create_engine_with_mappings(mappings);
-        let registry = engine
-            .field_registry
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        let created_at = *registry.fields.get("created_at").unwrap();
-
-        let mut doc = TantivyDocument::new();
-        doc.add_text(registry.id_field, "legacy");
-        doc.add_text(
-            registry.source_field,
-            json!({
-                "title": "legacy",
-                "created_at": "2025-01-05T08:15:00+05:30"
-            })
-            .to_string(),
-        );
-        doc.add_i64(
-            created_at,
-            crate::common::date::parse_iso8601_to_epoch_millis("2025-01-05T08:15:00+05:30")
-                .unwrap(),
-        );
-        drop(registry);
-
-        {
-            let mut writer_state = engine.writer.write().unwrap_or_else(|e| e.into_inner());
-            let writer = writer_state.writer_mut("legacy date test").unwrap();
-            writer.add_document(doc).unwrap();
-            writer.commit().unwrap();
-        }
-        engine.reader.reload().unwrap();
-
-        let doc = engine.get_document("legacy").unwrap().unwrap();
-        assert_eq!(doc["created_at"], json!("2025-01-05T02:45:00Z"));
-
-        let base_req = SearchRequest {
-            query: QueryClause::MatchAll(json!({})),
-            size: 10,
-            from: 0,
-            knn: None,
-            sort: vec![],
-            search_after: None,
-            aggs: HashMap::new(),
-        };
-        let (hits, _, _) = engine.search_query(&base_req).unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(
-            hits[0]["_source"]["created_at"],
-            json!("2025-01-05T02:45:00Z")
-        );
-
-        let sorted_req = SearchRequest {
-            sort: vec![SortClause::Field(HashMap::from([(
-                "created_at".to_string(),
-                SortOrder::Direction(SortDirection::Asc),
-            )]))],
-            ..base_req
-        };
-        let (sorted_hits, _, _) = engine.search_query(&sorted_req).unwrap();
-        assert_eq!(sorted_hits.len(), 1);
-        assert_eq!(
-            sorted_hits[0]["_source"]["created_at"],
-            json!("2025-01-05T02:45:00Z")
-        );
-    }
-
-    #[test]
     fn mapped_integer_field_does_not_parse_iso_string_query_as_date() {
         use crate::cluster::state::{FieldMapping, FieldType};
 
@@ -10860,9 +13069,9 @@ mod tests {
         let snapshot_reader = snapshot_index.reader().unwrap();
         assert_eq!(snapshot_reader.searcher().num_docs(), 2);
 
-        let suffix = engine.peer_recovery_ops(2, 16, 1024 * 1024).unwrap();
+        let suffix = engine.retained_recovery_ops(2, 16, 1024 * 1024).unwrap();
         assert!(suffix.complete);
-        assert_eq!(suffix.primary_next_seq_no, 3);
+        assert_eq!(suffix.source_max_seq_no, Some(2));
         assert_eq!(
             suffix
                 .operations
@@ -10877,6 +13086,84 @@ mod tests {
     }
 
     #[test]
+    fn peer_recovery_snapshot_rejects_a_processed_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+        apply_index(&engine, "zero", json!({"value": 0}), 0, 1);
+        apply_index(&engine, "two", json!({"value": 2}), 2, 1);
+
+        let snapshot_dir = dir.path().join("peer-recovery").join("gap");
+        let error = match engine.prepare_peer_recovery_snapshot(&snapshot_dir) {
+            Ok(prepared) => {
+                drop(prepared);
+                panic!("a snapshot cannot discard processed intervals above a gap");
+            }
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("processed checkpoint")
+                && error.to_string().contains("maximum sequence"),
+            "{error:#}"
+        );
+        assert!(!snapshot_dir.exists());
+    }
+
+    #[test]
+    fn peer_recovery_cursor_stops_before_an_unprocessed_wal_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+        apply_index(&engine, "zero", json!({"value": 0}), 0, 1);
+        let after_processed = engine
+            .with_translog("capture processed cursor", |translog| {
+                Ok(translog.recovery_read_snapshot()?.end_cursor())
+            })
+            .unwrap();
+        engine
+            .with_translog("append unapplied recovery entry", |translog| {
+                translog.append_with_seq(
+                    1,
+                    1,
+                    crate::wal::WalOperation::Index,
+                    json!({
+                        "_doc_id": "one",
+                        "_source": {"value": 1}
+                    }),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let wal_end = engine
+            .with_translog("capture WAL end", |translog| {
+                Ok(translog.recovery_read_snapshot()?.end_cursor())
+            })
+            .unwrap();
+
+        let batch = engine
+            .peer_recovery_ops(
+                crate::wal::WalCursor {
+                    generation_id: after_processed.generation_id,
+                    byte_offset: 0,
+                },
+                Some(wal_end),
+                16,
+                usize::MAX,
+            )
+            .unwrap();
+
+        assert_eq!(
+            batch
+                .operations
+                .iter()
+                .map(|entry| entry.seq_no)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+        assert_eq!(batch.next_cursor, after_processed);
+        assert!(!batch.complete);
+    }
+
+    #[test]
     fn peer_recovery_pin_is_respected_by_every_flush_path() {
         let dir = tempfile::tempdir().unwrap();
         let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
@@ -10887,7 +13174,7 @@ mod tests {
 
         let assert_retained = |expected: &[u64]| {
             let batch = engine
-                .peer_recovery_ops(snapshot.snapshot_next_seq_no, 32, 1024 * 1024)
+                .retained_recovery_ops(snapshot.snapshot_next_seq_no, 32, 1024 * 1024)
                 .unwrap();
             assert_eq!(
                 batch
@@ -10923,7 +13210,7 @@ mod tests {
         engine.flush().unwrap();
         assert!(
             engine
-                .peer_recovery_ops(snapshot.snapshot_next_seq_no, 32, 1024 * 1024)
+                .retained_recovery_ops(snapshot.snapshot_next_seq_no, 32, 1024 * 1024)
                 .unwrap()
                 .operations
                 .is_empty()
@@ -10951,7 +13238,7 @@ mod tests {
 
         let scan_engine = engine.clone();
         let scan = std::thread::spawn(move || {
-            scan_engine.peer_recovery_ops(suffix.seq_no, 16, 4 * 1024 * 1024)
+            scan_engine.retained_recovery_ops(suffix.seq_no, 16, 4 * 1024 * 1024)
         });
         barrier.wait();
 
@@ -11551,11 +13838,12 @@ mod tests {
             tl.next_seq_no()
         };
         let checkpoint_path = dir.path().join("translog.committed");
-        let before_force_merge = std::fs::read_to_string(&checkpoint_path)
+        let before_force_merge = CommittedBoundaryRecord::load(&checkpoint_path)
             .unwrap()
-            .trim()
-            .parse::<u64>()
-            .unwrap();
+            .unwrap()
+            .processed_checkpoint
+            .and_then(|checkpoint| checkpoint.checked_add(1))
+            .unwrap_or(0);
         assert!(
             before_force_merge < expected_next_seq,
             "expected pending writes before force-merge checkpoint advance"
@@ -11563,11 +13851,12 @@ mod tests {
 
         engine.force_merge(1).unwrap();
 
-        let after_force_merge = std::fs::read_to_string(&checkpoint_path)
+        let after_force_merge = CommittedBoundaryRecord::load(&checkpoint_path)
             .unwrap()
-            .trim()
-            .parse::<u64>()
-            .unwrap();
+            .unwrap()
+            .processed_checkpoint
+            .and_then(|checkpoint| checkpoint.checked_add(1))
+            .unwrap_or(0);
         assert_eq!(
             after_force_merge, expected_next_seq,
             "force_merge must advance translog.committed to the committed next seq_no"

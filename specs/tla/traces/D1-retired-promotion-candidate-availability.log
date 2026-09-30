@@ -1,0 +1,28 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 0 and seed -6634806170884860120 with 12 workers on 16 cores with 7127MB heap and 64MB offheap memory [pid: 80418] (Linux 6.6.87.2-microsoft-standard-WSL2 amd64, Amazon.com Inc. 25.0.2 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/rchilaka/ROpenSearch/specs/tla/MC_D1_PromotionReplayNoOp.tla
+Parsing file /tmp/d1-b4/Naturals.tla
+Parsing file /tmp/d1-b4/FiniteSets.tla
+Parsing file /tmp/d1-b4/TLC.tla
+Parsing file /tmp/d1-b4/Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module MC_D1_PromotionReplayNoOp
+Starting... (2026-09-28 05:48:53)
+Computing initial states...
+Error: Invariant B4NoCopyBehindAcked is violated by the initial state:
+/\ noOps = {}
+/\ replicaProcessed = {0, 2}
+/\ walEntries = {0, 2}
+/\ primaryCheckpoint = 0
+/\ phase = 0
+/\ acknowledged = {0, 2}
+/\ replicaCheckpoint = 1
+/\ replayed = {}
+/\ primaryProcessed = {}
+/\ activated = FALSE
+/\ noOpReplicationFailed = FALSE
+
+Finished in 01s at (2026-09-28 05:48:54)

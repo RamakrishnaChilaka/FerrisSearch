@@ -33,7 +33,6 @@ SqlRecordBatchStream(SqlRecordBatchRequest) → stream SqlRecordBatchResponse
 // Replication (primary → replica)
 ReplicateDoc(ReplicateDocRequest) → ReplicateDocResponse
 ReplicateBulk(ReplicateBulkRequest) → ReplicateBulkResponse
-RecoverReplica(RecoverReplicaRequest) → RecoverReplicaResponse
 StartPeerRecovery(StartPeerRecoveryRequest) → StartPeerRecoveryResponse
 FetchRecoveryFileChunk(FetchRecoveryFileChunkRequest) → FetchRecoveryFileChunkResponse
 FetchRecoveryOps(FetchRecoveryOpsRequest) → FetchRecoveryOpsResponse
@@ -75,17 +74,19 @@ RaftSnapshot(RaftRequest) → RaftReply
 `ShardDocResponse.seq_no`, `ShardDeleteResponse.seq_no`, and
 `ShardBulkResponse.start_seq_no` are optional on the wire so sequence zero is
 distinct from missing metadata. A successful single/delete response must carry
-`seq_no`; a successful non-empty bulk response must carry `start_seq_no`, while
+`seq_no` and `primary_term`; a successful non-empty bulk response must carry
+`start_seq_no` and `primary_term`, while
 an empty bulk must omit it. New clients fail closed on missing or inconsistent
 receipt metadata. FerrisSearch is pre-1.0: successful responses require these
 receipts, and metadata-free success responses from older peers fail. Do not add
 compatibility fallbacks or rollout machinery for this protocol change.
 
+`ClusterState.format_version` is required and must equal the one current wire
+version. Missing/unknown versions are rejected with recreate guidance.
 `ShardAssignment.in_sync_replica_node_ids` carries the authoritative replica
 acknowledgement/promotion set in JoinCluster snapshots. Conversion must preserve
 it losslessly and reject duplicate IDs, the primary ID, or any ID absent from
-`replica_node_ids` with `INVALID_ARGUMENT`. An absent field from pre-1.0 peers
-decodes as empty and therefore non-promotable.
+`replica_node_ids` with `INVALID_ARGUMENT`.
 `ShardAssignment` also carries primary/replica allocation IDs, the initial
 CreateIndex allocation ID, `primary_initialized`, and the status-only
 `primary_unavailable` flag. Missing allocation metadata is rejected on join
@@ -150,26 +151,64 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   before WAL/engine mutation. A higher term is fsynced before mutation. Bulk
   validates the shared envelope and every item before the first mutation and
   advances the fence once.
-- **recover_replica**: Read the live engine's captured generation snapshot and
-  return operations above the requested checkpoint. Never construct a second
-  `HotTranslog` on the live shard directory: open performs startup repair and
-  unreferenced-generation cleanup. The RPC remains available for transport
-  tests but the node lifecycle does not use this partial suffix as recovery or
-  admission. It returns `success=false` rather than an empty success when the
-  retained WAL cannot reach the captured head (for example after a flush, or
-  on a copy installed from files), when a concurrent flush removes a needed
-  generation, or when a legacy frame above the 32 MiB transfer limit falls in
-  the requested range.
-- Modern peer-recovery catch-up and legacy `RecoverReplica` share the strict WAL
-  document decoder. Missing `_doc_id`, or missing `_source` on an index
+- Primary and replica index RPCs reject reserved document-source metadata
+  through the shared validator before dynamic mapping, WAL append, or replica
+  apply. These failures are `INVALID_ARGUMENT`, allowing REST coordinators to
+  return `400 mapper_parsing_exception`.
+- Replica index payloads are decoded and source-validated once on the async
+  transport path, before shard open or worker dispatch. Reuse that parsed value
+  when constructing the sequenced operation; bulk still validates every
+  payload before the first worker-side fence or engine mutation.
+- `ReplicateBulk` accepts either contiguous ordered index operations or a
+  strictly increasing, potentially non-contiguous homogeneous NoOp batch.
+  Promotion activation uses bounded NoOp batches rather than one RPC per
+  missing sequence number.
+- A failed promotion NoOp batch remains pending in process-local activation
+  state. While that entry survives, the next lifecycle or request activation
+  retries it even when the local UUID/shard/allocation/term cache already says
+  the primary is active. Successful redelivery or copy invalidation removes the
+  entry. Restart, or an activation error after the NoOps were applied locally
+  but before retry state was retained, loses the intent; it is not reconstructed
+  from the WAL. The affected replica then follows the fixed gap deadline and
+  peer-recovery path. Activation and pending-NoOp retry mutexes are keyed by
+  exact index UUID, shard, and allocation. Never hold a node-wide or index-wide
+  lock across activation forwarding or replica fan-out.
+- Successful replica responses carry optional processed and persisted
+  checkpoints and must prove the exact single operation or every bulk item was
+  processed. A behind contiguous checkpoint is a gap observation, not failure
+  of the current operation. Under request durability the client also requires
+  exact-operation persisted proof; async durability may acknowledge processing
+  before the timer fsync.
+- A sequence/version collision is `DATA_LOSS`, is quarantined immediately even
+  when the replica's routing view lags the message term, and retains exact node
+  and allocation identity through fan-out. The primary conditionally reports
+  that exact copy at the write's captured term; do not depend only on the
+  replica's local routing view to start recovery. Quarantine is durable in the
+  copy identity; later single or bulk replication to the marked allocation
+  remains `DATA_LOSS` even during an existing open-I/O backoff window and
+  cannot reopen it. If the marker write fails, the process-local identity stays
+  marked and the engine stays evicted, so later replication and reads still
+  fail closed while the persistent-storage error remains reportable.
+- Gap probes run concurrently under a two-second per-probe timeout. A copy that
+  is assigned but still opening/replaying returns `UNAVAILABLE`. Only proven
+  UUID/allocation/durable-identity mismatch (`FAILED_PRECONDITION`) or
+  corruption (`DATA_LOSS`) is definitive. Probe completion must still match
+  the exact observation start/target identity before removal.
+- Peer-recovery catch-up uses the strict WAL document decoder. Missing
+  `_doc_id`, or missing `_source` on an index
   operation, fails closed; delete operations carry no synthetic source and
   must never be converted back into indexed documents.
+- A catch-up response stops at the first source-unprocessed WAL frame. An empty
+  incomplete response at the unchanged cursor sends the target to
+  `PrepareFinalizeRecovery`, whose exclusive source barrier rebuilds/replays the
+  writer before the remaining suffix is fetched.
 - **peer recovery RPCs**: source sessions are
   UUID/target/allocation/primary-term bound,
   file chunks are at most 1 MiB, operation batches are bounded by count and
-  bytes, and stale authority aborts the session. Prepare holds the exclusive
-  shard write barrier; Complete keeps it until conditional membership is
-  observed or a term bump settles the outcome.
+  bytes, and stale authority aborts the session. WAL catch-up uses physical
+  generation/byte cursors. Prepare captures the exclusive barrier WAL end and
+  processed checkpoint; Complete requires the target to match both before
+  conditional membership admission.
 - `StartPeerRecovery` is an asynchronous start/status RPC. `preparing=true`
   means the client should poll the same request/session reservation; snapshot
   commit/link/hash work is not performed in the RPC future.
@@ -188,6 +227,12 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - **sql_record_batch / sql_record_batch_stream**: Execute local shard SQL fast-field reads and return Arrow IPC batches. `SqlRecordBatchStream` may emit multiple batches for the same shard; `batch_size = 0` means use the engine default. Stream responses must carry `total_hits`, `collected_rows`, and actual `streaming_used` metadata on every batch so the coordinator can build accurate `meta` / truncation decisions before draining the rest of the stream. The coordinator-facing live path should prefer `open_sql_batch_stream_to_shard()` so only the first response is read eagerly.
 - **raft_vote / raft_append_entries / raft_snapshot**: Deserialize JSON, forward to Raft instance
 - **create_index / delete_index**: Must be leader; execute via `raft.client_write()`. `create_index` must preserve index settings from the forwarded JSON body, including `refresh_interval_ms` and `flush_threshold_bytes`.
+- `AddMappings` rejects every shared reserved document metadata name before
+  checking leadership or issuing a Raft write. There is no public put-mapping
+  HTTP route yet; this RPC is the existing mapping-update trust boundary.
+  `body` is accepted only as a text field without a dimension or other
+  parameters, so a mapping update cannot create a second or incompatible
+  Tantivy catch-all field.
 - **update_settings**: Must be leader; apply via `UpdateIndex` Raft command. Preserve `flush_threshold_bytes` exactly, including `null` resets and `0` as a valid disable value.
 
 ### Critical Invariants
@@ -212,16 +257,19 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   the shared count/time policy is exhausted. Quarantine happens only after the
   report throttle and only for definitive or open-level failures; Apply
   escalation leaves the engine open for reads and never triggers runtime WAL
-  replay. Replica escalation removes the copy; primary escalation is
+  replay. Sequence/version collisions bypass the ordinary quarantine throttle.
+  Replica escalation removes the copy; primary escalation is
   promote-only and requires an in-sync candidate.
 - Production transport and node lifecycle share one primary-activation state.
   Proactive lifecycle activation and request-triggered activation are
   idempotent for the same UUID/shard/allocation/term. The unavailable flag alone
-  does not bypass that cache. A repaired quarantined open-level failure forces a
-  fresh activation; a successful local write after an Apply-level failure
-  spawns throttled best-effort `MarkPrimaryAvailable` reporting without a term
-  bump. The already-successful write response must not wait for Raft leadership
-  discovery, forwarding, or the transport timeout of that status-only report.
+  does not bypass that cache, but pending promotion NoOps do bypass the fast
+  return so their best-effort fan-out is retried. A repaired quarantined
+  open-level failure forces a fresh activation; a successful local write after
+  an Apply-level failure spawns throttled best-effort `MarkPrimaryAvailable`
+  reporting without a term bump. The already-successful write response must not
+  wait for Raft leadership discovery, forwarding, or the transport timeout of
+  that status-only report.
   Check `primary_unavailable` through the shared applied-state read lock before
   cloning the service or spawning the task, so ordinary writes allocate no
   status-report work.
@@ -316,7 +364,8 @@ pub struct TransportClient {
 `forward_index_to_shard()` and `forward_bulk_to_shard()` MUST return `Err(...)` when the shard RPC returns `success: false`. Never wrap a shard failure in `Ok(json!({"error": ...}))` — this hides failures from API handlers, causing them to return HTTP 201 for failed writes.
 
 Successful forwarding returns the primary-assigned write identity:
-`forward_index_to_shard()` / `forward_delete_to_shard()` expose `_seq_no`, and
+`forward_index_to_shard()` / `forward_delete_to_shard()` expose `_seq_no` and
+`_primary_term`, and
 `forward_bulk_to_shard()` returns a typed `BulkWriteReceipt`. Do not reconstruct
 these values from a later checkpoint.
 

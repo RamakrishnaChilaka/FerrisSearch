@@ -2,8 +2,10 @@ pub mod column_cache;
 pub mod composite;
 pub mod remote_store;
 pub mod routing;
+pub(crate) mod sequence;
 pub mod tantivy;
 pub mod vector;
+pub(crate) mod version_map;
 
 use anyhow::Result;
 use datafusion::arrow::record_batch::RecordBatch;
@@ -13,26 +15,85 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 pub use self::composite::CompositeEngine;
+pub use self::sequence::{SEQUENCE_FORMAT_VERSION, SequenceStats};
 pub use self::tantivy::HotEngine;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DocumentMutation {
+    Index {
+        doc_id: String,
+        source: serde_json::Value,
+    },
+    Delete {
+        doc_id: String,
+    },
+    NoOp {
+        reason: String,
+    },
+}
+
+impl DocumentMutation {
+    pub fn doc_id(&self) -> Option<&str> {
+        match self {
+            Self::Index { doc_id, .. } | Self::Delete { doc_id } => Some(doc_id),
+            Self::NoOp { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SequencedOperation {
+    pub seq_no: u64,
+    pub primary_term: u64,
+    pub mutation: DocumentMutation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyOutcome {
+    Applied,
+    Stale,
+    Redelivery,
+    NoOp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicaApplyReceipt {
+    pub outcome: ApplyOutcome,
+    pub operation_processed: bool,
+    pub operation_persisted: bool,
+    pub sequence: SequenceStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaBulkApplyReceipt {
+    pub outcomes: Vec<ApplyOutcome>,
+    pub all_operations_processed: bool,
+    pub all_operations_persisted: bool,
+    pub sequence: SequenceStats,
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub(crate) struct DocumentValidationError(pub String);
 
 pub(crate) fn is_write_validation_error(error: &anyhow::Error) -> bool {
-    error.is::<DocumentValidationError>() || error.is::<crate::wal::WalFrameTooLargeError>()
+    error.is::<DocumentValidationError>()
+        || error.is::<crate::common::ReservedDocumentFieldError>()
+        || error.is::<crate::wal::WalFrameTooLargeError>()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexWriteReceipt {
     pub doc_id: String,
     pub seq_no: u64,
+    pub primary_term: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BulkWriteReceipt {
     pub doc_ids: Vec<String>,
     pub start_seq_no: Option<u64>,
+    pub primary_term: u64,
 }
 
 impl BulkWriteReceipt {
@@ -52,6 +113,7 @@ impl BulkWriteReceipt {
 pub struct DeleteWriteReceipt {
     pub deleted: u64,
     pub seq_no: u64,
+    pub primary_term: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,7 +124,15 @@ pub struct PeerRecoveryFileMetadata {
 }
 
 pub struct PeerRecoverySnapshot {
+    pub snapshot_cursor: crate::wal::WalCursor,
+    #[cfg(test)]
     pub snapshot_next_seq_no: u64,
+    #[cfg(feature = "protocol-trace")]
+    pub trace_processed_seqs: Vec<u64>,
+    #[cfg(feature = "protocol-trace")]
+    pub trace_documents: Vec<(String, serde_json::Value, u64, u64)>,
+    #[allow(dead_code)]
+    pub(crate) committed_boundary: sequence::CommittedBoundaryRecord,
     pub retention_pin_id: u64,
     pub files: Vec<PeerRecoveryFileMetadata>,
 }
@@ -117,13 +187,27 @@ impl Drop for PeerRecoveryRetentionPin {
 }
 
 pub struct PeerRecoverySnapshotPreparation {
+    pub snapshot_cursor: crate::wal::WalCursor,
+    #[cfg(test)]
     pub snapshot_next_seq_no: u64,
+    #[cfg(feature = "protocol-trace")]
+    pub trace_processed_seqs: Vec<u64>,
+    #[cfg(feature = "protocol-trace")]
+    pub trace_documents: Vec<(String, serde_json::Value, u64, u64)>,
+    pub(crate) committed_boundary: sequence::CommittedBoundaryRecord,
     pub retention_pin: PeerRecoveryRetentionPin,
     pub file_names: Vec<String>,
 }
 
 pub struct PreparedPeerRecoverySnapshot {
+    pub snapshot_cursor: crate::wal::WalCursor,
+    #[cfg(test)]
     pub snapshot_next_seq_no: u64,
+    #[cfg(feature = "protocol-trace")]
+    pub trace_processed_seqs: Vec<u64>,
+    #[cfg(feature = "protocol-trace")]
+    pub trace_documents: Vec<(String, serde_json::Value, u64, u64)>,
+    pub(crate) committed_boundary: sequence::CommittedBoundaryRecord,
     pub retention_pin: PeerRecoveryRetentionPin,
     pub files: Vec<PeerRecoveryFileMetadata>,
 }
@@ -131,7 +215,14 @@ pub struct PreparedPeerRecoverySnapshot {
 impl PeerRecoverySnapshotPreparation {
     pub fn hash_files(self, snapshot_dir: &Path) -> Result<PreparedPeerRecoverySnapshot> {
         let Self {
+            snapshot_cursor,
+            #[cfg(test)]
             snapshot_next_seq_no,
+            #[cfg(feature = "protocol-trace")]
+            trace_processed_seqs,
+            #[cfg(feature = "protocol-trace")]
+            trace_documents,
+            committed_boundary,
             retention_pin,
             file_names,
         } = self;
@@ -161,7 +252,14 @@ impl PeerRecoverySnapshotPreparation {
             });
         }
         Ok(PreparedPeerRecoverySnapshot {
+            snapshot_cursor,
+            #[cfg(test)]
             snapshot_next_seq_no,
+            #[cfg(feature = "protocol-trace")]
+            trace_processed_seqs,
+            #[cfg(feature = "protocol-trace")]
+            trace_documents,
+            committed_boundary,
             retention_pin,
             files,
         })
@@ -170,8 +268,15 @@ impl PeerRecoverySnapshotPreparation {
 
 pub struct PeerRecoveryOpsBatch {
     pub operations: Vec<crate::wal::TranslogEntry>,
-    pub primary_next_seq_no: u64,
+    pub next_cursor: crate::wal::WalCursor,
+    pub source_max_seq_no: Option<u64>,
     pub complete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerRecoveryBarrier {
+    pub wal_end: crate::wal::WalCursor,
+    pub sequence: SequenceStats,
 }
 
 /// Per-segment metadata for diagnostics and monitoring.
@@ -215,6 +320,13 @@ impl SqlStreamingBatchHandle {
     }
 }
 
+#[cfg(feature = "protocol-trace")]
+pub type ProtocolTraceCopyEvidence = (
+    Vec<(String, serde_json::Value, u64, u64)>,
+    Vec<crate::protocol_trace::TraceActualDocument>,
+    Vec<crate::protocol_trace::TraceWalEntry>,
+);
+
 /// Trait abstracting a search engine backend.
 /// Each shard/split is backed by one `SearchEngine` implementation.
 /// Implementations handle both text and vector indexing/search.
@@ -251,16 +363,16 @@ pub trait SearchEngine: Send + Sync {
         &self,
         doc_id: &str,
         payload: serde_json::Value,
-    ) -> Result<IndexWriteReceipt>;
+    ) -> Result<IndexWriteReceipt> {
+        self.add_document_with_receipt_at_term(doc_id, payload, self.current_primary_term())
+    }
 
-    /// Index a single document using a caller-supplied sequence number.
-    /// Replica/recovery paths use this so WAL entries preserve primary-assigned seq_nos.
-    fn add_document_with_seq(
+    fn add_document_with_receipt_at_term(
         &self,
         doc_id: &str,
         payload: serde_json::Value,
-        seq_no: u64,
-    ) -> Result<String>;
+        primary_term: u64,
+    ) -> Result<IndexWriteReceipt>;
 
     /// Bulk-index documents. Each tuple is (doc_id, payload). Returns document IDs.
     fn bulk_add_documents(&self, docs: Vec<(String, serde_json::Value)>) -> Result<Vec<String>> {
@@ -270,27 +382,70 @@ pub trait SearchEngine: Send + Sync {
     fn bulk_add_documents_with_receipt(
         &self,
         docs: Vec<(String, serde_json::Value)>,
-    ) -> Result<BulkWriteReceipt>;
+    ) -> Result<BulkWriteReceipt> {
+        self.bulk_add_documents_with_receipt_at_term(docs, self.current_primary_term())
+    }
 
-    /// Bulk-index documents using caller-supplied contiguous sequence numbers.
-    fn bulk_add_documents_with_start_seq(
+    fn bulk_add_documents_with_receipt_at_term(
         &self,
         docs: Vec<(String, serde_json::Value)>,
-        start_seq_no: u64,
-    ) -> Result<Vec<String>>;
+        primary_term: u64,
+    ) -> Result<BulkWriteReceipt>;
 
     /// Delete a document by its `_id`. Returns the number of deleted documents.
     fn delete_document(&self, doc_id: &str) -> Result<u64> {
         Ok(self.delete_document_with_receipt(doc_id)?.deleted)
     }
 
-    fn delete_document_with_receipt(&self, doc_id: &str) -> Result<DeleteWriteReceipt>;
+    fn delete_document_with_receipt(&self, doc_id: &str) -> Result<DeleteWriteReceipt> {
+        self.delete_document_with_receipt_at_term(doc_id, self.current_primary_term())
+    }
 
-    /// Delete a document using a caller-supplied sequence number.
-    fn delete_document_with_seq(&self, doc_id: &str, seq_no: u64) -> Result<u64>;
+    fn delete_document_with_receipt_at_term(
+        &self,
+        doc_id: &str,
+        primary_term: u64,
+    ) -> Result<DeleteWriteReceipt>;
+
+    fn apply_replica_operation(&self, operation: SequencedOperation)
+    -> Result<ReplicaApplyReceipt>;
+
+    fn apply_replica_batch(
+        &self,
+        operations: Vec<SequencedOperation>,
+    ) -> Result<ReplicaBulkApplyReceipt>;
+
+    /// Persist a sequence-numbered no-op without mutating document state.
+    fn apply_noop_with_seq(&self, reason: &str, seq_no: u64, primary_term: u64) -> Result<()> {
+        self.apply_replica_operation(SequencedOperation {
+            seq_no,
+            primary_term,
+            mutation: DocumentMutation::NoOp {
+                reason: reason.to_string(),
+            },
+        })?;
+        Ok(())
+    }
 
     /// Retrieve a document by its `_id`. Returns the `_source` JSON if found.
     fn get_document(&self, doc_id: &str) -> Result<Option<serde_json::Value>>;
+
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_documents(&self) -> Result<Vec<(String, serde_json::Value, u64, u64)>> {
+        anyhow::bail!("protocol trace document enumeration is not supported by this engine")
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_processed_sequences(&self) -> Result<Vec<u64>> {
+        anyhow::bail!(
+            "protocol trace processed-sequence enumeration is not supported by this engine"
+        )
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_copy_evidence(&self) -> Result<ProtocolTraceCopyEvidence> {
+        anyhow::bail!("protocol trace copy evidence is not supported by this engine")
+    }
 
     /// Commit in-memory buffer and reload the reader so new docs become searchable.
     fn refresh(&self) -> Result<()>;
@@ -413,20 +568,43 @@ pub trait SearchEngine: Send + Sync {
     /// Returns the number of searchable documents.
     fn doc_count(&self) -> u64;
 
-    /// Get the local checkpoint: highest observed seq_no applied to this shard copy.
-    /// This is currently a high-water mark, not a contiguous-prefix proof.
-    /// Returns 0 if no seq_no tracking is configured (backward compat).
-    fn local_checkpoint(&self) -> u64 {
-        0
+    /// Get the highest contiguous processed sequence on this shard copy.
+    /// `None` means no operation has been processed and differs from `Some(0)`.
+    fn local_checkpoint(&self) -> Option<u64> {
+        self.sequence_stats().processed_checkpoint
     }
 
     /// Update the local checkpoint after applying a replicated operation.
     fn update_local_checkpoint(&self, _seq_no: u64) {}
 
-    /// Get the global checkpoint: min of all in-sync replica checkpoints.
-    /// Only meaningful on the primary shard.
-    fn global_checkpoint(&self) -> u64 {
-        0
+    fn sequence_stats(&self) -> SequenceStats {
+        SequenceStats {
+            processed_checkpoint: None,
+            persisted_checkpoint: None,
+            max_seq_no: None,
+        }
+    }
+
+    fn wal_max_seq_no(&self) -> Option<u64> {
+        None
+    }
+
+    fn reconcile_term_sequence_state(
+        &self,
+        _identity_fence: u64,
+        _identity_fence_max_seq_no: Option<u64>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn current_primary_term(&self) -> u64 {
+        1
+    }
+
+    /// Get the monotonic minimum persisted checkpoint across authoritative copies.
+    /// Only meaningful on the primary shard; `None` means it is not yet available.
+    fn global_checkpoint(&self) -> Option<u64> {
+        None
     }
 
     /// Update the global checkpoint (called by primary after collecting replica checkpoints).
@@ -452,11 +630,29 @@ pub trait SearchEngine: Send + Sync {
 
     fn peer_recovery_ops(
         &self,
-        _min_seq_no: u64,
+        _cursor: crate::wal::WalCursor,
+        _end_cursor: Option<crate::wal::WalCursor>,
         _max_ops: usize,
         _max_bytes: usize,
     ) -> Result<PeerRecoveryOpsBatch> {
         anyhow::bail!("peer recovery operation streaming is not supported by this engine")
+    }
+
+    fn retained_recovery_ops(
+        &self,
+        _min_seq_no: u64,
+        _max_ops: usize,
+        _max_bytes: usize,
+    ) -> Result<PeerRecoveryOpsBatch> {
+        anyhow::bail!("retained recovery operation streaming is not supported by this engine")
+    }
+
+    fn peer_recovery_barrier(&self) -> Result<PeerRecoveryBarrier> {
+        anyhow::bail!("peer recovery barriers are not supported by this engine")
+    }
+
+    fn prepare_primary_activation(&self, _primary_term: u64) -> Result<Vec<SequencedOperation>> {
+        anyhow::bail!("primary activation gap filling is not supported by this engine")
     }
 
     fn peer_recovery_commit_files(&self) -> Result<Vec<String>> {
@@ -473,12 +669,14 @@ mod tests {
         let receipt = BulkWriteReceipt {
             doc_ids: vec!["a".into(), "b".into()],
             start_seq_no: Some(0),
+            primary_term: 1,
         };
         assert_eq!(receipt.last_seq_no().unwrap(), Some(1));
         assert!(
             BulkWriteReceipt {
                 doc_ids: vec!["a".into()],
                 start_seq_no: None,
+                primary_term: 1,
             }
             .last_seq_no()
             .is_err()
@@ -487,6 +685,7 @@ mod tests {
             BulkWriteReceipt {
                 doc_ids: vec!["a".into(), "b".into()],
                 start_seq_no: Some(u64::MAX),
+                primary_term: 1,
             }
             .last_seq_no()
             .is_err()
@@ -495,6 +694,7 @@ mod tests {
             BulkWriteReceipt {
                 doc_ids: vec![],
                 start_seq_no: None,
+                primary_term: 1,
             }
             .last_seq_no()
             .unwrap(),

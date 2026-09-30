@@ -5,13 +5,154 @@
 //! (write is only acknowledged after all in-sync replicas confirm).
 
 use crate::cluster::state::ClusterState;
+use crate::shard::ReplicaCheckpointUpdate;
 use crate::transport::TransportClient;
 use crate::transport::proto::{ReplicateBulkRequest, ReplicateDocRequest};
+use crate::wal::TranslogDurability;
+use std::sync::Arc;
 use tracing::error;
+
+#[cfg(feature = "protocol-trace")]
+fn trace_replication_failure(
+    node_id: impl Into<String>,
+    allocation_id: Option<u64>,
+    error: impl std::fmt::Display,
+) -> Vec<ReplicaReplicationFailure> {
+    vec![ReplicaReplicationFailure::message(
+        node_id,
+        allocation_id,
+        format!("protocol trace replication error: {error}"),
+    )]
+}
+
+#[cfg(feature = "protocol-trace")]
+fn trace_source_copy(
+    cluster_state: &ClusterState,
+    index_name: &str,
+    shard_id: u32,
+    source_node: &str,
+    index_uuid: &str,
+) -> Result<crate::protocol_trace::TraceCopy, Vec<ReplicaReplicationFailure>> {
+    let allocation = cluster_state
+        .shard_allocation_id(index_name, shard_id, source_node)
+        .ok_or_else(|| {
+            trace_replication_failure(
+                source_node,
+                None,
+                "source allocation is missing from the captured routing view",
+            )
+        })?;
+    Ok(crate::protocol_trace::TraceCopy {
+        node: source_node.to_string(),
+        index_uuid: index_uuid.to_string(),
+        shard: shard_id,
+        allocation,
+    })
+}
+
+#[cfg(feature = "protocol-trace")]
+fn trace_result_outcome(message_id: &str) -> &'static str {
+    match crate::protocol_trace::message_phase(message_id) {
+        Some("nack") => "failed",
+        _ => "timeout",
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaReplicationFailure {
+    pub node_id: String,
+    pub allocation_id: Option<u64>,
+    pub message: String,
+    pub definitive: bool,
+}
+
+impl ReplicaReplicationFailure {
+    fn message(node_id: impl Into<String>, allocation_id: Option<u64>, message: String) -> Self {
+        Self {
+            node_id: node_id.into(),
+            allocation_id,
+            message,
+            definitive: false,
+        }
+    }
+
+    fn from_error(node_id: String, allocation_id: u64, error: anyhow::Error) -> Self {
+        let definitive = error
+            .downcast_ref::<tonic::Status>()
+            .is_some_and(|status| status.code() == tonic::Code::DataLoss);
+        Self {
+            message: format!("{node_id}: {error}"),
+            node_id,
+            allocation_id: Some(allocation_id),
+            definitive,
+        }
+    }
+
+    pub fn contains(&self, value: &str) -> bool {
+        self.message.contains(value)
+    }
+}
+
+impl std::fmt::Display for ReplicaReplicationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ReplicaWireOperation {
+    seq_no: u64,
+    op: String,
+    doc_id: String,
+    payload_json: Vec<u8>,
+}
+
+struct ReplicaBatchRoute {
+    index_uuid: String,
+    #[cfg(feature = "protocol-trace")]
+    primary_node: String,
+    replica_node_ids: Vec<String>,
+}
+
+fn resolve_replica_batch_route(
+    cluster_state: &ClusterState,
+    index_name: &str,
+    shard_id: u32,
+    primary_term: u64,
+    operation_label: &'static str,
+) -> Result<Option<ReplicaBatchRoute>, Vec<ReplicaReplicationFailure>> {
+    let metadata = match cluster_state.indices.get(index_name) {
+        Some(metadata) => metadata,
+        None => return Ok(None),
+    };
+    let Some(routing) = metadata.shard_routing.get(&shard_id) else {
+        return Ok(None);
+    };
+    if routing.primary_term != primary_term {
+        return Err(vec![ReplicaReplicationFailure::message(
+            "<routing>",
+            None,
+            format!(
+                "{operation_label} replication term {primary_term} does not match captured routing term {}",
+                routing.primary_term
+            ),
+        )]);
+    }
+    let replica_node_ids = metadata
+        .in_sync_replica_nodes(shard_id)
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(Some(ReplicaBatchRoute {
+        index_uuid: metadata.uuid.to_string(),
+        #[cfg(feature = "protocol-trace")]
+        primary_node: routing.primary.clone(),
+        replica_node_ids,
+    }))
+}
 
 /// Replicate a single document write to all in-sync replica nodes for a shard.
 /// Returns Ok(replica_checkpoints) if all in-sync replicas acknowledged, Err otherwise.
-/// The returned Vec contains (node_id, local_checkpoint) for each replica.
 /// Replication is performed concurrently (fan-out) — latency = max(replica RTTs).
 #[allow(clippy::too_many_arguments)]
 pub async fn replicate_write(
@@ -23,7 +164,36 @@ pub async fn replicate_write(
     payload: &serde_json::Value,
     op: &str,
     seq_no: u64,
-) -> Result<Vec<(String, u64)>, Vec<String>> {
+    primary_term: u64,
+) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>> {
+    replicate_write_with_durability(
+        transport_client,
+        cluster_state,
+        index_name,
+        shard_id,
+        doc_id,
+        payload,
+        op,
+        seq_no,
+        primary_term,
+        TranslogDurability::Request,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn replicate_write_with_durability(
+    transport_client: &TransportClient,
+    cluster_state: &ClusterState,
+    index_name: &str,
+    shard_id: u32,
+    doc_id: &str,
+    payload: &serde_json::Value,
+    op: &str,
+    seq_no: u64,
+    primary_term: u64,
+    durability: TranslogDurability,
+) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>> {
     let metadata = match cluster_state.indices.get(index_name) {
         Some(m) => m,
         None => return Ok(vec![]), // no index metadata, nothing to replicate
@@ -32,9 +202,57 @@ pub async fn replicate_write(
         return Ok(vec![]);
     };
     let index_uuid = metadata.uuid.to_string();
-    let primary_term = routing.primary_term;
+    if routing.primary_term != primary_term {
+        return Err(vec![ReplicaReplicationFailure::message(
+            "<routing>",
+            None,
+            format!(
+                "replication term {primary_term} does not match captured routing term {}",
+                routing.primary_term
+            ),
+        )]);
+    }
 
     let replica_node_ids = metadata.in_sync_replica_nodes(shard_id);
+    #[cfg(feature = "protocol-trace")]
+    let trace_operation = crate::engine::SequencedOperation {
+        seq_no,
+        primary_term,
+        mutation: match op {
+            "index" => crate::engine::DocumentMutation::Index {
+                doc_id: doc_id.to_string(),
+                source: payload.clone(),
+            },
+            "delete" => crate::engine::DocumentMutation::Delete {
+                doc_id: doc_id.to_string(),
+            },
+            other => {
+                return Err(trace_replication_failure(
+                    routing.primary.clone(),
+                    None,
+                    format!("unsupported traced replication operation '{other}'"),
+                ));
+            }
+        },
+    };
+    #[cfg(feature = "protocol-trace")]
+    let trace_messages = crate::protocol_trace::start_replication(
+        &routing.primary,
+        cluster_state,
+        index_name,
+        shard_id,
+        std::slice::from_ref(&trace_operation),
+        false,
+    )
+    .map_err(|error| trace_replication_failure(routing.primary.clone(), None, error))?;
+    #[cfg(feature = "protocol-trace")]
+    let trace_source = trace_source_copy(
+        cluster_state,
+        index_name,
+        shard_id,
+        &routing.primary,
+        &index_uuid,
+    )?;
     if replica_node_ids.is_empty() {
         return Ok(vec![]);
     }
@@ -51,7 +269,12 @@ pub async fn replicate_write(
                 futures.push(tokio::spawn(async move {
                     (
                         rid.clone(),
-                        Err::<u64, String>(format!("Replica node {rid} not in cluster state")),
+                        0,
+                        Err(ReplicaReplicationFailure::message(
+                            rid.clone(),
+                            None,
+                            format!("Replica node {rid} not in cluster state"),
+                        )),
                     )
                 }));
                 continue;
@@ -70,22 +293,57 @@ pub async fn replicate_write(
             futures.push(tokio::spawn(async move {
                 (
                     rid.clone(),
-                    Err::<u64, String>(format!(
-                        "Replica node {rid} has no allocation ID in cluster state"
+                    0,
+                    Err(ReplicaReplicationFailure::message(
+                        rid.clone(),
+                        None,
+                        format!("Replica node {rid} has no allocation ID in cluster state"),
                     )),
                 )
             }));
             continue;
         };
         let uuid = index_uuid.clone();
+        #[cfg(feature = "protocol-trace")]
+        let trace_message = trace_messages
+            .iter()
+            .find(|message| message.target == rid)
+            .cloned();
+        #[cfg(feature = "protocol-trace")]
+        let trace_source = trace_source.clone();
 
         futures.push(tokio::spawn(async move {
+            #[cfg(feature = "protocol-trace")]
+            if let Some(message) = trace_message.as_ref()
+                && crate::protocol_trace::apply_request_fault(&message.message_id).await
+            {
+                let _ = crate::protocol_trace::record_replica_result(
+                    &trace_source,
+                    message,
+                    "dropped",
+                    None,
+                );
+                return (
+                    rid.clone(),
+                    target_allocation_id,
+                    Err(ReplicaReplicationFailure::message(
+                        rid.clone(),
+                        Some(target_allocation_id),
+                        format!("{rid}: injected trace request drop"),
+                    )),
+                );
+            }
             let payload_json = match serde_json::to_vec(&pl) {
                 Ok(payload_json) => payload_json,
                 Err(error) => {
                     return (
                         rid.clone(),
-                        Err(format!("{rid}: serialize replica payload: {error}")),
+                        target_allocation_id,
+                        Err(ReplicaReplicationFailure::message(
+                            rid.clone(),
+                            Some(target_allocation_id),
+                            format!("{rid}: serialize replica payload: {error}"),
+                        )),
                     );
                 }
             };
@@ -103,11 +361,57 @@ pub async fn replicate_write(
                         primary_term: Some(primary_term),
                         target_allocation_id: Some(target_allocation_id),
                     },
+                    matches!(durability, TranslogDurability::Request),
                 )
                 .await
             {
-                Ok(checkpoint) => (rid, Ok(checkpoint)),
-                Err(e) => (rid.clone(), Err(format!("{rid}: {e}"))),
+                Ok(checkpoint) => {
+                    #[cfg(feature = "protocol-trace")]
+                    if let Some(message) = trace_message.as_ref() {
+                        if crate::protocol_trace::should_drop_response(&message.message_id) {
+                            let _ = crate::protocol_trace::record_replica_result(
+                                &trace_source,
+                                message,
+                                "dropped",
+                                checkpoint.persisted_checkpoint,
+                            );
+                            return (
+                                rid.clone(),
+                                target_allocation_id,
+                                Err(ReplicaReplicationFailure::message(
+                                    rid.clone(),
+                                    Some(target_allocation_id),
+                                    format!("{rid}: injected trace response drop"),
+                                )),
+                            );
+                        }
+                        let _ = crate::protocol_trace::record_replica_result(
+                            &trace_source,
+                            message,
+                            "acknowledged",
+                            checkpoint.persisted_checkpoint,
+                        );
+                    }
+                    (rid, target_allocation_id, Ok(checkpoint))
+                }
+                Err(error) => {
+                    #[cfg(feature = "protocol-trace")]
+                    if let Some(message) = trace_message.as_ref() {
+                        let outcome = trace_result_outcome(&message.message_id);
+                        let _ = crate::protocol_trace::record_replica_result(
+                            &trace_source,
+                            message,
+                            outcome,
+                            None,
+                        );
+                    }
+                    let failure = ReplicaReplicationFailure::from_error(
+                        rid.clone(),
+                        target_allocation_id,
+                        error,
+                    );
+                    (rid, target_allocation_id, Err(failure))
+                }
             }
         }));
     }
@@ -118,8 +422,15 @@ pub async fn replicate_write(
 
     for result in results {
         match result {
-            Ok((rid, Ok(checkpoint))) => checkpoints.push((rid, checkpoint)),
-            Ok((rid, Err(e))) => {
+            Ok((rid, allocation_id, Ok(checkpoint))) => {
+                checkpoints.push(ReplicaCheckpointUpdate {
+                    node_id: rid,
+                    allocation_id,
+                    processed_checkpoint: checkpoint.processed_checkpoint,
+                    persisted_checkpoint: checkpoint.persisted_checkpoint,
+                });
+            }
+            Ok((rid, _, Err(e))) => {
                 error!(
                     "Replication to {} for {}/shard_{} failed: {}",
                     rid, index_name, shard_id, e
@@ -128,7 +439,11 @@ pub async fn replicate_write(
             }
             Err(e) => {
                 error!("Replication task panicked: {}", e);
-                errors.push(format!("task panicked: {e}"));
+                errors.push(ReplicaReplicationFailure::message(
+                    "<task>",
+                    None,
+                    format!("task panicked: {e}"),
+                ));
             }
         }
     }
@@ -141,7 +456,6 @@ pub async fn replicate_write(
 }
 
 /// Replicate a bulk set of writes to all in-sync replica nodes for a shard.
-/// Returns Ok(replica_checkpoints) with (node_id, local_checkpoint) for each replica.
 /// Replication is performed concurrently (fan-out) — latency = max(replica RTTs).
 pub async fn replicate_bulk(
     transport_client: &TransportClient,
@@ -150,36 +464,300 @@ pub async fn replicate_bulk(
     shard_id: u32,
     docs: &[(String, serde_json::Value)],
     start_seq_no: u64,
-) -> Result<Vec<(String, u64)>, Vec<String>> {
-    let metadata = match cluster_state.indices.get(index_name) {
-        Some(m) => m,
-        None => return Ok(vec![]),
-    };
-    let Some(routing) = metadata.shard_routing.get(&shard_id) else {
-        return Ok(vec![]);
-    };
-    let index_uuid = metadata.uuid.to_string();
-    let primary_term = routing.primary_term;
+    primary_term: u64,
+) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>> {
+    replicate_bulk_with_durability(
+        transport_client,
+        cluster_state,
+        index_name,
+        shard_id,
+        docs,
+        start_seq_no,
+        primary_term,
+        TranslogDurability::Request,
+    )
+    .await
+}
 
-    let replica_node_ids = metadata.in_sync_replica_nodes(shard_id);
-    if replica_node_ids.is_empty() {
-        return Ok(vec![]);
+#[allow(clippy::too_many_arguments)]
+pub async fn replicate_bulk_with_durability(
+    transport_client: &TransportClient,
+    cluster_state: &ClusterState,
+    index_name: &str,
+    shard_id: u32,
+    docs: &[(String, serde_json::Value)],
+    start_seq_no: u64,
+    primary_term: u64,
+    durability: TranslogDurability,
+) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>> {
+    let Some(route) =
+        resolve_replica_batch_route(cluster_state, index_name, shard_id, primary_term, "bulk")?
+    else {
+        return Ok(Vec::new());
+    };
+    if route.replica_node_ids.is_empty() {
+        #[cfg(feature = "protocol-trace")]
+        {
+            let trace_operations = docs
+                .iter()
+                .enumerate()
+                .map(|(offset, (doc_id, payload))| {
+                    let seq_no = start_seq_no.checked_add(offset as u64).ok_or_else(|| {
+                        trace_replication_failure(
+                            route.primary_node.clone(),
+                            None,
+                            "bulk replication sequence range overflows".to_string(),
+                        )
+                    })?;
+                    Ok(crate::engine::SequencedOperation {
+                        seq_no,
+                        primary_term,
+                        mutation: crate::engine::DocumentMutation::Index {
+                            doc_id: doc_id.clone(),
+                            source: payload.clone(),
+                        },
+                    })
+                })
+                .collect::<Result<Vec<_>, Vec<ReplicaReplicationFailure>>>()?;
+            crate::protocol_trace::start_replication(
+                &route.primary_node,
+                cluster_state,
+                index_name,
+                shard_id,
+                &trace_operations,
+                false,
+            )
+            .map_err(|error| trace_replication_failure(route.primary_node.clone(), None, error))?;
+        }
+        return Ok(Vec::new());
     }
+    let operations = docs
+        .iter()
+        .enumerate()
+        .map(|(offset, (doc_id, payload))| {
+            let seq_no = start_seq_no.checked_add(offset as u64).ok_or_else(|| {
+                ReplicaReplicationFailure::message(
+                    "<bulk>",
+                    None,
+                    "bulk replication sequence range overflows".to_string(),
+                )
+            })?;
+            let payload_json = serde_json::to_vec(payload).map_err(|error| {
+                ReplicaReplicationFailure::message(
+                    "<bulk>",
+                    None,
+                    format!("serialize replica payload: {error}"),
+                )
+            })?;
+            Ok(ReplicaWireOperation {
+                seq_no,
+                op: "index".to_string(),
+                doc_id: doc_id.clone(),
+                payload_json,
+            })
+        })
+        .collect::<Result<Vec<_>, ReplicaReplicationFailure>>()
+        .map_err(|error| vec![error])?;
+    replicate_explicit_batch_with_durability(
+        transport_client,
+        cluster_state,
+        route,
+        index_name,
+        shard_id,
+        Arc::from(operations),
+        primary_term,
+        durability,
+        "bulk",
+    )
+    .await
+}
 
-    let docs_owned: Vec<(String, serde_json::Value)> = docs.to_vec();
+#[allow(clippy::too_many_arguments)]
+pub async fn replicate_noop_batch_with_durability(
+    transport_client: &TransportClient,
+    cluster_state: &ClusterState,
+    index_name: &str,
+    shard_id: u32,
+    operations: &[crate::engine::SequencedOperation],
+    primary_term: u64,
+    durability: TranslogDurability,
+) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>> {
+    let mut previous_seq_no = None;
+    let operations = operations
+        .iter()
+        .map(|operation| {
+            if operation.primary_term != primary_term {
+                return Err(ReplicaReplicationFailure::message(
+                    "<promotion>",
+                    None,
+                    format!(
+                        "promotion NoOp term {} does not match activated term {primary_term}",
+                        operation.primary_term
+                    ),
+                ));
+            }
+            if previous_seq_no.is_some_and(|previous| operation.seq_no <= previous) {
+                return Err(ReplicaReplicationFailure::message(
+                    "<promotion>",
+                    None,
+                    "promotion NoOp sequences must be strictly increasing".to_string(),
+                ));
+            }
+            previous_seq_no = Some(operation.seq_no);
+            let crate::engine::DocumentMutation::NoOp { reason } = &operation.mutation else {
+                return Err(ReplicaReplicationFailure::message(
+                    "<promotion>",
+                    None,
+                    "promotion replication batch contains a non-NoOp operation".to_string(),
+                ));
+            };
+            let payload_json = serde_json::to_vec(&serde_json::json!({ "_reason": reason }))
+                .map_err(|error| {
+                    ReplicaReplicationFailure::message(
+                        "<promotion>",
+                        None,
+                        format!("serialize promotion NoOp: {error}"),
+                    )
+                })?;
+            Ok(ReplicaWireOperation {
+                seq_no: operation.seq_no,
+                op: "noop".to_string(),
+                doc_id: String::new(),
+                payload_json,
+            })
+        })
+        .collect::<Result<Vec<_>, ReplicaReplicationFailure>>()
+        .map_err(|error| vec![error])?;
+    let Some(route) = resolve_replica_batch_route(
+        cluster_state,
+        index_name,
+        shard_id,
+        primary_term,
+        "promotion NoOp",
+    )?
+    else {
+        return Ok(Vec::new());
+    };
+    if route.replica_node_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    replicate_explicit_batch_with_durability(
+        transport_client,
+        cluster_state,
+        route,
+        index_name,
+        shard_id,
+        Arc::from(operations),
+        primary_term,
+        durability,
+        "promotion NoOp",
+    )
+    .await
+}
 
+#[allow(clippy::too_many_arguments)]
+async fn replicate_explicit_batch_with_durability(
+    transport_client: &TransportClient,
+    cluster_state: &ClusterState,
+    route: ReplicaBatchRoute,
+    index_name: &str,
+    shard_id: u32,
+    operations: Arc<[ReplicaWireOperation]>,
+    primary_term: u64,
+    durability: TranslogDurability,
+    operation_label: &'static str,
+) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>> {
+    #[cfg(feature = "protocol-trace")]
+    let trace_operations = operations
+        .iter()
+        .map(|operation| {
+            let mutation = match operation.op.as_str() {
+                "index" => crate::engine::DocumentMutation::Index {
+                    doc_id: operation.doc_id.clone(),
+                    source: serde_json::from_slice(&operation.payload_json).map_err(|error| {
+                        trace_replication_failure(
+                            route.primary_node.clone(),
+                            None,
+                            format!("decode traced replica payload: {error}"),
+                        )
+                    })?,
+                },
+                "delete" => crate::engine::DocumentMutation::Delete {
+                    doc_id: operation.doc_id.clone(),
+                },
+                "noop" => {
+                    let payload: serde_json::Value =
+                        serde_json::from_slice(&operation.payload_json).map_err(|error| {
+                            trace_replication_failure(
+                                route.primary_node.clone(),
+                                None,
+                                format!("decode traced promotion NoOp: {error}"),
+                            )
+                        })?;
+                    let reason = payload
+                        .get("_reason")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            trace_replication_failure(
+                                route.primary_node.clone(),
+                                None,
+                                "traced promotion NoOp has no _reason",
+                            )
+                        })?;
+                    crate::engine::DocumentMutation::NoOp {
+                        reason: reason.to_string(),
+                    }
+                }
+                other => {
+                    return Err(trace_replication_failure(
+                        route.primary_node.clone(),
+                        None,
+                        format!("unsupported traced batch operation '{other}'"),
+                    ));
+                }
+            };
+            Ok(crate::engine::SequencedOperation {
+                seq_no: operation.seq_no,
+                primary_term,
+                mutation,
+            })
+        })
+        .collect::<Result<Vec<_>, Vec<ReplicaReplicationFailure>>>()?;
+    #[cfg(feature = "protocol-trace")]
+    let trace_messages = crate::protocol_trace::start_replication(
+        &route.primary_node,
+        cluster_state,
+        index_name,
+        shard_id,
+        &trace_operations,
+        operation_label == "promotion NoOp",
+    )
+    .map_err(|error| trace_replication_failure(route.primary_node.clone(), None, error))?;
+    #[cfg(feature = "protocol-trace")]
+    let trace_source = trace_source_copy(
+        cluster_state,
+        index_name,
+        shard_id,
+        &route.primary_node,
+        &route.index_uuid,
+    )?;
     // Build futures for concurrent replication to all in-sync replicas
-    let mut futures = Vec::with_capacity(replica_node_ids.len());
+    let mut futures = Vec::with_capacity(route.replica_node_ids.len());
 
-    for replica_node_id in &replica_node_ids {
-        let node_info = match cluster_state.nodes.get(*replica_node_id) {
+    for replica_node_id in &route.replica_node_ids {
+        let node_info = match cluster_state.nodes.get(replica_node_id) {
             Some(n) => n.clone(),
             None => {
                 let rid = replica_node_id.to_string();
                 futures.push(tokio::spawn(async move {
                     (
                         rid.clone(),
-                        Err::<u64, String>(format!("Replica node {rid} not in cluster state")),
+                        0,
+                        Err(ReplicaReplicationFailure::message(
+                            rid.clone(),
+                            None,
+                            format!("Replica node {rid} not in cluster state"),
+                        )),
                     )
                 }));
                 continue;
@@ -189,49 +767,70 @@ pub async fn replicate_bulk(
         let client = transport_client.clone();
         let idx = index_name.to_string();
         let rid = replica_node_id.to_string();
-        let docs_clone = docs_owned.clone();
+        let operations = Arc::clone(&operations);
         let Some(target_allocation_id) =
             cluster_state.shard_allocation_id(index_name, shard_id, replica_node_id)
         else {
             futures.push(tokio::spawn(async move {
                 (
                     rid.clone(),
-                    Err::<u64, String>(format!(
-                        "Replica node {rid} has no allocation ID in cluster state"
+                    0,
+                    Err(ReplicaReplicationFailure::message(
+                        rid.clone(),
+                        None,
+                        format!("Replica node {rid} has no allocation ID in cluster state"),
                     )),
                 )
             }));
             continue;
         };
-        let uuid = index_uuid.clone();
+        let uuid = route.index_uuid.clone();
+        #[cfg(feature = "protocol-trace")]
+        let trace_target_messages = trace_messages
+            .iter()
+            .filter(|message| message.target == rid)
+            .cloned()
+            .collect::<Vec<_>>();
+        #[cfg(feature = "protocol-trace")]
+        let trace_source = trace_source.clone();
 
         futures.push(tokio::spawn(async move {
-            let ops = match docs_clone
+            #[cfg(feature = "protocol-trace")]
+            for message in &trace_target_messages {
+                if crate::protocol_trace::apply_request_fault(&message.message_id).await {
+                    for result_message in &trace_target_messages {
+                        let _ = crate::protocol_trace::record_replica_result(
+                            &trace_source,
+                            result_message,
+                            "dropped",
+                            None,
+                        );
+                    }
+                    return (
+                        rid.clone(),
+                        target_allocation_id,
+                        Err(ReplicaReplicationFailure::message(
+                            rid.clone(),
+                            Some(target_allocation_id),
+                            format!("{rid}: injected trace request drop"),
+                        )),
+                    );
+                }
+            }
+            let ops = operations
                 .iter()
-                .enumerate()
-                .map(|(offset, (doc_id, payload))| {
-                    let seq_no = start_seq_no
-                        .checked_add(offset as u64)
-                        .ok_or_else(|| "bulk replication sequence range overflows".to_string())?;
-                    let payload_json = serde_json::to_vec(payload)
-                        .map_err(|error| format!("serialize replica payload: {error}"))?;
-                    Ok(ReplicateDocRequest {
-                        index_name: idx.clone(),
-                        shard_id,
-                        doc_id: doc_id.clone(),
-                        payload_json,
-                        op: "index".to_string(),
-                        seq_no,
-                        index_uuid: uuid.clone(),
-                        primary_term: Some(primary_term),
-                        target_allocation_id: Some(target_allocation_id),
-                    })
+                .map(|operation| ReplicateDocRequest {
+                    index_name: idx.clone(),
+                    shard_id,
+                    doc_id: operation.doc_id.clone(),
+                    payload_json: operation.payload_json.clone(),
+                    op: operation.op.clone(),
+                    seq_no: operation.seq_no,
+                    index_uuid: uuid.clone(),
+                    primary_term: Some(primary_term),
+                    target_allocation_id: Some(target_allocation_id),
                 })
-                .collect::<Result<Vec<_>, String>>()
-            {
-                Ok(ops) => ops,
-                Err(error) => return (rid.clone(), Err(format!("{rid}: {error}"))),
-            };
+                .collect();
             match client
                 .replicate_bulk_to_shard(
                     &node_info,
@@ -243,11 +842,61 @@ pub async fn replicate_bulk(
                         primary_term: Some(primary_term),
                         target_allocation_id: Some(target_allocation_id),
                     },
+                    matches!(durability, TranslogDurability::Request),
                 )
                 .await
             {
-                Ok(checkpoint) => (rid, Ok(checkpoint)),
-                Err(e) => (rid.clone(), Err(format!("{rid}: {e}"))),
+                Ok(checkpoint) => {
+                    #[cfg(feature = "protocol-trace")]
+                    {
+                        let drop_response = trace_target_messages.iter().any(|message| {
+                            crate::protocol_trace::should_drop_response(&message.message_id)
+                        });
+                        let outcome = if drop_response {
+                            "dropped"
+                        } else {
+                            "acknowledged"
+                        };
+                        for message in &trace_target_messages {
+                            let _ = crate::protocol_trace::record_replica_result(
+                                &trace_source,
+                                message,
+                                outcome,
+                                checkpoint.persisted_checkpoint,
+                            );
+                        }
+                        if drop_response {
+                            return (
+                                rid.clone(),
+                                target_allocation_id,
+                                Err(ReplicaReplicationFailure::message(
+                                    rid.clone(),
+                                    Some(target_allocation_id),
+                                    format!("{rid}: injected trace response drop"),
+                                )),
+                            );
+                        }
+                    }
+                    (rid, target_allocation_id, Ok(checkpoint))
+                }
+                Err(error) => {
+                    #[cfg(feature = "protocol-trace")]
+                    for message in &trace_target_messages {
+                        let outcome = trace_result_outcome(&message.message_id);
+                        let _ = crate::protocol_trace::record_replica_result(
+                            &trace_source,
+                            message,
+                            outcome,
+                            None,
+                        );
+                    }
+                    let failure = ReplicaReplicationFailure::from_error(
+                        rid.clone(),
+                        target_allocation_id,
+                        error,
+                    );
+                    (rid, target_allocation_id, Err(failure))
+                }
             }
         }));
     }
@@ -258,17 +907,28 @@ pub async fn replicate_bulk(
 
     for result in results {
         match result {
-            Ok((rid, Ok(checkpoint))) => checkpoints.push((rid, checkpoint)),
-            Ok((rid, Err(e))) => {
+            Ok((rid, allocation_id, Ok(checkpoint))) => {
+                checkpoints.push(ReplicaCheckpointUpdate {
+                    node_id: rid,
+                    allocation_id,
+                    processed_checkpoint: checkpoint.processed_checkpoint,
+                    persisted_checkpoint: checkpoint.persisted_checkpoint,
+                });
+            }
+            Ok((rid, _, Err(e))) => {
                 error!(
-                    "Bulk replication to {} for {}/shard_{} failed: {}",
-                    rid, index_name, shard_id, e
+                    "{} replication to {} for {}/shard_{} failed: {}",
+                    operation_label, rid, index_name, shard_id, e
                 );
                 errors.push(e);
             }
             Err(e) => {
                 error!("Bulk replication task panicked: {}", e);
-                errors.push(format!("task panicked: {e}"));
+                errors.push(ReplicaReplicationFailure::message(
+                    "<task>",
+                    None,
+                    format!("task panicked: {e}"),
+                ));
             }
         }
     }
@@ -358,6 +1018,7 @@ mod tests {
             &serde_json::json!({"field": "value"}),
             "index",
             0,
+            1,
         )
         .await;
         assert!(result.is_ok());
@@ -377,6 +1038,7 @@ mod tests {
             &serde_json::json!({"field": "value"}),
             "index",
             0,
+            1,
         )
         .await
         .unwrap();
@@ -397,6 +1059,7 @@ mod tests {
             &serde_json::json!({"field": "value"}),
             "index",
             0,
+            1,
         )
         .await;
         assert!(result.is_ok());
@@ -417,6 +1080,7 @@ mod tests {
             &serde_json::json!({"field": "value"}),
             "index",
             0,
+            1,
         )
         .await;
         assert!(result.is_ok());
@@ -436,6 +1100,7 @@ mod tests {
             &serde_json::json!({"field": "value"}),
             "index",
             0,
+            1,
         )
         .await;
         assert!(result.is_err());
@@ -459,6 +1124,7 @@ mod tests {
             &serde_json::json!({"field": "value"}),
             "index",
             0,
+            1,
         )
         .await;
         assert!(result.is_err());
@@ -482,6 +1148,7 @@ mod tests {
             &serde_json::json!({"field": "value"}),
             "index",
             0,
+            1,
         )
         .await;
         assert!(result.is_err());
@@ -496,7 +1163,7 @@ mod tests {
         let client = TransportClient::new();
         let cs = make_cluster_state_with_nodes();
         let docs = vec![("d1".into(), serde_json::json!({"a": 1}))];
-        let result = replicate_bulk(&client, &cs, "nonexistent", 0, &docs, 0).await;
+        let result = replicate_bulk(&client, &cs, "nonexistent", 0, &docs, 0, 1).await;
         assert!(result.is_ok());
     }
 
@@ -505,8 +1172,17 @@ mod tests {
         let client = TransportClient::new();
         let mut cs = make_cluster_state_with_nodes();
         add_index_with_routing(&mut cs, "test-idx", vec![]);
-        let docs = vec![("d1".into(), serde_json::json!({"a": 1}))];
-        let result = replicate_bulk(&client, &cs, "test-idx", 0, &docs, 0).await;
+        let docs = vec![
+            (
+                "d1".into(),
+                serde_json::json!({"payload": "x".repeat(4096)}),
+            ),
+            (
+                "d2".into(),
+                serde_json::json!({"payload": "y".repeat(4096)}),
+            ),
+        ];
+        let result = replicate_bulk(&client, &cs, "test-idx", 0, &docs, u64::MAX, 1).await;
         assert!(result.is_ok());
     }
 
@@ -516,7 +1192,7 @@ mod tests {
         let mut cs = make_cluster_state_with_nodes();
         add_index_with_membership(&mut cs, "test-idx", vec!["node-2".into()], vec![]);
         let docs = vec![("d1".into(), serde_json::json!({"a": 1}))];
-        let checkpoints = replicate_bulk(&client, &cs, "test-idx", 0, &docs, 0)
+        let checkpoints = replicate_bulk(&client, &cs, "test-idx", 0, &docs, 0, 1)
             .await
             .unwrap();
         assert!(checkpoints.is_empty());
@@ -531,7 +1207,7 @@ mod tests {
             ("d1".into(), serde_json::json!({"a": 1})),
             ("d2".into(), serde_json::json!({"b": 2})),
         ];
-        let result = replicate_bulk(&client, &cs, "test-idx", 0, &docs, 0).await;
+        let result = replicate_bulk(&client, &cs, "test-idx", 0, &docs, 0, 1).await;
         assert!(result.is_err());
         assert!(result.unwrap_err()[0].contains("phantom"));
     }
@@ -542,7 +1218,7 @@ mod tests {
         let mut cs = make_cluster_state_with_nodes();
         add_index_with_routing(&mut cs, "test-idx", vec!["node-2".into()]);
         let docs = vec![("d1".into(), serde_json::json!({"a": 1}))];
-        let result = replicate_bulk(&client, &cs, "test-idx", 0, &docs, 0).await;
+        let result = replicate_bulk(&client, &cs, "test-idx", 0, &docs, 0, 1).await;
         assert!(result.is_err());
     }
 
@@ -561,6 +1237,7 @@ mod tests {
             &serde_json::json!({"f": 1}),
             "index",
             0,
+            1,
         )
         .await
         .unwrap();
@@ -572,7 +1249,7 @@ mod tests {
         let client = TransportClient::new();
         let cs = make_cluster_state_with_nodes();
         let docs = vec![("d1".into(), serde_json::json!({"a": 1}))];
-        let checkpoints = replicate_bulk(&client, &cs, "nonexistent", 0, &docs, 0)
+        let checkpoints = replicate_bulk(&client, &cs, "nonexistent", 0, &docs, 0, 1)
             .await
             .unwrap();
         assert!(checkpoints.is_empty());

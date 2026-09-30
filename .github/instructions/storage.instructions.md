@@ -57,6 +57,10 @@ best-effort fallbacks.
 
 - Index UUID, manifest generation, split ID, checksum, schema hash, and bundle
   path are identities. Validate them and fail closed on disagreement.
+- Pointer and manifest format versions must match the current constants.
+  Unknown versions and placeholder checksums are unsupported pre-1.0 formats;
+  return the shared recreate-the-index error instead of adapting or reporting
+  an "unsupported" success entry.
 - Publish immutable data before the mutable pointer. A failed pointer update
   may leave unreachable immutable objects; it must not expose a partial split.
 - Never use `unwrap_or_default()` when decoding a pointer, manifest, summary, or
@@ -72,6 +76,10 @@ best-effort fallbacks.
   flattening, string/number/boolean coercion, null skipping, and per-field
   deduplication as `HotEngine` indexing. If every distinct value cannot fit
   within the summary cap, omit that field's summary entirely.
+- Publish validates every source before staging. Top-level `_id` is request
+  metadata and is stripped before indexing; every other shared reserved
+  document key is a `400 mapper_parsing_exception` and must not create a bundle
+  or manifest.
 - Any future multi-writer protocol needs conditional pointer publication,
   monotonic writer fencing, idempotent operation identity, and crash evidence.
   A process mutex or "last generation + 1" is not sufficient.

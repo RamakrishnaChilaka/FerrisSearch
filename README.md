@@ -143,6 +143,12 @@ curl -sS -X PUT 'http://localhost:9200/movies' \
 JSON
 ```
 
+Every index also has a built-in `body` text field. It collects the text values
+of each document for `?q=` search. You can omit it from `properties`, even in
+strict indices; an explicit `body` mapping must be exactly `{"type": "text"}`.
+Top-level document keys that name metadata fields, such as `_id`, `_source`,
+`_seq_no`, and `_primary_term`, are rejected with `400 mapper_parsing_exception`.
+
 ### 3. Index a small batch
 
 ```bash
@@ -262,11 +268,14 @@ coordinator-side merge semantics are required.
 - Primary/replica shard routing over gRPC
 - Generation-based binary translog with request or asynchronous durability
 - Primary write receipts propagated to REST `_seq_no` responses, including bulk
-  ranges, with replica WAL sequence preservation
-- Monotonic sequence high-watermark tracking
+  ranges and `_primary_term`, with replica WAL operation identity preservation
+- Gap-aware processed and persisted checkpoints, with explicit `None` distinct
+  from sequence zero and persisted-prefix global checkpoint calculation
 - Bounded file-based peer recovery for initial, later-added, and rejoining replicas:
-  committed Tantivy files, pinned WAL suffix, final write barrier, and
-  allocation-bound conditional in-sync admission
+  gap-free committed-boundary installation, pinned physical-order WAL streaming
+  that pauses at source-unapplied frames, processed-checkpoint finalization, a
+  final replaying write barrier, and allocation-bound conditional in-sync
+  admission
 - Raft-owned shard-copy allocation IDs, durable local copy identity, and
   replica primary-term fencing before WAL mutation
 - Fail-closed copy startup with immediate corruption reporting, bounded
@@ -334,18 +343,19 @@ allocation can currently choose the same faulty node again; a
 MaxRetryAllocationDecider-style exclusion policy and
 `index.allocation.max_retries` setting are deferred.
 
-This pre-1.0 protocol does not adopt legacy shard directories or routing
-snapshots that lack allocation identity. Clusters created before this change
-must be recreated or reindexed; there is no rolling compatibility path.
+FerrisSearch pre-1.0 does not migrate data or metadata from earlier builds.
+Existing indices, shard directories, WALs, manifests, copy identities, Raft
+logs/snapshots, and incompatible peer wire formats fail closed. Recreate
+incompatible indices and reindex their source data. For incompatible Raft logs
+or snapshots, wipe the node data directories and recreate the cluster. There is
+no rolling mixed-version compatibility path.
 
 For `local_shards`, each encoded WAL operation is limited to 32 MiB, including
 the frame header and internal `_doc_id` / `_source` wrapper. The maximum usable
 JSON document body is therefore slightly smaller and varies with the document
 ID and serialized shape. Oversized single or bulk items are rejected before
-WAL mutation. Restart and replay retain bounded upgrade compatibility for
-complete legacy frames up to 65 MiB; peer recovery may skip those frames when
-they are already represented by the file snapshot, but transferred operations
-remain limited to 32 MiB.
+WAL mutation. Restart, replay, and peer recovery enforce the same 32 MiB frame
+limit.
 
 Force merge keeps its asynchronous `202 Accepted` task lifecycle. A valid
 `max_num_segments` is at least 1; each shard drains already-scheduled automatic
@@ -440,12 +450,14 @@ production ready**. The most important limits are:
 - At the `8f17172` main baseline, startup replay resurrected acknowledged
   deletes and one transient Tantivy commit failure could lose later
   acknowledged writes. Both defects are fixed on this branch.
-- `_seq_no` now reports the primary WAL assignment, but `_version` and
-  `_primary_term` compatibility fields remain placeholders. Gap-aware
-  checkpoints, primary epochs, idempotent retries, `if_seq_no` /
+- `_seq_no` and `_primary_term` report the primary-assigned operation identity,
+  while `_version` remains a placeholder. Internal replica redelivery is
+  sequence/term aware, but client retry tokens, `if_seq_no` /
   `if_primary_term`, and complete optimistic concurrency control are still
   missing.
-- Replica bootstrap needs snapshot-plus-streamed-WAL recovery.
+- Replica bootstrap uses file snapshot plus physical-order WAL streaming, but
+  source sessions and retention pins remain process-local and general D10
+  rollback/resync is not implemented.
 - Remote manifest publication is serialized only inside one process; there is
   no cross-process compare-and-set or writer fencing.
 - Remote-store ingest is manual, not near-real-time, and there is no unified

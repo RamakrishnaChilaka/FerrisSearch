@@ -23,6 +23,17 @@ use tempfile::TempDir;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 
+const RESERVED_METADATA_KEYS_FOR_TEST: &[&str] = &[
+    "_id",
+    "_doc_id",
+    "_source",
+    "_seq_no",
+    "_primary_term",
+    "_version",
+    "_index",
+    "_routing",
+];
+
 struct RestTestHarness {
     _temp_dir: TempDir,
     app_state: AppState,
@@ -124,6 +135,36 @@ async fn get_json_from_base_url(
     let status = response.status();
     let value = response.json().await?;
     Ok((status, value))
+}
+
+fn assert_mapper_parsing_error(status: StatusCode, body: &Value, field: &str) {
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {body}");
+    assert_eq!(
+        body["error"]["type"],
+        json!("mapper_parsing_exception"),
+        "{field}: {body}"
+    );
+    assert_eq!(
+        body["error"]["reason"],
+        json!(format!(
+            "Field [{field}] is a metadata field and cannot be added inside a document. Use the index API request parameters."
+        )),
+        "{field}: {body}"
+    );
+}
+
+fn assert_body_mapping_error(status: StatusCode, body: &Value) {
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"]["type"],
+        json!("mapper_parsing_exception"),
+        "{body}"
+    );
+    assert_eq!(
+        body["error"]["reason"],
+        json!("Field [body] is the built-in catch-all text field and can only be mapped as [text]"),
+        "{body}"
+    );
 }
 
 impl RestTestHarness {
@@ -2969,6 +3010,310 @@ async fn rest_sql_distributed_semijoin_merges_inner_groups_across_shards() -> Re
 // ── Dynamic Mapping Integration Tests ──────────────────────────────────
 
 #[tokio::test]
+async fn reserved_metadata_fields_are_rejected_across_rest_write_entries() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+
+    for (offset, field) in RESERVED_METADATA_KEYS_FOR_TEST.iter().enumerate() {
+        let (status, body) = harness
+            .put_json(
+                &format!("/reserved-mapping-{offset}"),
+                json!({
+                    "settings": {
+                        "number_of_shards": 1,
+                        "number_of_replicas": 0
+                    },
+                    "mappings": {
+                        "properties": {
+                            (*field): { "type": "keyword" }
+                        }
+                    }
+                }),
+            )
+            .await?;
+        assert_mapper_parsing_error(status, &body, field);
+    }
+
+    let (status, body) = harness
+        .put_json(
+            "/reserved-docs",
+            json!({
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    for (offset, field) in RESERVED_METADATA_KEYS_FOR_TEST.iter().enumerate() {
+        let source = json!({ (*field): 999 });
+        let (status, body) = harness
+            .post_json("/reserved-docs/_doc", source.clone())
+            .await?;
+        assert_mapper_parsing_error(status, &body, field);
+
+        let (status, body) = harness
+            .put_json(&format!("/reserved-docs/_doc/put-{offset}"), source)
+            .await?;
+        assert_mapper_parsing_error(status, &body, field);
+    }
+
+    let (status, body) = harness
+        .put_json("/reserved-docs/_doc/base?refresh=true", json!({"value": 1}))
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    for field in RESERVED_METADATA_KEYS_FOR_TEST {
+        let (status, body) = harness
+            .post_json(
+                "/reserved-docs/_update/base",
+                json!({"doc": { (*field): 999 }}),
+            )
+            .await?;
+        assert_mapper_parsing_error(status, &body, field);
+
+        let (status, body) = harness
+            .post_json(
+                "/reserved-docs/_update/base",
+                json!({
+                    "doc": {"value": 2},
+                    "upsert": { (*field): 999 }
+                }),
+            )
+            .await?;
+        assert_mapper_parsing_error(status, &body, field);
+    }
+
+    let (status, body) = harness
+        .put_json(
+            "/reserved-docs/_doc/healthy?refresh=true",
+            json!({"body": "allowed", "value": 2}),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = harness.get_json("/reserved-docs/_doc/healthy").await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_source"]["body"], json!("allowed"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_index_accepts_plain_text_body_mapping_without_duplicate_schema() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let (status, body) = harness
+        .put_json(
+            "/explicit-body",
+            json!({
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0
+                },
+                "mappings": {
+                    "properties": {
+                        "body": { "type": "text" }
+                    }
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = harness
+        .put_json(
+            "/explicit-body/_doc/1?refresh=true",
+            json!({"body": "searchable value"}),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let state = harness.app_state.cluster_manager.get_state();
+    assert_eq!(
+        state.indices["explicit-body"].mappings["body"].field_type,
+        FieldType::Text
+    );
+    let (status, body) = harness
+        .get_json("/explicit-body/_search?q=searchable")
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["hits"]["total"]["value"], json!(1), "{body}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_index_rejects_non_text_or_parameterized_body_mappings() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    for (suffix, definition) in [
+        ("keyword", json!({"type": "keyword"})),
+        ("integer", json!({"type": "integer"})),
+        (
+            "parameterized",
+            json!({"type": "text", "analyzer": "keyword"}),
+        ),
+    ] {
+        let (status, body) = harness
+            .put_json(
+                &format!("/invalid-body-{suffix}"),
+                json!({
+                    "settings": {
+                        "number_of_shards": 1,
+                        "number_of_replicas": 0
+                    },
+                    "mappings": {
+                        "properties": {
+                            "body": definition
+                        }
+                    }
+                }),
+            )
+            .await?;
+        assert_body_mapping_error(status, &body);
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn bulk_reserved_metadata_fields_are_per_item_errors() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let (status, body) = harness
+        .put_json(
+            "/reserved-bulk",
+            json!({
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let mut ndjson = String::new();
+    let mut invalid_items = 0usize;
+    for action in ["index", "create", "update"] {
+        for field in RESERVED_METADATA_KEYS_FOR_TEST {
+            let doc_id = format!("{action}-{invalid_items}");
+            ndjson.push_str(&serde_json::to_string(&json!({
+                (action): { "_id": doc_id }
+            }))?);
+            ndjson.push('\n');
+            let source = if action == "update" {
+                json!({"doc": { (*field): 999 }, "upsert": {"value": 0}})
+            } else {
+                json!({ (*field): 999 })
+            };
+            ndjson.push_str(&serde_json::to_string(&source)?);
+            ndjson.push('\n');
+            invalid_items += 1;
+        }
+    }
+    ndjson.push_str("{\"index\":{\"_id\":\"healthy\"}}\n");
+    ndjson.push_str("{\"body\":\"allowed\",\"value\":1}\n");
+
+    let response = harness
+        .client
+        .post(format!(
+            "{}/reserved-bulk/_bulk?refresh=true",
+            harness.base_url
+        ))
+        .header(CONTENT_TYPE, "application/x-ndjson")
+        .body(ndjson)
+        .send()
+        .await?;
+    let status = response.status();
+    let body: Value = response.json().await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["errors"], json!(true));
+    let items = body["items"]
+        .as_array()
+        .expect("bulk items should be an array");
+    assert_eq!(items.len(), invalid_items + 1);
+    for item in &items[..invalid_items] {
+        let result = item
+            .as_object()
+            .and_then(|object| object.values().next())
+            .expect("bulk item should have one operation result");
+        assert_eq!(result["status"], json!(400), "{result}");
+        assert_eq!(
+            result["error"]["type"],
+            json!("mapper_parsing_exception"),
+            "{result}"
+        );
+    }
+    let healthy = items
+        .last()
+        .and_then(Value::as_object)
+        .and_then(|object| object.values().next())
+        .expect("healthy bulk item should have a result");
+    assert_eq!(healthy["status"], json!(201), "{healthy}");
+
+    let (status, body) = harness.get_json("/reserved-bulk/_doc/healthy").await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_source"]["body"], json!("allowed"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn bulk_update_wrapper_reserved_fields_are_isolated_per_item() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let (status, body) = harness
+        .put_json(
+            "/reserved-bulk-update",
+            json!({
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let bulk = concat!(
+        "{\"index\":{\"_id\":\"good\"}}\n",
+        "{\"value\":1}\n",
+        "{\"update\":{\"_id\":\"source-option\"}}\n",
+        "{\"doc\":{\"value\":2},\"_source\":true}\n",
+        "{\"update\":{\"_id\":\"sequence-option\"}}\n",
+        "{\"doc\":{\"value\":3},\"_seq_no\":999}\n"
+    );
+    let (status, body) = harness
+        .post_ndjson("/reserved-bulk-update/_bulk?refresh=true", bulk)
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["errors"], json!(true), "{body}");
+    assert_eq!(body["items"].as_array().map(Vec::len), Some(3), "{body}");
+    assert_eq!(body["items"][0]["index"]["status"], json!(201), "{body}");
+    for position in [1, 2] {
+        assert_eq!(
+            body["items"][position]["index"]["status"],
+            json!(400),
+            "{body}"
+        );
+        assert_eq!(
+            body["items"][position]["index"]["error"]["type"],
+            json!("mapper_parsing_exception"),
+            "{body}"
+        );
+    }
+
+    let (status, body) = harness.get_json("/reserved-bulk-update/_doc/good").await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_source"], json!({"value": 1}));
+
+    let (status, body) = harness
+        .put_json("/reserved-bulk-update/_doc/after", json!({"value": 4}))
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn dynamic_true_auto_creates_mappings_on_index() -> Result<()> {
     let harness = RestTestHarness::start().await?;
 
@@ -3045,6 +3390,157 @@ async fn dynamic_true_auto_creates_mappings_on_index() -> Result<()> {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["hits"]["total"]["value"], json!(1));
     assert_eq!(body["hits"]["hits"][0]["_id"], json!("1"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn dynamic_true_keeps_body_on_builtin_catch_all_across_reopen() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let (status, body) = harness
+        .put_json(
+            "/dynamic-body",
+            json!({
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0
+                },
+                "mappings": {
+                    "dynamic": "true"
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = harness
+        .put_json("/dynamic-body/_doc/1?refresh=true", json!({"body": 42}))
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(
+        !harness.app_state.cluster_manager.get_state().indices["dynamic-body"]
+            .mappings
+            .contains_key("body")
+    );
+
+    let (status, body) = harness
+        .put_json(
+            "/dynamic-body/_doc/2?refresh=true",
+            json!({"body": "still searchable", "count": 2}),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = harness.get_json("/dynamic-body/_refresh").await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = harness.get_json("/dynamic-body/_doc/1").await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_source"]["body"], json!(42));
+
+    let state = harness.app_state.cluster_manager.get_state();
+    let metadata = state.indices["dynamic-body"].clone();
+    let allocation_id = state
+        .primary_allocation_id("dynamic-body", 0)
+        .expect("dynamic-body primary allocation should exist");
+    drop(state);
+    harness
+        .app_state
+        .shard_manager
+        .reopen_shard(
+            "dynamic-body".into(),
+            0,
+            metadata.mappings,
+            metadata.settings,
+            metadata.uuid.to_string(),
+            allocation_id,
+        )
+        .await?;
+
+    let (status, body) = harness.get_json("/dynamic-body/_doc/2").await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_source"]["body"], json!("still searchable"));
+    let (status, body) = harness.get_json("/dynamic-body/_search?q=42").await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["hits"]["total"]["value"], json!(1), "{body}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn dynamic_builtin_body_keeps_direct_sql_path_without_persisted_mapping() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let index = "dynamic-body-sql";
+    let (status, body) = harness
+        .put_json(
+            &format!("/{index}"),
+            json!({
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0
+                },
+                "mappings": {
+                    "dynamic": true
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    for (id, source) in [
+        ("1", json!({"body": "hello world", "n": 1})),
+        ("2", json!({"body": "other text", "n": 2})),
+    ] {
+        let (status, body) = harness
+            .put_json(&format!("/{index}/_doc/{id}?refresh=true"), source)
+            .await?;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    assert!(
+        !harness.app_state.cluster_manager.get_state().indices[index]
+            .mappings
+            .contains_key("body")
+    );
+
+    let query = format!("SELECT body, n FROM \"{index}\" ORDER BY n");
+    let (status, body) = harness
+        .post_json(&format!("/{index}/_sql"), json!({"query": query.clone()}))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["execution_mode"], json!("tantivy_fast_fields"));
+    assert_eq!(
+        body["rows"],
+        json!([
+            {"body": "hello world", "n": 1},
+            {"body": "other text", "n": 2}
+        ])
+    );
+
+    let (status, stream) = harness
+        .post_json_text(&format!("/{index}/_sql/stream"), json!({"query": query}))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{stream}");
+    let frames: Vec<Value> = stream
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str::<Value>)
+        .collect::<std::result::Result<_, _>>()?;
+    assert_eq!(frames[0]["execution_mode"], json!("tantivy_fast_fields"));
+    let streamed_rows: Vec<Value> = frames
+        .iter()
+        .skip(1)
+        .flat_map(|frame| frame["rows"].as_array().cloned().unwrap_or_default())
+        .collect();
+    assert_eq!(streamed_rows, body["rows"].as_array().unwrap().clone());
+
+    let (status, describe) = harness
+        .post_json("/_sql", json!({"query": format!("DESCRIBE \"{index}\"")}))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{describe}");
+    assert!(
+        describe["rows"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"field": "body", "type": "text"}))
+    );
 
     Ok(())
 }
@@ -3272,6 +3768,42 @@ async fn create_index_with_remote_store_engine_allows_create_but_rejects_writes(
             .as_str()
             .unwrap()
             .contains("remote_store")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_index_rejects_settings_engine_and_names_top_level_field() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let (status, body) = harness
+        .put_json(
+            "/nested-engine",
+            json!({
+                "settings": {
+                    "engine": "remote_store",
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0
+                }
+            }),
+        )
+        .await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["type"], json!("illegal_argument_exception"));
+    assert_eq!(
+        body["error"]["reason"],
+        json!(
+            "index engine must be specified in the top-level [engine] field, not [settings.engine]"
+        )
+    );
+    assert!(
+        !harness
+            .app_state
+            .cluster_manager
+            .get_state()
+            .indices
+            .contains_key("nested-engine")
     );
 
     Ok(())
@@ -4460,6 +4992,59 @@ async fn remote_store_publish_rejects_keyword_objects_without_publishing() -> Re
 }
 
 #[tokio::test]
+async fn remote_store_publish_rejects_reserved_source_without_publishing() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let (status, body) = harness
+        .put_json("/pubreserved", json!({ "engine": "remote_store" }))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let metadata = harness
+        .app_state
+        .cluster_manager
+        .get_state()
+        .indices
+        .get("pubreserved")
+        .cloned()
+        .expect("index metadata should exist");
+    for field in RESERVED_METADATA_KEYS_FOR_TEST
+        .iter()
+        .copied()
+        .filter(|field| *field != "_id")
+    {
+        let (status, body) = harness
+            .post_json(
+                "/pubreserved/_remote_store/publish",
+                json!({
+                    "docs": [
+                        { "_id": "valid", "title": "allowed request metadata" },
+                        { "_id": "invalid", (field): 7, "title": "reserved source metadata" }
+                    ]
+                }),
+            )
+            .await?;
+        assert_mapper_parsing_error(status, &body, field);
+    }
+
+    let manifest = harness
+        .app_state
+        .storage_manager
+        .load_current_manifest(
+            metadata.uuid.as_str(),
+            Some(&ferrissearch::storage::compute_schema_hash(
+                &metadata.mappings,
+            )),
+        )
+        .await?;
+    assert!(
+        manifest.is_none(),
+        "reserved source metadata must not publish a manifest"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn remote_store_publish_rejects_on_local_shards_engine() -> Result<()> {
     let harness = RestTestHarness::start().await?;
     let (status, _) = harness
@@ -5439,5 +6024,42 @@ async fn security_put_api_key_transport_rpc_rejects_malformed_hash() -> Result<(
         list["api_keys"].as_array().unwrap().is_empty(),
         "rejected key must not be stored"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn group_by_unmapped_builtin_body_is_rejected_as_text() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    for (index, mappings) in [
+        ("gb-body-dynamic", json!({"dynamic": true})),
+        (
+            "gb-body-strict",
+            json!({"dynamic": "strict", "properties": {"n": {"type": "integer"}}}),
+        ),
+    ] {
+        let (status, body) = harness
+            .put_json(
+                &format!("/{index}"),
+                json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}, "mappings": mappings}),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = harness
+            .put_json(
+                &format!("/{index}/_doc/1?refresh=true"),
+                json!({"body": "hello world", "n": 1}),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let query = format!("SELECT body, count(*) AS c FROM \"{index}\" GROUP BY body");
+        let (status, body) = harness
+            .post_json(&format!("/{index}/_sql"), json!({"query": query}))
+            .await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{index}: {body}");
+        assert_eq!(
+            body["error"]["type"], "group_by_text_field_exception",
+            "{body}"
+        );
+    }
     Ok(())
 }

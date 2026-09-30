@@ -1444,9 +1444,45 @@ async fn grpc_fail_shard_copy_removes_exact_replica_allocation() {
         .data,
         ClusterResponse::Ok
     );
+    assert_eq!(
+        raft.client_write(ClusterCommand::ActivatePrimary {
+            index_name: "grpc-fail-copy".into(),
+            index_uuid: index_uuid.clone(),
+            shard_id: 0,
+            primary: "node-1".into(),
+            allocation_id: primary_allocation_id,
+            expected_term: 2,
+        })
+        .await
+        .unwrap()
+        .data,
+        ClusterResponse::Ok
+    );
 
     let addr = start_raft_grpc_server(raft, state_handle.clone()).await;
     let mut client = connect_grpc(addr).await;
+    let stale = client
+        .fail_shard_copy(tonic::Request::new(FailShardCopyRequest {
+            index_name: "grpc-fail-copy".into(),
+            index_uuid: index_uuid.clone(),
+            shard_id: 0,
+            node_id: "node-2".into(),
+            allocation_id: Some(allocation_id),
+            promote_only: false,
+            expected_primary_term: 2,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!stale.acknowledged);
+    assert!(stale.error.contains("primary term"));
+    assert_eq!(
+        state_handle
+            .read()
+            .unwrap()
+            .shard_allocation_id("grpc-fail-copy", 0, "node-2"),
+        Some(allocation_id)
+    );
     let response = client
         .fail_shard_copy(tonic::Request::new(FailShardCopyRequest {
             index_name: "grpc-fail-copy".into(),
@@ -1455,6 +1491,7 @@ async fn grpc_fail_shard_copy_removes_exact_replica_allocation() {
             node_id: "node-2".into(),
             allocation_id: Some(allocation_id),
             promote_only: false,
+            expected_primary_term: 3,
         }))
         .await
         .unwrap()
@@ -1546,6 +1583,7 @@ async fn grpc_promote_only_primary_failure_marks_unavailable_without_candidate()
             node_id: "node-1".into(),
             allocation_id: Some(promote_allocation),
             promote_only: true,
+            expected_primary_term: 2,
         }))
         .await
         .unwrap()
@@ -1592,6 +1630,7 @@ async fn grpc_promote_only_primary_failure_marks_unavailable_without_candidate()
             node_id: "node-1".into(),
             allocation_id: Some(single_allocation),
             promote_only: true,
+            expected_primary_term: 2,
         }))
         .await
         .unwrap()
@@ -1835,6 +1874,7 @@ async fn grpc_disk_loss_fails_closed_and_failure_report_restores_write_set() {
         &serde_json::json!({"value": 1}),
         "index",
         0,
+        2,
     )
     .await;
     assert!(failed.is_err(), "missing replica disk must fail the write");
@@ -1866,6 +1906,7 @@ async fn grpc_disk_loss_fails_closed_and_failure_report_restores_write_set() {
         &serde_json::json!({"value": 2}),
         "index",
         1,
+        2,
     )
     .await;
     assert!(
@@ -1944,6 +1985,7 @@ async fn grpc_conditional_membership_rpcs_reject_non_leader() {
             node_id: "node-2".into(),
             allocation_id: Some(1),
             promote_only: false,
+            expected_primary_term: 1,
         }))
         .await
         .unwrap_err();

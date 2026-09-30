@@ -207,7 +207,10 @@ TargetNeedsRecovery(target, source) ==
     /\ targetView.primary = source
     /\ target \in targetView.replicas
     /\ target \notin targetView.inSync
-    /\ copyMode[target] \notin AllStorageFailureModes
+    /\ \/ copyMode[target] \notin AllStorageFailureModes
+       \/ /\ AllocationIds
+          /\ targetView.allocations[target] > 0
+          /\ targetView.allocations[target] # copyAllocation[target]
 
 AvailableRecoveryWrites(target, upperBound) ==
     LET source == sessionSource[target]
@@ -390,8 +393,11 @@ PollSetupFailure(target) ==
 TargetBeginInstall(target) ==
     /\ sessionPhase[target] = "SnapshotReady"
     /\ alive[target]
-    /\ copyMode[target]
-       \notin {"Pending"} \cup AllStorageFailureModes
+    /\ copyMode[target] # "Pending"
+    /\ \/ copyMode[target] \notin AllStorageFailureModes
+       \/ /\ AllocationIds
+          /\ sessionAllocation[target] > 0
+          /\ sessionAllocation[target] # copyAllocation[target]
     /\ IF RestorePendingOnRestart
           THEN ~PendingMarkerMatchesCopy(target)
           ELSE TRUE

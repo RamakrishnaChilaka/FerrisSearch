@@ -61,14 +61,37 @@ impl DiskLogStore {
         io::Error::other(msg.to_string())
     }
 
-    fn read_meta<T: serde::de::DeserializeOwned>(&self, key: &str) -> io::Result<Option<T>> {
+    fn decode_log_entry(bytes: &[u8]) -> io::Result<types::Entry> {
+        serde_json::from_slice(bytes).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                crate::consensus::UnsupportedRaftFormatError::new(
+                    "Raft log entry",
+                    format!("cannot decode current command format: {error}"),
+                ),
+            )
+        })
+    }
+
+    fn read_meta<T: serde::de::DeserializeOwned>(
+        &self,
+        key: &str,
+        component: &str,
+    ) -> io::Result<Option<T>> {
         let db = self.db.lock().unwrap_or_else(|e| e.into_inner());
         let tx = db.begin_read().map_err(Self::io_err)?;
         let table = tx.open_table(META_TABLE).map_err(Self::io_err)?;
         match table.get(key).map_err(Self::io_err)? {
             Some(val) => {
-                let v: T = serde_json::from_slice(val.value())
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let v: T = serde_json::from_slice(val.value()).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        crate::consensus::UnsupportedRaftFormatError::new(
+                            component,
+                            format!("cannot decode current metadata format: {error}"),
+                        ),
+                    )
+                })?;
                 Ok(Some(v))
             }
             None => Ok(None),
@@ -139,8 +162,7 @@ impl RaftLogReader<TypeConfig> for DiskLogStore {
                 .map_err(DiskLogStore::io_err)?
             {
                 let (_, val) = item.map_err(DiskLogStore::io_err)?;
-                let entry: types::Entry = serde_json::from_slice(val.value())
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let entry = DiskLogStore::decode_log_entry(val.value())?;
                 entries.push(entry);
             }
             Ok(entries)
@@ -150,7 +172,7 @@ impl RaftLogReader<TypeConfig> for DiskLogStore {
 
     async fn read_vote(&mut self) -> Result<Option<types::Vote>, io::Error> {
         let store = self.clone();
-        run_blocking_io(move || store.read_meta("vote")).await
+        run_blocking_io(move || store.read_meta("vote", "Raft vote metadata")).await
     }
 }
 
@@ -162,7 +184,8 @@ impl RaftLogStorage<TypeConfig> for DiskLogStore {
     async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, io::Error> {
         let store = self.clone();
         run_blocking_io(move || {
-            let last_purged: Option<types::LogId> = store.read_meta("last_purged")?;
+            let last_purged: Option<types::LogId> =
+                store.read_meta("last_purged", "Raft last-purged metadata")?;
 
             let last_log_id = {
                 let db = store.db.lock().unwrap_or_else(|e| e.into_inner());
@@ -170,8 +193,7 @@ impl RaftLogStorage<TypeConfig> for DiskLogStore {
                 let table = tx.open_table(LOG_TABLE).map_err(DiskLogStore::io_err)?;
                 match table.last().map_err(DiskLogStore::io_err)? {
                     Some((_, val)) => {
-                        let entry: types::Entry = serde_json::from_slice(val.value())
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        let entry = DiskLogStore::decode_log_entry(val.value())?;
                         Some(entry.log_id)
                     }
                     None => None,
@@ -207,7 +229,7 @@ impl RaftLogStorage<TypeConfig> for DiskLogStore {
 
     async fn read_committed(&mut self) -> Result<Option<types::LogId>, io::Error> {
         let store = self.clone();
-        run_blocking_io(move || store.read_meta("committed")).await
+        run_blocking_io(move || store.read_meta("committed", "Raft committed metadata")).await
     }
 
     async fn append<I>(
@@ -358,6 +380,28 @@ mod tests {
         DiskLogStore::open(dir.path().join("raft.db")).unwrap()
     }
 
+    fn write_raw_meta(store: &DiskLogStore, key: &str, value: &[u8]) {
+        let db = store.db.lock().unwrap_or_else(|error| error.into_inner());
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx.open_table(META_TABLE).unwrap();
+            table.insert(key, value).unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    fn assert_cluster_recreation_error(error: io::Error, component: &str) {
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains(component), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("wipe the node data directories and recreate the cluster"),
+            "{error}"
+        );
+        assert!(!error.to_string().contains("recreate the index"), "{error}");
+    }
+
     #[test]
     fn open_creates_db_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -365,6 +409,48 @@ mod tests {
         assert!(!path.exists());
         let _store = DiskLogStore::open(&path).unwrap();
         assert!(path.exists());
+    }
+
+    #[test]
+    fn no_compat_old_raft_log_entry_requires_recreate() {
+        fn remove_field(value: &mut serde_json::Value, field: &str) -> bool {
+            match value {
+                serde_json::Value::Object(map) => {
+                    map.remove(field).is_some()
+                        || map.values_mut().any(|value| remove_field(value, field))
+                }
+                serde_json::Value::Array(values) => {
+                    values.iter_mut().any(|value| remove_field(value, field))
+                }
+                _ => false,
+            }
+        }
+
+        let entry = make_normal_entry(
+            7,
+            2,
+            ClusterCommand::FailShardCopy {
+                index_name: "idx".into(),
+                index_uuid: "uuid-1".into(),
+                shard_id: 0,
+                node: "node-2".into(),
+                allocation_id: 9,
+                expected_primary_term: 2,
+                promote_only: false,
+                promotion_candidate: None,
+            },
+        );
+        let mut value = serde_json::to_value(entry).unwrap();
+        assert!(remove_field(&mut value, "expected_primary_term"));
+        let bytes = serde_json::to_vec(&value).unwrap();
+
+        let error = DiskLogStore::decode_log_entry(&bytes).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("wipe the node data directories and recreate the cluster")
+        );
+        assert!(!error.to_string().contains("recreate the index"));
     }
 
     #[tokio::test]
@@ -375,6 +461,33 @@ mod tests {
         assert!(state.last_log_id.is_none());
         assert!(store.read_vote().await.unwrap().is_none());
         assert!(store.read_committed().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_raft_vote_metadata_requires_cluster_recreation() {
+        let mut store = temp_store();
+        write_raw_meta(&store, "vote", b"{not-json");
+
+        let error = store.read_vote().await.unwrap_err();
+        assert_cluster_recreation_error(error, "Raft vote metadata");
+    }
+
+    #[tokio::test]
+    async fn malformed_raft_committed_metadata_requires_cluster_recreation() {
+        let mut store = temp_store();
+        write_raw_meta(&store, "committed", b"{not-json");
+
+        let error = store.read_committed().await.unwrap_err();
+        assert_cluster_recreation_error(error, "Raft committed metadata");
+    }
+
+    #[tokio::test]
+    async fn malformed_raft_last_purged_metadata_requires_cluster_recreation() {
+        let mut store = temp_store();
+        write_raw_meta(&store, "last_purged", b"{not-json");
+
+        let error = store.get_log_state().await.unwrap_err();
+        assert_cluster_recreation_error(error, "Raft last-purged metadata");
     }
 
     #[tokio::test(flavor = "current_thread")]

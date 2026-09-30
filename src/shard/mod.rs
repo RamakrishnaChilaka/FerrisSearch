@@ -24,7 +24,7 @@ pub const SHARD_DATA_REMOVE_REASON_STALE_UUID_REPLACEMENT: &str = "stale_index_u
 pub const PEER_RECOVERY_IN_PROGRESS_MARKER: &str = "PEER_RECOVERY_IN_PROGRESS";
 pub const PEER_RECOVERY_AWAITING_MEMBERSHIP_MARKER: &str = "PEER_RECOVERY_AWAITING_MEMBERSHIP";
 pub const SHARD_COPY_IDENTITY_FILE: &str = "SHARD_COPY_IDENTITY.json";
-const SHARD_COPY_IDENTITY_VERSION: u32 = 1;
+const SHARD_COPY_IDENTITY_VERSION: u32 = 3;
 type SourceRecoveryIdentity = (String, u32);
 type SourceRecoveryLock = Arc<tokio::sync::Mutex<()>>;
 type SourceRecoveryLockMap = HashMap<SourceRecoveryIdentity, SourceRecoveryLock>;
@@ -49,6 +49,7 @@ enum ShardCopyIoOperation {
     Recovery,
     PendingMarker,
     InstallMarker,
+    CollisionMarker,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -132,7 +133,16 @@ enum CompositeOpenMode {
 #[derive(Clone, Copy)]
 enum ShardOpenAuthority {
     Local { allow_schema_reset: bool },
-    Assigned(AssignedShardOpen),
+    Assigned { assignment: AssignedShardOpen },
+}
+
+struct AssignedOpenRequest<'a> {
+    index: &'a str,
+    shard_id: u32,
+    mappings: &'a HashMap<String, crate::cluster::state::FieldMapping>,
+    settings: &'a IndexSettings,
+    index_uuid: &'a str,
+    assignment: AssignedShardOpen,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -192,7 +202,7 @@ pub(crate) trait SourceRecoverySessionCleanup: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<usize>> + Send + 'a>>;
 }
 
-pub struct PeerRecoveryTargetInstall {
+pub(crate) struct PeerRecoveryTargetInstall {
     pub index: String,
     pub shard_id: u32,
     pub mappings: HashMap<String, crate::cluster::state::FieldMapping>,
@@ -201,7 +211,7 @@ pub struct PeerRecoveryTargetInstall {
     pub allocation_id: AllocationId,
     pub primary_term: u64,
     pub shard_dir: PathBuf,
-    pub snapshot_next_seq_no: u64,
+    pub committed_boundary: crate::engine::sequence::CommittedBoundaryRecord,
     pub expected_files: Vec<String>,
 }
 
@@ -219,6 +229,15 @@ pub(crate) struct ReplicaApplyContext<'a> {
     pub message_term: u64,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "shard copy collision quarantine is active for index UUID {index_uuid}, allocation {allocation_id}"
+)]
+pub(crate) struct CollisionQuarantinedShardCopy {
+    index_uuid: String,
+    allocation_id: AllocationId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShardCopyIdentity {
@@ -226,15 +245,29 @@ pub struct ShardCopyIdentity {
     pub index_uuid: String,
     pub allocation_id: AllocationId,
     pub replica_fence: u64,
+    pub fence_max_seq_no: Option<u64>,
+    pub collision_quarantined: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct ShardCopyIdentityVersionHeader {
+    version: u32,
 }
 
 impl ShardCopyIdentity {
-    fn new(index_uuid: &str, allocation_id: AllocationId, replica_fence: u64) -> Result<Self> {
+    fn new(
+        index_uuid: &str,
+        allocation_id: AllocationId,
+        replica_fence: u64,
+        fence_max_seq_no: Option<u64>,
+    ) -> Result<Self> {
         let identity = Self {
             version: SHARD_COPY_IDENTITY_VERSION,
             index_uuid: index_uuid.to_string(),
             allocation_id,
             replica_fence,
+            fence_max_seq_no,
+            collision_quarantined: false,
         };
         identity.validate()?;
         Ok(identity)
@@ -242,10 +275,13 @@ impl ShardCopyIdentity {
 
     fn validate(&self) -> Result<()> {
         if self.version != SHARD_COPY_IDENTITY_VERSION {
-            return Err(definitive_shard_copy_failure(format!(
-                "unsupported shard copy identity version {}",
-                self.version
-            )));
+            return Err(crate::common::unsupported_index_format(
+                "shard copy identity",
+                format!(
+                    "version {} is not supported; expected {}",
+                    self.version, SHARD_COPY_IDENTITY_VERSION
+                ),
+            ));
         }
         if self.index_uuid.is_empty() {
             return Err(definitive_shard_copy_failure(
@@ -265,7 +301,7 @@ impl ShardCopyIdentity {
         Ok(())
     }
 
-    fn validate_expected(&self, index_uuid: &str, allocation_id: AllocationId) -> Result<()> {
+    fn validate_binding(&self, index_uuid: &str, allocation_id: AllocationId) -> Result<()> {
         self.validate()?;
         if self.index_uuid != index_uuid {
             return Err(definitive_shard_copy_failure(format!(
@@ -278,6 +314,18 @@ impl ShardCopyIdentity {
                 "local shard copy allocation mismatch: expected {allocation_id}, found {}",
                 self.allocation_id
             )));
+        }
+        Ok(())
+    }
+
+    fn validate_expected(&self, index_uuid: &str, allocation_id: AllocationId) -> Result<()> {
+        self.validate_binding(index_uuid, allocation_id)?;
+        if self.collision_quarantined {
+            return Err(CollisionQuarantinedShardCopy {
+                index_uuid: self.index_uuid.clone(),
+                allocation_id: self.allocation_id,
+            }
+            .into());
         }
         Ok(())
     }
@@ -336,11 +384,50 @@ impl ShardKey {
 /// Per-replica checkpoint info for ISR tracking.
 #[derive(Debug, Clone)]
 pub struct ReplicaCheckpoint {
-    /// The replica's last known applied sequence high-water mark.
-    /// This tracker does not prove contiguous application below the watermark.
-    pub checkpoint: u64,
+    pub allocation_id: AllocationId,
+    /// Highest contiguous processed checkpoint observed for this allocation.
+    pub processed_checkpoint: Option<u64>,
+    /// Highest contiguous persisted checkpoint observed for this allocation.
+    pub persisted_checkpoint: Option<u64>,
     /// When we last heard from this replica.
-    pub last_updated: std::time::Instant,
+    pub last_updated: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaCheckpointUpdate {
+    pub node_id: String,
+    pub allocation_id: AllocationId,
+    pub processed_checkpoint: Option<u64>,
+    pub persisted_checkpoint: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ReplicaCheckpointContext<'a> {
+    pub index_uuid: &'a str,
+    pub primary_term: u64,
+    pub primary_processed_checkpoint: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplicaGapObservation {
+    pub index_uuid: String,
+    pub replica_node_id: String,
+    pub allocation_id: AllocationId,
+    pub primary_term: u64,
+    pub first_seen: Instant,
+    pub target_checkpoint: u64,
+    pub max_reported_checkpoint: Option<u64>,
+}
+
+impl ReplicaGapObservation {
+    fn same_probe_identity(&self, other: &Self) -> bool {
+        self.index_uuid == other.index_uuid
+            && self.replica_node_id == other.replica_node_id
+            && self.allocation_id == other.allocation_id
+            && self.primary_term == other.primary_term
+            && self.first_seen == other.first_seen
+            && self.target_checkpoint == other.target_checkpoint
+    }
 }
 
 /// Tracks replica checkpoint observations for primary shards on this node.
@@ -352,6 +439,7 @@ pub struct IsrTracker {
     /// Per-shard, per-replica checkpoint tracking.
     /// Key: ShardKey, Value: HashMap<replica_node_id, ReplicaCheckpoint>
     replicas: RwLock<HashMap<ShardKey, HashMap<String, ReplicaCheckpoint>>>,
+    gap_observations: RwLock<HashMap<ShardKey, HashMap<String, ReplicaGapObservation>>>,
     /// Maximum allowed seq_no lag for the diagnostic lag-eligible view.
     max_lag: u64,
 }
@@ -360,27 +448,39 @@ impl IsrTracker {
     pub fn new(max_lag: u64) -> Self {
         Self {
             replicas: RwLock::new(HashMap::new()),
+            gap_observations: RwLock::new(HashMap::new()),
             max_lag,
         }
     }
 
-    /// Update a replica's checkpoint for a given shard.
+    fn max_checkpoint(current: Option<u64>, reported: Option<u64>) -> Option<u64> {
+        match (current, reported) {
+            (Some(current), Some(reported)) => Some(current.max(reported)),
+            (Some(current), None) => Some(current),
+            (None, Some(reported)) => Some(reported),
+            (None, None) => None,
+        }
+    }
+
     pub fn update_replica_checkpoint(
         &self,
         index: &str,
+        index_uuid: &str,
         shard_id: u32,
-        replica_node_id: &str,
-        checkpoint: u64,
+        primary_term: u64,
+        primary_processed_checkpoint: Option<u64>,
+        checkpoint: ReplicaCheckpointUpdate,
     ) {
-        let key = ShardKey::new(index, shard_id);
-        let mut replicas = self.replicas.write().unwrap_or_else(|e| e.into_inner());
-        let shard_replicas = replicas.entry(key).or_default();
-        shard_replicas.insert(
-            replica_node_id.to_string(),
-            ReplicaCheckpoint {
-                checkpoint,
-                last_updated: std::time::Instant::now(),
+        self.update_replica_checkpoints_at(
+            index,
+            shard_id,
+            ReplicaCheckpointContext {
+                index_uuid,
+                primary_term,
+                primary_processed_checkpoint,
             },
+            std::slice::from_ref(&checkpoint),
+            Instant::now(),
         );
     }
 
@@ -388,21 +488,101 @@ impl IsrTracker {
     pub fn update_replica_checkpoints(
         &self,
         index: &str,
+        index_uuid: &str,
         shard_id: u32,
-        checkpoints: &[(String, u64)],
+        primary_term: u64,
+        primary_processed_checkpoint: Option<u64>,
+        checkpoints: &[ReplicaCheckpointUpdate],
+    ) {
+        self.update_replica_checkpoints_at(
+            index,
+            shard_id,
+            ReplicaCheckpointContext {
+                index_uuid,
+                primary_term,
+                primary_processed_checkpoint,
+            },
+            checkpoints,
+            Instant::now(),
+        );
+    }
+
+    pub(crate) fn update_replica_checkpoints_at(
+        &self,
+        index: &str,
+        shard_id: u32,
+        context: ReplicaCheckpointContext<'_>,
+        checkpoints: &[ReplicaCheckpointUpdate],
+        now: Instant,
     ) {
         let key = ShardKey::new(index, shard_id);
         let mut replicas = self.replicas.write().unwrap_or_else(|e| e.into_inner());
-        let shard_replicas = replicas.entry(key).or_default();
-        let now = std::time::Instant::now();
-        for (node_id, cp) in checkpoints {
-            shard_replicas.insert(
-                node_id.clone(),
-                ReplicaCheckpoint {
-                    checkpoint: *cp,
+        let mut gaps = self
+            .gap_observations
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let shard_replicas = replicas.entry(key.clone()).or_default();
+        let shard_gaps = gaps.entry(key).or_default();
+        for checkpoint in checkpoints {
+            let stored = shard_replicas
+                .entry(checkpoint.node_id.clone())
+                .or_insert_with(|| ReplicaCheckpoint {
+                    allocation_id: checkpoint.allocation_id,
+                    processed_checkpoint: None,
+                    persisted_checkpoint: None,
                     last_updated: now,
-                },
-            );
+                });
+            if stored.allocation_id != checkpoint.allocation_id {
+                *stored = ReplicaCheckpoint {
+                    allocation_id: checkpoint.allocation_id,
+                    processed_checkpoint: None,
+                    persisted_checkpoint: None,
+                    last_updated: now,
+                };
+                shard_gaps.remove(&checkpoint.node_id);
+            }
+            stored.processed_checkpoint =
+                Self::max_checkpoint(stored.processed_checkpoint, checkpoint.processed_checkpoint);
+            stored.persisted_checkpoint =
+                Self::max_checkpoint(stored.persisted_checkpoint, checkpoint.persisted_checkpoint);
+            stored.last_updated = now;
+
+            if let Some(observation) = shard_gaps.get_mut(&checkpoint.node_id) {
+                if observation.index_uuid != context.index_uuid
+                    || observation.allocation_id != checkpoint.allocation_id
+                    || observation.primary_term != context.primary_term
+                {
+                    shard_gaps.remove(&checkpoint.node_id);
+                } else {
+                    observation.max_reported_checkpoint = stored.processed_checkpoint;
+                    if stored
+                        .processed_checkpoint
+                        .is_some_and(|reported| reported >= observation.target_checkpoint)
+                    {
+                        shard_gaps.remove(&checkpoint.node_id);
+                    }
+                }
+            }
+
+            if !shard_gaps.contains_key(&checkpoint.node_id)
+                && let Some(target_checkpoint) = context.primary_processed_checkpoint
+                && stored
+                    .processed_checkpoint
+                    .is_none_or(|reported| reported < target_checkpoint)
+            {
+                shard_gaps.insert(
+                    checkpoint.node_id.clone(),
+                    ReplicaGapObservation {
+                        index_uuid: context.index_uuid.to_string(),
+                        replica_node_id: checkpoint.node_id.clone(),
+                        allocation_id: checkpoint.allocation_id,
+                        primary_term: context.primary_term,
+                        first_seen: now,
+                        target_checkpoint,
+                        max_reported_checkpoint: stored.processed_checkpoint,
+                    },
+                );
+            }
         }
     }
 
@@ -419,7 +599,11 @@ impl IsrTracker {
         match replicas.get(&key) {
             Some(shard_replicas) => shard_replicas
                 .iter()
-                .filter(|(_, rc)| primary_checkpoint.saturating_sub(rc.checkpoint) <= self.max_lag)
+                .filter(|(_, rc)| {
+                    rc.processed_checkpoint.is_some_and(|checkpoint| {
+                        primary_checkpoint.saturating_sub(checkpoint) <= self.max_lag
+                    })
+                })
                 .map(|(node_id, _)| node_id.clone())
                 .collect(),
             None => vec![],
@@ -433,10 +617,131 @@ impl IsrTracker {
         match replicas.get(&key) {
             Some(shard_replicas) => shard_replicas
                 .iter()
-                .map(|(node_id, rc)| (node_id.clone(), rc.checkpoint))
+                .filter_map(|(node_id, rc)| {
+                    rc.processed_checkpoint
+                        .map(|checkpoint| (node_id.clone(), checkpoint))
+                })
                 .collect(),
             None => vec![],
         }
+    }
+
+    pub fn expired_gap_observations(
+        &self,
+        timeout: Duration,
+    ) -> Vec<(ShardKey, ReplicaGapObservation)> {
+        self.expired_gap_observations_at(timeout, Instant::now())
+    }
+
+    fn expired_gap_observations_at(
+        &self,
+        timeout: Duration,
+        now: Instant,
+    ) -> Vec<(ShardKey, ReplicaGapObservation)> {
+        self.gap_observations
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .flat_map(|(key, observations)| {
+                observations
+                    .values()
+                    .filter(|observation| now.duration_since(observation.first_seen) >= timeout)
+                    .map(|observation| (key.clone(), observation.clone()))
+            })
+            .collect()
+    }
+
+    pub fn record_gap_probe_checkpoint(
+        &self,
+        index: &str,
+        shard_id: u32,
+        expected: &ReplicaGapObservation,
+        processed_checkpoint: Option<u64>,
+    ) -> bool {
+        let key = ShardKey::new(index, shard_id);
+        let mut replicas = self.replicas.write().unwrap_or_else(|e| e.into_inner());
+        let mut gaps = self
+            .gap_observations
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(observation) = gaps
+            .get_mut(&key)
+            .and_then(|observations| observations.get_mut(&expected.replica_node_id))
+        else {
+            return false;
+        };
+        if !observation.same_probe_identity(expected) {
+            return false;
+        }
+        let max_reported =
+            Self::max_checkpoint(observation.max_reported_checkpoint, processed_checkpoint);
+        observation.max_reported_checkpoint = max_reported;
+        if let Some(stored) = replicas
+            .get_mut(&key)
+            .and_then(|replicas| replicas.get_mut(&expected.replica_node_id))
+            .filter(|stored| stored.allocation_id == expected.allocation_id)
+        {
+            stored.processed_checkpoint =
+                Self::max_checkpoint(stored.processed_checkpoint, processed_checkpoint);
+            stored.last_updated = Instant::now();
+        }
+        if max_reported.is_some_and(|reported| reported >= observation.target_checkpoint) {
+            if let Some(observations) = gaps.get_mut(&key) {
+                observations.remove(&expected.replica_node_id);
+            }
+            return true;
+        }
+        false
+    }
+
+    pub fn remove_gap_observation(
+        &self,
+        index: &str,
+        shard_id: u32,
+        expected: &ReplicaGapObservation,
+    ) {
+        let key = ShardKey::new(index, shard_id);
+        let mut gaps = self
+            .gap_observations
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(observations) = gaps.get_mut(&key) else {
+            return;
+        };
+        if observations
+            .get(&expected.replica_node_id)
+            .is_some_and(|observation| observation.same_probe_identity(expected))
+        {
+            observations.remove(&expected.replica_node_id);
+        }
+    }
+
+    pub fn has_gap_observation(
+        &self,
+        index: &str,
+        shard_id: u32,
+        expected: &ReplicaGapObservation,
+    ) -> bool {
+        self.gap_observations
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ShardKey::new(index, shard_id))
+            .and_then(|observations| observations.get(&expected.replica_node_id))
+            .is_some_and(|observation| observation.same_probe_identity(expected))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gap_observations(
+        &self,
+        index: &str,
+        shard_id: u32,
+    ) -> Vec<ReplicaGapObservation> {
+        self.gap_observations
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ShardKey::new(index, shard_id))
+            .map(|observations| observations.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Remove tracking data for a shard (e.g., when index is deleted).
@@ -444,12 +749,20 @@ impl IsrTracker {
         let key = ShardKey::new(index, shard_id);
         let mut replicas = self.replicas.write().unwrap_or_else(|e| e.into_inner());
         replicas.remove(&key);
+        self.gap_observations
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
     }
 
     /// Remove tracking for all shards of an index.
     pub fn remove_index(&self, index: &str) {
         let mut replicas = self.replicas.write().unwrap_or_else(|e| e.into_inner());
         replicas.retain(|k, _| k.index != index);
+        self.gap_observations
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|k, _| k.index != index);
     }
 }
 
@@ -491,6 +804,8 @@ pub struct ShardManager {
     assigned_open_io_failure: Mutex<Option<(i32, usize)>>,
     #[cfg(test)]
     assigned_open_attempts: AtomicUsize,
+    #[cfg(test)]
+    collision_quarantine_persist_failure: Mutex<Option<(i32, usize)>>,
     peer_recovery_targets: RwLock<HashMap<ShardKey, PeerRecoveryTargetState>>,
     source_recovery_cleanup: RwLock<Option<Arc<dyn SourceRecoverySessionCleanup>>>,
     /// ISR tracker for primary shards — tracks replica checkpoint lag.
@@ -500,6 +815,8 @@ pub struct ShardManager {
     /// Shared column cache for SQL fast-field Arrow arrays and grouped-partials
     /// full-segment decoded columns.
     column_cache: Arc<crate::engine::column_cache::ColumnCache>,
+    #[cfg(feature = "protocol-trace")]
+    protocol_trace_node: RwLock<Option<String>>,
 }
 
 impl ShardManager {
@@ -555,12 +872,44 @@ impl ShardManager {
             assigned_open_io_failure: Mutex::new(None),
             #[cfg(test)]
             assigned_open_attempts: AtomicUsize::new(0),
+            #[cfg(test)]
+            collision_quarantine_persist_failure: Mutex::new(None),
             peer_recovery_targets: RwLock::new(HashMap::new()),
             source_recovery_cleanup: RwLock::new(None),
             isr_tracker: IsrTracker::new(1000),
             durability,
             column_cache,
+            #[cfg(feature = "protocol-trace")]
+            protocol_trace_node: RwLock::new(None),
         }
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    pub fn set_protocol_trace_node(&self, node_id: impl Into<String>) {
+        *self
+            .protocol_trace_node
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(node_id.into());
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_copy(
+        &self,
+        index: &str,
+        shard_id: u32,
+    ) -> Option<crate::protocol_trace::TraceCopy> {
+        let node = self
+            .protocol_trace_node
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()?;
+        let identity = self.copy_identity(index, shard_id)?;
+        Some(crate::protocol_trace::TraceCopy {
+            node,
+            index_uuid: identity.index_uuid,
+            shard: shard_id,
+            allocation: identity.allocation_id,
+        })
     }
 
     /// Get the base data directory.
@@ -630,6 +979,10 @@ impl ShardManager {
     }
 
     fn record_copy_io_failure(&self, key: ShardCopyIoKey, error: anyhow::Error) -> anyhow::Error {
+        if !Self::is_retryable_io_failure(&error) {
+            self.clear_copy_io_failure(&key);
+            return error;
+        }
         let now = Instant::now();
         let operation = key.operation;
         let policy = *self
@@ -802,6 +1155,44 @@ impl ShardManager {
         Err(std::io::Error::from_raw_os_error(*raw_os_error).into())
     }
 
+    #[cfg(test)]
+    pub(crate) fn inject_collision_quarantine_persist_failures(
+        &self,
+        raw_os_error: i32,
+        attempts: usize,
+    ) {
+        *self
+            .collision_quarantine_persist_failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some((raw_os_error, attempts));
+    }
+
+    #[cfg(test)]
+    fn maybe_inject_collision_quarantine_persist_failure(&self) -> Result<()> {
+        let mut injection = self
+            .collision_quarantine_persist_failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some((raw_os_error, remaining)) = injection.as_mut() else {
+            return Ok(());
+        };
+        if *remaining == 0 {
+            return Ok(());
+        }
+        *remaining -= 1;
+        Err(std::io::Error::from_raw_os_error(*raw_os_error).into())
+    }
+
+    fn persist_collision_quarantine_identity(
+        &self,
+        shard_dir: &std::path::Path,
+        identity: &ShardCopyIdentity,
+    ) -> Result<()> {
+        #[cfg(test)]
+        self.maybe_inject_collision_quarantine_persist_failure()?;
+        Self::persist_copy_identity(shard_dir, identity)
+    }
+
     fn copy_identity_path(shard_dir: &std::path::Path) -> PathBuf {
         shard_dir.join(SHARD_COPY_IDENTITY_FILE)
     }
@@ -842,8 +1233,27 @@ impl ShardManager {
                 ));
             }
         };
+        let header: ShardCopyIdentityVersionHeader =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                crate::common::unsupported_index_format(
+                    "shard copy identity",
+                    format!("cannot decode version header at {path:?}: {error}"),
+                )
+            })?;
+        if header.version != SHARD_COPY_IDENTITY_VERSION {
+            return Err(crate::common::unsupported_index_format(
+                "shard copy identity",
+                format!(
+                    "version {} is not supported; expected {}",
+                    header.version, SHARD_COPY_IDENTITY_VERSION
+                ),
+            ));
+        }
         let identity: ShardCopyIdentity = serde_json::from_slice(&bytes).map_err(|error| {
-            definitive_shard_copy_failure(format!("decode shard copy identity {path:?}: {error}"))
+            crate::common::unsupported_index_format(
+                "shard copy identity",
+                format!("cannot decode current format at {path:?}: {error}"),
+            )
         })?;
         identity.validate()?;
         Ok(identity)
@@ -1006,6 +1416,7 @@ impl ShardManager {
         if assignment.allocation_id == 0 {
             anyhow::bail!("assigned shard copy has a zero allocation ID");
         }
+
         if assignment.primary_term == 0 {
             anyhow::bail!("assigned shard copy has a zero primary term");
         }
@@ -1050,6 +1461,7 @@ impl ShardManager {
                 index_uuid,
                 assignment.allocation_id,
                 assignment.primary_term,
+                None,
             )?;
             Self::persist_copy_identity(shard_dir, &identity)?;
             identity
@@ -1075,6 +1487,41 @@ impl ShardManager {
         }
         self.cache_copy_identity(key, identity.clone());
         Ok(identity)
+    }
+
+    fn ensure_collision_quarantine_not_active(
+        &self,
+        key: &ShardKey,
+        shard_dir: &std::path::Path,
+        index_uuid: &str,
+        allocation_id: AllocationId,
+    ) -> Result<()> {
+        if let Some(identity) = self
+            .copy_identities
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(key)
+            .cloned()
+        {
+            identity.validate_expected(index_uuid, allocation_id)?;
+            return Ok(());
+        }
+
+        let identity_path = Self::copy_identity_path(shard_dir);
+        if !identity_path.try_exists()? {
+            return Ok(());
+        }
+        let identity = Self::load_copy_identity(shard_dir)?;
+        identity.validate_binding(index_uuid, allocation_id)?;
+        if identity.collision_quarantined {
+            self.cache_copy_identity(key, identity.clone());
+            return Err(CollisionQuarantinedShardCopy {
+                index_uuid: identity.index_uuid,
+                allocation_id: identity.allocation_id,
+            }
+            .into());
+        }
+        Ok(())
     }
 
     fn ensure_local_test_identity(
@@ -1118,7 +1565,7 @@ impl ShardManager {
                 key.shard_id
             );
         }
-        let identity = ShardCopyIdentity::new(index_uuid, 1, 1)?;
+        let identity = ShardCopyIdentity::new(index_uuid, 1, 1, None)?;
         Self::persist_copy_identity(shard_dir, &identity)?;
         self.cache_copy_identity(key, identity.clone());
         Ok(identity)
@@ -1130,6 +1577,10 @@ impl ShardManager {
             .unwrap_or_else(|error| error.into_inner())
             .get(&ShardKey::new(index, shard_id))
             .cloned()
+    }
+
+    pub fn durability(&self) -> TranslogDurability {
+        self.durability
     }
 
     pub fn validate_open_copy_identity(
@@ -1151,6 +1602,9 @@ impl ShardManager {
         error.chain().any(|cause| {
             cause.downcast_ref::<DefinitiveShardCopyFailure>().is_some()
                 || cause
+                    .downcast_ref::<crate::common::UnsupportedIndexFormatError>()
+                    .is_some()
+                || cause
                     .downcast_ref::<crate::wal::WalCorruptionError>()
                     .is_some()
                 || cause.downcast_ref::<serde_json::Error>().is_some()
@@ -1159,8 +1613,40 @@ impl ShardManager {
                     .downcast_ref::<crate::engine::tantivy::AuthoritativeSchemaError>()
                     .is_some()
                 || cause
+                    .downcast_ref::<crate::engine::sequence::PrimaryTermSequenceCollisionError>()
+                    .is_some()
+                || cause
+                    .downcast_ref::<crate::engine::sequence::SequenceStateCorruptionError>()
+                    .is_some()
+                || cause
+                    .downcast_ref::<CollisionQuarantinedShardCopy>()
+                    .is_some()
+                || cause
+                    .downcast_ref::<crate::engine::tantivy::SequenceOperationCollisionError>()
+                    .is_some()
+                || cause
+                    .downcast_ref::<crate::engine::version_map::VersionMapCollisionError>()
+                    .is_some()
+                || cause
                     .downcast_ref::<tantivy::TantivyError>()
                     .is_some_and(Self::tantivy_failure_is_definitive)
+        })
+    }
+
+    pub(crate) fn is_sequence_collision_failure(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<crate::engine::sequence::PrimaryTermSequenceCollisionError>()
+                .is_some()
+                || cause
+                    .downcast_ref::<crate::engine::tantivy::SequenceOperationCollisionError>()
+                    .is_some()
+                || cause
+                    .downcast_ref::<crate::engine::version_map::VersionMapCollisionError>()
+                    .is_some()
+                || cause
+                    .downcast_ref::<CollisionQuarantinedShardCopy>()
+                    .is_some()
         })
     }
 
@@ -1173,13 +1659,25 @@ impl ShardManager {
     }
 
     pub(crate) fn should_quarantine_copy_failure(error: &anyhow::Error) -> bool {
+        if error.chain().any(|cause| {
+            cause
+                .downcast_ref::<CollisionQuarantinedShardCopy>()
+                .is_some()
+        }) {
+            return false;
+        }
         if Self::is_definitive_copy_failure(error) {
             return true;
         }
         error.chain().any(|cause| {
             cause
                 .downcast_ref::<PersistentShardCopyIoFailure>()
-                .is_some_and(|failure| failure.operation != ShardCopyIoOperation::Apply)
+                .is_some_and(|failure| {
+                    !matches!(
+                        failure.operation,
+                        ShardCopyIoOperation::Apply | ShardCopyIoOperation::CollisionMarker
+                    )
+                })
         })
     }
 
@@ -1284,6 +1782,60 @@ impl ShardManager {
         self.isr_tracker.remove_shard(index, shard_id);
     }
 
+    pub(crate) fn quarantine_sequence_collision(
+        &self,
+        index: &str,
+        shard_id: u32,
+        index_uuid: &str,
+        allocation_id: AllocationId,
+    ) -> Result<()> {
+        let key = ShardKey::new(index, shard_id);
+        let per_shard_lock = self.shard_open_lock(&key);
+        let _guard = per_shard_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let shard_dir = self
+            .data_dir
+            .join(index_uuid)
+            .join(format!("shard_{shard_id}"));
+        let mut identity = self
+            .copy_identities
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&key)
+            .cloned()
+            .map(Ok)
+            .unwrap_or_else(|| Self::load_copy_identity(&shard_dir))?;
+        identity.validate_binding(index_uuid, allocation_id)?;
+        identity.collision_quarantined = true;
+        let persist_result = self
+            .persist_collision_quarantine_identity(&shard_dir, &identity)
+            .map_err(|source| {
+                anyhow::Error::new(PersistentShardCopyIoFailure {
+                    operation: ShardCopyIoOperation::CollisionMarker,
+                    attempts: 1,
+                    elapsed_ms: 0,
+                    source,
+                })
+            });
+
+        self.shards
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&key);
+        let mut identities = self
+            .copy_identities
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        if persist_result.is_ok() {
+            identities.remove(&key);
+        } else {
+            identities.insert(key, identity);
+        }
+        self.isr_tracker.remove_shard(index, shard_id);
+        persist_result
+    }
+
     pub async fn quarantine_shard_copy_blocking(
         self: &Arc<Self>,
         index: String,
@@ -1296,6 +1848,26 @@ impl ShardManager {
         .await
         .map_err(|error| anyhow::anyhow!("blocking shard quarantine failed: {error}"))?;
         Ok(())
+    }
+
+    pub(crate) async fn quarantine_sequence_collision_blocking(
+        self: &Arc<Self>,
+        index: String,
+        shard_id: u32,
+        index_uuid: String,
+        allocation_id: AllocationId,
+    ) -> Result<()> {
+        let shard_manager = self.clone();
+        tokio::task::spawn_blocking(move || {
+            shard_manager.quarantine_sequence_collision(
+                &index,
+                shard_id,
+                &index_uuid,
+                allocation_id,
+            )
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("blocking collision quarantine failed: {error}"))?
     }
 
     pub(crate) fn register_source_recovery_cleanup(
@@ -1536,7 +2108,7 @@ impl ShardManager {
 
         let mut cleaned_stale_schema = false;
         for attempt in 0..=LOCK_BUSY_RETRIES {
-            let open_result = match mode {
+            let open = || match mode {
                 CompositeOpenMode::ExistingOnly => CompositeEngine::open_existing_with_mappings(
                     shard_dir,
                     refresh_interval,
@@ -1552,6 +2124,13 @@ impl ShardManager {
                     self.column_cache.clone(),
                 ),
             };
+            #[cfg(feature = "protocol-trace")]
+            let open_result = match self.protocol_trace_copy(index, shard_id) {
+                Some(copy) => crate::protocol_trace::with_open_copy(copy, open),
+                None => open(),
+            };
+            #[cfg(not(feature = "protocol-trace"))]
+            let open_result = open();
             match open_result {
                 Ok(engine) => return Ok(Arc::new(engine)),
                 Err(err) => {
@@ -1644,17 +2223,74 @@ impl ShardManager {
         index_uuid: &str,
         assignment: AssignedShardOpen,
     ) -> Result<Arc<dyn SearchEngine>> {
+        self.open_assigned_shard(AssignedOpenRequest {
+            index,
+            shard_id,
+            mappings,
+            settings,
+            index_uuid,
+            assignment,
+        })
+    }
+
+    pub fn open_primary_assigned_shard_with_settings(
+        &self,
+        index: &str,
+        shard_id: u32,
+        mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+        settings: &IndexSettings,
+        index_uuid: &str,
+        assignment: AssignedShardOpen,
+    ) -> Result<Arc<dyn SearchEngine>> {
+        self.open_assigned_shard(AssignedOpenRequest {
+            index,
+            shard_id,
+            mappings,
+            settings,
+            index_uuid,
+            assignment,
+        })
+    }
+
+    fn open_assigned_shard(
+        &self,
+        request: AssignedOpenRequest<'_>,
+    ) -> Result<Arc<dyn SearchEngine>> {
+        let AssignedOpenRequest {
+            index,
+            shard_id,
+            mappings,
+            settings,
+            index_uuid,
+            assignment,
+        } = request;
         let retry_key = Self::copy_io_key(
             index_uuid,
             shard_id,
             assignment.allocation_id,
             ShardCopyIoOperation::PendingMarker,
         );
+        let key = ShardKey::new(index, shard_id);
         let attempt_lock = self.copy_io_attempt_lock(&retry_key);
         let _attempt_guard = attempt_lock
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let per_shard_lock = self.shard_open_lock(&key);
+        let quarantine_guard = per_shard_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let shard_dir = self
+            .data_dir
+            .join(index_uuid)
+            .join(format!("shard_{shard_id}"));
+        self.ensure_collision_quarantine_not_active(
+            &key,
+            &shard_dir,
+            index_uuid,
+            assignment.allocation_id,
+        )?;
         self.ensure_copy_io_attempt_allowed(&retry_key)?;
+        drop(quarantine_guard);
         #[cfg(test)]
         if let Err(error) = self.maybe_inject_assigned_open_io_failure() {
             return Err(self.record_copy_io_failure(retry_key, error));
@@ -1665,7 +2301,7 @@ impl ShardManager {
             mappings,
             settings,
             index_uuid,
-            ShardOpenAuthority::Assigned(assignment),
+            ShardOpenAuthority::Assigned { assignment },
         ) {
             Ok(engine) => {
                 self.clear_copy_io_failure(&retry_key);
@@ -1688,16 +2324,16 @@ impl ShardManager {
             ShardOpenAuthority::Local { allow_schema_reset } => {
                 (None, CompositeOpenMode::CreateOrOpen { allow_schema_reset })
             }
-            ShardOpenAuthority::Assigned(assignment) => (
-                Some(assignment),
-                if assignment.allow_empty_creation {
+            ShardOpenAuthority::Assigned { assignment } => {
+                let open_mode = if assignment.allow_empty_creation {
                     CompositeOpenMode::CreateOrOpen {
                         allow_schema_reset: false,
                     }
                 } else {
                     CompositeOpenMode::ExistingOnly
-                },
-            ),
+                };
+                (Some(assignment), open_mode)
+            }
         };
         let key = ShardKey::new(index, shard_id);
         let shard_dir = self
@@ -1791,9 +2427,17 @@ impl ShardManager {
             None
         };
 
-        if let Some(assignment) = assignment {
-            self.prepare_assigned_copy_identity(&key, &shard_dir, index_uuid, assignment)?;
-        }
+        let mut prepared_identity = if let Some(assignment) = assignment {
+            self.ensure_collision_quarantine_not_active(
+                &key,
+                &shard_dir,
+                index_uuid,
+                assignment.allocation_id,
+            )?;
+            Some(self.prepare_assigned_copy_identity(&key, &shard_dir, index_uuid, assignment)?)
+        } else {
+            None
+        };
 
         self.register_index_uuid(index, index_uuid);
 
@@ -1805,7 +2449,8 @@ impl ShardManager {
 
         if assignment.is_none() {
             std::fs::create_dir_all(&shard_dir)?;
-            self.ensure_local_test_identity(&key, &shard_dir, index_uuid)?;
+            prepared_identity =
+                Some(self.ensure_local_test_identity(&key, &shard_dir, index_uuid)?);
         }
         let stale_snapshot_dir = shard_dir.join("peer-recovery");
         if stale_snapshot_dir.exists() {
@@ -1820,14 +2465,17 @@ impl ShardManager {
             mappings,
             open_mode,
         )?;
+        if let Some(identity) = prepared_identity {
+            engine
+                .reconcile_term_sequence_state(identity.replica_fence, identity.fence_max_seq_no)?;
+        }
         CompositeEngine::start_refresh_loop_reactive(
             engine.clone(),
             refresh_rx,
             flush_threshold_rx,
         );
 
-        // Only rebuild vectors when the index has knn_vector fields — otherwise
-        // the 100K-doc MatchAll search is pure waste and can OOM on large indices.
+        // Only scan stored documents when the index has vector fields.
         let has_vectors = mappings
             .values()
             .any(|m| matches!(m.field_type, crate::cluster::state::FieldType::KnnVector));
@@ -1907,6 +2555,26 @@ impl ShardManager {
         .map_err(|e| anyhow::anyhow!("blocking assigned shard open task failed: {e}"))?
     }
 
+    pub async fn open_primary_assigned_shard_with_settings_blocking(
+        self: &Arc<Self>,
+        index: String,
+        shard_id: u32,
+        mappings: HashMap<String, crate::cluster::state::FieldMapping>,
+        settings: IndexSettings,
+        index_uuid: impl Into<String> + Send + 'static,
+        assignment: AssignedShardOpen,
+    ) -> Result<Arc<dyn SearchEngine>> {
+        let shard_manager = self.clone();
+        let uuid_str = index_uuid.into();
+        tokio::task::spawn_blocking(move || {
+            shard_manager.open_primary_assigned_shard_with_settings(
+                &index, shard_id, &mappings, &settings, &uuid_str, assignment,
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("blocking primary shard open task failed: {e}"))?
+    }
+
     pub async fn open_shard_with_settings_strict_blocking(
         self: &Arc<Self>,
         index: String,
@@ -1952,8 +2620,30 @@ impl ShardManager {
                 context.message_term
             );
         }
+        let engine = self
+            .shards
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("replica shard engine is not open"))?;
+        #[cfg(feature = "protocol-trace")]
+        let trace_copy = self.protocol_trace_copy(index, shard_id);
+        #[cfg(feature = "protocol-trace")]
+        if let Some(copy) = trace_copy.as_ref() {
+            for operation in crate::protocol_trace::current_apply_operation_values() {
+                crate::protocol_trace::record_replica_received(copy, &operation)?;
+            }
+        }
         if context.message_term > identity.replica_fence {
+            let fence_max_seq_no = engine
+                .sequence_stats()
+                .max_seq_no
+                .into_iter()
+                .chain(engine.wal_max_seq_no())
+                .max();
             identity.replica_fence = context.message_term;
+            identity.fence_max_seq_no = fence_max_seq_no;
             let shard_dir = self
                 .data_dir
                 .join(context.index_uuid)
@@ -1969,16 +2659,26 @@ impl ShardManager {
                 return Err(self.record_copy_io_failure(retry_key, error));
             }
             self.clear_copy_io_failure(&retry_key);
-            self.cache_copy_identity(&key, identity);
+            self.cache_copy_identity(&key, identity.clone());
+            #[cfg(feature = "protocol-trace")]
+            if let Some(copy) = trace_copy.as_ref() {
+                crate::protocol_trace::record_fence(
+                    copy,
+                    identity.replica_fence,
+                    identity.fence_max_seq_no,
+                    "replication",
+                );
+            }
+            engine
+                .reconcile_term_sequence_state(identity.replica_fence, identity.fence_max_seq_no)?;
         }
-        let engine = self
-            .shards
-            .read()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(&key)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("replica shard engine is not open"))?;
         self.ensure_local_apply_allowed(context.index_uuid, shard_id, context.allocation_id)?;
+        #[cfg(feature = "protocol-trace")]
+        let result = match trace_copy {
+            Some(copy) => crate::protocol_trace::with_open_copy(copy, || operation(engine)),
+            None => operation(engine),
+        };
+        #[cfg(not(feature = "protocol-trace"))]
         let result = operation(engine);
         self.record_local_apply_result(context.index_uuid, shard_id, context.allocation_id, result)
     }
@@ -2004,7 +2704,23 @@ impl ShardManager {
             let mut identity =
                 shard_manager.validated_cached_copy_identity(&key, &index_uuid, allocation_id)?;
             if term > identity.replica_fence {
+                let engine = shard_manager
+                    .shards
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .get(&key)
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("shard engine is not open during fence raise")
+                    })?;
+                let fence_max_seq_no = engine
+                    .sequence_stats()
+                    .max_seq_no
+                    .into_iter()
+                    .chain(engine.wal_max_seq_no())
+                    .max();
                 identity.replica_fence = term;
+                identity.fence_max_seq_no = fence_max_seq_no;
                 let shard_dir = shard_manager
                     .data_dir
                     .join(&index_uuid)
@@ -2020,7 +2736,20 @@ impl ShardManager {
                     return Err(shard_manager.record_copy_io_failure(retry_key, error));
                 }
                 shard_manager.clear_copy_io_failure(&retry_key);
-                shard_manager.cache_copy_identity(&key, identity);
+                shard_manager.cache_copy_identity(&key, identity.clone());
+                #[cfg(feature = "protocol-trace")]
+                if let Some(copy) = shard_manager.protocol_trace_copy(&index, shard_id) {
+                    crate::protocol_trace::record_fence(
+                        &copy,
+                        identity.replica_fence,
+                        identity.fence_max_seq_no,
+                        "activation",
+                    );
+                }
+                engine.reconcile_term_sequence_state(
+                    identity.replica_fence,
+                    identity.fence_max_seq_no,
+                )?;
             }
             Ok(())
         })
@@ -2406,6 +3135,55 @@ impl ShardManager {
         index_uuid: String,
         allocation_id: AllocationId,
     ) -> Result<PathBuf> {
+        self.prepare_peer_recovery_target_blocking_with_observer(
+            index,
+            shard_id,
+            index_uuid,
+            allocation_id,
+            || {},
+        )
+        .await
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    pub(crate) async fn prepare_peer_recovery_target_blocking_traced(
+        self: &Arc<Self>,
+        index: String,
+        shard_id: u32,
+        index_uuid: String,
+        allocation_id: AllocationId,
+        trace: crate::protocol_trace::RecoveryTraceContext,
+    ) -> Result<PathBuf> {
+        self.prepare_peer_recovery_target_blocking_with_observer(
+            index,
+            shard_id,
+            index_uuid,
+            allocation_id,
+            move || {
+                crate::protocol_trace::record_recovery_started(
+                    &trace.source_node,
+                    &trace.target_node,
+                    &trace.index_uuid,
+                    trace.shard,
+                    trace.allocation,
+                    &trace.session_id,
+                );
+            },
+        )
+        .await
+    }
+
+    async fn prepare_peer_recovery_target_blocking_with_observer<F>(
+        self: &Arc<Self>,
+        index: String,
+        shard_id: u32,
+        index_uuid: String,
+        allocation_id: AllocationId,
+        observer: F,
+    ) -> Result<PathBuf>
+    where
+        F: FnOnce() + Send + 'static,
+    {
         let shard_manager = self.clone();
         tokio::task::spawn_blocking(move || {
             if allocation_id == 0 {
@@ -2461,16 +3239,50 @@ impl ShardManager {
             file.sync_all()?;
             std::fs::rename(&temporary_path, &marker_path)?;
             std::fs::File::open(&shard_dir)?.sync_all()?;
+            observer();
             Ok(shard_dir)
         })
         .await
         .map_err(|e| anyhow::anyhow!("blocking peer recovery target preparation failed: {e}"))?
     }
 
-    pub async fn finalize_peer_recovery_target_blocking(
+    #[cfg_attr(feature = "protocol-trace", allow(dead_code))]
+    pub(crate) async fn finalize_peer_recovery_target_blocking(
         self: &Arc<Self>,
         install: PeerRecoveryTargetInstall,
     ) -> Result<Arc<dyn SearchEngine>> {
+        self.finalize_peer_recovery_target_blocking_with_observer(install, || {})
+            .await
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    pub(crate) async fn finalize_peer_recovery_target_blocking_traced(
+        self: &Arc<Self>,
+        install: PeerRecoveryTargetInstall,
+        trace: crate::protocol_trace::RecoveryTraceContext,
+    ) -> Result<Arc<dyn SearchEngine>> {
+        self.finalize_peer_recovery_target_blocking_with_observer(install, move || {
+            crate::protocol_trace::record_recovery_installed(
+                &trace.source_node,
+                &trace.target_node,
+                &trace.index_uuid,
+                trace.shard,
+                trace.allocation,
+                &trace.session_id,
+                trace.snapshot_next_seq_no,
+            );
+        })
+        .await
+    }
+
+    async fn finalize_peer_recovery_target_blocking_with_observer<F>(
+        self: &Arc<Self>,
+        install: PeerRecoveryTargetInstall,
+        observer: F,
+    ) -> Result<Arc<dyn SearchEngine>>
+    where
+        F: FnOnce() + Send + 'static,
+    {
         let shard_manager = self.clone();
         tokio::task::spawn_blocking(move || {
             let PeerRecoveryTargetInstall {
@@ -2482,7 +3294,7 @@ impl ShardManager {
                 allocation_id,
                 primary_term,
                 shard_dir,
-                snapshot_next_seq_no,
+                committed_boundary,
                 mut expected_files,
             } = install;
             let key = ShardKey::new(&index, shard_id);
@@ -2511,20 +3323,26 @@ impl ShardManager {
                 ));
             }
 
-            HotTranslog::initialize_empty_at(
-                &shard_dir,
-                shard_manager.durability,
-                snapshot_next_seq_no,
-            )?;
+            committed_boundary.validate()?;
+            if committed_boundary.term_sequence_state.current_term != primary_term {
+                return Err(definitive_shard_copy_failure(
+                    "peer recovery committed boundary term does not match the source term",
+                ));
+            }
+            let allocator_next = committed_boundary
+                .max_seq_no
+                .map(|max_seq_no| {
+                    max_seq_no.checked_add(1).ok_or_else(|| {
+                        definitive_shard_copy_failure(
+                            "peer recovery maximum sequence exhausts the allocator",
+                        )
+                    })
+                })
+                .transpose()?
+                .unwrap_or(0);
+            HotTranslog::initialize_empty_at(&shard_dir, shard_manager.durability, allocator_next)?;
             let committed_path = shard_dir.join("translog.committed");
-            let mut committed = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&committed_path)?;
-            use std::io::Write;
-            write!(committed, "{snapshot_next_seq_no}")?;
-            committed.sync_all()?;
+            committed_boundary.persist(&committed_path)?;
             std::fs::File::open(shard_dir.join("index"))?.sync_all()?;
 
             shard_manager.register_index_uuid(&index, &index_uuid);
@@ -2538,9 +3356,7 @@ impl ShardManager {
                 &shard_dir,
                 refresh_interval,
                 &mappings,
-                CompositeOpenMode::CreateOrOpen {
-                    allow_schema_reset: false,
-                },
+                CompositeOpenMode::ExistingOnly,
             )?;
             let mut actual_files = engine.peer_recovery_commit_files()?;
             expected_files.sort();
@@ -2561,8 +3377,14 @@ impl ShardManager {
                 engine.rebuild_vectors()?;
             }
 
-            let identity = ShardCopyIdentity::new(&index_uuid, allocation_id, primary_term)?;
+            let fence_max_seq_no = committed_boundary
+                .term_sequence_state
+                .max_seq_no_at_term_start;
+            let identity =
+                ShardCopyIdentity::new(&index_uuid, allocation_id, primary_term, fence_max_seq_no)?;
             Self::persist_copy_identity(&shard_dir, &identity)?;
+            engine
+                .reconcile_term_sequence_state(identity.replica_fence, identity.fence_max_seq_no)?;
             std::fs::remove_file(&marker_path)?;
             std::fs::File::open(&shard_dir)?.sync_all()?;
 
@@ -2578,6 +3400,7 @@ impl ShardManager {
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(key, dynamic_engine.clone());
+            observer();
             Ok(dynamic_engine)
         })
         .await
@@ -2936,6 +3759,14 @@ impl ShardManager {
                     &mappings,
                     CompositeOpenMode::ExistingOnly,
                 )?;
+                if mappings.values().any(|mapping| {
+                    matches!(
+                        mapping.field_type,
+                        crate::cluster::state::FieldType::KnnVector
+                    )
+                }) {
+                    engine.rebuild_vectors()?;
+                }
                 CompositeEngine::start_refresh_loop_reactive(
                     engine.clone(),
                     refresh_rx,
@@ -3046,6 +3877,60 @@ impl ShardManager {
             .iter()
             .map(|(k, e)| (k.clone(), e.clone()))
             .collect()
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    pub fn capture_protocol_trace_copy_state(
+        &self,
+        index: &str,
+        shard_id: u32,
+    ) -> Result<crate::protocol_trace::TraceCopySnapshot> {
+        let copy = self
+            .protocol_trace_copy(index, shard_id)
+            .ok_or_else(|| anyhow::anyhow!("protocol trace copy is not open"))?;
+        let engine = self
+            .get_shard(index, shard_id)
+            .ok_or_else(|| anyhow::anyhow!("protocol trace shard engine is not open"))?;
+        let (documents, actual_documents, wal_entries) =
+            crate::protocol_trace::with_open_copy(copy.clone(), || {
+                engine.refresh()?;
+                engine.protocol_trace_copy_evidence()
+            })?;
+        let live_documents = documents
+            .into_iter()
+            .map(|(doc, source, seq_no, term)| {
+                let content_hash =
+                    crate::protocol_trace::content_hash(&crate::engine::DocumentMutation::Index {
+                        doc_id: doc.clone(),
+                        source,
+                    });
+                (doc, seq_no, term, content_hash)
+            })
+            .collect::<Vec<_>>();
+        Ok(crate::protocol_trace::TraceCopySnapshot {
+            copy,
+            live_documents,
+            actual_documents,
+            wal_entries,
+        })
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    pub fn close_protocol_trace_shard_for_restart(&self, index: &str, shard_id: u32) {
+        let key = ShardKey::new(index, shard_id);
+        let per_shard_lock = self.shard_open_lock(&key);
+        let _guard = per_shard_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.shards
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&key);
+        self.copy_identities
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&key);
+        self.isr_tracker.remove_shard(index, shard_id);
     }
 
     /// Close and remove all shard engines for an index, then delete the data directory.
@@ -3328,6 +4213,23 @@ mod tests {
         (dir, mgr)
     }
 
+    fn apply_index(
+        engine: &Arc<dyn SearchEngine>,
+        doc_id: &str,
+        source: serde_json::Value,
+        seq_no: u64,
+        primary_term: u64,
+    ) -> Result<crate::engine::ReplicaApplyReceipt> {
+        engine.apply_replica_operation(crate::engine::SequencedOperation {
+            seq_no,
+            primary_term,
+            mutation: crate::engine::DocumentMutation::Index {
+                doc_id: doc_id.to_string(),
+                source,
+            },
+        })
+    }
+
     // ── ShardKey ─────────────────────────────────────────────────────────
 
     #[test]
@@ -3378,6 +4280,81 @@ mod tests {
         let e2 = mgr.open_shard("idx", 0).unwrap();
         // Both should point to the same engine (Arc)
         assert!(std::sync::Arc::ptr_eq(&e1, &e2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dynamic_mapping_reopen_keeps_vectors_searchable() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+        let mut mappings = HashMap::from([(
+            "emb".to_string(),
+            FieldMapping {
+                field_type: FieldType::KnnVector,
+                dimension: Some(3),
+            },
+        )]);
+        let engine = manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &mappings,
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 1,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        engine
+            .add_document_with_receipt_at_term("a", json!({"emb": [1.0, 0.0, 0.0]}), 1)
+            .unwrap();
+        engine
+            .add_document_with_receipt_at_term("b", json!({"emb": [0.0, 1.0, 0.0]}), 1)
+            .unwrap();
+        engine.refresh().unwrap();
+        let hit_ids = |hits: Vec<serde_json::Value>| {
+            hits.into_iter()
+                .map(|hit| hit["_id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            hit_ids(engine.search_knn("emb", &[0.0, 1.0, 0.0], 2).unwrap()),
+            vec!["b", "a"]
+        );
+
+        drop(engine);
+        mappings.insert(
+            "title".to_string(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        );
+        let reopened = manager
+            .reopen_shard(
+                "idx".into(),
+                0,
+                mappings,
+                IndexSettings::default(),
+                "uuid-1".into(),
+                7,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            hit_ids(reopened.search_knn("emb", &[0.0, 1.0, 0.0], 2).unwrap()),
+            vec!["b", "a"]
+        );
+        reopened.refresh().unwrap();
+        assert_eq!(
+            hit_ids(reopened.search_knn("emb", &[0.0, 1.0, 0.0], 2).unwrap()),
+            vec!["b", "a"]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3670,6 +4647,37 @@ mod tests {
 
     // ── ISR Tracker ─────────────────────────────────────────────────────
 
+    fn replica_checkpoint(
+        node_id: &str,
+        allocation_id: u64,
+        processed_checkpoint: Option<u64>,
+        persisted_checkpoint: Option<u64>,
+    ) -> ReplicaCheckpointUpdate {
+        ReplicaCheckpointUpdate {
+            node_id: node_id.to_string(),
+            allocation_id,
+            processed_checkpoint,
+            persisted_checkpoint,
+        }
+    }
+
+    fn update_replica_checkpoint(
+        tracker: &IsrTracker,
+        index: &str,
+        shard_id: u32,
+        node_id: &str,
+        checkpoint: u64,
+    ) {
+        tracker.update_replica_checkpoint(
+            index,
+            &format!("{index}-uuid"),
+            shard_id,
+            1,
+            Some(checkpoint),
+            replica_checkpoint(node_id, 1, Some(checkpoint), Some(checkpoint)),
+        );
+    }
+
     #[test]
     fn isr_tracker_empty_returns_no_replicas() {
         let tracker = IsrTracker::new(100);
@@ -3680,8 +4688,8 @@ mod tests {
     #[test]
     fn isr_tracker_update_and_query_checkpoint() {
         let tracker = IsrTracker::new(100);
-        tracker.update_replica_checkpoint("idx", 0, "replica-1", 50);
-        tracker.update_replica_checkpoint("idx", 0, "replica-2", 90);
+        update_replica_checkpoint(&tracker, "idx", 0, "replica-1", 50);
+        update_replica_checkpoint(&tracker, "idx", 0, "replica-2", 90);
 
         let cps = tracker.replica_checkpoints("idx", 0);
         assert_eq!(cps.len(), 2);
@@ -3694,8 +4702,8 @@ mod tests {
     #[test]
     fn isr_tracker_lagging_replica_excluded() {
         let tracker = IsrTracker::new(10); // tight lag threshold
-        tracker.update_replica_checkpoint("idx", 0, "replica-1", 95);
-        tracker.update_replica_checkpoint("idx", 0, "replica-2", 50); // way behind
+        update_replica_checkpoint(&tracker, "idx", 0, "replica-1", 95);
+        update_replica_checkpoint(&tracker, "idx", 0, "replica-2", 50);
 
         let isr = tracker.in_sync_replicas("idx", 0, 100);
         assert_eq!(isr.len(), 1);
@@ -3705,29 +4713,143 @@ mod tests {
     #[test]
     fn isr_tracker_update_batch() {
         let tracker = IsrTracker::new(100);
-        let checkpoints = vec![("r1".to_string(), 10), ("r2".to_string(), 20)];
-        tracker.update_replica_checkpoints("idx", 0, &checkpoints);
+        let checkpoints = vec![
+            replica_checkpoint("r1", 1, Some(10), Some(10)),
+            replica_checkpoint("r2", 2, Some(20), Some(20)),
+        ];
+        tracker.update_replica_checkpoints("idx", "idx-uuid", 0, 1, Some(20), &checkpoints);
 
         let cps = tracker.replica_checkpoints("idx", 0);
         assert_eq!(cps.len(), 2);
     }
 
     #[test]
-    fn isr_tracker_update_overwrites_checkpoint() {
+    fn d1_commit3_replica_checkpoint_observation_never_regresses() {
         let tracker = IsrTracker::new(100);
-        tracker.update_replica_checkpoint("idx", 0, "r1", 10);
-        tracker.update_replica_checkpoint("idx", 0, "r1", 50);
+        update_replica_checkpoint(&tracker, "idx", 0, "r1", 10);
+        update_replica_checkpoint(&tracker, "idx", 0, "r1", 3);
 
         let cps = tracker.replica_checkpoints("idx", 0);
         assert_eq!(cps.len(), 1);
-        assert_eq!(cps[0].1, 50);
+        assert_eq!(cps[0].1, 10);
+    }
+
+    #[test]
+    fn replica_gap_target_stays_fixed_until_progress_reaches_it() {
+        let tracker = IsrTracker::new(100);
+        let first_seen = Instant::now();
+        tracker.update_replica_checkpoints_at(
+            "idx",
+            0,
+            ReplicaCheckpointContext {
+                index_uuid: "idx-uuid",
+                primary_term: 4,
+                primary_processed_checkpoint: Some(5),
+            },
+            &[replica_checkpoint("r1", 7, Some(0), Some(0))],
+            first_seen,
+        );
+        tracker.update_replica_checkpoints_at(
+            "idx",
+            0,
+            ReplicaCheckpointContext {
+                index_uuid: "idx-uuid",
+                primary_term: 4,
+                primary_processed_checkpoint: Some(10),
+            },
+            &[replica_checkpoint("r1", 7, Some(2), Some(2))],
+            first_seen + Duration::from_secs(30),
+        );
+
+        let observations = tracker.gap_observations("idx", 0);
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].target_checkpoint, 5);
+        assert_eq!(observations[0].first_seen, first_seen);
+        assert_eq!(observations[0].max_reported_checkpoint, Some(2));
+    }
+
+    #[test]
+    fn reordered_lower_checkpoint_cannot_reopen_a_closed_gap() {
+        let tracker = IsrTracker::new(100);
+        update_replica_checkpoint(&tracker, "idx", 0, "r1", 10);
+        update_replica_checkpoint(&tracker, "idx", 0, "r1", 3);
+
+        assert!(tracker.gap_observations("idx", 0).is_empty());
+        assert_eq!(
+            tracker.replica_checkpoints("idx", 0),
+            vec![("r1".to_string(), 10)]
+        );
+    }
+
+    #[test]
+    fn deadline_probe_clears_an_idle_gap_at_the_fixed_target() {
+        let tracker = IsrTracker::new(100);
+        let first_seen = Instant::now();
+        tracker.update_replica_checkpoints_at(
+            "idx",
+            0,
+            ReplicaCheckpointContext {
+                index_uuid: "idx-uuid",
+                primary_term: 4,
+                primary_processed_checkpoint: Some(5),
+            },
+            &[replica_checkpoint("r1", 7, Some(0), Some(0))],
+            first_seen,
+        );
+        let mut expired = tracker.expired_gap_observations_at(
+            Duration::from_secs(60),
+            first_seen + Duration::from_secs(61),
+        );
+        assert_eq!(expired.len(), 1);
+        let (_, observation) = expired.pop().unwrap();
+
+        assert!(tracker.record_gap_probe_checkpoint("idx", 0, &observation, Some(5)));
+        assert!(tracker.gap_observations("idx", 0).is_empty());
+    }
+
+    #[test]
+    fn review_c3_stale_probe_cannot_mutate_reopened_gap_observation() {
+        let tracker = IsrTracker::new(100);
+        let first_seen = Instant::now();
+        tracker.update_replica_checkpoints_at(
+            "idx",
+            0,
+            ReplicaCheckpointContext {
+                index_uuid: "idx-uuid",
+                primary_term: 4,
+                primary_processed_checkpoint: Some(5),
+            },
+            &[replica_checkpoint("r1", 7, Some(0), Some(0))],
+            first_seen,
+        );
+        let old = tracker.gap_observations("idx", 0).pop().unwrap();
+        tracker.remove_gap_observation("idx", 0, &old);
+
+        let reopened_at = first_seen + Duration::from_secs(30);
+        tracker.update_replica_checkpoints_at(
+            "idx",
+            0,
+            ReplicaCheckpointContext {
+                index_uuid: "idx-uuid",
+                primary_term: 4,
+                primary_processed_checkpoint: Some(10),
+            },
+            &[replica_checkpoint("r1", 7, Some(0), Some(0))],
+            reopened_at,
+        );
+
+        assert!(!tracker.record_gap_probe_checkpoint("idx", 0, &old, Some(10)));
+        let observations = tracker.gap_observations("idx", 0);
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].first_seen, reopened_at);
+        assert_eq!(observations[0].target_checkpoint, 10);
     }
 
     #[test]
     fn isr_tracker_remove_shard() {
         let tracker = IsrTracker::new(100);
-        tracker.update_replica_checkpoint("idx", 0, "r1", 10);
-        tracker.update_replica_checkpoint("idx", 1, "r1", 20);
+        update_replica_checkpoint(&tracker, "idx", 0, "r1", 10);
+        update_replica_checkpoint(&tracker, "idx", 1, "r1", 20);
 
         tracker.remove_shard("idx", 0);
 
@@ -3738,9 +4860,9 @@ mod tests {
     #[test]
     fn isr_tracker_remove_index() {
         let tracker = IsrTracker::new(100);
-        tracker.update_replica_checkpoint("idx-a", 0, "r1", 10);
-        tracker.update_replica_checkpoint("idx-a", 1, "r1", 20);
-        tracker.update_replica_checkpoint("idx-b", 0, "r1", 30);
+        update_replica_checkpoint(&tracker, "idx-a", 0, "r1", 10);
+        update_replica_checkpoint(&tracker, "idx-a", 1, "r1", 20);
+        update_replica_checkpoint(&tracker, "idx-b", 0, "r1", 30);
 
         tracker.remove_index("idx-a");
 
@@ -3752,8 +4874,8 @@ mod tests {
     #[test]
     fn isr_tracker_different_shards_independent() {
         let tracker = IsrTracker::new(100);
-        tracker.update_replica_checkpoint("idx", 0, "r1", 10);
-        tracker.update_replica_checkpoint("idx", 1, "r2", 20);
+        update_replica_checkpoint(&tracker, "idx", 0, "r1", 10);
+        update_replica_checkpoint(&tracker, "idx", 1, "r2", 20);
 
         let cps0 = tracker.replica_checkpoints("idx", 0);
         let cps1 = tracker.replica_checkpoints("idx", 1);
@@ -3766,10 +4888,8 @@ mod tests {
     #[test]
     fn close_index_cleans_isr_tracker() {
         let (_dir, mgr) = create_shard_manager();
-        mgr.isr_tracker
-            .update_replica_checkpoint("my-idx", 0, "r1", 10);
-        mgr.isr_tracker
-            .update_replica_checkpoint("other-idx", 0, "r1", 20);
+        update_replica_checkpoint(&mgr.isr_tracker, "my-idx", 0, "r1", 10);
+        update_replica_checkpoint(&mgr.isr_tracker, "other-idx", 0, "r1", 20);
 
         mgr.close_index_shards("my-idx").unwrap();
 
@@ -4162,10 +5282,14 @@ mod tests {
     async fn finalized_peer_recovery_install_opens_exact_snapshot() {
         let source_dir = tempfile::tempdir().unwrap();
         let source = CompositeEngine::new(source_dir.path(), Duration::from_secs(60)).unwrap();
-        source.add_document("doc-1", json!({"value": 1})).unwrap();
-        source.add_document("doc-2", json!({"value": 2})).unwrap();
+        let source: Arc<dyn SearchEngine> = Arc::new(source);
+        apply_index(&source, "doc-1", json!({"value": 1}), 0, 1).unwrap();
+        apply_index(&source, "doc-gap", json!({"value": "filled"}), 1, 1).unwrap();
+        apply_index(&source, "doc-2", json!({"value": 2}), 2, 1).unwrap();
         let snapshot_dir = source_dir.path().join("peer-recovery/session");
         let snapshot = source.create_peer_recovery_snapshot(&snapshot_dir).unwrap();
+        assert_eq!(snapshot.committed_boundary.processed_checkpoint, Some(2));
+        assert_eq!(snapshot.committed_boundary.max_seq_no, Some(2));
 
         let target_dir = tempfile::tempdir().unwrap();
         let manager = Arc::new(ShardManager::new(
@@ -4195,7 +5319,7 @@ mod tests {
                 allocation_id: 1,
                 primary_term: 1,
                 shard_dir: shard_dir.clone(),
-                snapshot_next_seq_no: snapshot.snapshot_next_seq_no,
+                committed_boundary: snapshot.committed_boundary.clone(),
                 expected_files: snapshot
                     .files
                     .iter()
@@ -4204,7 +5328,9 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(engine.doc_count(), 2);
+        assert_eq!(engine.doc_count(), 3);
+        assert_eq!(engine.sequence_stats().processed_checkpoint, Some(2));
+        assert_eq!(engine.sequence_stats().max_seq_no, Some(2));
         assert!(!shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER).exists());
         source
             .release_peer_recovery_pin(snapshot.retention_pin_id)
@@ -4236,8 +5362,11 @@ mod tests {
                 index_uuid: "uuid-1".into(),
                 allocation_id: 7,
                 replica_fence: 2,
+                fence_max_seq_no: None,
+                collision_quarantined: false,
             })
         );
+        apply_index(&engine, "before-raise", json!({"value": 0}), 0, 2).unwrap();
         manager
             .raise_copy_fence_blocking("idx".into(), 0, "uuid-1".into(), 7, 5)
             .await
@@ -4260,7 +5389,173 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(restarted.copy_identity("idx", 0).unwrap().replica_fence, 5);
+        let identity = restarted.copy_identity("idx", 0).unwrap();
+        assert_eq!(identity.replica_fence, 5);
+        assert_eq!(identity.fence_max_seq_no, Some(0));
+    }
+
+    #[tokio::test]
+    async fn collision_marker_persist_failure_keeps_in_memory_quarantine_reportable() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 2,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        manager.inject_collision_quarantine_persist_failures(28, 1);
+
+        let error = manager
+            .quarantine_sequence_collision("idx", 0, "uuid-1", 7)
+            .unwrap_err();
+
+        assert!(
+            ShardManager::should_report_copy_failure(&error),
+            "{error:#}"
+        );
+        assert!(
+            !ShardManager::should_quarantine_copy_failure(&error),
+            "the collision-specific in-memory marker must not be cleared by generic quarantine"
+        );
+        assert!(manager.get_shard("idx", 0).is_none());
+        let identity = manager
+            .copy_identity("idx", 0)
+            .expect("failed marker persistence must retain in-memory identity");
+        assert!(identity.collision_quarantined);
+        let durable = ShardManager::load_copy_identity(&dir.path().join("uuid-1/shard_0")).unwrap();
+        assert!(!durable.collision_quarantined);
+        let reopen = match manager.open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &IndexSettings::default(),
+            "uuid-1",
+            AssignedShardOpen {
+                allocation_id: 7,
+                primary_term: 2,
+                allow_empty_creation: false,
+            },
+        ) {
+            Ok(_) => panic!("in-memory collision quarantine must reject reopen"),
+            Err(error) => error,
+        };
+        assert!(reopen.is::<CollisionQuarantinedShardCopy>(), "{reopen:#}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_racing_unpersisted_collision_marker_stays_quarantined() {
+        let runtime = tokio::runtime::Handle::current();
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+        let assignment = AssignedShardOpen {
+            allocation_id: 7,
+            primary_term: 2,
+            allow_empty_creation: true,
+        };
+        manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                assignment,
+            )
+            .unwrap();
+        // The copy is closed (for example evicted by an earlier failure) but
+        // not marked, so a concurrent assigned open passes the marker check.
+        manager.quarantine_shard_copy("idx", 0);
+        assert!(manager.get_shard("idx", 0).is_none());
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *manager.open_before_lock_sender.lock().unwrap() = Some(entered_tx);
+        *manager.open_before_lock_release.lock().unwrap() = Some(release_rx);
+        let open_manager = manager.clone();
+        let open = std::thread::spawn(move || {
+            let _runtime = runtime.enter();
+            open_manager.open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 2,
+                    allow_empty_creation: false,
+                },
+            )
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // A collision is detected concurrently; its marker write fails.
+        manager.inject_collision_quarantine_persist_failures(28, 1);
+        let quarantine_error = manager
+            .quarantine_sequence_collision("idx", 0, "uuid-1", 7)
+            .unwrap_err();
+        assert!(ShardManager::should_report_copy_failure(&quarantine_error));
+        assert!(
+            manager
+                .copy_identity("idx", 0)
+                .unwrap()
+                .collision_quarantined
+        );
+        release_tx.send(()).unwrap();
+
+        let opened = open.join().unwrap();
+        assert!(
+            opened
+                .as_ref()
+                .is_err_and(|error| error.is::<CollisionQuarantinedShardCopy>()),
+            "the racing open must not serve a collision-quarantined copy"
+        );
+        assert!(manager.get_shard("idx", 0).is_none());
+        assert!(
+            manager
+                .copy_identity("idx", 0)
+                .unwrap()
+                .collision_quarantined
+        );
+        let later = manager.open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &IndexSettings::default(),
+            "uuid-1",
+            AssignedShardOpen {
+                allocation_id: 7,
+                primary_term: 2,
+                allow_empty_creation: false,
+            },
+        );
+        assert!(
+            later
+                .as_ref()
+                .is_err_and(|error| error.is::<CollisionQuarantinedShardCopy>()),
+            "a later open must stay collision-quarantined"
+        );
+    }
+
+    #[test]
+    fn sequence_state_identity_mismatch_is_definitive() {
+        let committed = crate::engine::sequence::CommittedBoundaryRecord::empty(2);
+        let error = crate::engine::sequence::initialize_term_sequence_state(2, Some(0), &committed)
+            .unwrap_err();
+
+        assert!(
+            ShardManager::is_definitive_copy_failure(&error),
+            "identity/commit fence disagreement must fail the copy immediately: {error:#}"
+        );
     }
 
     #[test]
@@ -4307,8 +5602,55 @@ mod tests {
             Ok(_) => panic!("malformed identity must fail closed"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("decode shard copy identity"));
+        assert!(error.is::<crate::common::UnsupportedIndexFormatError>());
+        assert!(error.to_string().contains("recreate the index"));
         assert!(manager.get_shard("idx", 0).is_none());
+    }
+
+    #[test]
+    fn no_compat_v1_identity_requires_recreate() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard_dir = dir.path();
+        std::fs::write(
+            shard_dir.join(SHARD_COPY_IDENTITY_FILE),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "index_uuid": "uuid-1",
+                "allocation_id": 7,
+                "replica_fence": 2,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = ShardManager::load_copy_identity(shard_dir).unwrap_err();
+        assert!(error.is::<crate::common::UnsupportedIndexFormatError>());
+        assert!(error.to_string().contains("recreate the index"));
+        assert!(ShardManager::should_report_copy_failure(&error));
+        assert!(ShardManager::should_quarantine_copy_failure(&error));
+    }
+
+    #[test]
+    fn no_compat_v2_identity_requires_recreate() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(SHARD_COPY_IDENTITY_FILE),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 2,
+                "index_uuid": "uuid-1",
+                "allocation_id": 7,
+                "replica_fence": 2,
+                "fence_max_seq_no": 0
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = ShardManager::load_copy_identity(dir.path()).unwrap_err();
+        assert!(error.is::<crate::common::UnsupportedIndexFormatError>());
+        assert!(error.to_string().contains("recreate the index"));
+        assert!(ShardManager::should_report_copy_failure(&error));
+        assert!(ShardManager::should_quarantine_copy_failure(&error));
     }
 
     #[test]
@@ -4423,9 +5765,7 @@ mod tests {
                 },
             )
             .unwrap();
-        engine
-            .add_document_with_seq("preserved", serde_json::json!({"value": 1}), 0)
-            .unwrap();
+        apply_index(&engine, "preserved", serde_json::json!({"value": 1}), 0, 3).unwrap();
         engine.refresh().unwrap();
         assert!(manager.begin_peer_recovery_target("idx", 0));
         manager
@@ -4842,13 +6182,14 @@ mod tests {
                         message_term: 2,
                     },
                     |engine| {
-                        engine
-                            .add_document_with_seq(
-                                "doc",
-                                serde_json::json!({"value": seq_no}),
-                                seq_no,
-                            )
-                            .map(|_| ())
+                        apply_index(
+                            &engine,
+                            "doc",
+                            serde_json::json!({"value": seq_no}),
+                            seq_no,
+                            2,
+                        )
+                        .map(|_| ())
                     },
                 )
                 .unwrap_err();
@@ -4920,7 +6261,7 @@ mod tests {
         first.inject_writer_replacement_failures_for_test(28, 1);
         assert!(first.force_merge(1).is_err());
         let wal_before = first
-            .peer_recovery_ops(0, usize::MAX, usize::MAX)
+            .retained_recovery_ops(0, usize::MAX, usize::MAX)
             .unwrap()
             .operations
             .len();
@@ -4939,7 +6280,7 @@ mod tests {
         assert!(!ShardManager::should_report_copy_failure(&blocked));
         assert_eq!(
             first
-                .peer_recovery_ops(0, usize::MAX, usize::MAX)
+                .retained_recovery_ops(0, usize::MAX, usize::MAX)
                 .unwrap()
                 .operations
                 .len(),
@@ -5024,7 +6365,11 @@ mod tests {
                 .unwrap();
             engine.refresh().unwrap();
             let committed_path = dir.path().join("uuid-1/shard_0/translog.committed");
-            assert_eq!(std::fs::read_to_string(&committed_path).unwrap(), "1");
+            let committed = crate::engine::sequence::CommittedBoundaryRecord::load(&committed_path)
+                .unwrap()
+                .unwrap();
+            assert_eq!(committed.processed_checkpoint, Some(0));
+            assert_eq!(committed.persisted_checkpoint, Some(0));
 
             let index_dir = dir.path().join("uuid-1/shard_0/index");
             std::fs::set_permissions(&index_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
@@ -5046,8 +6391,10 @@ mod tests {
                 "a failed commit must remove the writer before another write can queue"
             );
             assert_eq!(
-                std::fs::read_to_string(&committed_path).unwrap(),
-                "1",
+                crate::engine::sequence::CommittedBoundaryRecord::load(&committed_path)
+                    .unwrap()
+                    .unwrap(),
+                committed,
                 "a failed commit must not advance the persisted checkpoint"
             );
 
@@ -5082,10 +6429,12 @@ mod tests {
                 assert!(engine.get_document(id).unwrap().is_some(), "{id}");
             }
             engine.flush().unwrap();
-            assert_eq!(
-                std::fs::read_to_string(&committed_path).unwrap(),
-                (during_fault.seq_no + acknowledged.len() as u64 + 1).to_string()
-            );
+            let committed = crate::engine::sequence::CommittedBoundaryRecord::load(&committed_path)
+                .unwrap()
+                .unwrap();
+            let expected_checkpoint = during_fault.seq_no + acknowledged.len() as u64;
+            assert_eq!(committed.processed_checkpoint, Some(expected_checkpoint));
+            assert_eq!(committed.persisted_checkpoint, Some(expected_checkpoint));
         }
 
         let restarted = ShardManager::new(dir.path(), Duration::from_secs(60));
@@ -5235,9 +6584,7 @@ mod tests {
                     message_term: 2,
                 },
                 |engine| {
-                    engine
-                        .add_document_with_seq("doc", serde_json::json!({"value": 0}), 0)
-                        .map(|_| ())
+                    apply_index(&engine, "doc", serde_json::json!({"value": 0}), 0, 2).map(|_| ())
                 },
             )
             .unwrap_err();
@@ -5254,9 +6601,7 @@ mod tests {
                     message_term: 2,
                 },
                 |engine| {
-                    engine
-                        .add_document_with_seq("doc", serde_json::json!({"value": 1}), 0)
-                        .map(|_| ())
+                    apply_index(&engine, "doc", serde_json::json!({"value": 1}), 0, 2).map(|_| ())
                 },
             )
             .unwrap();
@@ -5273,9 +6618,7 @@ mod tests {
                     message_term: 2,
                 },
                 |engine| {
-                    engine
-                        .add_document_with_seq("doc", serde_json::json!({"value": 2}), 1)
-                        .map(|_| ())
+                    apply_index(&engine, "doc", serde_json::json!({"value": 2}), 1, 2).map(|_| ())
                 },
             )
             .unwrap_err();
@@ -5293,15 +6636,67 @@ mod tests {
                     message_term: 2,
                 },
                 |engine| {
-                    engine
-                        .add_document_with_seq("doc", serde_json::json!({"value": 3}), 1)
-                        .map(|_| ())
+                    apply_index(&engine, "doc", serde_json::json!({"value": 3}), 1, 2).map(|_| ())
                 },
             )
             .unwrap_err();
         assert!(ShardManager::should_report_copy_failure(
             &persistent_after_reset
         ));
+    }
+
+    #[tokio::test]
+    async fn primary_term_sequence_collision_is_definitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+        manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 1,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        manager
+            .apply_replica_operation(
+                "idx",
+                0,
+                ReplicaApplyContext {
+                    index_uuid: "uuid-1",
+                    allocation_id: 7,
+                    applied_view_term: 1,
+                    message_term: 1,
+                },
+                |engine| apply_index(&engine, "doc", json!({"value": 1}), 0, 1).map(|_| ()),
+            )
+            .unwrap();
+        manager
+            .raise_copy_fence_blocking("idx".into(), 0, "uuid-1".into(), 7, 2)
+            .await
+            .unwrap();
+
+        let error = manager
+            .apply_replica_operation(
+                "idx",
+                0,
+                ReplicaApplyContext {
+                    index_uuid: "uuid-1",
+                    allocation_id: 7,
+                    applied_view_term: 2,
+                    message_term: 2,
+                },
+                |engine| apply_index(&engine, "doc", json!({"value": 2}), 0, 2).map(|_| ()),
+            )
+            .unwrap_err();
+
+        assert!(ShardManager::is_definitive_copy_failure(&error));
+        assert!(ShardManager::should_report_copy_failure(&error));
     }
 
     #[tokio::test]

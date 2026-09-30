@@ -6,6 +6,7 @@ use std::time::Instant;
 pub type NodeId = String;
 /// Monotonic identity of one routed shard-copy assignment.
 pub type AllocationId = u64;
+pub const CLUSTER_STATE_FORMAT_VERSION: u32 = 1;
 
 /// The role a node plays in the OpenSearch cluster
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -26,7 +27,6 @@ pub struct NodeInfo {
     pub http_port: u16,
     pub roles: Vec<NodeRole>,
     /// Unique Raft consensus node ID. 0 means not assigned.
-    #[serde(default)]
     pub raft_node_id: u64,
 }
 
@@ -51,17 +51,13 @@ pub struct ShardCopy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardRoutingEntry {
     pub primary: NodeId,
-    /// Monotonic authority epoch for the shard primary. Legacy snapshots
-    /// deserialize to zero and must be activated before serving writes.
-    #[serde(default)]
+    /// Monotonic authority epoch for the shard primary.
     pub primary_term: u64,
     pub replicas: Vec<NodeId>,
     /// Replica copies that are authoritative for acknowledgements and promotion.
     /// The primary is implicitly authoritative and must not appear here.
-    #[serde(default)]
     pub in_sync_replicas: Vec<NodeId>,
     /// Replica copies that couldn't be assigned (not enough distinct nodes).
-    #[serde(default)]
     pub unassigned_replicas: u32,
 }
 
@@ -117,24 +113,18 @@ impl ShardRoutingEntry {
 
 /// Allocation identities and first-activation state owned by Raft routing.
 ///
-/// The routing entry keeps the existing node-oriented compatibility shape,
-/// while this state binds each assigned copy to the committed log position
-/// that created that assignment. A missing allocation is never authoritative.
+/// This state binds each assigned copy to the committed log position that
+/// created that assignment. A missing allocation is never authoritative.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShardAllocationIds {
-    #[serde(default)]
     pub primary: Option<AllocationId>,
-    #[serde(default)]
     pub replicas: HashMap<NodeId, AllocationId>,
     /// The allocation ID used for copies assigned by CreateIndex.
-    #[serde(default)]
     pub initial_allocation_id: AllocationId,
     /// Set by the first successful allocation-bound ActivatePrimary command.
-    #[serde(default)]
     pub primary_initialized: bool,
     /// Status-only flag: the assigned primary could not serve from local
     /// storage and no in-sync promotion candidate was available.
-    #[serde(default)]
     pub primary_unavailable: bool,
 }
 
@@ -257,8 +247,8 @@ pub struct FieldMapping {
 pub enum DynamicMapping {
     /// Auto-detect field types and add new fields to mappings on first encounter.
     True,
-    /// Ignore unknown fields (index only into the "body" catch-all). This is the
-    /// legacy behaviour and the default for backward compatibility.
+    /// Ignore unknown fields (index only into the "body" catch-all). This is
+    /// the current default.
     #[default]
     False,
     /// Reject documents that contain fields not present in the explicit mappings.
@@ -279,6 +269,7 @@ impl std::fmt::Display for DynamicMapping {
 pub enum CreateIndexMetadataError {
     NoDataNodes,
     InvalidArgument(String),
+    MapperParsing(String),
     UnimplementedEngine(IndexEngine),
 }
 
@@ -287,6 +278,7 @@ impl std::fmt::Display for CreateIndexMetadataError {
         match self {
             Self::NoDataNodes => write!(f, "No data nodes available to assign shards"),
             Self::InvalidArgument(message) => f.write_str(message),
+            Self::MapperParsing(message) => f.write_str(message),
             Self::UnimplementedEngine(engine) => {
                 write!(
                     f,
@@ -343,14 +335,16 @@ impl IndexEngine {
     /// Accepts either:
     /// - top-level `{"engine": "local_shards"}`
     /// - top-level `{"engine": {"type": "remote_store"}}`
-    /// - legacy-friendly `{"settings": {"engine": "local_shards"}}`
     pub fn from_create_request_body(
         body: &serde_json::Value,
     ) -> Result<Self, CreateIndexMetadataError> {
-        let engine_value = body
-            .get("engine")
-            .or_else(|| body.pointer("/settings/engine"));
-        Self::from_create_value(engine_value)
+        if body.pointer("/settings/engine").is_some() {
+            return Err(CreateIndexMetadataError::InvalidArgument(
+                "index engine must be specified in the top-level [engine] field, not [settings.engine]"
+                    .to_string(),
+            ));
+        }
+        Self::from_create_value(body.get("engine"))
     }
 
     pub fn parse_name(name: &str) -> Result<Self, ParseIndexEngineNameError> {
@@ -487,7 +481,6 @@ impl RemoteStoreSettings {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct IndexSettings {
     /// Immutable engine selector chosen at index creation time.
-    #[serde(default)]
     pub engine: IndexEngine,
     // ── Common settings ─────────────────────────────────────────────
     /// Refresh interval in milliseconds. `None` = use cluster default (5000ms).
@@ -600,13 +593,10 @@ pub struct IndexMetadata {
     /// Maps Shard ID → routing entry (primary + replicas)
     pub shard_routing: HashMap<u32, ShardRoutingEntry>,
     /// Field name → mapping definition. Empty means dynamic (all-to-body).
-    #[serde(default)]
     pub mappings: HashMap<String, FieldMapping>,
-    /// Controls auto-detection of unmapped fields. Default: `False` (legacy).
-    #[serde(default)]
+    /// Controls auto-detection of unmapped fields. Default: `False`.
     pub dynamic: DynamicMapping,
     /// Per-index dynamic and engine-specific settings.
-    #[serde(default)]
     pub settings: IndexSettings,
 }
 
@@ -688,7 +678,11 @@ impl IndexMetadata {
             .pointer("/mappings/properties")
             .and_then(|v| v.as_object())
         {
+            crate::common::validate_mapping_field_names(properties.keys().map(String::as_str))
+                .map_err(|error| CreateIndexMetadataError::MapperParsing(error.to_string()))?;
             for (field_name, field_def) in properties {
+                crate::common::validate_builtin_body_mapping_definition(field_name, field_def)
+                    .map_err(|error| CreateIndexMetadataError::MapperParsing(error.to_string()))?;
                 let Some(type_str) = field_def.get("type").and_then(|v| v.as_str()) else {
                     continue;
                 };
@@ -1010,12 +1004,9 @@ pub struct SecurityApiKeyRecord {
     pub name: String,
     /// 64-character lowercase hex SHA-256 of the secret.
     pub hash_sha256: String,
-    #[serde(default)]
     pub roles: Vec<String>,
     /// Optional index allow-list patterns. Empty means all indices.
-    #[serde(default)]
     pub indices: Vec<String>,
-    #[serde(default)]
     pub created_at_millis: i64,
 }
 
@@ -1025,36 +1016,27 @@ pub struct SecurityApiKeyRecord {
 pub struct SecurityRoleDefinition {
     pub name: String,
     /// Cluster-level privilege names (e.g. "monitor", "state", "admin", "metrics").
-    #[serde(default)]
     pub cluster: Vec<String>,
     /// Index patterns the index privileges apply to. Empty means all indices.
-    #[serde(default)]
     pub indices: Vec<String>,
     /// Index privilege names: "read", "write", "admin".
-    #[serde(default)]
     pub index_privileges: Vec<String>,
 }
 
 /// The globally agreed-upon state of the entire cluster
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterState {
+    pub format_version: u32,
     pub cluster_name: String,
     pub version: u64,
     pub master_node: Option<NodeId>,
     pub nodes: HashMap<NodeId, NodeInfo>,
     pub indices: HashMap<String, IndexMetadata>,
     /// Per-index, per-shard allocation identities and first-activation state.
-    ///
-    /// Older pre-1.0 snapshots deserialize with this map empty and therefore
-    /// fail closed at every authoritative data path.
-    #[serde(default)]
     pub shard_allocations: HashMap<String, HashMap<u32, ShardAllocationIds>>,
-    /// Dynamically-managed API keys, keyed by key id. Snapshotted via serde;
-    /// `#[serde(default)]` keeps older snapshots without this field readable.
-    #[serde(default)]
+    /// Dynamically-managed API keys, keyed by key id.
     pub api_keys: HashMap<String, SecurityApiKeyRecord>,
     /// Dynamically-managed custom roles, keyed by role name.
-    #[serde(default)]
     pub roles: HashMap<String, SecurityRoleDefinition>,
     #[serde(skip, default)]
     pub last_seen: HashMap<NodeId, Instant>,
@@ -1063,6 +1045,7 @@ pub struct ClusterState {
 impl ClusterState {
     pub fn new(cluster_name: String) -> Self {
         Self {
+            format_version: CLUSTER_STATE_FORMAT_VERSION,
             cluster_name,
             version: 0,
             master_node: None,
@@ -1803,13 +1786,9 @@ mod tests {
     }
 
     #[test]
-    fn index_metadata_without_mappings_defaults_to_empty() {
+    fn old_index_metadata_without_current_fields_is_rejected() {
         let json = r#"{"name":"test","uuid":"test-uuid","number_of_shards":1,"number_of_replicas":0,"shard_routing":{}}"#;
-        let meta: IndexMetadata = serde_json::from_str(json).unwrap();
-        assert!(
-            meta.mappings.is_empty(),
-            "missing mappings field should default to empty"
-        );
+        assert!(serde_json::from_str::<IndexMetadata>(json).is_err());
     }
 
     #[test]
@@ -1933,33 +1912,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_shard_routing_defaults_to_no_in_sync_replicas_and_is_not_promotable() {
+    fn old_shard_routing_without_current_fields_is_rejected() {
         let json = r#"{"primary":"node-1","replicas":["node-2"]}"#;
-        let entry: ShardRoutingEntry = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            entry.primary_term, 0,
-            "legacy snapshots must require primary activation"
-        );
-        assert_eq!(
-            entry.unassigned_replicas, 0,
-            "missing field should default to 0"
-        );
-        assert!(
-            entry.in_sync_replicas.is_empty(),
-            "legacy snapshots must fail closed instead of granting promotion eligibility"
-        );
-
-        let mut metadata = IndexMetadata {
-            name: "legacy".into(),
-            uuid: IndexUuid::new("legacy-uuid"),
-            number_of_shards: 1,
-            number_of_replicas: 1,
-            shard_routing: HashMap::from([(0, entry)]),
-            mappings: HashMap::new(),
-            dynamic: Default::default(),
-            settings: IndexSettings::default(),
-        };
-        assert!(!metadata.promote_replica(0));
+        assert!(serde_json::from_str::<ShardRoutingEntry>(json).is_err());
     }
 
     #[test]
@@ -2362,9 +2317,8 @@ mod tests {
     }
 
     #[test]
-    fn index_settings_deserialize_empty_object() {
-        let back: IndexSettings = serde_json::from_str("{}").unwrap();
-        assert_eq!(back, IndexSettings::default());
+    fn old_index_settings_without_engine_is_rejected() {
+        assert!(serde_json::from_str::<IndexSettings>("{}").is_err());
     }
 
     #[test]
@@ -2439,6 +2393,45 @@ mod tests {
         assert_eq!(metadata.dynamic, DynamicMapping::True);
         assert_eq!(metadata.mappings["created_at"].field_type, FieldType::Date);
         assert_eq!(metadata.mappings["title"].field_type, FieldType::Text);
+    }
+
+    #[test]
+    fn create_index_rejects_reserved_mapping_properties() {
+        for field in [
+            "_id",
+            "_doc_id",
+            "_source",
+            "_seq_no",
+            "_primary_term",
+            "_version",
+            "_index",
+            "_routing",
+        ] {
+            let error = IndexMetadata::from_create_request_body(
+                "events",
+                &serde_json::json!({
+                    "settings": {
+                        "number_of_shards": 1,
+                        "number_of_replicas": 0
+                    },
+                    "mappings": {
+                        "properties": {
+                            (field): { "type": "keyword" }
+                        }
+                    }
+                }),
+                &["node-1".into()],
+            )
+            .unwrap_err();
+
+            assert!(matches!(
+                error,
+                CreateIndexMetadataError::MapperParsing(reason)
+                    if reason == format!(
+                        "Field [{field}] is a metadata field and cannot be added inside a document. Use the index API request parameters."
+                    )
+            ));
+        }
     }
 
     #[test]
@@ -2533,6 +2526,26 @@ mod tests {
 
         assert_eq!(metadata.settings.engine, IndexEngine::RemoteStore);
         assert!(!metadata.settings.engine.supports_writes());
+    }
+
+    #[test]
+    fn index_metadata_rejects_settings_engine_and_names_top_level_field() {
+        let error = IndexMetadata::from_create_request_body(
+            "idx",
+            &serde_json::json!({
+                "settings": {
+                    "engine": "remote_store"
+                }
+            }),
+            &["node-1".into()],
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CreateIndexMetadataError::InvalidArgument(reason)
+                if reason == "index engine must be specified in the top-level [engine] field, not [settings.engine]"
+        ));
     }
 
     #[test]
@@ -2896,12 +2909,10 @@ mod tests {
     }
 
     #[test]
-    fn index_metadata_missing_dynamic_defaults_to_false() {
-        // Simulates loading legacy JSON that predates the dynamic field.
+    fn old_index_metadata_missing_dynamic_is_rejected() {
         let json = r#"{"name":"legacy","uuid":"u","number_of_shards":1,
                        "number_of_replicas":0,"shard_routing":{},"mappings":{},"settings":{}}"#;
-        let meta: IndexMetadata = serde_json::from_str(json).unwrap();
-        assert_eq!(meta.dynamic, DynamicMapping::False);
+        assert!(serde_json::from_str::<IndexMetadata>(json).is_err());
     }
 
     #[test]
@@ -2920,13 +2931,9 @@ mod tests {
     }
 
     #[test]
-    fn api_key_record_defaults_for_missing_optional_fields() {
-        // Only the required fields are present; optional fields use serde defaults.
+    fn old_api_key_record_missing_current_fields_is_rejected() {
         let json = r#"{"id":"k","name":"n","hash_sha256":"deadbeef"}"#;
-        let record: SecurityApiKeyRecord = serde_json::from_str(json).unwrap();
-        assert!(record.roles.is_empty());
-        assert!(record.indices.is_empty());
-        assert_eq!(record.created_at_millis, 0);
+        assert!(serde_json::from_str::<SecurityApiKeyRecord>(json).is_err());
     }
 
     #[test]
@@ -2943,12 +2950,9 @@ mod tests {
     }
 
     #[test]
-    fn role_definition_defaults_for_missing_optional_fields() {
+    fn old_role_definition_missing_current_fields_is_rejected() {
         let json = r#"{"name":"empty"}"#;
-        let role: SecurityRoleDefinition = serde_json::from_str(json).unwrap();
-        assert!(role.cluster.is_empty());
-        assert!(role.indices.is_empty());
-        assert!(role.index_privileges.is_empty());
+        assert!(serde_json::from_str::<SecurityRoleDefinition>(json).is_err());
     }
 
     #[test]
@@ -2983,14 +2987,10 @@ mod tests {
     }
 
     #[test]
-    fn cluster_state_missing_security_fields_default_empty() {
-        // Simulates restoring a snapshot taken before the security fields existed.
+    fn old_cluster_state_missing_current_fields_is_rejected() {
         let json = r#"{"cluster_name":"old","version":7,"master_node":null,
                        "nodes":{},"indices":{}}"#;
-        let state: ClusterState = serde_json::from_str(json).unwrap();
-        assert_eq!(state.version, 7);
-        assert!(state.api_keys.is_empty());
-        assert!(state.roles.is_empty());
+        assert!(serde_json::from_str::<ClusterState>(json).is_err());
     }
 
     #[test]
@@ -3071,16 +3071,5 @@ mod tests {
             .unwrap()
             .primary_initialized = true;
         assert!(!state.may_create_initial_empty_copy("idx", 0, "node-1"));
-    }
-
-    #[test]
-    fn cluster_state_missing_allocation_identity_defaults_fail_closed() {
-        let json = r#"{"cluster_name":"old","version":7,"master_node":null,
-                       "nodes":{},"indices":{}}"#;
-        let state: ClusterState = serde_json::from_str(json).unwrap();
-        assert!(state.shard_allocations.is_empty());
-        assert_eq!(state.primary_allocation_id("idx", 0), None);
-        assert!(!state.may_create_initial_empty_copy("idx", 0, "node-1"));
-        assert!(!state.primary_unavailable("idx", 0));
     }
 }

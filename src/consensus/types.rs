@@ -91,6 +91,7 @@ pub enum ClusterCommand {
         shard_id: u32,
         node: String,
         allocation_id: u64,
+        expected_primary_term: u64,
         promote_only: bool,
         promotion_candidate: Option<String>,
     },
@@ -163,12 +164,13 @@ impl std::fmt::Display for ClusterCommand {
                 index_name,
                 shard_id,
                 node,
+                expected_primary_term,
                 promote_only,
                 promotion_candidate,
                 ..
             } => write!(
                 f,
-                "FailShardCopy({index_name}/{shard_id}, {node}, promote_only={promote_only}, candidate={promotion_candidate:?})"
+                "FailShardCopy({index_name}/{shard_id}, {node}, term={expected_primary_term}, promote_only={promote_only}, candidate={promotion_candidate:?})"
             ),
             ClusterCommand::AddMappings {
                 index_name,
@@ -472,6 +474,7 @@ mod tests {
                 shard_id: 2,
                 node: "node-2".into(),
                 allocation_id: 42,
+                expected_primary_term: 7,
                 promote_only: false,
                 promotion_candidate: None,
             },
@@ -497,5 +500,26 @@ mod tests {
             let restored: ClusterCommand = serde_json::from_str(&json).unwrap();
             assert_eq!(format!("{restored}"), format!("{command}"));
         }
+    }
+
+    #[test]
+    fn no_compat_old_fail_shard_copy_command_is_rejected() {
+        let command = ClusterCommand::FailShardCopy {
+            index_name: "logs".into(),
+            index_uuid: "uuid-1".into(),
+            shard_id: 2,
+            node: "node-2".into(),
+            allocation_id: 42,
+            expected_primary_term: 7,
+            promote_only: false,
+            promotion_candidate: None,
+        };
+        let mut value = serde_json::to_value(command).unwrap();
+        value["FailShardCopy"]
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_primary_term");
+
+        assert!(serde_json::from_value::<ClusterCommand>(value).is_err());
     }
 }

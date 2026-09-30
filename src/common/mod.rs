@@ -6,6 +6,151 @@ pub mod sql_parse;
 
 pub type Result<T> = std::result::Result<T, anyhow::Error>;
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "unsupported {component} format: {detail}; FerrisSearch pre-1.0 does not support migrations; recreate the index"
+)]
+pub(crate) struct UnsupportedIndexFormatError {
+    component: String,
+    detail: String,
+}
+
+impl UnsupportedIndexFormatError {
+    pub(crate) fn new(component: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            component: component.into(),
+            detail: detail.into(),
+        }
+    }
+}
+
+pub(crate) fn unsupported_index_format(
+    component: impl Into<String>,
+    detail: impl Into<String>,
+) -> anyhow::Error {
+    anyhow::Error::new(UnsupportedIndexFormatError::new(component, detail))
+}
+
+pub const RESERVED_DOCUMENT_KEYS: &[&str] = &[
+    "_id",
+    "_doc_id",
+    "_source",
+    "_seq_no",
+    "_primary_term",
+    "_version",
+    "_index",
+    "_routing",
+];
+
+pub const BUILTIN_BODY_FIELD: &str = "body";
+pub const BUILTIN_BODY_MAPPING_ERROR: &str =
+    "Field [body] is the built-in catch-all text field and can only be mapped as [text]";
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "Field [{field}] is a metadata field and cannot be added inside a document. Use the index API request parameters."
+)]
+pub struct ReservedDocumentFieldError {
+    field: String,
+}
+
+impl ReservedDocumentFieldError {
+    fn new(field: impl Into<String>) -> Self {
+        Self {
+            field: field.into(),
+        }
+    }
+
+    pub fn field(&self) -> &str {
+        &self.field
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("Field [body] is the built-in catch-all text field and can only be mapped as [text]")]
+pub struct BuiltinBodyMappingError;
+
+pub fn is_reserved_document_key(field: &str) -> bool {
+    RESERVED_DOCUMENT_KEYS.contains(&field)
+}
+
+pub fn is_builtin_body_field(field: &str) -> bool {
+    field == BUILTIN_BODY_FIELD
+}
+
+pub fn validate_document_source(
+    source: &serde_json::Value,
+) -> std::result::Result<(), ReservedDocumentFieldError> {
+    let Some(object) = source.as_object() else {
+        return Ok(());
+    };
+    validate_mapping_field_names(object.keys().map(String::as_str))
+}
+
+pub fn validate_mapping_field_names<'a>(
+    fields: impl IntoIterator<Item = &'a str>,
+) -> std::result::Result<(), ReservedDocumentFieldError> {
+    for field in fields {
+        if is_reserved_document_key(field) {
+            return Err(ReservedDocumentFieldError::new(field));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_builtin_body_mapping_definition(
+    field: &str,
+    definition: &serde_json::Value,
+) -> std::result::Result<(), BuiltinBodyMappingError> {
+    if !is_builtin_body_field(field) {
+        return Ok(());
+    }
+    let is_plain_text = definition.as_object().is_some_and(|object| {
+        object.len() == 1 && object.get("type").and_then(serde_json::Value::as_str) == Some("text")
+    });
+    if is_plain_text {
+        Ok(())
+    } else {
+        Err(BuiltinBodyMappingError)
+    }
+}
+
+pub fn validate_builtin_body_mapping_entry(
+    field: &str,
+    field_type: &str,
+    has_additional_parameters: bool,
+) -> std::result::Result<(), BuiltinBodyMappingError> {
+    if !is_builtin_body_field(field) || (field_type == "text" && !has_additional_parameters) {
+        Ok(())
+    } else {
+        Err(BuiltinBodyMappingError)
+    }
+}
+
+pub fn validate_builtin_body_field_mapping(
+    field: &str,
+    mapping: &FieldMapping,
+) -> std::result::Result<(), BuiltinBodyMappingError> {
+    if !is_builtin_body_field(field)
+        || (mapping.field_type == FieldType::Text && mapping.dimension.is_none())
+    {
+        Ok(())
+    } else {
+        Err(BuiltinBodyMappingError)
+    }
+}
+
+pub fn is_reserved_document_field_error_message(message: &str) -> bool {
+    message.starts_with("Field [")
+        && message.contains(
+            "] is a metadata field and cannot be added inside a document. Use the index API request parameters.",
+        )
+}
+
+pub fn is_mapping_parsing_error_message(message: &str) -> bool {
+    is_reserved_document_field_error_message(message) || message == BUILTIN_BODY_MAPPING_ERROR
+}
+
 /// Validates that an index name is safe and well-formed.
 /// Prevents path traversal attacks and rejects names that would cause filesystem issues.
 fn validate_index_name(name: &str) -> std::result::Result<(), &'static str> {
@@ -146,12 +291,12 @@ pub fn infer_field_type(value: &serde_json::Value) -> Option<FieldMapping> {
 }
 
 /// Scan a JSON document object and return inferred mappings for every top-level
-/// field. Fields named `_id` are excluded (reserved).
+/// non-metadata field.
 pub fn infer_field_mappings(payload: &serde_json::Value) -> HashMap<String, FieldMapping> {
     let mut mappings = HashMap::new();
     if let Some(obj) = payload.as_object() {
         for (key, value) in obj {
-            if key == "_id" {
+            if is_reserved_document_key(key) || is_builtin_body_field(key) {
                 continue;
             }
             if let Some(mapping) = infer_field_type(value) {
@@ -185,7 +330,8 @@ pub fn detect_new_fields_batch(
     for (_, payload) in payloads {
         if let Some(obj) = payload.as_object() {
             for (key, value) in obj {
-                if key == "_id"
+                if is_reserved_document_key(key)
+                    || is_builtin_body_field(key)
                     || existing_mappings.contains_key(key)
                     || new_fields.contains_key(key)
                 {
@@ -215,7 +361,11 @@ pub fn detect_unknown_fields(
 
     let mut unknown: Vec<String> = obj
         .keys()
-        .filter(|key| key.as_str() != "_id" && !existing_mappings.contains_key(*key))
+        .filter(|key| {
+            !is_reserved_document_key(key)
+                && !is_builtin_body_field(key)
+                && !existing_mappings.contains_key(*key)
+        })
         .cloned()
         .collect();
     unknown.sort();
@@ -232,7 +382,10 @@ pub fn detect_unknown_fields_batch(
     for (_, payload) in payloads {
         if let Some(obj) = payload.as_object() {
             for key in obj.keys() {
-                if key != "_id" && !existing_mappings.contains_key(key) {
+                if !is_reserved_document_key(key)
+                    && !is_builtin_body_field(key)
+                    && !existing_mappings.contains_key(key)
+                {
                     unknown.insert(key.clone());
                 }
             }
@@ -416,6 +569,47 @@ mod tests {
         assert!(!m.contains_key("_id"));
         assert!(!m.contains_key("tags"));
         assert!(!m.contains_key("nested"));
+    }
+
+    #[test]
+    fn dynamic_mapping_excludes_reserved_metadata_and_builtin_body() {
+        let mut document = serde_json::Map::new();
+        for field in [
+            "_id",
+            "_doc_id",
+            "_source",
+            "_seq_no",
+            "_primary_term",
+            "_version",
+            "_index",
+            "_routing",
+        ] {
+            document.insert(field.to_string(), json!(1));
+        }
+        document.insert("body".to_string(), json!("searchable"));
+        document.insert("title".to_string(), json!("hello"));
+        let document = serde_json::Value::Object(document);
+
+        let inferred = infer_field_mappings(&document);
+        assert_eq!(
+            inferred.keys().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from(["title".to_string()])
+        );
+        assert_eq!(
+            detect_unknown_fields(&document, &HashMap::new()),
+            vec!["title".to_string()]
+        );
+        assert_eq!(
+            detect_new_fields_batch(&[("1".to_string(), document.clone())], &HashMap::new())
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["title".to_string()])
+        );
+        assert_eq!(
+            detect_unknown_fields_batch(&[("1".to_string(), document)], &HashMap::new()),
+            vec!["title".to_string()]
+        );
     }
 
     #[test]

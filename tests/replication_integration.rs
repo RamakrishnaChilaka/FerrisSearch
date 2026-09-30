@@ -19,7 +19,9 @@ use ferrissearch::transport::proto::{
     ShardDeleteRequest, ShardDocRequest, ShardGetRequest, ShardSearchDslRequest,
     ShardSearchRequest, StartPeerRecoveryRequest,
 };
-use ferrissearch::transport::server::create_transport_service_for_test;
+use ferrissearch::transport::server::{
+    create_transport_service_for_test, create_transport_service_with_raft,
+};
 use futures::TryStreamExt;
 
 use std::collections::HashMap;
@@ -804,11 +806,187 @@ async fn replicate_doc_index_via_grpc() {
     let entries = sm
         .get_shard("replica-idx", 0)
         .unwrap()
-        .peer_recovery_ops(0, usize::MAX, usize::MAX)
+        .retained_recovery_ops(0, usize::MAX, usize::MAX)
         .unwrap()
         .operations;
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].seq_no, 0);
+}
+
+#[tokio::test]
+async fn out_of_order_replica_delivery_keeps_the_newer_document_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let cluster_manager = Arc::new(ClusterManager::new("d1-ordering".into()));
+    let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cluster_manager, "d1-ordering");
+
+    let address = start_grpc_server(cluster_manager, shard_manager.clone()).await;
+    let mut client = connect_client(address).await;
+    for (seq_no, value) in [(1, 2), (0, 1)] {
+        let response = client
+            .replicate_doc(tonic::Request::new(ReplicateDocRequest {
+                index_name: "d1-ordering".into(),
+                shard_id: 0,
+                doc_id: "shared".into(),
+                payload_json: serde_json::to_vec(&serde_json::json!({"value": value})).unwrap(),
+                op: "index".into(),
+                seq_no,
+                index_uuid: "d1-ordering-uuid".into(),
+                primary_term: Some(1),
+                target_allocation_id: Some(1),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success, "{}", response.error);
+    }
+
+    refresh_all(&shard_manager);
+    let response = client
+        .get_doc(tonic::Request::new(ShardGetRequest {
+            index_name: "d1-ordering".into(),
+            shard_id: 0,
+            doc_id: "shared".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.found);
+    let source: serde_json::Value = serde_json::from_slice(&response.source_json).unwrap();
+    assert_eq!(source["value"], 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deterministic_reordering_survives_promotion_and_new_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let cluster_manager = Arc::new(ClusterManager::new("d1-full-ordering".into()));
+    setup_replica_target_state(&cluster_manager, "d1-full-ordering", 1);
+    let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    install_recovered_replica_fixture(&cluster_manager, &shard_manager, "d1-full-ordering");
+    let (address, server) = start_grpc_server_for_node_with_handle(
+        cluster_manager.clone(),
+        shard_manager.clone(),
+        "replica-node",
+    )
+    .await;
+    let mut client = connect_client(address).await;
+
+    for offset in 0..10u64 {
+        let response = client
+            .replicate_doc(tonic::Request::new(ReplicateDocRequest {
+                index_name: "d1-full-ordering".into(),
+                shard_id: 0,
+                doc_id: format!("doc-{offset}"),
+                payload_json: serde_json::to_vec(&serde_json::json!({"value": 20 + offset}))
+                    .unwrap(),
+                op: "index".into(),
+                seq_no: 20 + offset,
+                index_uuid: "d1-full-ordering-uuid".into(),
+                primary_term: Some(1),
+                target_allocation_id: Some(1),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success, "{}", response.error);
+    }
+    let bulk = (0..20u64)
+        .map(|seq_no| ReplicateDocRequest {
+            index_name: "d1-full-ordering".into(),
+            shard_id: 0,
+            doc_id: format!("doc-{seq_no}"),
+            payload_json: serde_json::to_vec(&serde_json::json!({"value": seq_no})).unwrap(),
+            op: "index".into(),
+            seq_no,
+            index_uuid: "d1-full-ordering-uuid".into(),
+            primary_term: Some(1),
+            target_allocation_id: Some(1),
+        })
+        .collect();
+    let response = client
+        .replicate_bulk(tonic::Request::new(ReplicateBulkRequest {
+            index_name: "d1-full-ordering".into(),
+            shard_id: 0,
+            ops: bulk,
+            index_uuid: "d1-full-ordering-uuid".into(),
+            primary_term: Some(1),
+            target_allocation_id: Some(1),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.success, "{}", response.error);
+    refresh_all(&shard_manager);
+    for offset in 0..10u64 {
+        assert_eq!(
+            shard_manager
+                .get_shard("d1-full-ordering", 0)
+                .unwrap()
+                .get_document(&format!("doc-{offset}"))
+                .unwrap()
+                .unwrap()["value"],
+            20 + offset
+        );
+    }
+
+    let mut promoted = cluster_manager.get_state();
+    let routing = promoted
+        .indices
+        .get_mut("d1-full-ordering")
+        .unwrap()
+        .shard_routing
+        .get_mut(&0)
+        .unwrap();
+    routing.primary = "replica-node".into();
+    routing.primary_term = 2;
+    routing.replicas.clear();
+    routing.in_sync_replicas.clear();
+    routing.unassigned_replicas = 1;
+    promoted
+        .shard_allocations
+        .get_mut("d1-full-ordering")
+        .unwrap()
+        .get_mut(&0)
+        .unwrap()
+        .primary_initialized = true;
+    cluster_manager.update_state(promoted);
+    let response = client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: "d1-full-ordering".into(),
+            shard_id: 0,
+            doc_id: "post-promotion".into(),
+            payload_json: serde_json::to_vec(&serde_json::json!({"value": "promoted"})).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.success, "{}", response.error);
+    shard_manager
+        .get_shard("d1-full-ordering", 0)
+        .unwrap()
+        .refresh()
+        .unwrap();
+    assert_eq!(
+        shard_manager
+            .get_shard("d1-full-ordering", 0)
+            .unwrap()
+            .get_document("post-promotion")
+            .unwrap()
+            .unwrap()["value"],
+        "promoted"
+    );
+    for offset in 0..10u64 {
+        assert_eq!(
+            shard_manager
+                .get_shard("d1-full-ordering", 0)
+                .unwrap()
+                .get_document(&format!("doc-{offset}"))
+                .unwrap()
+                .unwrap()["value"],
+            20 + offset
+        );
+    }
+    server.abort();
 }
 
 #[tokio::test]
@@ -846,7 +1024,7 @@ async fn replicate_doc_delete_via_grpc() {
             doc_id: "to-delete".into(),
             payload_json: vec![],
             op: "delete".into(),
-            seq_no: 0,
+            seq_no: 1,
             index_uuid: "rep-del-idx-uuid".into(),
             primary_term: Some(1),
             target_allocation_id: Some(1),
@@ -855,7 +1033,7 @@ async fn replicate_doc_delete_via_grpc() {
         .unwrap()
         .into_inner();
 
-    assert!(resp.success);
+    assert!(resp.success, "{}", resp.error);
 
     // Verify deleted
     refresh_all(&sm);
@@ -931,7 +1109,7 @@ async fn replicate_bulk_via_grpc() {
     let entries = sm
         .get_shard("bulk-rep-idx", 0)
         .unwrap()
-        .peer_recovery_ops(0, usize::MAX, usize::MAX)
+        .retained_recovery_ops(0, usize::MAX, usize::MAX)
         .unwrap()
         .operations;
     assert_eq!(entries.len(), 3);
@@ -1061,6 +1239,7 @@ async fn stale_primary_replication_is_rejected_by_promoted_target() {
         &serde_json::json!({"value": "old-primary"}),
         "index",
         0,
+        1,
     )
     .await;
 
@@ -1219,7 +1398,7 @@ async fn replica_apply_rejects_uuid_allocation_term_and_missing_identity_fields(
     assert_eq!(engine.doc_count(), 0);
     assert!(
         engine
-            .peer_recovery_ops(0, usize::MAX, usize::MAX)
+            .retained_recovery_ops(0, usize::MAX, usize::MAX)
             .unwrap()
             .operations
             .is_empty()
@@ -1371,7 +1550,7 @@ async fn bulk_replication_validates_common_identity_before_first_mutation() {
     assert!(engine.get_document("first").unwrap().is_none());
     assert!(
         engine
-            .peer_recovery_ops(0, usize::MAX, usize::MAX)
+            .retained_recovery_ops(0, usize::MAX, usize::MAX)
             .unwrap()
             .operations
             .is_empty()
@@ -1384,27 +1563,72 @@ async fn bulk_replication_validates_common_identity_before_first_mutation() {
 }
 
 #[tokio::test]
-async fn join_cluster_and_publish_state_via_grpc() {
+async fn join_existing_raft_voter_via_grpc() {
     let dir = tempfile::tempdir().unwrap();
-    let cm = Arc::new(ClusterManager::new("cluster-test".into()));
+    let (raft, shared_state) =
+        ferrissearch::consensus::create_raft_instance_mem(1, "cluster-test".into())
+            .await
+            .unwrap();
+    ferrissearch::consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:0".into())
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !raft.is_leader() {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    }
+    let existing = DomainNodeInfo {
+        id: "node-1".into(),
+        name: "node-1".into(),
+        host: "127.0.0.1".into(),
+        transport_port: 9300,
+        http_port: 9200,
+        roles: vec![NodeRole::Data],
+        raft_node_id: 1,
+    };
+    assert_eq!(
+        raft.client_write(ferrissearch::consensus::types::ClusterCommand::AddNode {
+            node: existing.clone(),
+        })
+        .await
+        .unwrap()
+        .data,
+        ferrissearch::consensus::types::ClusterResponse::Ok
+    );
+    let cm = Arc::new(ClusterManager::with_shared_state(shared_state));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
-
-    let addr = start_grpc_server(cm.clone(), sm).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let service = create_transport_service_with_raft(
+        cm.clone(),
+        sm,
+        TransportClient::new(),
+        raft,
+        Arc::new(ferrissearch::tasks::TaskManager::new()),
+        "node-1".into(),
+    );
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
     let mut client = connect_client(addr).await;
 
-    // Join cluster
     let join_resp = client
         .join_cluster(tonic::Request::new(JoinRequest {
             node_info: Some(proto::NodeInfo {
-                id: "joining-node".into(),
-                name: "joiner".into(),
-                host: "127.0.0.1".into(),
-                transport_port: 9301,
-                http_port: 9201,
+                id: existing.id.clone(),
+                name: existing.name.clone(),
+                host: existing.host.clone(),
+                transport_port: u32::from(existing.transport_port),
+                http_port: u32::from(existing.http_port),
                 roles: vec!["data".into()],
-                raft_node_id: 0,
+                raft_node_id: 1,
             }),
-            raft_node_id: 0,
+            raft_node_id: 1,
         }))
         .await
         .unwrap()
@@ -1413,11 +1637,11 @@ async fn join_cluster_and_publish_state_via_grpc() {
     assert!(join_resp.state.is_some());
     let state = join_resp.state.unwrap();
     assert_eq!(state.cluster_name, "cluster-test");
-    assert!(state.nodes.iter().any(|n| n.id == "joining-node"));
+    assert_eq!(state.format_version, 1);
+    assert!(state.nodes.iter().any(|n| n.id == "node-1"));
 
-    // Verify cluster manager has the node
     let cs = cm.get_state();
-    assert!(cs.nodes.contains_key("joining-node"));
+    assert!(cs.nodes.contains_key("node-1"));
 }
 
 // ─── Two-node integration tests: primary → replica replication ──────────────
@@ -1487,11 +1711,118 @@ async fn primary_write_replicates_to_replica_node() {
     let entries = replica_sm
         .get_shard("replicated-idx", 0)
         .unwrap()
-        .peer_recovery_ops(0, usize::MAX, usize::MAX)
+        .retained_recovery_ops(0, usize::MAX, usize::MAX)
         .unwrap()
         .operations;
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].seq_no, 0);
+}
+
+#[tokio::test]
+async fn reserved_source_never_mutates_primary_or_replica() {
+    let replica_dir = tempfile::tempdir().unwrap();
+    let replica_cm = Arc::new(ClusterManager::new("reserved-source".into()));
+    let replica_sm = Arc::new(ShardManager::new(
+        replica_dir.path(),
+        Duration::from_secs(60),
+    ));
+    let replica_addr = start_replica_grpc_server(replica_cm.clone(), replica_sm.clone()).await;
+
+    let primary_dir = tempfile::tempdir().unwrap();
+    let primary_cm = Arc::new(ClusterManager::new("reserved-source".into()));
+    let primary_sm = Arc::new(ShardManager::new(
+        primary_dir.path(),
+        Duration::from_secs(60),
+    ));
+
+    setup_two_node_cluster_state(
+        &primary_cm,
+        &replica_cm,
+        "reserved-source-idx",
+        replica_addr.port(),
+    );
+    install_recovered_replica_fixture(&replica_cm, &replica_sm, "reserved-source-idx");
+
+    let primary_addr = start_primary_grpc_server(primary_cm, primary_sm.clone()).await;
+    let mut primary_client = connect_client(primary_addr).await;
+
+    let error = primary_client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: "reserved-source-idx".into(),
+            shard_id: 0,
+            doc_id: "poison".into(),
+            payload_json: serde_json::to_vec(&serde_json::json!({"_seq_no": 999})).unwrap(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(
+        error
+            .message()
+            .contains("Field [_seq_no] is a metadata field")
+    );
+
+    let error = primary_client
+        .bulk_index(tonic::Request::new(ShardBulkRequest {
+            index_name: "reserved-source-idx".into(),
+            shard_id: 0,
+            documents_json: vec![
+                serde_json::to_vec(&serde_json::json!({
+                    "_source": {"value": 999}
+                }))
+                .unwrap(),
+            ],
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(
+        error
+            .message()
+            .contains("Field [_source] is a metadata field")
+    );
+
+    for manager in [&primary_sm, &replica_sm] {
+        let engine = manager.get_shard("reserved-source-idx", 0).unwrap();
+        assert_eq!(engine.sequence_stats().max_seq_no, None);
+        assert!(
+            engine
+                .retained_recovery_ops(0, usize::MAX, usize::MAX)
+                .unwrap()
+                .operations
+                .is_empty()
+        );
+    }
+
+    let response = primary_client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: "reserved-source-idx".into(),
+            shard_id: 0,
+            doc_id: "healthy".into(),
+            payload_json: serde_json::to_vec(&serde_json::json!({"value": 1})).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.success, "{}", response.error);
+
+    refresh_all(&primary_sm);
+    refresh_all(&replica_sm);
+    for address in [primary_addr, replica_addr] {
+        let mut client = connect_client(address).await;
+        let response = client
+            .get_doc(tonic::Request::new(ShardGetRequest {
+                index_name: "reserved-source-idx".into(),
+                shard_id: 0,
+                doc_id: "healthy".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.found);
+        let source: serde_json::Value = serde_json::from_slice(&response.source_json).unwrap();
+        assert_eq!(source["value"], 1);
+    }
 }
 
 #[tokio::test]
@@ -1745,7 +2076,7 @@ async fn primary_bulk_replicates_to_replica_node() {
     let entries = replica_sm
         .get_shard("bulk-repl-idx", 0)
         .unwrap()
-        .peer_recovery_ops(0, usize::MAX, usize::MAX)
+        .retained_recovery_ops(0, usize::MAX, usize::MAX)
         .unwrap()
         .operations;
     assert_eq!(entries.len(), 5);
@@ -3104,16 +3435,16 @@ async fn update_nonexistent_document_returns_not_found() {
 // ─── Recovery & Checkpoint integration tests ────────────────────────────────
 
 #[tokio::test]
-async fn replicate_doc_returns_local_checkpoint() {
+async fn replicate_doc_returns_sequence_proof() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("integ-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
     setup_single_node_cluster_state(&cm, "cp-idx");
 
-    let addr = start_grpc_server(cm, sm).await;
+    let addr = start_grpc_server(cm, sm.clone()).await;
     let mut client = connect_client(addr).await;
 
-    // First replicate — checkpoint should be 0 (or whatever the first seq_no is)
+    // A higher sequence can be processed without advancing the contiguous checkpoint.
     let payload = serde_json::json!({"title": "checkpoint test 1"});
     let resp = client
         .replicate_doc(tonic::Request::new(ReplicateDocRequest {
@@ -3132,12 +3463,37 @@ async fn replicate_doc_returns_local_checkpoint() {
         .into_inner();
 
     assert!(resp.success);
-    assert_eq!(
-        resp.local_checkpoint, 5,
-        "local checkpoint should match the seq_no we sent"
-    );
+    assert_eq!(resp.processed_checkpoint, None);
+    assert_eq!(resp.persisted_checkpoint, None);
+    assert!(resp.operation_processed);
+    assert!(resp.operation_persisted);
 
-    // Second replicate with higher seq_no
+    // Filling the missing prefix closes the gap through sequence 5.
+    let mut checkpoint = None;
+    for seq_no in 0..5 {
+        let response = client
+            .replicate_doc(tonic::Request::new(ReplicateDocRequest {
+                index_name: "cp-idx".into(),
+                shard_id: 0,
+                doc_id: format!("cp-prefix-{seq_no}"),
+                payload_json: serde_json::to_vec(&serde_json::json!({"seq": seq_no})).unwrap(),
+                op: "index".into(),
+                seq_no,
+                index_uuid: "cp-idx-uuid".into(),
+                primary_term: Some(1),
+                target_allocation_id: Some(1),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success);
+        assert!(response.operation_processed);
+        assert!(response.operation_persisted);
+        checkpoint = response.processed_checkpoint;
+    }
+    assert_eq!(checkpoint, Some(5));
+
+    // A second gap holds the checkpoint at 5 until 6..9 arrive.
     let payload2 = serde_json::json!({"title": "checkpoint test 2"});
     let resp2 = client
         .replicate_doc(tonic::Request::new(ReplicateDocRequest {
@@ -3156,14 +3512,33 @@ async fn replicate_doc_returns_local_checkpoint() {
         .into_inner();
 
     assert!(resp2.success);
-    assert_eq!(
-        resp2.local_checkpoint, 10,
-        "checkpoint should advance to 10"
-    );
+    assert_eq!(resp2.processed_checkpoint, Some(5));
+    assert!(resp2.operation_processed);
+    assert!(resp2.operation_persisted);
+    for seq_no in 6..10 {
+        let response = client
+            .replicate_doc(tonic::Request::new(ReplicateDocRequest {
+                index_name: "cp-idx".into(),
+                shard_id: 0,
+                doc_id: format!("cp-gap-{seq_no}"),
+                payload_json: serde_json::to_vec(&serde_json::json!({"seq": seq_no})).unwrap(),
+                op: "index".into(),
+                seq_no,
+                index_uuid: "cp-idx-uuid".into(),
+                primary_term: Some(1),
+                target_allocation_id: Some(1),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success);
+        checkpoint = response.processed_checkpoint;
+    }
+    assert_eq!(checkpoint, Some(10));
 }
 
 #[tokio::test]
-async fn replicate_bulk_returns_local_checkpoint() {
+async fn replicate_bulk_returns_sequence_proof() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("integ-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
@@ -3179,7 +3554,7 @@ async fn replicate_bulk_returns_local_checkpoint() {
             doc_id: format!("bulk-cp-{i}"),
             payload_json: serde_json::to_vec(&serde_json::json!({"n": i})).unwrap(),
             op: "index".into(),
-            seq_no: 100 + i as u64,
+            seq_no: i as u64,
             index_uuid: "bulk-cp-idx-uuid".into(),
             primary_term: Some(1),
             target_allocation_id: Some(1),
@@ -3201,9 +3576,106 @@ async fn replicate_bulk_returns_local_checkpoint() {
 
     assert!(resp.success);
     assert_eq!(
-        resp.local_checkpoint, 102,
-        "checkpoint should equal highest seq_no in batch"
+        resp.processed_checkpoint,
+        Some(2),
+        "checkpoint should equal the batch's contiguous final sequence"
     );
+    assert_eq!(resp.persisted_checkpoint, Some(2));
+    assert!(resp.all_operations_processed);
+    assert!(resp.all_operations_persisted);
+}
+
+#[tokio::test]
+async fn async_replica_response_separates_processed_from_persisted() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("async-sequence-proof".into()));
+    let sm = Arc::new(ShardManager::new_with_durability(
+        dir.path(),
+        Duration::from_secs(60),
+        ferrissearch::wal::TranslogDurability::Async {
+            sync_interval_ms: 3_600_000,
+        },
+    ));
+    setup_single_node_cluster_state(&cm, "async-proof-idx");
+    let addr = start_grpc_server(cm, sm).await;
+    let mut client = connect_client(addr).await;
+
+    let response = client
+        .replicate_doc(tonic::Request::new(ReplicateDocRequest {
+            index_name: "async-proof-idx".into(),
+            shard_id: 0,
+            doc_id: "doc".into(),
+            payload_json: serde_json::to_vec(&serde_json::json!({"value": 1})).unwrap(),
+            op: "index".into(),
+            seq_no: 0,
+            index_uuid: "async-proof-idx-uuid".into(),
+            primary_term: Some(1),
+            target_allocation_id: Some(1),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(response.success, "{}", response.error);
+    assert_eq!(response.processed_checkpoint, Some(0));
+    assert_eq!(response.persisted_checkpoint, None);
+    assert!(response.operation_processed);
+    assert!(!response.operation_persisted);
+}
+
+#[tokio::test]
+async fn sequence_state_probe_reports_exact_open_copy_and_activation() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("sequence-probe".into()));
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    setup_single_node_cluster_state(&cm, "probe-idx");
+    let addr = start_grpc_server(cm, sm.clone()).await;
+    let mut client = connect_client(addr).await;
+
+    let write = client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: "probe-idx".into(),
+            shard_id: 0,
+            doc_id: "doc".into(),
+            payload_json: serde_json::to_vec(&serde_json::json!({"value": 1})).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(write.success, "{}", write.error);
+
+    let response = client
+        .get_shard_sequence_state(tonic::Request::new(proto::GetShardSequenceStateRequest {
+            index_name: "probe-idx".into(),
+            index_uuid: "probe-idx-uuid".into(),
+            shard_id: 0,
+            allocation_id: Some(1),
+            expected_primary_term: 1,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.processed_checkpoint, Some(0));
+    assert_eq!(response.persisted_checkpoint, Some(0));
+    assert_eq!(response.max_seq_no, Some(0));
+    assert_eq!(
+        response.sequence_format_version,
+        ferrissearch::engine::SEQUENCE_FORMAT_VERSION
+    );
+    assert!(response.active_primary);
+
+    let error = client
+        .get_shard_sequence_state(tonic::Request::new(proto::GetShardSequenceStateRequest {
+            index_name: "probe-idx".into(),
+            index_uuid: "probe-idx-uuid".into(),
+            shard_id: 0,
+            allocation_id: Some(2),
+            expected_primary_term: 1,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(sm.get_shard("probe-idx", 0).is_some());
 }
 
 #[tokio::test]
@@ -3249,15 +3721,16 @@ async fn primary_write_advances_global_checkpoint() {
     let primary_engine = primary_sm.get_shard("gc-idx", 0).unwrap();
     let global_cp = primary_engine.global_checkpoint();
     assert!(
-        global_cp > 0,
-        "global checkpoint should advance after successful replication, got {global_cp}"
+        global_cp.is_some_and(|checkpoint| checkpoint > 0),
+        "global checkpoint should advance after successful replication, got {global_cp:?}"
     );
 
     // And the ISR tracker should know about the replica
-    let isr =
-        primary_sm
-            .isr_tracker
-            .in_sync_replicas("gc-idx", 0, primary_engine.local_checkpoint());
+    let isr = primary_sm.isr_tracker.in_sync_replicas(
+        "gc-idx",
+        0,
+        primary_engine.local_checkpoint().unwrap_or(0),
+    );
     assert!(!isr.is_empty(), "ISR should contain the replica node");
 }
 
@@ -3396,7 +3869,7 @@ async fn concurrent_primary_receipts_match_primary_and_replica_wal() {
         let entries = shard_manager
             .get_shard(index, 0)
             .unwrap()
-            .peer_recovery_ops(0, usize::MAX, usize::MAX)
+            .retained_recovery_ops(0, usize::MAX, usize::MAX)
             .unwrap()
             .operations;
         assert_eq!(entries.len(), receipts.len());
@@ -3421,7 +3894,7 @@ async fn concurrent_primary_receipts_match_primary_and_replica_wal() {
     }
     assert_eq!(
         primary_sm.get_shard(index, 0).unwrap().global_checkpoint(),
-        40
+        Some(40)
     );
 }
 
@@ -3467,102 +3940,12 @@ async fn replicate_bulk_rejects_invalid_sequence_ranges_before_writing() {
         shards
             .get_shard(index, 0)
             .unwrap()
-            .peer_recovery_ops(0, usize::MAX, usize::MAX)
+            .retained_recovery_ops(0, usize::MAX, usize::MAX)
             .unwrap()
             .operations
             .is_empty()
     );
     assert_eq!(shards.get_shard(index, 0).unwrap().doc_count(), 0);
-}
-
-#[tokio::test]
-async fn recover_replica_returns_translog_entries() {
-    let dir = tempfile::tempdir().unwrap();
-    let cm = Arc::new(ClusterManager::new("recovery-test".into()));
-    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
-    setup_single_node_cluster_state(&cm, "recover-idx");
-
-    let addr = start_grpc_server(cm, sm.clone()).await;
-    let mut client = connect_client(addr).await;
-
-    // Index some documents to build up the translog
-    for i in 0..5 {
-        let payload = serde_json::json!({"data": format!("doc-{}", i)});
-        let resp = client
-            .index_doc(tonic::Request::new(ShardDocRequest {
-                index_name: "recover-idx".into(),
-                shard_id: 0,
-                doc_id: format!("rec-{i}"),
-                payload_json: serde_json::to_vec(&payload).unwrap(),
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(resp.success);
-    }
-
-    // Request recovery from checkpoint 2 — should get entries 3 and 4
-    let resp = client
-        .recover_replica(tonic::Request::new(proto::RecoverReplicaRequest {
-            index_name: "recover-idx".into(),
-            shard_id: 0,
-            local_checkpoint: 2,
-        }))
-        .await
-        .unwrap()
-        .into_inner();
-
-    assert!(resp.success, "recovery should succeed: {}", resp.error);
-    assert_eq!(
-        resp.ops_replayed, 2,
-        "should have 2 entries above checkpoint 2"
-    );
-    assert_eq!(resp.operations.len(), 2, "should return 2 operations");
-
-    // Verify the operations have correct seq_nos
-    assert_eq!(resp.operations[0].seq_no, 3);
-    assert_eq!(resp.operations[1].seq_no, 4);
-    assert_eq!(resp.operations[0].op, "index");
-}
-
-#[tokio::test]
-async fn recover_replica_returns_empty_when_caught_up() {
-    let dir = tempfile::tempdir().unwrap();
-    let cm = Arc::new(ClusterManager::new("recovery-test".into()));
-    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
-    setup_single_node_cluster_state(&cm, "caught-up-idx");
-
-    let addr = start_grpc_server(cm, sm).await;
-    let mut client = connect_client(addr).await;
-
-    // Index 2 docs
-    for i in 0..2 {
-        let payload = serde_json::json!({"data": i});
-        client
-            .index_doc(tonic::Request::new(ShardDocRequest {
-                index_name: "caught-up-idx".into(),
-                shard_id: 0,
-                doc_id: format!("cu-{i}"),
-                payload_json: serde_json::to_vec(&payload).unwrap(),
-            }))
-            .await
-            .unwrap();
-    }
-
-    // Request recovery from checkpoint 100 — should get 0 entries
-    let resp = client
-        .recover_replica(tonic::Request::new(proto::RecoverReplicaRequest {
-            index_name: "caught-up-idx".into(),
-            shard_id: 0,
-            local_checkpoint: 100,
-        }))
-        .await
-        .unwrap()
-        .into_inner();
-
-    assert!(resp.success);
-    assert_eq!(resp.ops_replayed, 0);
-    assert!(resp.operations.is_empty());
 }
 
 // ─── Checkpoint + ISR integration tests ────────────────────────────────────
@@ -3592,8 +3975,10 @@ async fn bulk_replication_advances_global_checkpoint() {
     // Bulk index 5 docs
     let documents_json: Vec<Vec<u8>> = (0..5)
         .map(|i| {
-            let payload =
-                serde_json::json!({"_id": format!("b-{}", i), "msg": format!("bulk-{}", i)});
+            let payload = serde_json::json!({
+                "_doc_id": format!("b-{i}"),
+                "_source": {"msg": format!("bulk-{i}")}
+            });
             serde_json::to_vec(&payload).unwrap()
         })
         .collect();
@@ -3611,12 +3996,16 @@ async fn bulk_replication_advances_global_checkpoint() {
 
     let engine = primary_sm.get_shard("bgc-idx", 0).unwrap();
     assert!(
-        engine.global_checkpoint() > 0,
-        "global checkpoint should advance after bulk replication, got {}",
+        engine
+            .global_checkpoint()
+            .is_some_and(|checkpoint| checkpoint > 0),
+        "global checkpoint should advance after bulk replication, got {:?}",
         engine.global_checkpoint()
     );
     assert!(
-        engine.local_checkpoint() > 0,
+        engine
+            .local_checkpoint()
+            .is_some_and(|checkpoint| checkpoint > 0),
         "local checkpoint should be set after bulk write"
     );
 }
@@ -3678,7 +4067,7 @@ async fn delete_replication_advances_global_checkpoint() {
         .global_checkpoint();
     assert!(
         cp_after_delete > cp_after_index,
-        "global checkpoint should advance after delete replication: {cp_after_delete} > {cp_after_index}"
+        "global checkpoint should advance after delete replication: {cp_after_delete:?} > {cp_after_index:?}"
     );
 }
 
@@ -3720,9 +4109,11 @@ async fn isr_tracker_updated_after_replication() {
 
     // ISR tracker should have the replica checkpoint
     let engine = primary_sm.get_shard("isr-idx", 0).unwrap();
-    let isr = primary_sm
-        .isr_tracker
-        .in_sync_replicas("isr-idx", 0, engine.local_checkpoint());
+    let isr = primary_sm.isr_tracker.in_sync_replicas(
+        "isr-idx",
+        0,
+        engine.local_checkpoint().unwrap_or(0),
+    );
     assert!(
         !isr.is_empty(),
         "ISR should contain the replica after successful replication"
@@ -3731,80 +4122,6 @@ async fn isr_tracker_updated_after_replication() {
     // Replica checkpoints should be tracked
     let cps = primary_sm.isr_tracker.replica_checkpoints("isr-idx", 0);
     assert!(!cps.is_empty(), "replica checkpoints should be recorded");
-}
-
-#[tokio::test]
-async fn recover_replica_ops_have_correct_fields() {
-    let dir = tempfile::tempdir().unwrap();
-    let cm = Arc::new(ClusterManager::new("op-fields".into()));
-    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
-    setup_single_node_cluster_state(&cm, "opf-idx");
-
-    let addr = start_grpc_server(cm, sm).await;
-    let mut client = connect_client(addr).await;
-
-    // Reserve seq_no 0 so legacy recovery can request the index and delete
-    // operations from local checkpoint 0.
-    client
-        .index_doc(tonic::Request::new(ShardDocRequest {
-            index_name: "opf-idx".into(),
-            shard_id: 0,
-            doc_id: "baseline".into(),
-            payload_json: serde_json::to_vec(&serde_json::json!({"title": "baseline"})).unwrap(),
-        }))
-        .await
-        .unwrap();
-
-    // Index a doc, then delete it.
-    let payload = serde_json::json!({"title": "recover-test"});
-    client
-        .index_doc(tonic::Request::new(ShardDocRequest {
-            index_name: "opf-idx".into(),
-            shard_id: 0,
-            doc_id: "opf-1".into(),
-            payload_json: serde_json::to_vec(&payload).unwrap(),
-        }))
-        .await
-        .unwrap();
-
-    client
-        .delete_doc(tonic::Request::new(proto::ShardDeleteRequest {
-            index_name: "opf-idx".into(),
-            shard_id: 0,
-            doc_id: "opf-1".into(),
-        }))
-        .await
-        .unwrap();
-
-    // Recover from seq_no 0 — should get the later index and delete ops.
-    let resp = client
-        .recover_replica(tonic::Request::new(proto::RecoverReplicaRequest {
-            index_name: "opf-idx".into(),
-            shard_id: 0,
-            local_checkpoint: 0,
-        }))
-        .await
-        .unwrap()
-        .into_inner();
-
-    assert!(resp.success);
-    assert_eq!(resp.operations.len(), 2);
-    let index = &resp.operations[0];
-    assert_eq!(index.seq_no, 1);
-    assert_eq!(index.op, "index");
-    assert_eq!(index.doc_id, "opf-1");
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&index.payload_json).unwrap(),
-        payload
-    );
-    let delete = &resp.operations[1];
-    assert_eq!(delete.seq_no, 2);
-    assert_eq!(delete.op, "delete");
-    assert_eq!(delete.doc_id, "opf-1");
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&delete.payload_json).unwrap(),
-        serde_json::json!({})
-    );
 }
 
 // ─── Shard Stats integration tests ─────────────────────────────────────────

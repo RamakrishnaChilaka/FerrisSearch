@@ -7,6 +7,28 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[test]
+fn d1_commit3_version_map_capacity_is_retryable_429() {
+    let unrelated = anyhow::Error::new(tonic::Status::resource_exhausted("worker queue full"));
+    assert_eq!(
+        forwarded_write_error_classification(&unrelated),
+        (StatusCode::INTERNAL_SERVER_ERROR, "forward_exception")
+    );
+
+    let error = anyhow::Error::new(tonic::Status::resource_exhausted(format!(
+        "{}version map capacity exceeded",
+        crate::engine::version_map::VERSION_MAP_CAPACITY_STATUS_PREFIX
+    )));
+
+    assert_eq!(
+        forwarded_write_error_classification(&error),
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            "version_map_capacity_exceeded"
+        )
+    );
+}
+
+#[test]
 fn remote_store_search_stats_response_json_contains_pruning_counters() {
     let stats = RemoteStoreSearchStats {
         published_splits: 5,
@@ -57,33 +79,6 @@ fn parse_opensearch_create_action() {
 }
 
 #[test]
-fn parse_legacy_ferrissearch_format() {
-    let input = r#"{}
-{"_doc_id":"d1","_source":{"name":"Alice"}}
-{}
-{"_doc_id":"d2","_source":{"name":"Bob"}}
-"#;
-    let docs = parse_bulk_ndjson(input);
-    assert_eq!(docs.len(), 2);
-    assert_eq!(docs[0].doc_id, "d1");
-    assert_eq!(docs[0].payload["name"], "Alice");
-    assert_eq!(docs[1].doc_id, "d2");
-    assert_eq!(docs[1].payload["name"], "Bob");
-}
-
-#[test]
-fn parse_id_in_doc_body_fallback() {
-    let input = r#"{"index":{}}
-{"_id":"from-body","title":"test"}
-"#;
-    let docs = parse_bulk_ndjson(input);
-    assert_eq!(docs.len(), 1);
-    assert_eq!(docs[0].doc_id, "from-body");
-    assert!(docs[0].payload.get("_id").is_none());
-    assert_eq!(docs[0].payload["title"], "test");
-}
-
-#[test]
 fn parse_action_id_takes_precedence_over_body_id() {
     let input = r#"{"index":{"_id":"action-id"}}
 {"_id":"body-id","title":"test"}
@@ -122,17 +117,6 @@ fn parse_blank_lines_are_skipped() {
 "#;
     let docs = parse_bulk_ndjson(input);
     assert_eq!(docs.len(), 2);
-}
-
-#[test]
-fn parse_source_wrapper_unwrapped() {
-    let input = r#"{"index":{"_id":"1"}}
-{"_source":{"name":"Alice"},"_doc_id":"ignored"}
-"#;
-    let docs = parse_bulk_ndjson(input);
-    assert_eq!(docs.len(), 1);
-    assert_eq!(docs[0].doc_id, "1");
-    assert_eq!(docs[0].payload["name"], "Alice");
 }
 
 #[test]
@@ -513,8 +497,22 @@ fn finalize_bulk_items_preserves_receipts_across_targets_and_duplicate_ids() {
         })
         .collect();
     let outcomes = HashMap::from([
-        (("a".to_string(), "node-1".to_string(), 0), Ok(10)),
-        (("b".to_string(), "node-1".to_string(), 1), Ok(20)),
+        (
+            ("a".to_string(), "node-1".to_string(), 0),
+            Ok(crate::engine::BulkWriteReceipt {
+                doc_ids: vec!["same".into(), "same".into()],
+                start_seq_no: Some(10),
+                primary_term: 7,
+            }),
+        ),
+        (
+            ("b".to_string(), "node-1".to_string(), 1),
+            Ok(crate::engine::BulkWriteReceipt {
+                doc_ids: vec!["other".into()],
+                start_seq_no: Some(20),
+                primary_term: 8,
+            }),
+        ),
     ]);
     let items = finalize_bulk_items(vec![None, None, None], routed, &outcomes);
     assert_eq!(
@@ -524,6 +522,8 @@ fn finalize_bulk_items_preserves_receipts_across_targets_and_duplicate_ids() {
             .collect::<Vec<_>>(),
         vec![10, 20, 11]
     );
+    assert_eq!(items[0]["index"]["_primary_term"], 7);
+    assert_eq!(items[1]["index"]["_primary_term"], 8);
     assert!(items.iter().all(|item| item["index"]["status"] == 201));
 }
 

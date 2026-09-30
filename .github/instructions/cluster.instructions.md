@@ -37,15 +37,33 @@ ClusterState { cluster_name, version, master_node, nodes, indices, shard_allocat
 
 ### Engine Selection
 - `IndexSettings.engine` is a create-time selector persisted in cluster state, surfaced by `GET /{index}/_settings`, `SHOW TABLES`, and `SHOW CREATE TABLE`
+- Create-index parsing accepts only the top-level `engine` selector.
+  `settings.engine` is rejected and the error names the supported top-level
+  field instead of silently defaulting to `local_shards`.
 - `engine` is immutable after creation — `PUT /{index}/_settings` must reject attempts to change it
 - `local_shards` supports ordinary document CRUD through shard routing, WAL, and replication
 - `remote_store` can be created and queried through manifest-backed split execution; it is shardless and ordinary document CRUD returns `501`
 - `remote_store` data is added through the dedicated publish endpoint, which is currently a manually invoked, single-writer-oriented path rather than near-real-time ingest
 - The shared `AppConfig.storage_uri` selects the process object-store backend; do not treat per-index `object_store_uri` metadata as an independently wired backend without verifying source
 
+### Reserved Mapping Names
+
+Create-index `mappings.properties` rejects document metadata names from
+`common::RESERVED_DOCUMENT_KEYS` with a mapper-parsing error before metadata is
+committed. The internal `AddMappings` transport boundary applies the same
+validation. The non-underscore `body` name is the built-in catch-all text
+field, not reserved document metadata. Dynamic mapping never infers or persists
+it. An explicit mapping accepts only the plain definition `{"type":"text"}`;
+other types or parameters are mapper-parsing errors. Authoritative metadata
+with a reserved mapping name or an incompatible `body` mapping is an
+unsupported index format and must fail open with recreate-index guidance.
+Strict (`dynamic: strict`) indices accept an unmapped `body` because the field
+is built in. SQL treats an unmapped `body` as `text`: `DESCRIBE` lists it, and
+the direct fast-field path derives its schema without a persisted mapping.
+
 ### Index UUID
 - Every `IndexMetadata` has a non-empty `uuid: IndexUuid` value; production
-  creation generates UUID v4 values, while transport and legacy fixtures may
+  creation generates UUID v4 values, while transport and test fixtures may
   preserve any non-empty identifier
 - Missing or empty UUIDs fail deserialization; startup must not synthesize
   identity for an existing index
@@ -99,12 +117,12 @@ fn allocate_unassigned_replicas_for_shards(&mut self, data_nodes: &[String], eli
   the in-sync set. The node recovery driver installs and admits them; until
   then they remain `INITIALIZING`, receive no live writes, and are not
   promotable.
-- Missing `in_sync_replicas` in pre-1.0 serde metadata defaults to empty. This
-  deliberately fails closed; legacy replicas do not inherit eligibility.
-- `primary_term` is per shard, starts at 1 for new indices, and defaults to 0
-  only when reading legacy pre-term metadata. `UpdateIndex` cannot set it:
-  unchanged primaries preserve the current term and accepted primary changes
-  increment it in the Raft state machine.
+- Persisted routing and allocation metadata must contain the complete current
+  shape. Missing `in_sync_replicas`, primary term, allocation identity, or
+  activation fields is an unsupported format; do not serde-default it.
+- `primary_term` is per shard and starts at 1 for new indices. `UpdateIndex`
+  cannot set it: unchanged primaries preserve the current term and accepted
+  primary changes increment it in the Raft state machine.
 - `UpdateIndex` can only remove in-sync members by intersecting the current set
   with the submitted replica assignments. It cannot add members. A primary
   change is accepted only when the candidate is in the current in-sync set.

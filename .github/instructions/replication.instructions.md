@@ -16,8 +16,8 @@ pub async fn replicate_write(
     payload: &Value,
     op: &str,          // "index" or "delete"
     seq_no: u64,       // from primary's WAL
-) -> Result<Vec<(String, u64)>, Vec<String>>
-// Ok: [(replica_node_id, replica_checkpoint), ...]
+    primary_term: u64,
+) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>>
 // Err: list of error messages
 
 pub async fn replicate_bulk(
@@ -27,7 +27,8 @@ pub async fn replicate_bulk(
     shard_id: u32,
     docs: &[(String, Value)],
     start_seq_no: u64,
-) -> Result<Vec<(String, u64)>, Vec<String>>
+    primary_term: u64,
+) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>>
 ```
 
 ## Replication Flow (Primary → Replicas)
@@ -45,9 +46,12 @@ pub async fn replicate_bulk(
 7. A higher accepted term is atomically persisted in the local copy identity
    before the WAL/engine operation. Bulk validates the common envelope first
    and advances the fence once.
-8. Each replica applies the write using the primary-provided seq_no, persists that exact seq_no in its WAL, updates its local checkpoint, and returns the checkpoint
-9. Primary updates ISR tracker with returned checkpoints
-10. Primary computes global checkpoint (min of all replica checkpoints)
+8. Each replica applies through the sequence-aware planner and returns optional
+   processed/persisted checkpoints plus proof that the exact operation was processed
+9. Primary stores monotonic processed observations per exact allocation and
+   creates a fixed-target gap observation when the contiguous prefix lags
+10. Primary advances the global checkpoint only from the minimum persisted
+   checkpoint across every authoritative copy
 11. Write acknowledged to client **only after every in-sync replica confirms**
 
 ## File-Based Peer Recovery
@@ -55,31 +59,37 @@ pub async fn replicate_bulk(
   `in_sync_replicas`; metadata-leader role does not disable the driver.
 - `StartPeerRecovery` carries the target-observed allocation ID. The source
   rejects snapshot setup until its own current assignment has the exact same ID.
-- The primary commits under the translog lock, captures boundary `B`, registers
-  a WAL retention pin before releasing that lock, and hard-links the existing
-  committed Tantivy files into a per-session directory.
+- The primary commits under the translog lock, captures the exact committed
+  boundary plus physical WAL end, requires a gap-free processed prefix, pins
+  from `processed_checkpoint + 1`, and hard-links the committed Tantivy files.
 - The target wipes only its out-of-sync copy, persists
   `PEER_RECOVERY_IN_PROGRESS`, validates bounded chunks and SHA-256 hashes,
-  initializes an empty WAL at `B`, and opens with schema-wipe fallback disabled.
+  initializes an empty WAL allocator at source `max_seq_no + 1`, installs the
+  exact committed boundary, and opens with schema-wipe fallback disabled.
 - After sending completion, the target persists
   `PEER_RECOVERY_AWAITING_MEMBERSHIP`, keeps the caught-up engine open, and
   accepts live replica apply while local membership is unresolved. Reconcile
   clears this state on admission/promotion and only writes the destructive
   in-progress marker after definitive rejection.
-- Catch-up applies explicit primary sequence numbers. A final exclusive shard
-  write barrier establishes `H`; the target applies through `H`, then the
+- Catch-up paginates by `(generation_id, byte_offset)` in physical file order.
+  It stops before the first source-unprocessed WAL frame rather than advancing
+  past it; finalization rebuilds the source writer and resumes from that exact
+  cursor. If finalization requests another catch-up and that fetch stalls empty
+  at the same cursor, the target re-enters finalization instead of destroying
+  the installed snapshot.
+  A final exclusive shard write barrier captures a physical end and processed
+  checkpoint; the target must match both, then the
   primary submits `MarkReplicaInSync(allocation_id, primary, term)` and observes local
   membership before releasing writes.
 - Admission uncertainty remains write-blocking until membership is observed or
   `ActivatePrimary` commits a term bump that makes the stale admission
-  impossible. `RecoverReplica` remains a legacy isolated transport API.
+  impossible.
 
 ## gRPC RPCs Used
 | RPC | Purpose |
 |-----|---------|
 | `ReplicateDoc` | Single document replication to replica |
 | `ReplicateBulk` | Batch document replication to replica |
-| `RecoverReplica` | Fetch missed operations from primary's WAL |
 | `StartPeerRecovery` / `FetchRecoveryFileChunk` | Create and transfer the pinned file snapshot |
 | `FetchRecoveryOps` | Fetch bounded ordered WAL suffix batches |
 | `PrepareFinalizeRecovery` / `CompleteFinalizeRecovery` | Establish the final barrier and conditionally admit the target |
@@ -87,6 +97,11 @@ pub async fn replicate_bulk(
 ## Key Design Decisions
 - **Synchronous replication**: primary waits for every authoritative in-sync replica before ACK
 - **Concurrent fan-out**: replicas are contacted in parallel via `tokio::spawn` + `join_all` — write latency = max(replica RTTs), not sum
+- Bulk replication resolves the captured routing term and authoritative targets
+  before cloning document IDs or serializing payloads. A zero-target bulk
+  returns immediately. Non-empty fan-out serializes each payload once and
+  shares the immutable operation slice across replica tasks; each gRPC request
+  performs only its required owned protobuf copy.
 - Assigned replicas are in `ShardRoutingEntry.replicas`; required
   acknowledgement targets are in `ShardRoutingEntry.in_sync_replicas`
 - Primary write handlers hold the shard's shared write-barrier guard from
@@ -105,6 +120,11 @@ pub async fn replicate_bulk(
 - Each replicated operation must fit the same 32 MiB encoded WAL-frame limit as
   a primary operation. Oversized explicit-sequence single or bulk writes fail
   validation before replica WAL mutation.
+- Replica transport decodes each index payload exactly once and reuses the
+  validated JSON value when constructing the sequenced operation. Bulk decodes
+  and source-validates every index payload before shard open, then completes
+  envelope and operation validation before fence advancement or engine
+  mutation.
 - Pending-target reconciliation admits only the same allocation when in sync or
   after promotion. Admission is checked first; otherwise missing/different
   allocation identity, a different primary, or a strictly newer observed term
@@ -128,7 +148,18 @@ pub async fn replicate_bulk(
   changing authority; the first later successful local write conditionally
   clears that status at the same term. Definitive and open-level failures may
   quarantine and require fresh activation after repair.
-- Failed replication returns `Err(Vec<String>)` with per-replica error messages
+- Failed replication returns typed per-replica failures retaining node,
+  allocation, message, and definitive status. A primary receiving a definitive
+  `DATA_LOSS` failure conditionally removes that exact allocation at the
+  captured term before returning the write failure. The replica persists an
+  allocation-bound collision marker before closing; lifecycle failure reports
+  retry until the exact allocation is removed.
+- Request durability requires every replica response to prove the exact
+  operation persisted; async durability requires processed proof and advances
+  persisted checkpoints only after fsync or commit.
+- Replica background auto-flush uses its own contiguous persisted prefix when
+  no primary global checkpoint exists. It may prune through that committed
+  prefix but never through a gap; promotion clears the replica-only bound.
 - `ShardManager.isr_tracker` stores checkpoint observations only. It can rank
   authoritative candidates only when the reporting leader hosts the primary;
   otherwise candidate selection falls back to a live in-sync cluster member.
@@ -138,15 +169,31 @@ pub async fn replicate_bulk(
 - Never derive an operation's sequence from `last_seq_no()` or a checkpoint after
   releasing the primary write lock. Concurrent writes can advance both before
   replication begins.
-- Current local/global checkpoints are monotonic high-water marks. They are not
-  a gap-free applied-prefix protocol and do not add idempotent retry handling
-  or a complete new failover ordering model beyond the implemented
-  allocation/replica-term fences.
+- Processed and persisted checkpoints are gap-aware contiguous prefixes.
+  Internal redelivery is term/sequence aware, promotion fills local gaps with
+  NoOps, and sustained gaps are probed before exact-allocation removal. This is
+  still not general D10 rollback/resync or client retry-token support.
+- Promotion NoOps are replicated in bounded homogeneous bulk batches, preserving
+  each explicit non-contiguous sequence number. A batch transport failure
+  remains best-effort, creates the same replica gap observation as the former
+  single-operation path, and retains that failed batch in process memory for
+  redelivery on the next activation attempt at the same
+  UUID/allocation/term. Restart or an activation failure after local NoOp
+  application can lose the pending batch; the WAL does not reconstruct the
+  replica fan-out intent. The fixed gap deadline and peer recovery are the
+  fallback.
+- A primary engine failure after WAL append but before replication leaves an
+  operation that no replica received. After local rebuild/replay advances the
+  primary prefix, later replica responses expose the permanent gap; each
+  affected replica is normally removed after the approximately 60-second gap
+  deadline and peer-recovered. Promotion NoOps do not repair this live-primary
+  divergence; targeted gap repair is deferred to D10.
 
-## Proposed Recovery Work
+## Recovery Protocol Work
 
 For recovery-protocol changes, read
 [`docs/recovery-protocol.md`](../../docs/recovery-protocol.md) and its
-[`acceptance matrix`](../../docs/recovery-acceptance-matrix.md). They are proposed
-contracts, not implemented behavior. Keep changes scoped to one dependency-aware
-package and do not describe partial fencing/checkpoint/recovery work as parity.
+[`acceptance matrix`](../../docs/recovery-acceptance-matrix.md). D1 foundations
+in those documents are implemented; later RP/D10 sections remain proposed.
+Keep changes scoped to one dependency-aware package and do not describe the
+implemented subset as production parity.
