@@ -77,17 +77,46 @@ expect_tla_rejected() {
     printf '%s\n' "$output"
 }
 
+arrival_order_step() {
+    python3 - "$1" "$2" <<'PY'
+import json
+import sys
+
+trace_path, expected_outcome = sys.argv[1:]
+events = [json.loads(line) for line in open(trace_path, encoding="utf-8")]
+pair = {
+    event["seq_no"]: event
+    for event in events
+    if event.get("event") == "operation_processed"
+    and event.get("node") == "q"
+    and event.get("origin") == "live_replication"
+    and event.get("seq_no") in {0, 1}
+}
+if set(pair) != {0, 1}:
+    raise SystemExit("arrival-order trace does not contain q's seq 0/1 pair")
+if pair[1]["step"] >= pair[0]["step"]:
+    raise SystemExit("arrival-order trace did not process q seq 1 before seq 0")
+if pair[0]["outcome"] != expected_outcome:
+    raise SystemExit(
+        f"q seq 0 outcome is {pair[0]['outcome']!r}, expected {expected_outcome!r}"
+    )
+print(pair[0]["step"])
+PY
+}
+
 correct="$RUN_DIR/correct.jsonl"
 arrival="$RUN_DIR/arrival-order.jsonl"
 seq_only="$RUN_DIR/seq-only-redelivery.jsonl"
 
 capture none "$correct"
+arrival_order_step "$correct" stale >/dev/null
 python3 "$CHECKER" "$correct"
 TLA_TRACE_EXPECTED=accepted "$VALIDATOR" "$correct"
 
 capture arrival-order "$arrival"
-expect_checker_rejected "$arrival" 27
-expect_tla_rejected "$arrival" 27
+arrival_step=$(arrival_order_step "$arrival" applied_newer)
+expect_checker_rejected "$arrival" "$arrival_step"
+expect_tla_rejected "$arrival" "$arrival_step"
 
 capture seq-only-redelivery "$seq_only"
 expect_checker_rejected "$seq_only" 117
