@@ -1278,6 +1278,7 @@ def load_trace(path: Path) -> LoadedTrace:
     copy_max_seq_no: dict[str, int | None] = {
         item["node"]: None for item in start["nodes"]
     }
+    recovery_term_state: dict[str, dict[str, Any]] = {}
 
     def register_identity(
         ident: tuple[int, int],
@@ -2052,6 +2053,30 @@ def load_trace(path: Path) -> LoadedTrace:
         elif kind == "in_sync_removed":
             available.discard(event["removed_node"])
             latest_views[event["emitter"]]["in_sync"] = set(event["in_sync"])
+
+        elif kind == "recovery_snapshot":
+            recovery_term_state[event["session_id"]] = copy_term_state(
+                term_state[event["source_node"]]
+            )
+
+        elif kind == "recovery_installed":
+            snapshot_term_state = recovery_term_state.get(event["session_id"])
+            if snapshot_term_state is None:
+                fail(line, "recovery install has no captured source term state")
+            target = event["target_node"]
+            term_state[target] = copy_term_state(snapshot_term_state)
+            persisted_term_state[target] = copy_term_state(snapshot_term_state)
+            durable_fence[target] = {
+                "term": snapshot_term_state["current_term"],
+                "max_seq_no": snapshot_term_state[
+                    "max_seq_no_at_term_start"
+                ],
+            }
+            copy_max_seq_no[target] = (
+                event["snapshot_next_seq_no"] - 1
+                if event["snapshot_next_seq_no"] > 0
+                else None
+            )
 
         elif kind == "recovery_membership":
             if event["outcome"] == "admitted":

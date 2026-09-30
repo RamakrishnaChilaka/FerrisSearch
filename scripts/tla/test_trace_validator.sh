@@ -235,6 +235,14 @@ run_invalid \
     invalid-r6-commit-term-state-invalid-shape.jsonl \
     199 \
     commit_captured
+run_valid \
+    recovery-installs-term-state \
+    valid-recovery-installs-term-state.jsonl
+run_invalid \
+    recovery-loses-term-state-range \
+    invalid-recovery-loses-term-state-range.jsonl \
+    261 \
+    commit_captured
 run_inconclusive \
     timeout \
     "trace validation exceeded 1s" \
