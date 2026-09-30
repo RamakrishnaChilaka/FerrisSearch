@@ -541,6 +541,7 @@ impl IsrTracker {
     }
 
     /// Update reports and consume their monotonic view under the same lock.
+    /// Keep engine sequence-state reads and blocking I/O outside the consumer.
     pub(crate) fn with_updated_replica_checkpoints_at<R>(
         &self,
         index: &str,

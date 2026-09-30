@@ -5907,6 +5907,11 @@ impl TransportService {
             })
             .cloned()
             .collect::<Vec<_>>();
+        // Request durability persists before fan-out, so a post-replication sample
+        // covers the primary prefix completed by a last-gap or highest-sequence round.
+        // Serialized tracker maxima then converge without holding the node-wide
+        // tracker lock while waiting for the engine's apply-state mutex.
+        let primary_persisted_checkpoint = engine.sequence_stats().persisted_checkpoint;
         self.shard_manager
             .isr_tracker
             .with_updated_replica_checkpoints_at(
@@ -5951,7 +5956,7 @@ impl TransportService {
                     };
                     Self::advance_global_checkpoint(
                         engine,
-                        engine.sequence_stats().persisted_checkpoint,
+                        primary_persisted_checkpoint,
                         &authoritative,
                     );
                 },

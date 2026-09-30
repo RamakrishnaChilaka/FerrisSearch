@@ -51,9 +51,9 @@ pub async fn replicate_bulk(
 9. Primary stores monotonic observations per index UUID, allocation ID, and
    primary term and creates a fixed-target gap observation when the contiguous
    processed prefix lags
-10. Primary updates observations and computes the global checkpoint under one
-    tracker lock. It uses its current persisted checkpoint and the highest
-    reported persisted checkpoint of every current authoritative in-sync replica
+10. Primary samples its persisted checkpoint after replication, before taking
+    the tracker lock. It then updates observations and computes the minimum
+    with every current authoritative in-sync replica under one tracker lock
 11. Write acknowledged to client **only after every in-sync replica confirms**
 
 ## File-Based Peer Recovery
@@ -127,11 +127,16 @@ pub async fn replicate_bulk(
   UUID, allocation, and term before accepting reports. Count only current
   `in_sync_replicas` with matching allocation IDs. A missing current-identity
   report holds progress back; a removed copy no longer holds it back.
-- Compute from the primary's current persisted prefix after updating replica
-  observations under the tracker lock. Do not use the pre-replication primary
-  snapshot or only the current round's replica values. Reset an observation
-  when its UUID, allocation, or primary term changes. Never move the global
-  checkpoint backward.
+- Sample the primary's persisted prefix after replication and before taking
+  the node-wide tracker lock. Engine sequence-state reads can wait behind
+  bulk fsync and apply; never perform them under that lock. Update replica
+  observations and compute from their monotonic maxima in one critical section.
+  Request durability persists each operation on the primary before fan-out,
+  so the last gap-closing round can reach the persisted minimum without sampling
+  inside the lock. The highest-sequence round covers the no-replica case.
+  Do not use the pre-replication primary snapshot or only the current round's
+  replica values. Reset an observation when its UUID, allocation, or primary
+  term changes. Never move the global checkpoint backward.
 - Dynamic-mapping reopen and async index close abort safe pre-finalize source
   sessions and await pin/snapshot/engine-Arc cleanup before replacing or
   deleting the primary engine. Encountering an admitting/settling source

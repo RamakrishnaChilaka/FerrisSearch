@@ -203,7 +203,8 @@ pub struct ReplicaCheckpoint {
 - `update_replica_checkpoint(...)` / `update_replica_checkpoints(...)` take
   exact-allocation typed checkpoint responses plus the captured primary prefix
 - `with_updated_replica_checkpoints_at(...)` updates observations and computes
-  from their monotonic view under the same lock
+  from their monotonic view under the same node-wide lock. Its consumer must
+  not read engine sequence state or perform blocking I/O.
 - `in_sync_replicas(index, shard_id, primary_checkpoint) -> Vec<String>`
   - Returns a lag-based diagnostic view only; it does not grant
     authoritative in-sync membership
