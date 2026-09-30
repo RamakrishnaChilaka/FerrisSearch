@@ -1379,7 +1379,7 @@ fn resolve_document_primary(
         return Err(resp);
     }
 
-    let shard_id = crate::engine::routing::calculate_shard(&doc_id, metadata.number_of_shards);
+    let shard_id = crate::engine::routing::calculate_shard(doc_id, metadata.number_of_shards);
     let target_node_id = match metadata.primary_node(shard_id) {
         Some(id) => id.clone(),
         None => {

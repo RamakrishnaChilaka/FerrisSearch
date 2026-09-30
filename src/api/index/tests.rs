@@ -253,6 +253,23 @@ fn route_bulk_doc_reports_missing_primary() {
 }
 
 #[tokio::test]
+async fn empty_bulk_does_not_create_an_index() {
+    let (_temporary, state) = make_test_app_state(ClusterState::new("empty-bulk".into())).await;
+    let (status, Json(body)) = bulk_index(
+        State(state.clone()),
+        Path(crate::common::IndexName::new("empty").unwrap()),
+        None,
+        Query(RefreshParam { refresh: None }),
+        axum::body::Bytes::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["items"], serde_json::json!([]));
+    assert_eq!(body["errors"], false);
+    assert!(state.cluster_manager.get_state().indices.is_empty());
+}
+
+#[tokio::test]
 async fn bulk_index_reports_missing_primary_node_as_item_error() {
     let mut cluster_state = ClusterState::new("test-cluster".into());
     cluster_state.add_node(make_test_node("node-1"));
@@ -399,6 +416,43 @@ async fn bulk_index_global_enforces_principal_index_permissions() {
         body["items"][0]["index"]["error"]["type"],
         "security_exception"
     );
+}
+
+#[tokio::test]
+async fn index_scoped_bulk_authorizes_the_action_index_override() {
+    let (_temporary, mut state) =
+        make_test_app_state(ClusterState::new("bulk-override".into())).await;
+    state.security_manager = Arc::new(
+        crate::security::SecurityManager::new(crate::security::SecurityConfig {
+            enabled: true,
+            auto_create_security_index: false,
+            bootstrap_api_keys: vec![],
+        })
+        .unwrap(),
+    );
+    let principal = crate::security::Principal {
+        name: "writer".into(),
+        key_id: "writer-key".into(),
+        roles: vec!["write".into()],
+        indices: vec!["logs-*".into()],
+    };
+    let (status, Json(body)) = bulk_index(
+        State(state.clone()),
+        Path(crate::common::IndexName::new("logs-2026").unwrap()),
+        Some(axum::extract::Extension(principal)),
+        Query(RefreshParam { refresh: None }),
+        axum::body::Bytes::from(
+            "{\"index\":{\"_index\":\"metrics\",\"_id\":\"1\"}}\n{\"value\":1}\n",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["items"][0]["index"]["status"], 403);
+    assert_eq!(
+        body["items"][0]["index"]["error"]["type"],
+        "security_exception"
+    );
+    assert!(state.cluster_manager.get_state().indices.is_empty());
 }
 
 #[test]

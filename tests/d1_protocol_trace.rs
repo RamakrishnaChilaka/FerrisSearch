@@ -1676,6 +1676,161 @@ async fn run_randomized_seed(seed: u64, mutation: MutationMode, output: PathBuf)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn conditional_and_mixed_bulk_write_protocol_trace() -> Result<()> {
+    let trace_dir = tempfile::tempdir()?;
+    let output = std::env::var_os("D1_WRITES_TRACE_OUTPUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| trace_dir.path().join("conditional-bulk.jsonl"));
+    let mut cluster = RandomTraceCluster::start().await?;
+    let trace = protocol_trace::start(TraceConfig {
+        output: output.clone(),
+        run_id: "d1-conditional-bulk".to_string(),
+        test: "conditional_and_mixed_bulk_write_protocol_trace".to_string(),
+        durability: "request",
+        nodes: ["p", "q", "r"]
+            .into_iter()
+            .map(|node| TraceNode {
+                node: node.to_string(),
+                incarnation: 0,
+            })
+            .collect(),
+        shard_state: TraceStartShard {
+            index_uuid: INDEX_UUID.to_string(),
+            shard: SHARD,
+            primary: "p".to_string(),
+            term: 1,
+            activated: true,
+            in_sync: vec!["q".to_string(), "r".to_string()],
+            copies: ["p", "q", "r"]
+                .into_iter()
+                .map(|node| TraceStartCopy {
+                    node: node.to_string(),
+                    allocation: 1,
+                    exists: true,
+                    fence_term: 1,
+                })
+                .collect(),
+        },
+        mutation: MutationMode::None,
+        faults: Vec::new(),
+    })?;
+    let execution = async {
+        cluster.record_initial_routing_views()?;
+        let mut client = connect(cluster.address("p")?).await?;
+        let created = client
+            .index_doc(tonic::Request::new(ShardDocRequest {
+                index_name: INDEX.to_string(),
+                shard_id: SHARD,
+                doc_id: "a".to_string(),
+                payload_json: serde_json::to_vec(&serde_json::json!({"value": 1}))?,
+                create_only: true,
+                ..Default::default()
+            }))
+            .await?
+            .into_inner();
+        anyhow::ensure!(
+            created.success && created.created && created.seq_no == Some(0),
+            "{created:?}"
+        );
+        let conditional = ShardDocRequest {
+            index_name: INDEX.to_string(),
+            shard_id: SHARD,
+            doc_id: "a".to_string(),
+            payload_json: serde_json::to_vec(&serde_json::json!({"value": 2}))?,
+            if_seq_no: Some(0),
+            if_primary_term: Some(1),
+            create_only: false,
+        };
+        let updated = client
+            .index_doc(tonic::Request::new(conditional.clone()))
+            .await?
+            .into_inner();
+        anyhow::ensure!(
+            updated.success && !updated.created && updated.seq_no == Some(1),
+            "{updated:?}"
+        );
+        let conflict = client
+            .index_doc(tonic::Request::new(conditional))
+            .await
+            .unwrap_err();
+        anyhow::ensure!(conflict.code() == tonic::Code::AlreadyExists, "{conflict}");
+        let document = client
+            .get_doc(tonic::Request::new(ShardGetRequest {
+                index_name: INDEX.to_string(),
+                shard_id: SHARD,
+                doc_id: "a".to_string(),
+                realtime: Some(true),
+            }))
+            .await?
+            .into_inner();
+        anyhow::ensure!(
+            document.found && document.seq_no == Some(1) && document.primary_term == Some(1)
+        );
+        anyhow::ensure!(
+            serde_json::from_slice::<serde_json::Value>(&document.source_json)?["value"] == 2
+        );
+        let bulk = client
+            .bulk_index(tonic::Request::new(ShardBulkRequest {
+                index_name: INDEX.to_string(),
+                shard_id: SHARD,
+                documents_json: vec![
+                    serde_json::to_vec(&serde_json::json!({"_doc_id": "a"}))?,
+                    serde_json::to_vec(
+                        &serde_json::json!({"_doc_id": "a", "_source": {"value": 3}}),
+                    )?,
+                    serde_json::to_vec(
+                        &serde_json::json!({"_doc_id": "a", "_source": {"value": 4}}),
+                    )?,
+                    serde_json::to_vec(&serde_json::json!({"_doc_id": "b"}))?,
+                ],
+                operations: [
+                    ferrissearch::transport::proto::ShardBulkOpKind::Delete,
+                    ferrissearch::transport::proto::ShardBulkOpKind::Create,
+                    ferrissearch::transport::proto::ShardBulkOpKind::Create,
+                    ferrissearch::transport::proto::ShardBulkOpKind::Delete,
+                ]
+                .into_iter()
+                .map(|kind| ferrissearch::transport::proto::ShardBulkOperation {
+                    kind: kind as i32,
+                    ..Default::default()
+                })
+                .collect(),
+            }))
+            .await?
+            .into_inner();
+        anyhow::ensure!(bulk.success && bulk.results.len() == 4, "{bulk:?}");
+        anyhow::ensure!(bulk.results[0].seq_no == Some(2) && bulk.results[0].result == "deleted");
+        anyhow::ensure!(bulk.results[1].seq_no == Some(3) && bulk.results[1].result == "created");
+        anyhow::ensure!(bulk.results[2].status == 409 && bulk.results[2].seq_no.is_none());
+        anyhow::ensure!(
+            bulk.results[3].status == 404
+                && bulk.results[3].seq_no == Some(4)
+                && bulk.results[3].error.is_empty()
+        );
+        let snapshots = cluster
+            .nodes
+            .values()
+            .map(|node| {
+                capture_final_copy_state(&node.shard_manager)?
+                    .context("conditional/bulk trace copy is unavailable")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for snapshot in snapshots {
+            protocol_trace::record_copy_snapshot(snapshot, "trace_end")?;
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    let result = trace.finish(execution.is_ok());
+    cluster.stop_all().await;
+    let output = result?;
+    execution?;
+    assert_trace_completeness(&output)?;
+    println!("D1 conditional/bulk write trace: {}", output.display());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn seeded_three_node_fault_trace() -> Result<()> {
     let seed = parse_seed()?;
     let mutation = mutation_mode()?;

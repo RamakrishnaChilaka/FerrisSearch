@@ -692,6 +692,15 @@ mod tests {
     }
 
     #[test]
+    fn create_document_routes_require_index_write_not_admin() {
+        for method in [Method::PUT, Method::POST] {
+            let request = classify_request(&method, "/logs-2026/_create/doc");
+            assert_eq!(request.action, SecurityAction::IndexWrite);
+            assert_eq!(request.index.as_deref(), Some("logs-2026"));
+        }
+    }
+
+    #[test]
     fn protected_system_index_requires_security_admin() {
         let request = classify_request(&Method::GET, "/.ferris_security/_search");
         assert_eq!(request.action, SecurityAction::SecurityAdmin);

@@ -428,6 +428,24 @@ PrimaryReject(writeId) ==
             sharedHolders, exclusiveHolder, acked, promotionSafe,
             admissionSafe, ackMembershipSafe, termMonotonic>>
 
+\* External OCC/create input rejection, before sequence assignment or WAL.
+\* Unconditional model workloads do not enable this input action in Next.
+PrimaryVersionConflict(writeId) ==
+    /\ writeId \in WriteIds
+    /\ CanPrimaryReachMutation(writeId)
+    /\ writePrimary[writeId] = NoNode
+    /\ \A node \in Nodes : writeId \notin ops[node]
+    /\ writeStatus' = [writeStatus EXCEPT ![writeId] = "Failed"]
+    /\ failed' = failed \cup {writeId}
+    /\ UNCHANGED
+          <<RaftVars, routing, alive, epoch, raftConnected, activated,
+            activationPending, nextWrite, writeDoc, writeKind, writeTarget,
+            writePrimary, writeEpoch, writeSeq, writeTerm, writeRequired,
+            writeWait, ops, durableOps, docValue, nextSeq, committed,
+            truncBelow, pins, copyExists, copyMode, installMarker, messages,
+            sharedHolders, exclusiveHolder, acked, promotionSafe,
+            admissionSafe, ackMembershipSafe, termMonotonic>>
+
 \* TransportService::{index_doc,bulk_index,delete_doc} after authority
 \* validation, plus ShardManager::record_local_apply_result, when the local
 \* primary's WAL/fsync/engine mutation returns persistent local-storage I/O.

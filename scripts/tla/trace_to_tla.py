@@ -1630,6 +1630,13 @@ def load_trace(path: Path) -> LoadedTrace:
 
         elif kind == "client_result":
             assert request is not None
+            if event["failure_stage"] == "version_conflict" and any(
+                item["event"] == "wal_appended"
+                and item.get("origin") == "primary"
+                and item.get("request_id") == request
+                for item in events
+            ):
+                fail(line, "version conflict has a primary WAL append")
             if event["outcome"] == "acknowledged":
                 if request not in required_by_request:
                     fail(line, "client ack has no replication start")
@@ -2489,6 +2496,13 @@ def render(trace: LoadedTrace) -> tuple[str, str]:
                 abstract_allocation(event_node, event.get("allocation"))
             ),
             "required": tla_set(required),
+            "preWalVersionConflict": (
+                "TRUE"
+                if event["event"] == "client_result"
+                and event["outcome"] == "failed"
+                and event["failure_stage"] == "version_conflict"
+                else "FALSE"
+            ),
             "requiredMessages": tla_set(required_messages),
             "hasTransportMessage": (
                 "TRUE" if has_transport_message else "FALSE"

@@ -116,6 +116,37 @@ class TraceConverterTests(unittest.TestCase):
         self.assertIn("Trace == <<", module)
         self.assertIn("SPECIFICATION TraceSpec", config)
 
+    def test_pre_wal_version_conflict_is_an_explicit_input(self) -> None:
+        rejected = {
+            "schema": trace_to_tla.SCHEMA,
+            "run_id": "unit",
+            "step": 2,
+            "event": "client_result",
+            "node": "p",
+            "index_uuid": "idx",
+            "shard": 0,
+            "request_id": "w0",
+            "outcome": "failed",
+            "failure_stage": "version_conflict",
+        }
+        path = self.write_trace([
+            start_record(), route_record(), rejected, absent_copy_state(3),
+            end_record(4, 4),
+        ])
+        module, _ = trace_to_tla.render(trace_to_tla.load_trace(path))
+        self.assertIn("preWalVersionConflict |-> TRUE", module)
+
+    def test_version_conflict_after_primary_wal_is_rejected(self) -> None:
+        fixture = ROOT / "specs" / "tla" / "trace" / "v4" / "valid-concurrent-order.jsonl"
+        records = [json.loads(line) for line in fixture.read_text().splitlines()]
+        result = next(record for record in records if record["event"] == "client_result")
+        result["outcome"] = "failed"
+        result["failure_stage"] = "version_conflict"
+        with self.assertRaisesRegex(
+            trace_to_tla.TraceSchemaError, "version conflict has a primary WAL append"
+        ):
+            trace_to_tla.load_trace(self.write_trace(records))
+
     def test_v3_is_rejected(self) -> None:
         start = start_record()
         start["schema"] = "ferrissearch.d1.trace/v3"

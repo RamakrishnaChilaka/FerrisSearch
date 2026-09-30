@@ -505,6 +505,12 @@ async fn execute_bulk(
         Ok(documents) => documents,
         Err(error) => return illegal_argument(error),
     };
+    if documents.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"took": 0, "errors": false, "items": []})),
+        );
+    }
     let cluster_state = state.cluster_manager.get_state();
     if let Some(index) = default_index
         && let Some(metadata) = cluster_state.indices.get(index)

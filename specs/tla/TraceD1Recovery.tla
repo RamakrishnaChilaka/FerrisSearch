@@ -229,8 +229,10 @@ ReplicaResultEvent(event) ==
        [] OTHER -> FALSE
 
 ClientResultEvent(event) ==
-    /\ event.outcome = "acknowledged"
-    /\ D1PrimaryAck(event.writeId)
+    /\ CASE event.outcome = "acknowledged" -> D1PrimaryAck(event.writeId)
+       [] event.outcome = "failed" /\ event.preWalVersionConflict ->
+              StableReplication(PrimaryVersionConflict(event.writeId))
+       [] OTHER -> FALSE
 
 SnapshotEvent(event) ==
     /\ event.source \in Nodes

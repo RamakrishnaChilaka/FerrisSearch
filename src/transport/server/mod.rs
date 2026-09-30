@@ -909,7 +909,7 @@ impl InternalTransport for TransportService {
                         &activated_primary.index_uuid,
                         req.shard_id,
                         "failed",
-                        Some("primary_apply"),
+                        Some("version_conflict"),
                     );
                 }
                 Err(Status::already_exists(e.to_string()))
@@ -1587,7 +1587,7 @@ impl InternalTransport for TransportService {
                         &activated_primary.index_uuid,
                         req.shard_id,
                         "failed",
-                        Some("primary_apply"),
+                        Some("version_conflict"),
                     );
                 }
                 Err(Status::already_exists(e.to_string()))
