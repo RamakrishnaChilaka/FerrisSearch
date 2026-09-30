@@ -3959,6 +3959,100 @@ async fn writes_regression_conditional_rest_updates_and_mixed_bulk_keep_replica_
     raft.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn gcp_transport_rejects_checkpoint_observations_from_previous_copy_authority() {
+    for (old_uuid_suffix, old_allocation, old_term) in
+        [("uuid", 1, 1), ("uuid", 2, 2), ("old-uuid", 1, 2)]
+    {
+        let index = "gcp-authority";
+        let replica_dir = tempfile::tempdir().unwrap();
+        let primary_dir = tempfile::tempdir().unwrap();
+        let replica_cm = Arc::new(ClusterManager::new("gcp-authority".into()));
+        let primary_cm = Arc::new(ClusterManager::new("gcp-authority".into()));
+        let replica_sm = Arc::new(ShardManager::new(
+            replica_dir.path(),
+            Duration::from_secs(60),
+        ));
+        let primary_sm = Arc::new(ShardManager::new(
+            primary_dir.path(),
+            Duration::from_secs(60),
+        ));
+        let (replica_addr, replica_server) = start_grpc_server_for_node_with_handle(
+            replica_cm.clone(),
+            replica_sm.clone(),
+            "replica-node",
+        )
+        .await;
+        setup_two_node_cluster_state(&primary_cm, &replica_cm, index, replica_addr.port());
+        for manager in [&primary_cm, &replica_cm] {
+            let mut state = manager.get_state();
+            let metadata = state.indices.get_mut(index).unwrap();
+            metadata.shard_routing.get_mut(&0).unwrap().primary_term = 2;
+            metadata.dynamic = ferrissearch::cluster::state::DynamicMapping::Strict;
+            metadata.mappings.insert(
+                "message".into(),
+                FieldMapping {
+                    field_type: FieldType::Text,
+                    dimension: None,
+                },
+            );
+            manager.update_state(state);
+        }
+        install_recovered_replica_fixture(&replica_cm, &replica_sm, index);
+        primary_sm.isr_tracker.update_replica_checkpoint(
+            index,
+            &format!("{index}-{old_uuid_suffix}"),
+            0,
+            old_term,
+            Some(99),
+            ferrissearch::shard::ReplicaCheckpointUpdate {
+                node_id: "replica-node".into(),
+                allocation_id: old_allocation,
+                processed_checkpoint: Some(99),
+                persisted_checkpoint: Some(99),
+            },
+        );
+        let (primary_addr, primary_server) =
+            start_grpc_server_for_node_with_handle(primary_cm, primary_sm.clone(), "primary-node")
+                .await;
+        let mut client = connect_client(primary_addr).await;
+        let response = client
+            .index_doc(tonic::Request::new(ShardDocRequest {
+                index_name: index.into(),
+                shard_id: 0,
+                doc_id: "new-term".into(),
+                payload_json: serde_json::to_vec(&serde_json::json!({"message": "new term"}))
+                    .unwrap(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success, "{}", response.error);
+        assert_eq!((response.seq_no, response.primary_term), (Some(0), Some(2)));
+        let primary = primary_sm.get_shard(index, 0).unwrap();
+        let replica = replica_sm.get_shard(index, 0).unwrap();
+        assert_eq!(primary.global_checkpoint(), Some(0));
+        assert_eq!(replica.sequence_stats().persisted_checkpoint, Some(0));
+        assert!(primary.global_checkpoint() <= replica.sequence_stats().persisted_checkpoint);
+        assert_eq!(
+            primary
+                .get_document_with_metadata("new-term", true)
+                .unwrap(),
+            replica
+                .get_document_with_metadata("new-term", true)
+                .unwrap(),
+        );
+        assert_eq!(
+            primary_sm.isr_tracker.replica_checkpoints(index, 0),
+            vec![("replica-node".into(), 0)],
+            "old authority must not contaminate the current copy's checkpoint",
+        );
+        primary_server.abort();
+        replica_server.abort();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_primary_receipts_match_primary_and_replica_wal() {
     let replica_dir = tempfile::tempdir().unwrap();

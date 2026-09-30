@@ -651,6 +651,460 @@ fn replica_checkpoint(
     }
 }
 
+fn gcp_test_primary(
+    last_seq_no: u64,
+) -> (
+    tempfile::TempDir,
+    TransportService,
+    Arc<dyn SearchEngine>,
+    ActivatedPrimary,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let cluster_manager = Arc::new(ClusterManager::new("gcp".into()));
+    cluster_manager.update_state(gap_test_state(0));
+    let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    let engine = shard_manager
+        .open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &crate::cluster::state::IndexSettings::default(),
+            "uuid-1",
+            crate::shard::AssignedShardOpen {
+                allocation_id: 1,
+                primary_term: 2,
+                allow_empty_creation: true,
+            },
+        )
+        .unwrap();
+    engine.prepare_primary_activation(2).unwrap();
+    for seq_no in 0..=last_seq_no {
+        let receipt = engine
+            .add_document_with_receipt_at_term(
+                &format!("doc-{seq_no}"),
+                json!({"value": seq_no}),
+                2,
+            )
+            .unwrap();
+        assert_eq!(receipt.seq_no, seq_no);
+    }
+    let service = build_transport_service_for_test(
+        cluster_manager,
+        shard_manager,
+        crate::transport::TransportClient::new(),
+        Arc::new(crate::tasks::TaskManager::new()),
+        "source".into(),
+    );
+    (
+        dir,
+        service,
+        engine,
+        ActivatedPrimary {
+            index_uuid: "uuid-1".into(),
+            allocation_id: 1,
+            primary_term: 2,
+        },
+    )
+}
+
+fn gcp_replica_operations(
+    range: std::ops::RangeInclusive<u64>,
+) -> Vec<crate::engine::SequencedOperation> {
+    range
+        .map(|seq_no| crate::engine::SequencedOperation {
+            seq_no,
+            primary_term: 2,
+            mutation: crate::engine::DocumentMutation::Index {
+                doc_id: format!("doc-{seq_no}"),
+                source: json!({"value": seq_no}),
+            },
+        })
+        .collect()
+}
+
+fn gcp_add_replica(service: &TransportService, node_id: &str, allocation_id: u64) {
+    let mut state = service.cluster_manager.get_state();
+    let routing = state
+        .indices
+        .get_mut("idx")
+        .unwrap()
+        .shard_routing
+        .get_mut(&0)
+        .unwrap();
+    routing.replicas.push(node_id.into());
+    routing.in_sync_replicas.push(node_id.into());
+    state
+        .shard_allocations
+        .get_mut("idx")
+        .unwrap()
+        .get_mut(&0)
+        .unwrap()
+        .replicas
+        .insert(node_id.into(), allocation_id);
+    service.cluster_manager.update_state(state);
+}
+
+fn gcp_assert_persisted_bound(
+    primary: &Arc<dyn SearchEngine>,
+    replicas: &[&Arc<dyn SearchEngine>],
+) {
+    let global = primary.global_checkpoint();
+    assert!(global <= primary.sequence_stats().persisted_checkpoint);
+    for replica in replicas {
+        assert!(
+            global <= replica.sequence_stats().persisted_checkpoint,
+            "global checkpoint {global:?} exceeds an in-sync replica's persisted prefix"
+        );
+    }
+}
+
+#[tokio::test]
+async fn gcp_out_of_order_completion_reaches_current_persisted_minimum() {
+    let (_dir, service, primary, activated) = gcp_test_primary(36);
+    let (_replica_dir, replica) = make_checkpoint_engine();
+    replica
+        .apply_replica_batch(gcp_replica_operations(0..=36))
+        .unwrap();
+    service.record_replica_checkpoints(
+        &primary,
+        "idx",
+        0,
+        &activated,
+        primary.sequence_stats(),
+        &[replica_checkpoint("replica", Some(36), Some(36))],
+    );
+    assert_eq!(primary.global_checkpoint(), Some(36));
+
+    primary
+        .add_document_with_receipt_at_term("doc-37", json!({"value": 37}), 2)
+        .unwrap();
+    let seq_37_snapshot = primary.sequence_stats();
+    for seq_no in 38..=40 {
+        primary
+            .add_document_with_receipt_at_term(
+                &format!("doc-{seq_no}"),
+                json!({"value": seq_no}),
+                2,
+            )
+            .unwrap();
+    }
+    let bulk_snapshot = primary.sequence_stats();
+    replica
+        .apply_replica_batch(gcp_replica_operations(38..=40))
+        .unwrap();
+    assert_eq!(replica.sequence_stats().persisted_checkpoint, Some(36));
+    service.record_replica_checkpoints(
+        &primary,
+        "idx",
+        0,
+        &activated,
+        bulk_snapshot,
+        &[replica_checkpoint("replica", Some(36), Some(36))],
+    );
+    gcp_assert_persisted_bound(&primary, &[&replica]);
+
+    replica
+        .apply_replica_batch(gcp_replica_operations(37..=37))
+        .unwrap();
+    assert_eq!(replica.sequence_stats().persisted_checkpoint, Some(40));
+    service.record_replica_checkpoints(
+        &primary,
+        "idx",
+        0,
+        &activated,
+        seq_37_snapshot,
+        &[replica_checkpoint("replica", Some(40), Some(40))],
+    );
+    gcp_assert_persisted_bound(&primary, &[&replica]);
+    assert_eq!(primary.global_checkpoint(), Some(40));
+}
+
+#[tokio::test]
+async fn gcp_reordered_reports_use_each_copys_monotonic_maximum() {
+    let (_dir, service, primary, activated) = gcp_test_primary(40);
+    let (_first_dir, first) = make_checkpoint_engine();
+    let (_second_dir, second) = make_checkpoint_engine();
+    first
+        .apply_replica_batch(gcp_replica_operations(0..=40))
+        .unwrap();
+    second
+        .apply_replica_batch(gcp_replica_operations(0..=40))
+        .unwrap();
+    gcp_add_replica(&service, "replica-2", 1);
+    for checkpoints in [
+        [
+            replica_checkpoint("replica", Some(40), Some(40)),
+            replica_checkpoint("replica-2", Some(36), Some(36)),
+        ],
+        [
+            replica_checkpoint("replica", Some(36), Some(36)),
+            replica_checkpoint("replica-2", Some(40), Some(40)),
+        ],
+    ] {
+        service.record_replica_checkpoints(
+            &primary,
+            "idx",
+            0,
+            &activated,
+            primary.sequence_stats(),
+            &checkpoints,
+        );
+        gcp_assert_persisted_bound(&primary, &[&first, &second]);
+    }
+    assert_eq!(primary.global_checkpoint(), Some(40));
+}
+
+#[tokio::test]
+async fn gcp_partial_round_cannot_advance_past_an_in_sync_copys_real_persisted_gap() {
+    let (_dir, service, primary, activated) = gcp_test_primary(40);
+    let (_first_dir, first) = make_checkpoint_engine();
+    let (_second_dir, second) = make_checkpoint_engine();
+    first
+        .apply_replica_batch(gcp_replica_operations(0..=36))
+        .unwrap();
+    first
+        .apply_replica_batch(gcp_replica_operations(38..=40))
+        .unwrap();
+    second
+        .apply_replica_batch(gcp_replica_operations(0..=40))
+        .unwrap();
+    gcp_add_replica(&service, "replica-2", 1);
+    service.record_replica_checkpoints(
+        &primary,
+        "idx",
+        0,
+        &activated,
+        primary.sequence_stats(),
+        &[
+            replica_checkpoint("replica", Some(36), Some(36)),
+            replica_checkpoint("replica-2", Some(40), Some(40)),
+        ],
+    );
+    assert_eq!(primary.global_checkpoint(), Some(36));
+    service.record_replica_checkpoints(
+        &primary,
+        "idx",
+        0,
+        &activated,
+        primary.sequence_stats(),
+        &[replica_checkpoint("replica-2", Some(40), Some(40))],
+    );
+    gcp_assert_persisted_bound(&primary, &[&first, &second]);
+    assert_eq!(primary.global_checkpoint(), Some(36));
+    first
+        .apply_replica_batch(gcp_replica_operations(37..=37))
+        .unwrap();
+    service.record_replica_checkpoints(
+        &primary,
+        "idx",
+        0,
+        &activated,
+        primary.sequence_stats(),
+        &[replica_checkpoint("replica", Some(40), Some(40))],
+    );
+    gcp_assert_persisted_bound(&primary, &[&first, &second]);
+    assert_eq!(primary.global_checkpoint(), Some(40));
+}
+
+#[tokio::test]
+async fn gcp_old_term_allocation_and_incarnation_observations_do_not_count() {
+    for (old_uuid, old_allocation, old_term) in
+        [("uuid-1", 1, 1), ("uuid-1", 2, 2), ("old-uuid", 1, 2)]
+    {
+        let (_dir, service, primary, activated) = gcp_test_primary(40);
+        service.shard_manager.isr_tracker.update_replica_checkpoint(
+            "idx",
+            old_uuid,
+            0,
+            old_term,
+            Some(99),
+            crate::shard::ReplicaCheckpointUpdate {
+                allocation_id: old_allocation,
+                ..replica_checkpoint("replica", Some(99), Some(99))
+            },
+        );
+        service.record_replica_checkpoints(
+            &primary,
+            "idx",
+            0,
+            &activated,
+            primary.sequence_stats(),
+            &[replica_checkpoint("replica", None, None)],
+        );
+        assert_eq!(primary.global_checkpoint(), None);
+        service.record_replica_checkpoints(
+            &primary,
+            "idx",
+            0,
+            &activated,
+            primary.sequence_stats(),
+            &[],
+        );
+        assert_eq!(
+            primary.global_checkpoint(),
+            None,
+            "unreported current copy must hold progress"
+        );
+        service.record_replica_checkpoints(
+            &primary,
+            "idx",
+            0,
+            &activated,
+            primary.sequence_stats(),
+            &[replica_checkpoint("replica", Some(3), Some(3))],
+        );
+        assert_eq!(primary.global_checkpoint(), Some(3));
+        assert_eq!(
+            service
+                .shard_manager
+                .isr_tracker
+                .replica_checkpoints("idx", 0),
+            vec![("replica".into(), 3)],
+        );
+    }
+}
+
+#[tokio::test]
+async fn gcp_stale_primary_and_replaced_replica_completions_cannot_advance() {
+    let (_dir, service, primary, activated) = gcp_test_primary(40);
+    for stale in [
+        ActivatedPrimary {
+            primary_term: 1,
+            ..activated.clone()
+        },
+        ActivatedPrimary {
+            allocation_id: 2,
+            ..activated.clone()
+        },
+        ActivatedPrimary {
+            index_uuid: "old-uuid".into(),
+            ..activated.clone()
+        },
+    ] {
+        service.record_replica_checkpoints(
+            &primary,
+            "idx",
+            0,
+            &stale,
+            primary.sequence_stats(),
+            &[replica_checkpoint("replica", Some(40), Some(40))],
+        );
+        assert_eq!(primary.global_checkpoint(), None);
+    }
+    let mut state = service.cluster_manager.get_state();
+    state
+        .shard_allocations
+        .get_mut("idx")
+        .unwrap()
+        .get_mut(&0)
+        .unwrap()
+        .replicas
+        .insert("replica".into(), 2);
+    service.cluster_manager.update_state(state);
+    service.record_replica_checkpoints(
+        &primary,
+        "idx",
+        0,
+        &activated,
+        primary.sequence_stats(),
+        &[replica_checkpoint("replica", Some(40), Some(40))],
+    );
+    assert_eq!(primary.global_checkpoint(), None);
+    service.record_replica_checkpoints(
+        &primary,
+        "idx",
+        0,
+        &activated,
+        primary.sequence_stats(),
+        &[crate::shard::ReplicaCheckpointUpdate {
+            allocation_id: 2,
+            ..replica_checkpoint("replica", Some(3), Some(3))
+        }],
+    );
+    assert_eq!(primary.global_checkpoint(), Some(3));
+}
+
+#[tokio::test]
+async fn gcp_new_in_sync_copy_without_a_report_holds_progress() {
+    let (_dir, service, primary, activated) = gcp_test_primary(40);
+    service.record_replica_checkpoints(
+        &primary,
+        "idx",
+        0,
+        &activated,
+        primary.sequence_stats(),
+        &[replica_checkpoint("replica", Some(3), Some(3))],
+    );
+    assert_eq!(primary.global_checkpoint(), Some(3));
+    gcp_add_replica(&service, "replica-2", 1);
+    service.record_replica_checkpoints(
+        &primary,
+        "idx",
+        0,
+        &activated,
+        primary.sequence_stats(),
+        &[replica_checkpoint("replica", Some(40), Some(40))],
+    );
+    assert_eq!(primary.global_checkpoint(), Some(3));
+    service.record_replica_checkpoints(
+        &primary,
+        "idx",
+        0,
+        &activated,
+        primary.sequence_stats(),
+        &[replica_checkpoint("replica-2", Some(40), Some(40))],
+    );
+    assert_eq!(primary.global_checkpoint(), Some(40));
+}
+
+#[tokio::test]
+async fn gcp_removed_copy_stops_holding_progress_and_none_reports_never_regress() {
+    let (_dir, service, primary, activated) = gcp_test_primary(40);
+    gcp_add_replica(&service, "replica-2", 1);
+    let reports = [
+        replica_checkpoint("replica", Some(40), Some(40)),
+        replica_checkpoint("replica-2", Some(3), Some(3)),
+    ];
+    service.record_replica_checkpoints(
+        &primary,
+        "idx",
+        0,
+        &activated,
+        primary.sequence_stats(),
+        &reports,
+    );
+    assert_eq!(primary.global_checkpoint(), Some(3));
+    let mut state = service.cluster_manager.get_state();
+    state
+        .indices
+        .get_mut("idx")
+        .unwrap()
+        .shard_routing
+        .get_mut(&0)
+        .unwrap()
+        .in_sync_replicas
+        .retain(|node| node != "replica-2");
+    service.cluster_manager.update_state(state);
+    service.record_replica_checkpoints(
+        &primary,
+        "idx",
+        0,
+        &activated,
+        primary.sequence_stats(),
+        &reports,
+    );
+    assert_eq!(primary.global_checkpoint(), Some(40));
+    service.record_replica_checkpoints(
+        &primary,
+        "idx",
+        0,
+        &activated,
+        primary.sequence_stats(),
+        &[replica_checkpoint("replica", None, None)],
+    );
+    assert_eq!(primary.global_checkpoint(), Some(40));
+}
+
 #[test]
 fn advance_global_checkpoint_no_replicas_uses_primary() {
     let (_dir, engine) = make_checkpoint_engine();
@@ -3183,6 +3637,11 @@ async fn failed_promotion_noop_fanout_is_retried_end_to_end() {
     .unwrap();
     assert_eq!(source_engine.sequence_stats().processed_checkpoint, Some(2));
     assert_eq!(
+        source_engine.global_checkpoint(),
+        None,
+        "failed NoOp fan-out must not turn missing persistence reports into progress"
+    );
+    assert_eq!(
         source_service
             .shard_manager
             .isr_tracker
@@ -3254,6 +3713,8 @@ async fn failed_promotion_noop_fanout_is_retried_end_to_end() {
     let sequence = replica_engine.sequence_stats();
     assert_eq!(sequence.processed_checkpoint, Some(2));
     assert_eq!(sequence.persisted_checkpoint, Some(2));
+    assert_eq!(source_engine.global_checkpoint(), Some(2));
+    assert!(source_engine.global_checkpoint() <= sequence.persisted_checkpoint);
     assert!(
         source_service
             .shard_manager
