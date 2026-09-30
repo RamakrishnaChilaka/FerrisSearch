@@ -985,13 +985,7 @@ impl SearchEngine for CompositeEngine {
     }
 
     #[cfg(feature = "protocol-trace")]
-    fn protocol_trace_copy_evidence(
-        &self,
-    ) -> Result<(
-        Vec<(String, serde_json::Value, u64, u64)>,
-        Vec<crate::protocol_trace::TraceActualDocument>,
-        Vec<crate::protocol_trace::TraceWalEntry>,
-    )> {
+    fn protocol_trace_copy_evidence(&self) -> Result<super::ProtocolTraceCopyEvidence> {
         self.text.protocol_trace_copy_evidence()
     }
 

@@ -3845,13 +3845,7 @@ impl HotEngine {
     }
 
     #[cfg(feature = "protocol-trace")]
-    pub(crate) fn protocol_trace_copy_evidence(
-        &self,
-    ) -> Result<(
-        Vec<(String, serde_json::Value, u64, u64)>,
-        Vec<crate::protocol_trace::TraceActualDocument>,
-        Vec<crate::protocol_trace::TraceWalEntry>,
-    )> {
+    pub(crate) fn protocol_trace_copy_evidence(&self) -> Result<super::ProtocolTraceCopyEvidence> {
         let live_documents = self.vector_rebuild_documents()?;
         let versions = self
             .apply_state
@@ -7597,13 +7591,7 @@ impl super::SearchEngine for HotEngine {
     }
 
     #[cfg(feature = "protocol-trace")]
-    fn protocol_trace_copy_evidence(
-        &self,
-    ) -> Result<(
-        Vec<(String, serde_json::Value, u64, u64)>,
-        Vec<crate::protocol_trace::TraceActualDocument>,
-        Vec<crate::protocol_trace::TraceWalEntry>,
-    )> {
+    fn protocol_trace_copy_evidence(&self) -> Result<super::ProtocolTraceCopyEvidence> {
         HotEngine::protocol_trace_copy_evidence(self)
     }
 

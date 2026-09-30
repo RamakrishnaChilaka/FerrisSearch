@@ -320,6 +320,13 @@ impl SqlStreamingBatchHandle {
     }
 }
 
+#[cfg(feature = "protocol-trace")]
+pub type ProtocolTraceCopyEvidence = (
+    Vec<(String, serde_json::Value, u64, u64)>,
+    Vec<crate::protocol_trace::TraceActualDocument>,
+    Vec<crate::protocol_trace::TraceWalEntry>,
+);
+
 /// Trait abstracting a search engine backend.
 /// Each shard/split is backed by one `SearchEngine` implementation.
 /// Implementations handle both text and vector indexing/search.
@@ -436,13 +443,7 @@ pub trait SearchEngine: Send + Sync {
     }
 
     #[cfg(feature = "protocol-trace")]
-    fn protocol_trace_copy_evidence(
-        &self,
-    ) -> Result<(
-        Vec<(String, serde_json::Value, u64, u64)>,
-        Vec<crate::protocol_trace::TraceActualDocument>,
-        Vec<crate::protocol_trace::TraceWalEntry>,
-    )> {
+    fn protocol_trace_copy_evidence(&self) -> Result<ProtocolTraceCopyEvidence> {
         anyhow::bail!("protocol trace copy evidence is not supported by this engine")
     }
 
