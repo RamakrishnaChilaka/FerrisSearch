@@ -6026,3 +6026,40 @@ async fn security_put_api_key_transport_rpc_rejects_malformed_hash() -> Result<(
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn group_by_unmapped_builtin_body_is_rejected_as_text() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    for (index, mappings) in [
+        ("gb-body-dynamic", json!({"dynamic": true})),
+        (
+            "gb-body-strict",
+            json!({"dynamic": "strict", "properties": {"n": {"type": "integer"}}}),
+        ),
+    ] {
+        let (status, body) = harness
+            .put_json(
+                &format!("/{index}"),
+                json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}, "mappings": mappings}),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = harness
+            .put_json(
+                &format!("/{index}/_doc/1?refresh=true"),
+                json!({"body": "hello world", "n": 1}),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let query = format!("SELECT body, count(*) AS c FROM \"{index}\" GROUP BY body");
+        let (status, body) = harness
+            .post_json(&format!("/{index}/_sql"), json!({"query": query}))
+            .await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{index}: {body}");
+        assert_eq!(
+            body["error"]["type"], "group_by_text_field_exception",
+            "{body}"
+        );
+    }
+    Ok(())
+}

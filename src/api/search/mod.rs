@@ -1218,9 +1218,12 @@ async fn execute_sql_query_with_plan(
         if let Some(grouped) = &plan.grouped_sql {
             for col in &grouped.group_columns {
                 let mapping_name = grouped_column_mapping_name(&col.source_name);
-                if let Some(mapping) = metadata.mappings.get(&mapping_name)
-                    && matches!(mapping.field_type, crate::cluster::state::FieldType::Text)
-                {
+                // The built-in `body` field is text even without a persisted mapping.
+                let is_text = match metadata.mappings.get(&mapping_name) {
+                    Some(mapping) => mapping.field_type == crate::cluster::state::FieldType::Text,
+                    None => crate::common::is_builtin_body_field(&mapping_name),
+                };
+                if is_text {
                     return Err(crate::api::error_response(
                         StatusCode::BAD_REQUEST,
                         "group_by_text_field_exception",
