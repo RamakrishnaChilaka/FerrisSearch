@@ -3466,6 +3466,86 @@ async fn dynamic_true_keeps_body_on_builtin_catch_all_across_reopen() -> Result<
 }
 
 #[tokio::test]
+async fn dynamic_builtin_body_keeps_direct_sql_path_without_persisted_mapping() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let index = "dynamic-body-sql";
+    let (status, body) = harness
+        .put_json(
+            &format!("/{index}"),
+            json!({
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0
+                },
+                "mappings": {
+                    "dynamic": true
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    for (id, source) in [
+        ("1", json!({"body": "hello world", "n": 1})),
+        ("2", json!({"body": "other text", "n": 2})),
+    ] {
+        let (status, body) = harness
+            .put_json(&format!("/{index}/_doc/{id}?refresh=true"), source)
+            .await?;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    assert!(
+        !harness.app_state.cluster_manager.get_state().indices[index]
+            .mappings
+            .contains_key("body")
+    );
+
+    let query = format!("SELECT body, n FROM \"{index}\" ORDER BY n");
+    let (status, body) = harness
+        .post_json(&format!("/{index}/_sql"), json!({"query": query.clone()}))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["execution_mode"], json!("tantivy_fast_fields"));
+    assert_eq!(
+        body["rows"],
+        json!([
+            {"body": "hello world", "n": 1},
+            {"body": "other text", "n": 2}
+        ])
+    );
+
+    let (status, stream) = harness
+        .post_json_text(&format!("/{index}/_sql/stream"), json!({"query": query}))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{stream}");
+    let frames: Vec<Value> = stream
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str::<Value>)
+        .collect::<std::result::Result<_, _>>()?;
+    assert_eq!(frames[0]["execution_mode"], json!("tantivy_fast_fields"));
+    let streamed_rows: Vec<Value> = frames
+        .iter()
+        .skip(1)
+        .flat_map(|frame| frame["rows"].as_array().cloned().unwrap_or_default())
+        .collect();
+    assert_eq!(streamed_rows, body["rows"].as_array().unwrap().clone());
+
+    let (status, describe) = harness
+        .post_json("/_sql", json!({"query": format!("DESCRIBE \"{index}\"")}))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{describe}");
+    assert!(
+        describe["rows"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"field": "body", "type": "text"}))
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn dynamic_false_index_does_not_add_mappings() -> Result<()> {
     let harness = RestTestHarness::start().await?;
 

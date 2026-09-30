@@ -143,6 +143,12 @@ curl -sS -X PUT 'http://localhost:9200/movies' \
 JSON
 ```
 
+Every index also has a built-in `body` text field. It collects the text values
+of each document for `?q=` search. You can omit it from `properties`, even in
+strict indices; an explicit `body` mapping must be exactly `{"type": "text"}`.
+Top-level document keys that name metadata fields, such as `_id`, `_source`,
+`_seq_no`, and `_primary_term`, are rejected with `400 mapper_parsing_exception`.
+
 ### 3. Index a small batch
 
 ```bash

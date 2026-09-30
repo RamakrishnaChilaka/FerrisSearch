@@ -2198,6 +2198,17 @@ async fn handle_describe(state: &AppState, index_name: &str) -> (StatusCode, Jso
             row
         })
         .collect();
+    if !metadata
+        .mappings
+        .contains_key(crate::common::BUILTIN_BODY_FIELD)
+    {
+        // Every index has the built-in catch-all text field, even though it
+        // is never persisted as a mapping.
+        rows.push(serde_json::json!({
+            "field": crate::common::BUILTIN_BODY_FIELD,
+            "type": "text",
+        }));
+    }
 
     // Sort by field name
     rows.sort_by(|a, b| {

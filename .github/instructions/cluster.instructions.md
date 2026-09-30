@@ -57,6 +57,9 @@ it. An explicit mapping accepts only the plain definition `{"type":"text"}`;
 other types or parameters are mapper-parsing errors. Authoritative metadata
 with a reserved mapping name or an incompatible `body` mapping is an
 unsupported index format and must fail open with recreate-index guidance.
+Strict (`dynamic: strict`) indices accept an unmapped `body` because the field
+is built in. SQL treats an unmapped `body` as `text`: `DESCRIBE` lists it, and
+the direct fast-field path derives its schema without a persisted mapping.
 
 ### Index UUID
 - Every `IndexMetadata` has a non-empty `uuid: IndexUuid` value; production
