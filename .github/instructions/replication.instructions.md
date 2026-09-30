@@ -102,6 +102,10 @@ pub async fn replicate_bulk(
   returns immediately. Non-empty fan-out serializes each payload once and
   shares the immutable operation slice across replica tasks; each gRPC request
   performs only its required owned protobuf copy.
+- Single-operation fan-out also serializes the borrowed source once, after a
+  valid target is found, and shares the encoded result across replica tasks.
+  Do not deep-clone the JSON source or serialize it separately for each target;
+  retain per-target serialization-error reporting and protocol-trace events.
 - Assigned replicas are in `ShardRoutingEntry.replicas`; required
   acknowledgement targets are in `ShardRoutingEntry.in_sync_replicas`
 - Primary write handlers hold the shard's shared write-barrier guard from

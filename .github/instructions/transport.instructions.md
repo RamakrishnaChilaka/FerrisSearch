@@ -159,6 +159,9 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   transport path, before shard open or worker dispatch. Reuse that parsed value
   when constructing the sequenced operation; bulk still validates every
   payload before the first worker-side fence or engine mutation.
+- Primary bulk decoding moves `_doc_id` and `_source` out of valid document
+  envelopes rather than cloning the nested source. Preserve the existing
+  whole-value fallback and its validation errors for non-envelope inputs.
 - `ReplicateBulk` accepts either contiguous ordered index operations or a
   strictly increasing, potentially non-contiguous homogeneous NoOp batch.
   Promotion activation uses bounded NoOp batches rather than one RPC per

@@ -983,14 +983,17 @@ impl InternalTransport for TransportService {
         let mut docs: Vec<(String, serde_json::Value)> =
             Vec::with_capacity(req.documents_json.len());
         for b in &req.documents_json {
-            let val: serde_json::Value = serde_json::from_slice(b)
+            let mut val: serde_json::Value = serde_json::from_slice(b)
                 .map_err(|e| Status::invalid_argument(format!("invalid JSON in bulk: {e}")))?;
-            let (doc_id, payload) = match (
-                val.get("_doc_id").and_then(serde_json::Value::as_str),
-                val.get("_source"),
-            ) {
-                (Some(doc_id), Some(source)) => (doc_id.to_string(), source.clone()),
-                _ => (uuid::Uuid::new_v4().to_string(), val),
+            let (doc_id, payload) = if val.get("_doc_id").is_some_and(serde_json::Value::is_string)
+                && val.get("_source").is_some()
+            {
+                let serde_json::Value::String(doc_id) = val["_doc_id"].take() else {
+                    unreachable!("bulk envelope document ID was checked as a string");
+                };
+                (doc_id, val["_source"].take())
+            } else {
+                (uuid::Uuid::new_v4().to_string(), val)
             };
             crate::common::validate_document_source(&payload)
                 .map_err(|error| Status::invalid_argument(error.to_string()))?;

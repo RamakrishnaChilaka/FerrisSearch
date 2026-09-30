@@ -259,6 +259,7 @@ pub async fn replicate_write_with_durability(
 
     // Build futures for concurrent replication to all in-sync replicas
     let mut futures = Vec::with_capacity(replica_node_ids.len());
+    let mut serialized_payload = None;
 
     for replica_node_id in &replica_node_ids {
         let node_info = match cluster_state.nodes.get(*replica_node_id) {
@@ -284,7 +285,6 @@ pub async fn replicate_write_with_durability(
         let client = transport_client.clone();
         let idx = index_name.to_string();
         let did = doc_id.to_string();
-        let pl = payload.clone();
         let operation = op.to_string();
         let rid = replica_node_id.to_string();
         let Some(target_allocation_id) =
@@ -303,6 +303,9 @@ pub async fn replicate_write_with_durability(
             }));
             continue;
         };
+        let payload_json = Arc::clone(serialized_payload.get_or_insert_with(|| {
+            Arc::new(serde_json::to_vec(payload).map_err(|error| error.to_string()))
+        }));
         let uuid = index_uuid.clone();
         #[cfg(feature = "protocol-trace")]
         let trace_message = trace_messages
@@ -333,7 +336,7 @@ pub async fn replicate_write_with_durability(
                     )),
                 );
             }
-            let payload_json = match serde_json::to_vec(&pl) {
+            let payload_json = match Arc::unwrap_or_clone(payload_json) {
                 Ok(payload_json) => payload_json,
                 Err(error) => {
                     return (
@@ -415,6 +418,7 @@ pub async fn replicate_write_with_durability(
             }
         }));
     }
+    drop(serialized_payload);
 
     let results = futures::future::join_all(futures).await;
     let mut errors = Vec::new();
