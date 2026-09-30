@@ -40,6 +40,7 @@ class CopyState:
     wal: list[Identity] = field(default_factory=list)
     fence_term: int = 0
     last_effect_step: int = 0
+    history_initialized: bool = False
 
 
 def fail(event: dict[str, Any], message: str) -> None:
@@ -84,7 +85,37 @@ def check_checkpoint_event(event: dict[str, Any], copy: CopyState) -> None:
         )
 
 
-def observe_batch_max(event: dict[str, Any], copy: CopyState) -> None:
+def initialize_unknown_history(
+    event: dict[str, Any],
+    copy: CopyState,
+    excluded_sequences: set[int] | None = None,
+) -> None:
+    if copy.history_initialized:
+        return
+    excluded_sequences = excluded_sequences or set()
+    observed = event["checkpoints"]
+    processed = observed["processed"]
+    persisted = observed["persisted"]
+    copy.processed = (
+        set(range(processed + 1)) - excluded_sequences
+        if processed is not None
+        else set()
+    )
+    copy.persisted = (
+        set(range(persisted + 1)) - excluded_sequences
+        if persisted is not None
+        else set()
+    )
+    copy.max_seq_no = observed["max_seq_no"]
+    copy.history_initialized = True
+
+
+def observe_batch_max(
+    event: dict[str, Any],
+    copy: CopyState,
+    excluded_sequences: set[int] | None = None,
+) -> None:
+    initialize_unknown_history(event, copy, excluded_sequences)
     observed = event.get("batch_max_seq_no", event["checkpoints"]["max_seq_no"])
     if observed != event["checkpoints"]["max_seq_no"]:
         fail(event, "batch maximum differs from the engine checkpoint maximum")
@@ -148,6 +179,7 @@ def apply_observed_operation(
         durable = replay or wal_durable.get((event["node"], event["receipt_id"]), False)
         if durable:
             copy.persisted.add(observed.seq_no)
+    copy.history_initialized = True
 
     if (
         event["outcome"] == "stale"
@@ -389,6 +421,7 @@ def check_completeness(
 def check_trace(
     events: list[dict[str, Any]],
     actual_copies: dict[str, dict[str, Any]] | None = None,
+    fixture_mode: bool = False,
 ) -> None:
     start = events[0]
     nodes = {entry["node"]: entry["incarnation"] for entry in start["nodes"]}
@@ -411,6 +444,7 @@ def check_trace(
     message_results: dict[str, str] = {}
     pending_commits: dict[str, dict[str, Any]] = {}
     persisted_commits: dict[str, dict[str, Any]] = {}
+    recovery_snapshots: dict[str, CopyState] = {}
     final_copy_states: dict[
         str, tuple[int, int, dict[str, tuple[Any, ...]]]
     ] = {}
@@ -456,7 +490,13 @@ def check_trace(
                 and event["term"] < copy.fence_term
             ):
                 fail(event, "operation was processed below the durable fence")
-            observe_batch_max(event, copy)
+            pending_sequences = {
+                message["identity"].seq_no
+                for message in messages.values()
+                if message["target"] == event["node"]
+                and message["phase"] == "request"
+            }
+            observe_batch_max(event, copy, pending_sequences)
             observed = identity(event)
             prior = receipt_identity.setdefault(event["receipt_id"], observed)
             if prior != observed:
@@ -466,6 +506,20 @@ def check_trace(
                 request_operations[request_id] = observed
                 request_status[request_id] = "replicating"
             apply_observed_operation(event, copy, wal_durable)
+            if (
+                event["origin"] == "live_replication"
+                and event["outcome"] == "collision"
+                and observed.doc is not None
+                and primary != event["node"]
+            ):
+                source = copies.setdefault(primary, CopyState())
+                source.identities[observed.seq_no] = observed
+                source.documents[observed.doc] = (
+                    "deleted" if observed.op == "delete" else "live",
+                    observed.seq_no,
+                    observed.term,
+                    observed.content_hash,
+                )
             if event["origin"] == "live_replication":
                 matching = [
                     message
@@ -644,6 +698,7 @@ def check_trace(
             message["phase"] = None
         elif kind == "commit_captured":
             copy = copies.setdefault(event["node"], CopyState())
+            initialize_unknown_history(event, copy)
             check_checkpoint_event(event, copy)
             pending_commits[event["commit_id"]] = {
                 "node": event["node"],
@@ -693,8 +748,47 @@ def check_trace(
             copy = copies.setdefault(node, CopyState())
             persisted = persisted_commits.get(node)
             reset_to_persisted_commit(event, copy, persisted)
+        elif kind == "recovery_snapshot":
+            documents = normalized_documents(event["documents"])
+            snapshot = CopyState(
+                processed=set(event["processed_seqs"]),
+                persisted=set(event["processed_seqs"]),
+                max_seq_no=(
+                    event["snapshot_next_seq_no"] - 1
+                    if event["snapshot_next_seq_no"] > 0
+                    else None
+                ),
+                documents={
+                    doc: (state, seq_no, term, content_hash)
+                    for doc, (state, seq_no, term, content_hash) in documents.items()
+                    if state != "absent"
+                    and seq_no is not None
+                    and term is not None
+                    and content_hash is not None
+                },
+                identities={
+                    seq_no: Identity(term, seq_no, doc, "delete" if state == "deleted" else "index", content_hash)
+                    for doc, (state, seq_no, term, content_hash) in documents.items()
+                    if state != "absent"
+                    and seq_no is not None
+                    and term is not None
+                    and content_hash is not None
+                },
+                history_initialized=True,
+            )
+            recovery_snapshots[event["session_id"]] = snapshot
         elif kind == "recovery_installed":
-            copies.setdefault(event["target_node"], CopyState()).wal.clear()
+            copy = copies.setdefault(event["target_node"], CopyState())
+            snapshot = recovery_snapshots.get(event["session_id"])
+            if snapshot is None:
+                fail(event, "recovery install has no matching snapshot")
+            copy.processed = set(snapshot.processed)
+            copy.persisted = set(snapshot.persisted)
+            copy.max_seq_no = snapshot.max_seq_no
+            copy.documents = dict(snapshot.documents)
+            copy.identities = dict(snapshot.identities)
+            copy.wal.clear()
+            copy.history_initialized = True
         elif kind == "replay_started":
             node = event["node"]
             reset_to_persisted_commit(
@@ -741,6 +835,8 @@ def check_trace(
         if not alive.get(node, False):
             continue
         if node not in final_copy_states:
+            if fixture_mode:
+                continue
             raise InvariantViolation(
                 events[-1]["step"],
                 "trace_end",
@@ -757,7 +853,11 @@ def check_trace(
     if authoritative:
         reference_node = primary
         reference = final_copy_states.get(reference_node)
-        if reference is None and alive.get(reference_node, False):
+        if (
+            reference is None
+            and alive.get(reference_node, False)
+            and not fixture_mode
+        ):
             raise InvariantViolation(
                 events[-1]["step"],
                 "trace_end",
@@ -821,6 +921,11 @@ def main() -> int:
     parser.add_argument("trace", type=Path)
     parser.add_argument("--actual", type=Path)
     parser.add_argument("--completeness-only", action="store_true")
+    parser.add_argument(
+        "--fixture",
+        action="store_true",
+        help="skip only the Rust-harness final copy_state completeness rule",
+    )
     args = parser.parse_args()
     try:
         events = load_trace(args.trace)
@@ -842,7 +947,7 @@ def main() -> int:
                 )
             check_completeness(events, actual)
         else:
-            check_trace(events, actual)
+            check_trace(events, actual, fixture_mode=args.fixture)
     except InvariantViolation as error:
         print(
             f"Invariant violation at step {error.step} "

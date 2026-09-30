@@ -137,6 +137,33 @@ class D1TraceInvariantTests(unittest.TestCase):
             checker.check_trace(events)
         self.assertIn("batch maximum differs", str(caught.exception))
 
+    def test_non_empty_initial_history_and_recovery_fixtures_pass(self) -> None:
+        for fixture in [
+            "n8-collision-at-seq-12.jsonl",
+            "valid-term-collision.jsonl",
+            "valid-recovery-snapshot-barrier.jsonl",
+            "n1c-recovery-profile-late-older-stale.jsonl",
+            "valid-recovery-installs-term-state.jsonl",
+        ]:
+            with self.subTest(fixture=fixture):
+                checker.check_trace(
+                    checker.load_trace(FIXTURES / fixture),
+                    fixture_mode=True,
+                )
+
+    def test_fixture_mode_skips_only_missing_final_copy_state(self) -> None:
+        for fixture in [
+            "valid-r6-primary-crash-before-noop-send.jsonl",
+            "valid-replay-failed-unavailable.jsonl",
+            "valid-stale-primary-local-append.jsonl",
+        ]:
+            events = checker.load_trace(FIXTURES / fixture)
+            with self.subTest(fixture=fixture, mode="strict"):
+                with self.assertRaises(checker.InvariantViolation):
+                    checker.check_trace(events)
+            with self.subTest(fixture=fixture, mode="fixture"):
+                checker.check_trace(events, fixture_mode=True)
+
 
 if __name__ == "__main__":
     unittest.main()

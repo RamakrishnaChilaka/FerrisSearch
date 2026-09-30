@@ -121,6 +121,20 @@ and physical WAL from `wal_appended` plus `wal_truncated`, then requires exact
 agreement with the sidecar. Missing and invented events both fail. Fixtures do
 not require a sidecar; every Rust fault-harness run does.
 
+The independent checker is an invariant oracle, not a complete
+protocol-conformance oracle. It checks acknowledged-write retention,
+authoritative-copy convergence, durable-fence acceptance, checkpoint
+consistency, transport acknowledgement prerequisites, and optional actual-state
+completeness. Protocol-order constraints such as activation sequencing,
+promotion NoOp fan-out completeness, replay lifecycle ordering, commit
+term-state shape, and hidden-action budgets remain TLA+-only checks.
+
+Hand-written fixtures may run the checker with `--fixture`. That mode skips
+only the requirement that every available authoritative copy has a final
+`copy_state`; all safety checks still run. Rust-captured traces must not use
+fixture mode because the harness always emits final copy state and an actual
+sidecar.
+
 ## Shared value contracts
 
 ### Operation identity

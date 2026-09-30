@@ -48,6 +48,13 @@ Validate one implementation trace or run the trace validator's self-tests:
 ./scripts/tla/check.sh trace-validator-round4
 ```
 
+`check_d1_trace_invariants.py` is an independent invariant oracle rather than a
+full protocol-conformance checker. Activation/fan-out/replay ordering,
+commit-term-state shape, and hidden-action budget violations may therefore be
+TLA+-only rejections. Use `--fixture` only for hand-written fixtures that omit
+final copy-state observations; it skips that one completeness requirement.
+Rust harness traces always require the strict mode and actual-state sidecar.
+
 `validate_trace.sh` defaults to 120 seconds and a 4 GiB Java heap per TLC run.
 Exit code `0` means accepted, `1` means rejected, and `3` with an
 `INCONCLUSIVE` label means TLC timed out, exhausted memory, or failed before
