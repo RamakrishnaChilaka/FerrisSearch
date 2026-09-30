@@ -128,8 +128,9 @@ tokio::select! {
 - A text apply failure after WAL persistence durably creates `vectors.stale`.
   Its temporary file also means stale on restart. Primary writes, replica
   apply, refresh, flush, force merge, peer-snapshot preparation, recovery
-  barriers, primary activation, startup open, and peer-recovery finalization
-  must rebuild vectors before clearing that state.
+  barriers, primary activation, startup open, dynamic-mapping reopen, and
+  peer-recovery finalization must rebuild vectors before clearing that state or
+  publishing a replacement engine.
 - `vector_recovery` serializes those rebuild paths with vector mutations so a
   later failed text operation cannot be hidden by an earlier rebuild clearing
   the marker.

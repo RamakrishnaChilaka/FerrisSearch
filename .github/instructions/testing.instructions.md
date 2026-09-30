@@ -346,6 +346,10 @@ cargo test -- test_name                         # Single test by name
   multiple batch boundaries with a deleted document, plus an explicit
   greater-than-100,000-document activation regression proving vector count,
   last-document version state, text visibility, and kNN visibility.
+- Dynamic-mapping reopen coverage must prove kNN results remain value-identical
+  immediately after replacement and after a later refresh. A replacement
+  engine with an unloaded or empty vector index is a failure even when text
+  documents remain visible.
 - Promotion NoOp coverage must include a real source activation, an initial
   failed gRPC fan-out, a later lifecycle activation, and value-level proof that
   the replica durably received the original term/sequence NoOp and closed its

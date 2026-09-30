@@ -2423,8 +2423,7 @@ impl ShardManager {
             flush_threshold_rx,
         );
 
-        // Only rebuild vectors when the index has knn_vector fields — otherwise
-        // the 100K-doc MatchAll search is pure waste and can OOM on large indices.
+        // Only scan stored documents when the index has vector fields.
         let has_vectors = mappings
             .values()
             .any(|m| matches!(m.field_type, crate::cluster::state::FieldType::KnnVector));
@@ -3592,6 +3591,14 @@ impl ShardManager {
                     &mappings,
                     CompositeOpenMode::ExistingOnly,
                 )?;
+                if mappings.values().any(|mapping| {
+                    matches!(
+                        mapping.field_type,
+                        crate::cluster::state::FieldType::KnnVector
+                    )
+                }) {
+                    engine.rebuild_vectors()?;
+                }
                 CompositeEngine::start_refresh_loop_reactive(
                     engine.clone(),
                     refresh_rx,
@@ -4051,6 +4058,81 @@ mod tests {
         let e2 = mgr.open_shard("idx", 0).unwrap();
         // Both should point to the same engine (Arc)
         assert!(std::sync::Arc::ptr_eq(&e1, &e2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dynamic_mapping_reopen_keeps_vectors_searchable() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+        let mut mappings = HashMap::from([(
+            "emb".to_string(),
+            FieldMapping {
+                field_type: FieldType::KnnVector,
+                dimension: Some(3),
+            },
+        )]);
+        let engine = manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &mappings,
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 1,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        engine
+            .add_document_with_receipt_at_term("a", json!({"emb": [1.0, 0.0, 0.0]}), 1)
+            .unwrap();
+        engine
+            .add_document_with_receipt_at_term("b", json!({"emb": [0.0, 1.0, 0.0]}), 1)
+            .unwrap();
+        engine.refresh().unwrap();
+        let hit_ids = |hits: Vec<serde_json::Value>| {
+            hits.into_iter()
+                .map(|hit| hit["_id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            hit_ids(engine.search_knn("emb", &[0.0, 1.0, 0.0], 2).unwrap()),
+            vec!["b", "a"]
+        );
+
+        drop(engine);
+        mappings.insert(
+            "title".to_string(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        );
+        let reopened = manager
+            .reopen_shard(
+                "idx".into(),
+                0,
+                mappings,
+                IndexSettings::default(),
+                "uuid-1".into(),
+                7,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            hit_ids(reopened.search_knn("emb", &[0.0, 1.0, 0.0], 2).unwrap()),
+            vec!["b", "a"]
+        );
+        reopened.refresh().unwrap();
+        assert_eq!(
+            hit_ids(reopened.search_knn("emb", &[0.0, 1.0, 0.0], 2).unwrap()),
+            vec!["b", "a"]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

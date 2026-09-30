@@ -122,7 +122,9 @@ pub struct ShardManager {
 2. Create SettingsManager (one per index) with watch channels
 3. Create directory at `<data_dir>/<uuid>/shard_<id>`
 4. Start `CompositeEngine::start_refresh_loop_reactive()` — responds to setting changes
-5. Call `engine.rebuild_vectors()` only when `mappings` contains `KnnVector` fields — skip the expensive 100K-doc MatchAll query for non-vector indices to prevent OOM during multi-shard restart
+5. Call `engine.rebuild_vectors()` only when `mappings` contains `KnnVector`
+   fields. Rebuild scans every live Tantivy document in bounded batches; skip
+   that scan entirely for non-vector indices.
 6. Handle schema mismatch by wiping orphaned directories and retrying
 
 Peer-recovery install is the exception to step 6: while
@@ -154,7 +156,9 @@ Reopen is replacement-only: after acquiring that lifecycle lock and again
 under the per-shard open lock, the registered UUID must still match and the
 exact shard engine/directory must still exist. A detached reopen must never
 register an old UUID, recreate a deleted directory, or create a missing engine.
-Its existing-only engine open also requires `index/meta.json`.
+Its existing-only engine open also requires `index/meta.json`. When mappings
+contain vector fields, rebuild and persist the complete vector index on the
+blocking pool before starting maintenance or publishing the replacement engine.
 Async index deletion acquires every lifecycle lock registered for the UUID and
 every per-shard open lock registered for the index, including shards temporarily
 absent from the engine map during reopen, before removing engines or storage.
