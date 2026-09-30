@@ -188,7 +188,11 @@ missing local sequence through the fenced maximum with durable current-term
 NoOps, and only then enables writes. Best-effort NoOp replication may leave a
 bounded replica gap for normal probe/removal handling; it must not weaken local
 activation. Lifecycle ticks retry failed promotion NoOp batches for the same
-active UUID/allocation/term until fan-out succeeds or the copy is invalidated.
+active UUID/allocation/term only while the process-local pending entry remains.
+Restart or an activation failure after local NoOp application can lose that
+entry; current code does not rebuild it from the WAL. The replica then remains
+gapful until the fixed deadline removes the allocation and peer recovery
+rebuilds it.
 Activation and retry serialization is allocation-local; a slow or unreachable
 replica for one shard must not delay activation or client writes on another
 shard.

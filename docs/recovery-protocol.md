@@ -74,10 +74,14 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > uses the final replaying barrier to resume from that cursor before admission.
 > Promotion persists its fence, fills local gaps with NoOps, and replicates
 > those NoOps in bounded batches. Failed batches remain best-effort for local
-> activation but are retried by later lifecycle or request activation at the
-> same UUID, allocation, and term. Activation and retry locks are scoped to the
-> exact UUID, shard, and allocation, so a slow fan-out cannot serialize
-> unrelated shards. A term/sequence collision durably marks the
+> activation. They are retried by later lifecycle or request activation at the
+> same UUID, allocation, and term only while the process-local pending entry
+> survives. Restart, or an activation error after the NoOps were applied
+> locally but before retry state was retained, loses that intent; it is not
+> reconstructed from the WAL. The replica then follows the fixed gap deadline
+> and peer-recovery fallback. Activation and retry locks are scoped to the exact
+> UUID, shard, and allocation, so a slow fan-out cannot serialize unrelated
+> shards. A term/sequence collision durably marks the
 > exact allocation as quarantined before closing it; the copy cannot reopen or
 > accept replication until Raft removes it and fresh peer recovery installs a
 > new allocation identity. The marker is checked before open-I/O backoff, so

@@ -163,13 +163,16 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   strictly increasing, potentially non-contiguous homogeneous NoOp batch.
   Promotion activation uses bounded NoOp batches rather than one RPC per
   missing sequence number.
-- A failed promotion NoOp batch remains pending in the shared activation state.
-  The next lifecycle or request activation retries it even when the local
-  UUID/shard/allocation/term cache already says the primary is active. Remove
-  pending state only after successful redelivery or when that primary copy is
-  invalidated. Activation and pending-NoOp retry mutexes are keyed by exact
-  index UUID, shard, and allocation. Never hold a node-wide or index-wide lock
-  across activation forwarding or replica fan-out.
+- A failed promotion NoOp batch remains pending in process-local activation
+  state. While that entry survives, the next lifecycle or request activation
+  retries it even when the local UUID/shard/allocation/term cache already says
+  the primary is active. Successful redelivery or copy invalidation removes the
+  entry. Restart, or an activation error after the NoOps were applied locally
+  but before retry state was retained, loses the intent; it is not reconstructed
+  from the WAL. The affected replica then follows the fixed gap deadline and
+  peer-recovery path. Activation and pending-NoOp retry mutexes are keyed by
+  exact index UUID, shard, and allocation. Never hold a node-wide or index-wide
+  lock across activation forwarding or replica fan-out.
 - Successful replica responses carry optional processed and persisted
   checkpoints and must prove the exact single operation or every bulk item was
   processed. A behind contiguous checkpoint is a gap observation, not failure

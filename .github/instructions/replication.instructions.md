@@ -176,8 +176,12 @@ pub async fn replicate_bulk(
 - Promotion NoOps are replicated in bounded homogeneous bulk batches, preserving
   each explicit non-contiguous sequence number. A batch transport failure
   remains best-effort, creates the same replica gap observation as the former
-  single-operation path, and retains that failed batch for redelivery on the
-  next activation attempt at the same UUID/allocation/term.
+  single-operation path, and retains that failed batch in process memory for
+  redelivery on the next activation attempt at the same
+  UUID/allocation/term. Restart or an activation failure after local NoOp
+  application can lose the pending batch; the WAL does not reconstruct the
+  replica fan-out intent. The fixed gap deadline and peer recovery are the
+  fallback.
 - A primary engine failure after WAL append but before replication leaves an
   operation that no replica received. After local rebuild/replay advances the
   primary prefix, later replica responses expose the permanent gap; each
