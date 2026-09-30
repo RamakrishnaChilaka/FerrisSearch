@@ -48,10 +48,12 @@ pub async fn replicate_bulk(
    and advances the fence once.
 8. Each replica applies through the sequence-aware planner and returns optional
    processed/persisted checkpoints plus proof that the exact operation was processed
-9. Primary stores monotonic processed observations per exact allocation and
-   creates a fixed-target gap observation when the contiguous prefix lags
-10. Primary advances the global checkpoint only from the minimum persisted
-   checkpoint across every authoritative copy
+9. Primary stores monotonic observations per index UUID, allocation ID, and
+   primary term and creates a fixed-target gap observation when the contiguous
+   processed prefix lags
+10. Primary updates observations and computes the global checkpoint under one
+    tracker lock. It uses its current persisted checkpoint and the highest
+    reported persisted checkpoint of every current authoritative in-sync replica
 11. Write acknowledged to client **only after every in-sync replica confirms**
 
 ## File-Based Peer Recovery
@@ -120,6 +122,16 @@ pub async fn replicate_bulk(
   activated index UUID and term, then mutate and replicate using that exact
   cluster-state snapshot. Never re-read a newer acknowledgement set after
   mutation.
+- Global-checkpoint computation uses a fresh applied Raft snapshot, not the
+  write's captured acknowledgement set. Revalidate the activated primary's
+  UUID, allocation, and term before accepting reports. Count only current
+  `in_sync_replicas` with matching allocation IDs. A missing current-identity
+  report holds progress back; a removed copy no longer holds it back.
+- Compute from the primary's current persisted prefix after updating replica
+  observations under the tracker lock. Do not use the pre-replication primary
+  snapshot or only the current round's replica values. Reset an observation
+  when its UUID, allocation, or primary term changes. Never move the global
+  checkpoint backward.
 - Dynamic-mapping reopen and async index close abort safe pre-finalize source
   sessions and await pin/snapshot/engine-Arc cleanup before replacing or
   deleting the primary engine. Encountering an admitting/settling source
@@ -166,11 +178,16 @@ pub async fn replicate_bulk(
 - Request durability requires every replica response to prove the exact
   operation persisted; async durability requires processed proof and advances
   persisted checkpoints only after fsync or commit.
+- Async background fsync does not send a new checkpoint report or recompute
+  the primary's global checkpoint. After idle async writes, the global
+  checkpoint can lag the true persisted minimum until another write reports
+  progress. Checkpoint tracking does not add background synchronization.
 - Replica background auto-flush uses its own contiguous persisted prefix when
   no primary global checkpoint exists. It may prune through that committed
   prefix but never through a gap; promotion clears the replica-only bound.
-- `ShardManager.isr_tracker` stores checkpoint observations only. It can rank
-  authoritative candidates only when the reporting leader hosts the primary;
+- `ShardManager.isr_tracker` stores checkpoint proofs, not membership. The
+  primary uses identity- and term-scoped persisted proofs for WAL retention.
+  It can rank authoritative candidates only when the reporting leader hosts the primary;
   otherwise candidate selection falls back to a live in-sync cluster member.
   Checkpoint observations cannot grant membership.
 - Single writes and index-only shard batches return `success: false` when
@@ -187,7 +204,8 @@ pub async fn replicate_bulk(
 - Promotion NoOps are replicated in bounded homogeneous bulk batches, preserving
   each explicit non-contiguous sequence number. A batch transport failure
   remains best-effort, creates the same replica gap observation as the former
-  single-operation path, and retains that failed batch in process memory for
+  single-operation path, and does not advance the global checkpoint from its
+  unknown persistence reports. It retains that failed batch in process memory for
   redelivery on the next activation attempt at the same
   UUID/allocation/term. Restart or an activation failure after local NoOp
   application can lose the pending batch; the WAL does not reconstruct the

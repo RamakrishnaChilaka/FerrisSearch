@@ -384,13 +384,28 @@ impl ShardKey {
 /// Per-replica checkpoint info for ISR tracking.
 #[derive(Debug, Clone)]
 pub struct ReplicaCheckpoint {
+    pub index_uuid: String,
     pub allocation_id: AllocationId,
-    /// Highest contiguous processed checkpoint observed for this allocation.
+    pub primary_term: u64,
+    /// Highest contiguous processed checkpoint observed for this copy and term.
     pub processed_checkpoint: Option<u64>,
-    /// Highest contiguous persisted checkpoint observed for this allocation.
+    /// Highest contiguous persisted checkpoint observed for this copy and term.
     pub persisted_checkpoint: Option<u64>,
     /// When we last heard from this replica.
     pub last_updated: Instant,
+}
+
+impl ReplicaCheckpoint {
+    pub(crate) fn matches_copy(
+        &self,
+        index_uuid: &str,
+        allocation_id: AllocationId,
+        primary_term: u64,
+    ) -> bool {
+        self.index_uuid == index_uuid
+            && self.allocation_id == allocation_id
+            && self.primary_term == primary_term
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -515,6 +530,26 @@ impl IsrTracker {
         checkpoints: &[ReplicaCheckpointUpdate],
         now: Instant,
     ) {
+        self.with_updated_replica_checkpoints_at(
+            index,
+            shard_id,
+            context,
+            checkpoints,
+            now,
+            |_| (),
+        );
+    }
+
+    /// Update reports and consume their monotonic view under the same lock.
+    pub(crate) fn with_updated_replica_checkpoints_at<R>(
+        &self,
+        index: &str,
+        shard_id: u32,
+        context: ReplicaCheckpointContext<'_>,
+        checkpoints: &[ReplicaCheckpointUpdate],
+        now: Instant,
+        consume: impl FnOnce(&HashMap<String, ReplicaCheckpoint>) -> R,
+    ) -> R {
         let key = ShardKey::new(index, shard_id);
         let mut replicas = self.replicas.write().unwrap_or_else(|e| e.into_inner());
         let mut gaps = self
@@ -527,14 +562,22 @@ impl IsrTracker {
             let stored = shard_replicas
                 .entry(checkpoint.node_id.clone())
                 .or_insert_with(|| ReplicaCheckpoint {
+                    index_uuid: context.index_uuid.to_string(),
                     allocation_id: checkpoint.allocation_id,
+                    primary_term: context.primary_term,
                     processed_checkpoint: None,
                     persisted_checkpoint: None,
                     last_updated: now,
                 });
-            if stored.allocation_id != checkpoint.allocation_id {
+            if !stored.matches_copy(
+                context.index_uuid,
+                checkpoint.allocation_id,
+                context.primary_term,
+            ) {
                 *stored = ReplicaCheckpoint {
+                    index_uuid: context.index_uuid.to_string(),
                     allocation_id: checkpoint.allocation_id,
+                    primary_term: context.primary_term,
                     processed_checkpoint: None,
                     persisted_checkpoint: None,
                     last_updated: now,
@@ -584,6 +627,8 @@ impl IsrTracker {
                 );
             }
         }
+        drop(gaps);
+        consume(shard_replicas)
     }
 
     /// Get replica node IDs whose observed checkpoint is within `max_lag`.
@@ -679,7 +724,13 @@ impl IsrTracker {
         if let Some(stored) = replicas
             .get_mut(&key)
             .and_then(|replicas| replicas.get_mut(&expected.replica_node_id))
-            .filter(|stored| stored.allocation_id == expected.allocation_id)
+            .filter(|stored| {
+                stored.matches_copy(
+                    &expected.index_uuid,
+                    expected.allocation_id,
+                    expected.primary_term,
+                )
+            })
         {
             stored.processed_checkpoint =
                 Self::max_checkpoint(stored.processed_checkpoint, processed_checkpoint);

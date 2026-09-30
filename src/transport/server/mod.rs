@@ -5883,19 +5883,79 @@ impl TransportService {
         primary_sequence: crate::engine::SequenceStats,
         replica_checkpoints: &[crate::shard::ReplicaCheckpointUpdate],
     ) {
-        Self::advance_global_checkpoint(
-            engine,
-            primary_sequence.persisted_checkpoint,
-            replica_checkpoints,
-        );
-        self.shard_manager.isr_tracker.update_replica_checkpoints(
-            index_name,
-            &activated_primary.index_uuid,
-            shard_id,
-            activated_primary.primary_term,
-            primary_sequence.processed_checkpoint,
-            replica_checkpoints,
-        );
+        let state =
+            match self.validated_primary_write_state(index_name, shard_id, activated_primary) {
+                Ok(state) => state,
+                Err(reason) => {
+                    tracing::debug!(
+                        index = index_name,
+                        shard_id,
+                        reason,
+                        "Skipping checkpoint reports from obsolete primary authority"
+                    );
+                    return;
+                }
+            };
+        let metadata = &state.indices[index_name];
+        let routing = &metadata.shard_routing[&shard_id];
+        let current_reports = replica_checkpoints
+            .iter()
+            .filter(|checkpoint| {
+                routing.is_replica_in_sync(&checkpoint.node_id)
+                    && state.shard_allocation_id(index_name, shard_id, &checkpoint.node_id)
+                        == Some(checkpoint.allocation_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        self.shard_manager
+            .isr_tracker
+            .with_updated_replica_checkpoints_at(
+                index_name,
+                shard_id,
+                crate::shard::ReplicaCheckpointContext {
+                    index_uuid: &activated_primary.index_uuid,
+                    primary_term: activated_primary.primary_term,
+                    primary_processed_checkpoint: primary_sequence.processed_checkpoint,
+                },
+                &current_reports,
+                std::time::Instant::now(),
+                |tracked| {
+                    let authoritative = metadata
+                        .in_sync_replica_nodes(shard_id)
+                        .into_iter()
+                        .map(|node_id| {
+                            let allocation_id =
+                                state.shard_allocation_id(index_name, shard_id, node_id)?;
+                            let checkpoint = tracked.get(node_id)?;
+                            checkpoint
+                                .matches_copy(
+                                    &activated_primary.index_uuid,
+                                    allocation_id,
+                                    activated_primary.primary_term,
+                                )
+                                .then(|| crate::shard::ReplicaCheckpointUpdate {
+                                    node_id: node_id.clone(),
+                                    allocation_id,
+                                    processed_checkpoint: checkpoint.processed_checkpoint,
+                                    persisted_checkpoint: checkpoint.persisted_checkpoint,
+                                })
+                        })
+                        .collect::<Option<Vec<_>>>();
+                    let Some(authoritative) = authoritative else {
+                        tracing::debug!(
+                            index = index_name,
+                            shard_id,
+                            "Waiting for checkpoint reports from every current in-sync copy"
+                        );
+                        return;
+                    };
+                    Self::advance_global_checkpoint(
+                        engine,
+                        engine.sequence_stats().persisted_checkpoint,
+                        &authoritative,
+                    );
+                },
+            );
     }
 
     fn replication_failure_message(
