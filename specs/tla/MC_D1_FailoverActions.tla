@@ -179,41 +179,50 @@ CommitActivation ==
 FenceQ ==
     /\ Advance(31, 32, D1ObserveFence(Q, 3, 3))
 
-FillQGap ==
-    /\ Advance(32, 33, D1FillPromotionNoOps(Q, {1}))
+AppendQGap ==
+    /\ Advance(32, 33, D1AppendPromotionNoOp(Q, 1, 3))
+
+ProcessQGap ==
+    /\ Advance(33, 34, D1ProcessPromotionNoOp(Q, 1, 3))
+
+ObserveQGapFill ==
+    /\ Advance(34, 35, D1ObservePromotionNoOpFill(Q, {1}, 3))
 
 ActivateQ ==
-    /\ Advance(33, 34, FenceChanging(D1ObserveActivation(Q)))
+    /\ Advance(35, 36, FenceChanging(D1ObserveActivation(Q)))
+
+SendNoOpR ==
+    /\ Advance(36, 37, D1RedeliverPromotionNoOp(Q, R, 1))
 
 FenceRForNoOp ==
-    /\ Advance(34, 35, D1ObserveFence(R, 3, 4))
+    /\ Advance(37, 38, D1ObserveFence(R, 3, 4))
 
 ApplyNoOpR ==
-    /\ Advance(35, 36, D1FixedReplicaNoOpProcess(NoOpFor(1, R)))
+    /\ Advance(38, 39, D1FixedReplicaNoOpProcess(NoOpFor(1, R)))
 
 AckNoOpR ==
-    /\ Advance(36, 37, D1DeliverNoOpAck(NoOpAckMessageFor(1, R)))
-
-RedeliverNoOpR ==
-    /\ Advance(37, 38, D1RedeliverPromotionNoOp(Q, R, 1))
-
-ProcessNoOpRedeliveryR ==
-    /\ Advance(38, 39, D1FixedReplicaNoOpRedelivery(NoOpFor(1, R)))
-
-AckNoOpRedeliveryR ==
     /\ Advance(39, 40, D1DeliverNoOpAck(NoOpAckMessageFor(1, R)))
 
+RedeliverNoOpR ==
+    /\ Advance(40, 41, D1RedeliverPromotionNoOp(Q, R, 1))
+
+ProcessNoOpRedeliveryR ==
+    /\ Advance(41, 42, D1FixedReplicaNoOpRedelivery(NoOpFor(1, R)))
+
+AckNoOpRedeliveryR ==
+    /\ Advance(42, 43, D1DeliverNoOpAck(NoOpAckMessageFor(1, R)))
+
 Submit5 ==
-    /\ Advance(40, 41, D1ClientWriteFrom(Q, Y, "Put"))
+    /\ Advance(43, 44, D1ClientWriteFrom(Q, Y, "Put"))
 
 Accept5 ==
-    /\ Advance(41, 42, D1PrimaryAccept(5))
+    /\ Advance(44, 45, D1PrimaryAccept(5))
 
 FenceR ==
-    /\ Advance(42, 43, D1ObserveFence(R, 3, 4))
+    /\ Advance(45, 46, D1ObserveFence(R, 3, 4))
 
 CollideR ==
-    /\ Advance(43, 44, D1FixedReplicaCollision(ReplicateFor(5, R)))
+    /\ Advance(46, 47, D1FixedReplicaCollision(ReplicateFor(5, R)))
 
 FailoverNext ==
     \/ Submit1
@@ -248,8 +257,11 @@ FailoverNext ==
     \/ ProposeActivation
     \/ CommitActivation
     \/ FenceQ
-    \/ FillQGap
+    \/ AppendQGap
+    \/ ProcessQGap
+    \/ ObserveQGapFill
     \/ ActivateQ
+    \/ SendNoOpR
     \/ FenceRForNoOp
     \/ ApplyNoOpR
     \/ AckNoOpR
@@ -263,14 +275,14 @@ FailoverNext ==
 
 FailoverTypeOK ==
     /\ D1TypeOK
-    /\ phase \in 0..44
+    /\ phase \in 0..47
 
 FailoverProgressEnabled ==
-    \/ phase = 44
+    \/ phase = 47
     \/ ENABLED FailoverNext
 
 FailoverActionsCovered ==
-    phase = 44 =>
+    phase = 47 =>
         /\ routing.primary = Q
         /\ routing.term = 3
         /\ activated[Q] = 3

@@ -297,17 +297,24 @@ of requests in `Replicating` state whose primary is the crashed node.
 | `promotion_noop_received` | `node`, `index_uuid`, `shard`, `allocation`, `source_node`, `source_incarnation`, `batch_id`, `receipt_id`, `message_id`, `term`, `seq_no`, `content_hash` | The NoOp branch of `TransportService::replicate_bulk`, through `ShardManager::apply_replica_operation`, at the same boundary as `replica_received`. | Hold `shard_open_lock`, after identity/term validation and before fence/WAL/planner mutation. |
 | `promotion_noop_result` | `node`, `index_uuid`, `shard`, `allocation`, `batch_id`, `receipt_id`, `message_id`, `term`, `seq_no`, `replica`, `replica_incarnation`, `outcome`, `message_phase`, nullable `persisted_checkpoint` | `replicate_explicit_batch_with_durability`, immediately after the target result resolves. | Use the response-time checkpoint and clear the exact trace message phase under the trace-state mutex. |
 
-The required source order is:
+For a faithfully emitted non-empty fill, the required source order is:
 
-1. `promotion_noop_fill`;
-2. `primary_activated`;
-3. all `promotion_noop_replication_started` events for that batch; and
-4. each replica's receive, optional `fence_persisted`, WAL/process or collision,
+1. every promotion-origin `wal_appended` in physical batch order;
+2. every promotion-origin `operation_processed`;
+3. `promotion_noop_fill` after explicit sync and persisted-checkpoint marking;
+4. `primary_activated`;
+5. all `promotion_noop_replication_started` events for the validated send-time
+   routing snapshot; and
+6. each replica's receive, optional `fence_persisted`, WAL/process or collision,
    and result events.
 
 Activation does not depend on successful NoOp fan-out. A failed NoOp may cause
-exact in-sync removal. Every NoOp from a non-empty fill batch must have exactly
-one send for every replica in the primary's captured in-sync view.
+exact in-sync removal. Fill does not create transport messages. The first send
+captures the then-current validated local routing view; every NoOp in the batch
+must have exactly one send to every replica in that snapshot. A primary crash
+before the snapshot is taken may leave the batch unsent. A replica crash does
+not remove an already selected target and therefore may produce a later
+`dropped/request` result with no crash-time message loss.
 
 ### Recovery
 
@@ -378,7 +385,8 @@ Before TLC, `trace_to_tla.py` rejects, among other structural failures:
 - request-durability acknowledgement without durable WAL on the primary and
   every required replica;
 - replica apply or acknowledgement without the exact transport attempt;
-- NoOp batches missing any sequence/target send;
+- NoOp batches missing any sequence/target send from the validated post-
+  activation snapshot while the primary remains able to send;
 - crash lost sets that differ from exact trace transport/request state;
 - malformed replay ordinals, unknown replay receipt IDs, or lifecycle pairs;
 - commit persistence without a captured immutable boundary;
@@ -398,6 +406,9 @@ bookkeeping do not replace model transitions.
 - Added exact crash `failed_request_ids` and phase-qualified
   `dropped_messages`.
 - Added exact NoOp fill batches and replay `receipt_id`s.
+- Split promotion fill, activation, and send-time NoOp message creation.
+- Added faithful promotion-fill WAL/process effects, alive-copy replay, and
+  idempotent repeated persistence of one captured commit.
 - Directed hidden promotion, activation, view-delivery, failure-removal, replay,
   and transport actions from emitted evidence rather than unconstrained
   choices.

@@ -138,30 +138,39 @@ CommitActivation ==
 FenceQ ==
     /\ Advance(18, 19, D1ObserveFence(Q, 3, 2))
 
-FillQGap ==
-    /\ Advance(19, 20, D1FillPromotionNoOps(Q, {0}))
+AppendQGap ==
+    /\ Advance(19, 20, D1AppendPromotionNoOp(Q, 0, 3))
+
+ProcessQGap ==
+    /\ Advance(20, 21, D1ProcessPromotionNoOp(Q, 0, 3))
+
+ObserveQGapFill ==
+    /\ Advance(21, 22, D1ObservePromotionNoOpFill(Q, {0}, 3))
 
 ActivateQ ==
-    /\ Advance(20, 21, FenceChanging(D1ObserveActivation(Q)))
+    /\ Advance(22, 23, FenceChanging(D1ObserveActivation(Q)))
+
+SendNoOpR ==
+    /\ Advance(23, 24, D1RedeliverPromotionNoOp(Q, R, 0))
 
 FenceR ==
-    /\ Advance(21, 22, D1ObserveFence(R, 3, 1))
+    /\ Advance(24, 25, D1ObserveFence(R, 3, 1))
 
 CollideNoOpR ==
-    /\ Advance(22, 23, D1FixedReplicaNoOpCollision(NoOpFor(0, R)))
+    /\ Advance(25, 26, D1FixedReplicaNoOpCollision(NoOpFor(0, R)))
 
 IgnoreNoOpNack ==
-    /\ Advance(23, 24, D1DeliverNoOpNack(NoOpNackMessageFor(0, R)))
+    /\ Advance(26, 27, D1DeliverNoOpNack(NoOpNackMessageFor(0, R)))
 
 ReportR ==
-    /\ Advance(24, 25, FaultAction(ReportShardCopyFailure(R, NoNode)))
+    /\ Advance(27, 28, FaultAction(ReportShardCopyFailure(R, NoNode)))
 
 CommitRemoval ==
-    /\ phase = 25
+    /\ phase = 28
     /\ \E command \in pendingRaft :
            /\ command.kind = "FailShardCopy"
            /\ FenceChanging(CommitRaft(command))
-    /\ phase' = 26
+    /\ phase' = 29
 
 CollisionNext ==
     \/ Submit1
@@ -183,8 +192,11 @@ CollisionNext ==
     \/ ProposeActivation
     \/ CommitActivation
     \/ FenceQ
-    \/ FillQGap
+    \/ AppendQGap
+    \/ ProcessQGap
+    \/ ObserveQGapFill
     \/ ActivateQ
+    \/ SendNoOpR
     \/ FenceR
     \/ CollideNoOpR
     \/ IgnoreNoOpNack
@@ -193,14 +205,14 @@ CollisionNext ==
 
 CollisionTypeOK ==
     /\ D1TypeOK
-    /\ phase \in 0..26
+    /\ phase \in 0..29
 
 CollisionProgressEnabled ==
-    \/ phase = 26
+    \/ phase = 29
     \/ ENABLED CollisionNext
 
 NoOpCollisionActionsCovered ==
-    phase = 26 =>
+    phase = 29 =>
         /\ routing.primary = Q
         /\ routing.term = 3
         /\ activated[Q] = 3

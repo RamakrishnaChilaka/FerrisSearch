@@ -160,28 +160,55 @@ FinishPrimaryReplay ==
             capturedDocValue, capturedDocSeqNext,
             capturedTombstoneSeqNext>>
 
-CrashReplica ==
+StartInPlacePrimaryReplay ==
     /\ tracePhase = 12
-    /\ D1CrashCopy(ReplicaNode)
+    /\ D1StartInPlaceReplay(PrimaryNode)
     /\ tracePhase' = 13
     /\ UNCHANGED
           <<capturedBoundary, capturedPersisted, capturedMax, capturedOps,
             capturedDocValue, capturedDocSeqNext,
             capturedTombstoneSeqNext>>
 
-RestartReplica ==
+ReplayPrimaryInPlace ==
     /\ tracePhase = 13
-    /\ D1RestartCopy(ReplicaNode)
+    /\ D1FixedReplayApplyAt(PrimaryNode)
     /\ tracePhase' = 14
     /\ UNCHANGED
           <<capturedBoundary, capturedPersisted, capturedMax, capturedOps,
             capturedDocValue, capturedDocSeqNext,
             capturedTombstoneSeqNext>>
 
-FailReplicaReplay ==
+FinishPrimaryInPlaceReplay ==
     /\ tracePhase = 14
-    /\ D1FailReplayAt(ReplicaNode)
+    /\ D1FinishReplayAt(PrimaryNode)
     /\ tracePhase' = 15
+    /\ UNCHANGED
+          <<capturedBoundary, capturedPersisted, capturedMax, capturedOps,
+            capturedDocValue, capturedDocSeqNext,
+            capturedTombstoneSeqNext>>
+
+CrashReplica ==
+    /\ tracePhase = 15
+    /\ D1CrashCopy(ReplicaNode)
+    /\ tracePhase' = 16
+    /\ UNCHANGED
+          <<capturedBoundary, capturedPersisted, capturedMax, capturedOps,
+            capturedDocValue, capturedDocSeqNext,
+            capturedTombstoneSeqNext>>
+
+RestartReplica ==
+    /\ tracePhase = 16
+    /\ D1RestartCopy(ReplicaNode)
+    /\ tracePhase' = 17
+    /\ UNCHANGED
+          <<capturedBoundary, capturedPersisted, capturedMax, capturedOps,
+            capturedDocValue, capturedDocSeqNext,
+            capturedTombstoneSeqNext>>
+
+FailReplicaReplay ==
+    /\ tracePhase = 17
+    /\ D1FailReplayAt(ReplicaNode)
+    /\ tracePhase' = 18
     /\ UNCHANGED
           <<capturedBoundary, capturedPersisted, capturedMax, capturedOps,
             capturedDocValue, capturedDocSeqNext,
@@ -200,13 +227,16 @@ TraceActionsNext ==
     \/ RestartPrimary
     \/ ReplayPrimary
     \/ FinishPrimaryReplay
+    \/ StartInPlacePrimaryReplay
+    \/ ReplayPrimaryInPlace
+    \/ FinishPrimaryInPlaceReplay
     \/ CrashReplica
     \/ RestartReplica
     \/ FailReplicaReplay
 
 TraceActionsTypeOK ==
     /\ D1TypeOK
-    /\ tracePhase \in 0..15
+    /\ tracePhase \in 0..18
     /\ capturedBoundary \in 0..MaxWrites
     /\ capturedPersisted \in 0..MaxWrites
     /\ capturedMax \in 0..MaxWrites
@@ -222,12 +252,12 @@ EarlierCapturePersists ==
         /\ processedNext[ReplicaNode] >= persistedProcessedNext[ReplicaNode]
 
 BothNodesRestarted ==
-    tracePhase >= 14 =>
+    tracePhase >= 17 =>
         /\ epoch[PrimaryNode] = 1
         /\ epoch[ReplicaNode] = 1
 
 FailedReplayUnavailable ==
-    tracePhase = 15 =>
+    tracePhase = 18 =>
         /\ copyMode[ReplicaNode] = "InstallMarker"
         /\ installMarker[ReplicaNode]
         /\ ReplicaNode \notin AvailableInSyncCopies

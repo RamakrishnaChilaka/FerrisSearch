@@ -123,6 +123,77 @@ run_invalid \
     invalid-r6-recovery-apply-wrong-identity.jsonl \
     16 \
     operation_processed
+run_valid r6-activation-replay valid-r6-activation-replay-literal.jsonl
+run_valid \
+    r6-activation-replay-events \
+    valid-r6-activation-replay-events-only.jsonl
+run_valid \
+    r6-activation-double-persist \
+    valid-r6-activation-double-commit-persist.jsonl
+run_valid \
+    r6-restart-double-persist \
+    valid-r6-restart-double-commit-persist.jsonl
+run_valid \
+    r6-restart-empty-replay \
+    valid-r6-restart-no-truncate-empty-replay.jsonl
+run_valid r6-physical-noop-fill valid-r6-promotion-physical-fill.jsonl
+run_valid \
+    r6-replica-crash-before-noop-send \
+    valid-r6-noop-send-after-replica-crash.jsonl
+run_valid \
+    r6-primary-crash-before-noop-send \
+    valid-r6-primary-crash-before-noop-send.jsonl
+run_valid rust-faithful-scripted valid-rust-faithful-scripted.jsonl
+run_invalid \
+    r6-double-persist-unknown \
+    invalid-r6-double-persist-unknown-commit.jsonl \
+    181 \
+    commit_persisted
+run_invalid \
+    r6-noop-send-omitted \
+    invalid-r6-noop-send-omitted.jsonl \
+    180 \
+    promotion_noop_fill
+run_invalid \
+    r6-noop-send-before-activation \
+    invalid-r6-noop-send-before-activation.jsonl \
+    181 \
+    promotion_noop_replication_started
+run_invalid \
+    r6-noop-send-non-insync \
+    invalid-r6-noop-send-to-non-insync.jsonl \
+    182 \
+    promotion_noop_replication_started
+run_invalid \
+    r6-replay-omits-retained \
+    invalid-r6-replay-omits-retained-entry.jsonl \
+    221 \
+    replay_entry
+run_invalid \
+    r6-replay-reapplies-committed \
+    invalid-r6-replay-reapplies-committed-entry.jsonl \
+    219 \
+    replay_entry
+run_invalid \
+    r6-replay-finishes-early \
+    invalid-r6-replay-finishes-early.jsonl \
+    222 \
+    replay_finished
+run_invalid \
+    r6-replay-reordered \
+    invalid-r6-replay-reordered.jsonl \
+    221 \
+    replay_entry
+run_invalid \
+    r6-replay-receipt-relabeled \
+    invalid-r6-replay-receipt-relabeled.jsonl \
+    221 \
+    replay_entry
+run_invalid \
+    rust-faithful-omitted-wal \
+    invalid-rust-faithful-omitted-wal.jsonl \
+    19 \
+    operation_processed
 run_inconclusive \
     timeout \
     "trace validation exceeded 1s" \

@@ -123,9 +123,9 @@ liveness configurations use neither symmetry nor a state constraint.
 | `MC_D1_TermCollisionRestart.tla` | B1 crash/rebuild after fence raise, committed-record-only versus identity-based restoration of collision state. |
 | `MC_D1_PrimaryGap.tla` | Primary engine-apply gap, max-based recovery loop, and processed-checkpoint comparison. |
 | `MC_D1_PromotionReplayNoOp.tla` | Promotion ordering: replay local WAL, fill gaps with NoOps, tolerate failed NoOp replication, then activate. |
-| `MC_D1_TraceActions.tla` | Checked coverage for earlier captured-boundary persistence, trace truncation, arbitrary-node restart/replay, and failed-replay unavailability. |
-| `MC_D1_FailoverActions.tla` | One scripted three-copy action path covering promotion fencing, NoOp fan-out/apply/redelivery, activation, sequence reuse, and fail-closed collision handling. |
-| `MC_D1_NoOpCollisionActions.tla` | One scripted path covering promotion NoOp collision, NACK delivery, and exact in-sync removal. |
+| `MC_D1_TraceActions.tla` | Checked coverage for earlier captured-boundary persistence, trace truncation, restart replay, alive-copy replay, and failed-replay unavailability. |
+| `MC_D1_FailoverActions.tla` | One scripted three-copy action path covering promotion fencing, physical NoOp append/process/sync, post-activation send, apply/redelivery, sequence reuse, and fail-closed collision handling. |
+| `MC_D1_NoOpCollisionActions.tla` | One scripted path covering physical promotion NoOp fill, post-activation send, collision, NACK delivery, and exact in-sync removal. |
 | `TraceD1.tla` | Existential schema-v4 witness search over real `MC_D1_SeqNoApply` actions, with evidence-directed hidden D1 actions and copy-state observations. |
 | `TraceD1Authority.tla` | Exact composition with Raft routing views, failover, durable fencing, activation, and primary write gating. |
 | `TraceD1Collision.tla` | Exact composition with the bounded B1 term/sequence collision and in-sync removal actions. |
@@ -1021,9 +1021,9 @@ performance benchmarks.
 | `d1-primary-gap-max` | 2 copies / seq 0..2 | Both checkpoints 1; primary max next 3 | Max-based detector | Expected `B3NoRecoveryLoop` violation | 4 / 4 | 4 | <1s |
 | `d1-primary-gap-processed` | Same primary gap | Compare processed checkpoint 1 to 1 | Processed detector | Pass | 3 / 3 | 3 | 1s |
 | `d1-promotion-replay-noop` | Promoted copy WAL `{0,2}` | Replay, NoOp 1, failed NoOp replication, activate | Promotion ordering | Pass | 8 / 7 | 6 | 1s |
-| `d1-trace-actions` | 2 nodes / 1 acknowledged write | Earlier captured commit; truncation; both-node restart; successful and failed replay | Trace action coverage | Pass | 16 / 16 | 16 | 2s |
-| `d1-failover-actions` | 3 nodes / 5 writes | Scripted gap/failover path; durable term-3 fences; NoOp fan-out/apply/redelivery; activation; collision | Scripted action coverage, not exhaustive model checking | Pass | 47 / 45 | 45 | 2s |
-| `d1-noop-collision-actions` | 3 nodes / 2 writes | Scripted promotion NoOp collision, NACK, and exact removal | Scripted action coverage, not exhaustive model checking | Pass | 28 / 27 | 27 | 2s |
+| `d1-trace-actions` | 2 nodes / 1 acknowledged write | Earlier captured commit; truncation; both-node restart; restart and alive-copy replay; failed replay | Trace action coverage | Pass | 19 / 19 | 19 | 2s |
+| `d1-failover-actions` | 3 nodes / 5 writes | Scripted gap/failover path; durable term-3 fences; physical NoOp fill; post-activation send/apply/redelivery; collision | Scripted action coverage, not exhaustive model checking | Pass | 50 / 48 | 48 | 3s |
+| `d1-noop-collision-actions` | 3 nodes / 2 writes | Scripted physical promotion NoOp fill, post-activation send, collision, NACK, and exact removal | Scripted action coverage, not exhaustive model checking | Pass | 31 / 30 | 30 | 2s |
 | `trace-validator` | Schema-v4 one-shard traces | Exact messages/crash sets/fill ranges; inferred core/authority/collision/recovery composition; semantic copy state | Four 2 GiB jobs; 120s per trace | Baselines plus m-, n-, p7-, and NoOp mutations match expected verdicts | Per-trace witness search | Per-trace witness search | 2m01s on four CPUs |
 | `trace-validator-round4` | Schema-v4 combined traces | Late delivery, truncation/restart, activation gaps, replayable NoOps | Four 2 GiB jobs; 120s per trace | Round-4 fixture verdicts match | Per-trace witness search | Per-trace witness search | 28.14s on four CPUs |
 | `two-shard` | 3 nodes / 2 shards | One shard red; sibling primary failure, promotion, and allocation | Per-shard update validation | Safety and liveness pass | 4 / 4 | 4 | 1s |
@@ -1037,9 +1037,10 @@ remained isolated. Every expected pass and expected counterexample matched.
 The two large exhaustive runs remain manual eight-worker commands.
 
 `d1-failover-actions` was introduced as scripted action coverage along one
-31-state path, not as exhaustive model checking. Explicit NoOp
-request/ACK/redelivery actions extend the current scripted path to 45 distinct
-states; its purpose remains coverage of named actions and order constraints.
+31-state path, not as exhaustive model checking. Explicit physical fill,
+post-activation request/ACK, and redelivery actions extend the current scripted
+path to 48 distinct states; its purpose remains coverage of named actions and
+order constraints.
 `d1-noop-collision-actions` is the same kind of scripted coverage for the
 collision/NACK/removal path.
 

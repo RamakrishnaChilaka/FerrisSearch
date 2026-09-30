@@ -286,13 +286,13 @@ PromotionNoOpSendObservation(event) ==
     /\ TraceCombined
     /\ event.writeId = NoWrite
     /\ event.hasTransportMessage
-    /\ event.transportMessage \in messages
+    /\ D1RedeliverPromotionNoOp(event.node, event.peer, event.seq)
+    /\ event.transportMessage \in messages'
     /\ event.transportMessage.kind = "ReplicateNoOp"
     /\ event.transportMessage.from = event.node
     /\ event.transportMessage.to = event.peer
     /\ event.transportMessage.term = event.term
     /\ event.transportMessage.seq = event.seq
-    /\ UNCHANGED d1vars
     /\ UNCHANGED AuxVars
 
 PromotionNoOpReceiveObservation(event) ==
@@ -317,6 +317,23 @@ PromotionNoOpWalObservation(event) ==
     /\ D1NoOpMessageEnabled(event.transportMessage)
     /\ IF RequestDurability THEN event.durable ELSE TRUE
     /\ UNCHANGED d1vars
+    /\ UNCHANGED AuxVars
+
+PromotionFillWalEvent(event) ==
+    /\ TraceCombined
+    /\ event.writeId = NoWrite
+    /\ event.origin \in {"primary", "promotion"}
+    /\ D1AppendPromotionNoOp(event.node, event.seq, event.term)
+    /\ IF RequestDurability THEN event.durable ELSE TRUE
+    /\ UNCHANGED AuxVars
+
+PromotionFillProcessEvent(event) ==
+    /\ TraceCombined
+    /\ event.writeId = NoWrite
+    /\ event.origin \in {"primary", "promotion"}
+    /\ event.outcome = "noop"
+    /\ D1ProcessPromotionNoOp(event.node, event.seq, event.term)
+    /\ LiveCheckpointMatchesPrime(event.node, event)
     /\ UNCHANGED AuxVars
 
 PromotionNoOpProcessEvent(event) ==
@@ -401,25 +418,32 @@ CommitCaptureEvent(event) ==
 
 CommitPersistEvent(event) ==
     /\ event.node \in Nodes
-    /\ captureActive[event.node]
-    /\ event.processedNext = captureBoundary[event.node]
-    /\ event.maxNext = captureMax[event.node]
-    /\ D1PersistBoundary(
-           event.node,
-           captureBoundary[event.node],
-           capturePersisted[event.node],
-           captureMax[event.node],
-           captureOps[event.node],
-           captureDocValue[event.node],
-           captureDocSeqNext[event.node],
-           captureTombstoneSeqNext[event.node],
-           TRUE)
-    /\ captureActive' =
-          [captureActive EXCEPT ![event.node] = FALSE]
-    /\ UNCHANGED
-          <<captureBoundary, capturePersisted, captureMax, captureOps, captureDocValue,
-            captureDocSeqNext,
-            captureTombstoneSeqNext>>
+    /\ CASE captureActive[event.node] ->
+              /\ event.processedNext = captureBoundary[event.node]
+              /\ event.persistedNext = capturePersisted[event.node]
+              /\ event.maxNext = captureMax[event.node]
+              /\ D1PersistBoundary(
+                     event.node,
+                     captureBoundary[event.node],
+                     capturePersisted[event.node],
+                     captureMax[event.node],
+                     captureOps[event.node],
+                     captureDocValue[event.node],
+                     captureDocSeqNext[event.node],
+                     captureTombstoneSeqNext[event.node],
+                     TRUE)
+              /\ captureActive' =
+                    [captureActive EXCEPT ![event.node] = FALSE]
+              /\ UNCHANGED
+                    <<captureBoundary, capturePersisted, captureMax, captureOps,
+                      captureDocValue, captureDocSeqNext,
+                      captureTombstoneSeqNext>>
+       [] ~captureActive[event.node] ->
+              /\ event.processedNext = persistedProcessedNext[event.node]
+              /\ event.persistedNext = persistedCommittedNext[event.node]
+              /\ event.maxNext = persistedMaxSeqNext[event.node]
+              /\ UNCHANGED d1vars
+              /\ UNCHANGED CaptureVars
     /\ UNCHANGED replicaResponsePersisted
 
 CrashEvent(event) ==
@@ -435,10 +459,14 @@ RestartEvent(event) ==
 
 ReplayStartObservation(event) ==
     /\ event.node \in Nodes
-    /\ replaying[event.node]
-    /\ replayBoundary[event.node] = event.processedNext
-    /\ LiveCheckpointMatches(event.node, event)
-    /\ UNCHANGED d1vars
+    /\ CASE replaying[event.node] ->
+              /\ replayBoundary[event.node] = event.processedNext
+              /\ LiveCheckpointMatches(event.node, event)
+              /\ UNCHANGED d1vars
+       [] ~replaying[event.node] ->
+              /\ D1StartInPlaceReplay(event.node)
+              /\ replayBoundary'[event.node] = event.processedNext
+              /\ LiveCheckpointMatchesPrime(event.node, event)
     /\ UNCHANGED AuxVars
 
 ReplayEntryEvent(event) ==
@@ -523,9 +551,11 @@ InSyncRemovalObservation(event) ==
 
 PromotionNoOpFillObservation(event) ==
     /\ TraceCombined
-    /\ D1FillPromotionNoOps(event.node, event.observedProcessed)
+    /\ IF event.fillPhysical
+          THEN D1ObservePromotionNoOpFill(
+                   event.node, event.observedProcessed, event.term)
+          ELSE D1FillPromotionNoOps(event.node, event.observedProcessed)
     /\ event.term = routing.term
-    /\ event.requiredMessages \subseteq messages'
     /\ LiveCheckpointMatchesPrime(event.node, event)
     /\ UNCHANGED AuxVars
 
@@ -602,7 +632,10 @@ RecoveryMembershipEvent(event) ==
 CoreEvent(event) ==
     CASE event.kind = "client_write_routed" -> ClientWriteEvent(event)
       [] event.kind = "wal_appended" ->
-            IF event.origin = "primary"
+            IF event.writeId = NoWrite
+                  /\ event.origin \in {"primary", "promotion"}
+            THEN PromotionFillWalEvent(event)
+            ELSE IF event.origin = "primary"
             THEN PrimaryWalObservation(event)
             ELSE IF event.origin = "recovery"
                  THEN RecoveryWalObservation(event)
@@ -610,7 +643,10 @@ CoreEvent(event) ==
                  THEN PromotionNoOpWalObservation(event)
                  ELSE ReplicaWalObservation(event)
       [] event.kind = "operation_processed" ->
-            IF event.origin = "primary"
+            IF event.writeId = NoWrite
+                  /\ event.origin \in {"primary", "promotion"}
+            THEN PromotionFillProcessEvent(event)
+            ELSE IF event.origin = "primary"
             THEN PrimaryProcessEvent(event)
             ELSE IF event.origin = "recovery"
                  THEN RecoveryApplyEvent(event)

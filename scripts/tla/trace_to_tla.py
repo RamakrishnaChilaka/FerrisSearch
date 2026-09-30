@@ -606,7 +606,12 @@ def validate_event(
         if value["op"] not in {"index", "delete"}:
             fail(line, "client op must be index or delete")
     elif event in {"wal_appended", "operation_processed"}:
-        if value["origin"] not in {"primary", "live_replication", "recovery"}:
+        if value["origin"] not in {
+            "primary",
+            "live_replication",
+            "recovery",
+            "promotion",
+        }:
             fail(line, "origin is invalid")
         if value["op"] not in {"index", "delete", "noop"}:
             fail(line, "operation kind is invalid")
@@ -1178,9 +1183,16 @@ def load_trace(path: Path) -> LoadedTrace:
             "term": start["shard_state"]["term"],
             "in_sync": set(start["shard_state"]["in_sync"]),
             "allocations": dict(initial_allocations),
+            "initialized": start["shard_state"]["activated"],
         }
         for item in start["nodes"]
     }
+    node_alive = {item["node"]: True for item in start["nodes"]}
+    activated_terms = {item["node"]: 0 for item in start["nodes"]}
+    if start["shard_state"]["activated"]:
+        activated_terms[start["shard_state"]["primary"]] = start["shard_state"][
+            "term"
+        ]
     node_incarnations = {
         item["node"]: item["incarnation"] for item in start["nodes"]
     }
@@ -1273,7 +1285,11 @@ def load_trace(path: Path) -> LoadedTrace:
 
         elif kind == "wal_appended":
             receipt = event["receipt_id"]
-            if event["origin"] == "primary" and request not in routed:
+            if (
+                event["origin"] == "primary"
+                and request not in routed
+                and not (request is None and event["op"] == "noop")
+            ):
                 fail(line, "primary WAL append has no routed request")
             register_receipt(receipt, ident, line)
             copy_key = (receipt, event["node"])
@@ -1310,10 +1326,13 @@ def load_trace(path: Path) -> LoadedTrace:
             process_by_receipt[receipt] = event
             processed_by_copy.add((receipt, event["node"]))
             if event["origin"] == "primary":
-                if request not in routed:
+                if request not in routed and not (
+                    request is None and event["op"] == "noop"
+                ):
                     fail(line, "primary process has no routed request")
-                request_state[request] = "Replicating"
-                request_primary[request] = event["node"]
+                if request is not None:
+                    request_state[request] = "Replicating"
+                    request_primary[request] = event["node"]
             if "_message_id" in event:
                 attempt = message_attempts[event["_message_id"]]
                 if attempt["phase"] != "request":
@@ -1480,6 +1499,7 @@ def load_trace(path: Path) -> LoadedTrace:
             if batch_id in noop_batches:
                 fail(line, f"promotion NoOp batch {batch_id!r} was reused")
             noops: dict[str, dict[str, Any]] = {}
+            physical_effects: list[bool] = []
             for noop in event["noops"]:
                 noop_ident = (event["term"], noop["seq_no"])
                 content = {
@@ -1489,18 +1509,54 @@ def load_trace(path: Path) -> LoadedTrace:
                 }
                 register_identity(noop_ident, content, line)
                 register_receipt(noop["receipt_id"], noop_ident, line)
-                if (noop["receipt_id"], event["node"]) in wal_by_copy:
-                    fail(line, "promotion NoOp receipt already exists on primary")
-                wal_by_copy.add((noop["receipt_id"], event["node"]))
-                wal_entries_by_node[event["node"]].append(noop["receipt_id"])
+                copy_key = (noop["receipt_id"], event["node"])
+                has_wal = copy_key in wal_by_copy
+                has_process = copy_key in processed_by_copy
+                if has_wal != has_process:
+                    fail(
+                        line,
+                        "promotion NoOp fill has only one physical apply effect",
+                    )
+                if has_wal:
+                    wal_event = wal_by_receipt[noop["receipt_id"]]
+                    process_event = process_by_receipt[noop["receipt_id"]]
+                    if (
+                        wal_event["node"] != event["node"]
+                        or wal_event["origin"] not in {"primary", "promotion"}
+                        or process_event["node"] != event["node"]
+                        or process_event["origin"] not in {"primary", "promotion"}
+                        or process_event["outcome"] != "noop"
+                    ):
+                        fail(
+                            line,
+                            "promotion NoOp physical effects do not match the fill",
+                        )
+                else:
+                    wal_by_receipt.setdefault(
+                        noop["receipt_id"],
+                        {
+                            "node": event["node"],
+                            "origin": "promotion",
+                            "durable": True,
+                        },
+                    )
+                    wal_by_copy.add(copy_key)
+                    processed_by_copy.add(copy_key)
+                    wal_entries_by_node[event["node"]].append(noop["receipt_id"])
+                physical_effects.append(has_wal)
                 noops[noop["receipt_id"]] = noop
-            expected_targets = set(latest_views[event["node"]]["in_sync"])
+            if any(physical_effects) and not all(physical_effects):
+                fail(line, "promotion NoOp fill mixes summary and physical effects")
+            event["_fill_physical"] = bool(physical_effects and physical_effects[0])
             noop_batches[batch_id] = {
                 "event": event,
                 "node": event["node"],
                 "term": event["term"],
                 "noops": noops,
-                "expected_targets": expected_targets,
+                "send_targets": None,
+                "send_allocations": None,
+                "candidate_targets": None,
+                "candidate_allocations": None,
                 "message_ids": [],
             }
 
@@ -1512,15 +1568,29 @@ def load_trace(path: Path) -> LoadedTrace:
             if noop is None:
                 fail(line, "promotion NoOp send has an unknown receipt")
             view = latest_views[event["node"]]
+            if batch["send_targets"] is None:
+                if (
+                    not node_alive[event["node"]]
+                    or activated_terms[event["node"]] != event["term"]
+                    or view["primary"] != event["node"]
+                    or view["term"] != event["term"]
+                    or not view["initialized"]
+                ):
+                    fail(line, "promotion NoOp send precedes a valid activation")
+                batch["send_targets"] = set(view["in_sync"])
+                batch["send_allocations"] = {
+                    target: view["allocations"][target]
+                    for target in view["in_sync"]
+                }
             if (
                 batch["node"] != event["node"]
                 or batch["term"] != event["term"]
                 or noop["seq_no"] != event["seq_no"]
                 or noop["content_hash"] != event["content_hash"]
                 or event["source_incarnation"] != node_incarnations[event["node"]]
-                or event["replica"] not in batch["expected_targets"]
+                or event["replica"] not in batch["send_targets"]
                 or event["replica_allocation"]
-                != view["allocations"][event["replica"]]
+                != batch["send_allocations"][event["replica"]]
                 or event["replica_incarnation"]
                 != node_incarnations[event["replica"]]
             ):
@@ -1668,7 +1738,25 @@ def load_trace(path: Path) -> LoadedTrace:
                     item["node"]: item["allocation"]
                     for item in event["allocations"]
                 },
+                "initialized": event["initialized"],
             }
+            for batch in noop_batches.values():
+                if (
+                    batch["node"] == event["node"]
+                    and batch["term"] == event["term"]
+                    and batch["send_targets"] is None
+                    and activated_terms[event["node"]] == event["term"]
+                ):
+                    if event["primary"] == event["node"] and event["initialized"]:
+                        batch["candidate_targets"] = set(event["in_sync"])
+                        batch["candidate_allocations"] = {
+                            item["node"]: item["allocation"]
+                            for item in event["allocations"]
+                            if item["node"] in event["in_sync"]
+                        }
+                    else:
+                        batch["candidate_targets"] = None
+                        batch["candidate_allocations"] = None
 
         elif kind == "node_crashed":
             if event["incarnation"] != node_incarnations[event["node"]]:
@@ -1699,12 +1787,16 @@ def load_trace(path: Path) -> LoadedTrace:
             for request_id in expected_failed:
                 request_state[request_id] = "Failed"
             available.discard(event["node"])
+            node_alive[event["node"]] = False
+            activated_terms[event["node"]] = 0
 
         elif kind == "node_restarted":
             if event["incarnation"] != node_incarnations[event["node"]] + 1:
                 fail(line, "node_restarted incarnation must advance by one")
             node_incarnations[event["node"]] = event["incarnation"]
             available.discard(event["node"])
+            node_alive[event["node"]] = True
+            activated_terms[event["node"]] = 0
 
         elif kind == "routing_promoted":
             current_primary = event["new_primary"]
@@ -1719,6 +1811,21 @@ def load_trace(path: Path) -> LoadedTrace:
         elif kind == "primary_activated":
             available.add(event["node"])
             latest_views[event["node"]]["term"] = event["term"]
+            activated_terms[event["node"]] = event["term"]
+            view = latest_views[event["node"]]
+            for batch in noop_batches.values():
+                if (
+                    batch["node"] == event["node"]
+                    and batch["term"] == event["term"]
+                    and batch["send_targets"] is None
+                    and view["primary"] == event["node"]
+                    and view["initialized"]
+                ):
+                    batch["candidate_targets"] = set(view["in_sync"])
+                    batch["candidate_allocations"] = {
+                        target: view["allocations"][target]
+                        for target in view["in_sync"]
+                    }
 
         elif kind == "in_sync_removed":
             available.discard(event["removed_node"])
@@ -1732,10 +1839,17 @@ def load_trace(path: Path) -> LoadedTrace:
                 available.add(event["target_node"])
 
     for batch in noop_batches.values():
+        expected_targets = batch["send_targets"]
+        if expected_targets is None:
+            expected_targets = (
+                set(batch["candidate_targets"] or set())
+                if node_alive[batch["node"]]
+                else set()
+            )
         expected_pairs = {
             (receipt, target)
             for receipt in batch["noops"]
-            for target in batch["expected_targets"]
+            for target in expected_targets
         }
         actual_pairs = {
             (attempt["receipt_id"], attempt["target"])
@@ -1749,7 +1863,7 @@ def load_trace(path: Path) -> LoadedTrace:
                 "promotion NoOp sends must cover every filled sequence and "
                 "in-sync replica",
             )
-        batch["event"]["_required_message_ids"] = list(batch["message_ids"])
+        batch["event"]["_required_message_ids"] = []
 
     if last_copy_state != (events[-1]["step"] if events else -1):
         fail(len(records), "trace must end with copy_state")
@@ -2109,6 +2223,9 @@ def render(trace: LoadedTrace) -> tuple[str, str]:
             "persistedNext": str(cp_next(checkpoints_value["persisted"])),
             "maxNext": str(cp_next(checkpoints_value["max_seq_no"])),
             "durable": "TRUE" if durable_observed else "FALSE",
+            "fillPhysical": (
+                "TRUE" if event.get("_fill_physical", False) else "FALSE"
+            ),
             "fenceObservedTerm": str(fence_observed),
             "fenceMaxNext": str(cp_next(event.get("fence_max_seq_no"))),
             "truncateNext": str(cp_next(event.get("truncate_through"))),
