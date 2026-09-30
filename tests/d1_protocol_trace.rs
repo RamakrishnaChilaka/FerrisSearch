@@ -2058,6 +2058,214 @@ async fn seeded_three_node_fault_trace() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn promotion_noop_retry_emits_every_transport_attempt() -> Result<()> {
+    let trace_dir = tempfile::tempdir()?;
+    let output = std::env::var_os("D1_TRACE_RETRY_OUTPUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| trace_dir.path().join("promotion-noop-retry.jsonl"));
+    let mut cluster = RandomTraceCluster::start().await?;
+    let trace = protocol_trace::start(TraceConfig {
+        output,
+        run_id: "d1-promotion-noop-retry".to_string(),
+        test: "promotion_noop_retry_emits_every_transport_attempt".to_string(),
+        durability: "request",
+        nodes: ["p", "q", "r"]
+            .into_iter()
+            .map(|node| TraceNode {
+                node: node.to_string(),
+                incarnation: 0,
+            })
+            .collect(),
+        shard_state: TraceStartShard {
+            index_uuid: INDEX_UUID.to_string(),
+            shard: SHARD,
+            primary: "p".to_string(),
+            term: 1,
+            activated: true,
+            in_sync: vec!["q".to_string(), "r".to_string()],
+            copies: ["p", "q", "r"]
+                .into_iter()
+                .map(|node| TraceStartCopy {
+                    node: node.to_string(),
+                    allocation: 1,
+                    exists: true,
+                    fence_term: 1,
+                })
+                .collect(),
+        },
+        mutation: MutationMode::None,
+        faults: ["q", "r", "r"]
+            .into_iter()
+            .map(|target| FaultRule {
+                target: target.to_string(),
+                seq_no: 1,
+                action: FaultAction::DropRequest,
+            })
+            .collect(),
+    })?;
+
+    let execution: Result<()> = async {
+        cluster.record_initial_routing_views()?;
+        let mut client = connect(cluster.address("p")?).await?;
+        for value in 0..=2 {
+            let _operation = cluster.operation_gate.read().await;
+            let response = index_document(&mut client, "retry-doc", value).await?;
+            anyhow::ensure!(
+                response.seq_no == Some(value as u64) && response.success == (value != 1),
+                "unexpected promotion-gap write result: {response:?}"
+            );
+        }
+        drop(client);
+
+        {
+            let operation_gate = cluster.operation_gate.clone();
+            let _exclusive = operation_gate.write_owned().await;
+            let primary = cluster
+                .nodes
+                .get_mut("p")
+                .context("primary node is missing")?
+                .running
+                .take()
+                .context("primary is already stopped")?;
+            stop_node(primary).await;
+            protocol_trace::record_node_crashed("p", "unclean")?;
+            cluster.apply_command(
+                ClusterCommand::FailShardCopy {
+                    index_name: INDEX.to_string(),
+                    index_uuid: INDEX_UUID.to_string(),
+                    shard_id: SHARD,
+                    node: "p".to_string(),
+                    allocation_id: 1,
+                    expected_primary_term: 1,
+                    promote_only: true,
+                    promotion_candidate: Some("q".to_string()),
+                },
+                "retry probe primary promotion",
+            )?;
+            let promoted = cluster.authoritative_state();
+            cluster.apply_command(
+                ClusterCommand::ActivatePrimary {
+                    index_name: INDEX.to_string(),
+                    index_uuid: INDEX_UUID.to_string(),
+                    shard_id: SHARD,
+                    primary: "q".to_string(),
+                    allocation_id: 1,
+                    expected_term: promoted.indices[INDEX].shard_routing[&SHARD].primary_term,
+                },
+                "retry probe primary activation",
+            )?;
+            cluster.current_primary = "q".to_string();
+        }
+
+        let service = cluster.service("q")?;
+        for (expected_pending, expected_checkpoint) in [(true, Some(0)), (false, Some(2))] {
+            let _operation = cluster.operation_gate.read().await;
+            service
+                .protocol_trace_activate_primary_for_test(INDEX, SHARD)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            let has_pending = !service
+                .shard_manager
+                .isr_tracker
+                .expired_gap_observations(Duration::ZERO)
+                .is_empty();
+            anyhow::ensure!(
+                has_pending == expected_pending,
+                "promotion NoOp retry did not update the replica gap"
+            );
+            let replica = cluster
+                .node("r")?
+                .shard_manager
+                .get_shard(INDEX, SHARD)
+                .context("retry target is not open")?;
+            let sequence = replica.sequence_stats();
+            anyhow::ensure!(
+                sequence.processed_checkpoint == expected_checkpoint
+                    && sequence.persisted_checkpoint == expected_checkpoint,
+                "retry target has incorrect checkpoints: {sequence:?}"
+            );
+        }
+
+        {
+            let _exclusive = cluster.operation_gate.write().await;
+            let snapshots = ["q", "r"]
+                .into_iter()
+                .map(|node| {
+                    let manager = &cluster.nodes[node].shard_manager;
+                    let engine = manager
+                        .get_shard(INDEX, SHARD)
+                        .context("copy is not open")?;
+                    anyhow::ensure!(
+                        engine.sequence_stats().processed_checkpoint == Some(2)
+                            && engine.sequence_stats().persisted_checkpoint == Some(2),
+                        "copy {node} did not durably close the promotion gap"
+                    );
+                    let snapshot = manager.capture_protocol_trace_copy_state(INDEX, SHARD)?;
+                    anyhow::ensure!(
+                        engine.get_document("retry-doc")? == Some(serde_json::json!({"value": 2})),
+                        "copy {node} lost the acknowledged document"
+                    );
+                    Ok(snapshot)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for snapshot in snapshots {
+                protocol_trace::record_copy_snapshot(snapshot, "trace_end")?;
+            }
+        }
+        Ok(())
+    }
+    .await;
+    let trace_result = trace.finish(execution.is_ok());
+    cluster.stop_all().await;
+    let output = trace_result?;
+    execution
+        .with_context(|| format!("promotion retry probe failed; trace={}", output.display()))?;
+    assert_trace_completeness(&output)?;
+
+    let events = std::fs::read_to_string(&output)?
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let sends = events
+        .iter()
+        .filter(|event| event["event"] == "promotion_noop_replication_started")
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        sends.len() == 2,
+        "both promotion transport attempts must be emitted"
+    );
+    anyhow::ensure!(
+        sends[0]["message_id"] != sends[1]["message_id"]
+            && sends[0]["receipt_id"] == sends[1]["receipt_id"]
+            && sends[0]["batch_id"] == sends[1]["batch_id"],
+        "retry must preserve the NoOp identity but allocate a fresh message"
+    );
+    for (send, expected_outcome) in sends.iter().zip(["dropped", "acknowledged"]) {
+        let result = events
+            .iter()
+            .find(|event| {
+                event["event"] == "promotion_noop_result"
+                    && event["message_id"] == send["message_id"]
+            })
+            .context("promotion transport attempt has no result")?;
+        anyhow::ensure!(
+            result["outcome"] == expected_outcome,
+            "incorrect retry result"
+        );
+    }
+    let promotion_appends = events
+        .iter()
+        .filter(|event| event["event"] == "wal_appended" && event["origin"] == "promotion")
+        .count();
+    anyhow::ensure!(
+        promotion_appends == 1,
+        "retry must not invent another local WAL append"
+    );
+    println!("D1 promotion retry trace: {}", output.display());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn randomized_three_node_fault_trace() -> Result<()> {
     let seeds = parse_random_seeds()?;
     let mutation = mutation_mode()?;

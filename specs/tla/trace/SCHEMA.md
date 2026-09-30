@@ -355,6 +355,25 @@ before the snapshot is taken may leave the batch unsent. A replica crash does
 not remove an already selected target and therefore may produce a later
 `dropped/request` result with no crash-time message loss.
 
+`TransportService::ensure_primary_activated` serializes activation with
+`PrimaryCopyActivationLocks::activation`, obtained through
+`PrimaryActivationState::copy_locks` for the exact `(index_uuid, shard,
+allocation)` key. `TransportService::retry_pending_promotion_noops` holds that
+copy's separate `noop_replication` mutex while redelivering pending batches.
+Neither is a node-wide lock. Cached activation retries do not emit another
+fill or activation; each actual retry still passes through
+`replicate_noop_batch_with_durability` and emits fresh sequence-target message
+IDs plus all receive, rejection, WAL/process, and result effects that occur.
+The replay/fill, activation-cache, and replica effect locks in the tables above
+remain the linearization boundaries.
+
+Collision quarantine is checked in both `ShardManager::open_assigned_shard`
+and the slow path of `open_shard_with_settings_mode` under `shard_open_lock`.
+An allocation-bound in-memory marker remains authoritative even if its disk
+write or a lifecycle failure report failed. A subsequent replica RPC rejected
+there emits `replica_rejected` with `reason=quarantined` before its result,
+without inventing a receive, fence, WAL append, or processing effect.
+
 ### Recovery
 
 | Event | Required fields | Emit in current Rust code | Required lock and ordering |

@@ -107,6 +107,7 @@ PY
 correct="$RUN_DIR/correct.jsonl"
 arrival="$RUN_DIR/arrival-order.jsonl"
 seq_only="$RUN_DIR/seq-only-redelivery.jsonl"
+retry="$RUN_DIR/promotion-noop-retry.jsonl"
 
 capture none "$correct"
 arrival_order_step "$correct" stale >/dev/null
@@ -121,5 +122,14 @@ expect_tla_rejected "$arrival" "$arrival_step"
 capture seq-only-redelivery "$seq_only"
 expect_checker_rejected "$seq_only" 117
 expect_tla_rejected "$seq_only" 117
+
+D1_TRACE_RETRY_OUTPUT="$retry" cargo test \
+    --manifest-path "$ROOT_DIR/Cargo.toml" \
+    --test d1_protocol_trace \
+    --features protocol-trace \
+    promotion_noop_retry_emits_every_transport_attempt \
+    -- --exact --nocapture
+python3 "$CHECKER" "$retry"
+TLA_TRACE_EXPECTED=accepted "$VALIDATOR" "$retry"
 
 echo "D1 Rust trace validation passed (seed=$SEED)."
