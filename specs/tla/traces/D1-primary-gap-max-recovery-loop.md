@@ -21,4 +21,3 @@ same legitimate primary gap, so the comparison triggers again.
 The fixed configuration compares processed checkpoints. Both copies report
 checkpoint 1, so no recovery loop begins. Acknowledged operations 0 and 2 are
 present on both copies despite the checkpoint gap.
-

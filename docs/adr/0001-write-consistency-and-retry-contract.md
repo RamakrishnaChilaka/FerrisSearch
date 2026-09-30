@@ -126,10 +126,23 @@ source and the Elasticsearch 7.10 reference, the fork point.
 
 ### D1. Operation identity and replica apply
 
-**Status:** Accepted and implemented (FS-012). The implemented behavior and its
-limits are in [`recovery-protocol.md`](../recovery-protocol.md). Evidence: the
+**Status:** Accepted and implemented for `local_shards` (FS-012). The
+implemented behavior and its limits are in
+[`recovery-protocol.md`](../recovery-protocol.md). Evidence: the
 `d1_*_regression` integration suites in `tests/`, and bounded model checking in
 [`specs/tla/README.md`](../../specs/tla/README.md#d1-sequence-aware-replica-apply).
+
+Known limitations of the implementation:
+
+- History convergence after failover (D10) is not implemented. A replica that
+  misses an operation the primary wrote to its WAL is removed at the gap
+  deadline and rebuilt by peer recovery.
+- Pending promotion NoOp retries live only in process memory. A restart loses
+  them, and the replica falls back to the gap deadline.
+- A collision marker that could not be persisted is lost on restart.
+- Every primary activation rebuilds the vector index.
+- D2, D5, and D14 remain proposed.
+- The model-checking evidence is bounded, not a proof.
 
 - **Identity:** each write is identified by
   `(index UUID, shard, primary term, seq_no)`. The primary assigns `seq_no` at
@@ -336,6 +349,10 @@ In-sync copies must not keep divergent operations after a failover:
   single-document rules or are rejected per item with 400 until implemented.
 - **Shard-group failures:** every item in the group receives that group's
   outcome class.
+- **Metadata keys in sources:** a top-level source key that names a metadata
+  field, such as `_id`, `_source`, `_seq_no`, or `_primary_term`, is rejected
+  per item with 400 `mapper_parsing_exception`. This rule is implemented with
+  D1.
 
 ### D13. Unimplemented parameters fail loudly
 

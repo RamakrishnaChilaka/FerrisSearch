@@ -19,4 +19,3 @@ already contained all acknowledged operations.
 The corrected property always checks available in-sync replicas, but checks
 the promotion candidate only after WAL replay, NoOp gap fill, and activation.
 This is an availability-scope correction, not evidence against D1.
-

@@ -193,9 +193,11 @@ Restart or an activation failure after local NoOp application can lose that
 entry; current code does not rebuild it from the WAL. The replica then remains
 gapful until the fixed deadline removes the allocation and peer recovery
 rebuilds it.
-Activation and retry serialization is allocation-local; a slow or unreachable
-replica for one shard must not delay activation or client writes on another
-shard.
+Activation and retry serialization is allocation-local, so a slow or
+unreachable replica for one shard does not delay client writes on another
+shard. Lifecycle ticks still activate shards one at a time: a retry that waits
+on an unreachable replica, for up to its 30 s timeout, delays activation of the
+shards after it in the same tick.
 These promotion NoOps fill gaps on the promoted copy only; they do not repair
 replicas that missed a real post-WAL primary operation. Such copies follow the
 gap deadline and peer-recovery path until D10 exists.

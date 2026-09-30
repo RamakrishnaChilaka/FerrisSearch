@@ -27,4 +27,3 @@ The fixed variant persists local `max_seq_no` when raising the replica fence.
 An already-processed sequence at or below that maximum, received under a newer
 term, is a definitive identity collision rather than redelivery. The copy is
 failed, removed from eligibility, and peer-recovered before promotion.
-

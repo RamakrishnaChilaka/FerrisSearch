@@ -39,7 +39,8 @@ escalation, and a bounded TLA+ model of replication and recovery
 (`specs/tla/`). The status notes on FS-012 and FS-022 through FS-026 record
 what those PRs completed, measured against each task's done criteria.
 
-**Raised: replica apply order (under FS-012).** Replicas apply replicated
+**Raised: replica apply order (under FS-012).** *Fixed by ADR 0001 D1
+(2026-09-30); see the FS-012 status.* Replicas applied replicated
 writes in arrival order. The primary replicates after leaving its WAL critical
 section, so concurrent writes can arrive out of sequence order. A review probe
 with a 3,000-document bulk plus 50 concurrent single writes left the replica
@@ -252,6 +253,13 @@ new sequence/version state, including timeout-after-commit and failover cases.
 ### FS-012 — Fence Stale Primaries And Replica Applies
 
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-007, FS-009, FS-010
+
+**Status (2026-09-30):** Partial. ADR 0001 D1 is implemented: replicas and
+replay apply by per-document `seq_no` and primary term, with gap-aware
+checkpoints, ignored redelivery, term-collision quarantine, and promotion NoOp
+gap fill. Evidence: the `d1_*_regression` suites, the D1 TLA+ model, and TLA+
+validation of traces captured from seeded three-node Rust fault runs. The
+stale-primary criterion below is still unmet, because it needs FS-007.
 
 **Status (2026-09-27):** Partial.
 - **Fencing is implemented** (PRs #143-#144), ahead of the listed dependencies:

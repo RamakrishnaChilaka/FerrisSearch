@@ -27,4 +27,3 @@ produced a depth-13 trace.
 This is implementation-faithful evidence for the pre-D1 code. The primary may
 be ahead safely, but an available in-sync replica may never be behind the
 highest acknowledged sequence for a document.
-

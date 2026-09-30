@@ -27,4 +27,3 @@ Quiescent convergence now compares only semantic document state:
 - deletion status for deleted documents.
 
 Retention, cache, and bookkeeping metadata are intentionally excluded.
-

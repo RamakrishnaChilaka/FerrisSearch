@@ -22,4 +22,3 @@ Promoting R rolled back the acknowledged term-2 value.
 The fixed configuration restores both fence term and fence maximum from
 durable copy identity before serving replication. It detects the collision,
 fails the copy, and requires recovery before promotion.
-

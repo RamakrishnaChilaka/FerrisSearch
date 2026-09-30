@@ -30,4 +30,3 @@ The trace maps to `HotEngine` commit metadata and
 `HotTranslog::for_each_from`. D1 instead persists the gap-aware processed
 checkpoint and replays every retained operation above it through the same
 sequence-aware planner.
-

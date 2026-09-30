@@ -25,4 +25,3 @@ The property was replaced by:
   acknowledged.
 
 This trace is a model-property correction, not evidence against D1.
-
