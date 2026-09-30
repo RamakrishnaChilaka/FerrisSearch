@@ -73,9 +73,9 @@ and reject the mutations at `operation_processed` steps 27 and 117.
 replay, primary failover with NoOp gap fill, exact replica removal, and peer
 recovery. CI builds the integration target in a separate untimed step; only the
 capture and validation wrapper has the five-minute timeout. On September 30,
-2026, the separate build took 1m43.13s and the validation wrapper completed in
-1m25.85s with 695,160 KB peak RSS under `taskset -c 0-3` on the development
-host.
+2026, the validation wrapper completed in 1m33.01s with 721,452 KB peak RSS
+under `taskset -c 0-3` on the development host; compilation was completed
+before that timed command.
 
 Run the full deterministic sweep manually:
 
@@ -102,7 +102,7 @@ done
 ```
 
 On September 30, 2026, all 200 correct-code seeds passed. The independent
-checker took 0.11s p50 and 0.36s maximum; TLC took 12.125s p50 and 26.08s
+checker took 0.11s p50 and 2.46s maximum; TLC took 13.58s p50 and 26.48s
 maximum. Both checkers detected all 50 arrival-order and all 50
 sequence-only-redelivery mutations. These are development-host validation
 times from two concurrent one-worker TLC processes with 2 GiB heaps, not
