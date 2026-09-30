@@ -76,6 +76,47 @@ struct ApplyState {
     max_seq_no_of_updates_or_deletes: Option<u64>,
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct ApplyStateTiming {
+    enabled: std::sync::atomic::AtomicBool,
+    samples: Mutex<Vec<(&'static str, usize, Duration)>>,
+}
+
+#[cfg(test)]
+impl ApplyStateTiming {
+    fn start(&self, context: &'static str, operations: usize) -> Option<ApplyStateTimer<'_>> {
+        self.enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .then(|| ApplyStateTimer {
+                timing: self,
+                context,
+                operations,
+                started: Instant::now(),
+            })
+    }
+}
+
+#[cfg(test)]
+struct ApplyStateTimer<'a> {
+    timing: &'a ApplyStateTiming,
+    context: &'static str,
+    operations: usize,
+    started: Instant,
+}
+
+#[cfg(test)]
+impl Drop for ApplyStateTimer<'_> {
+    fn drop(&mut self) {
+        let duration = self.started.elapsed();
+        self.timing
+            .samples
+            .lock()
+            .unwrap()
+            .push((self.context, self.operations, duration));
+    }
+}
+
 #[derive(Clone)]
 struct SequencePlanningSnapshot {
     checkpoints: LocalCheckpointTracker,
@@ -354,6 +395,8 @@ pub struct HotEngine {
     writer: Arc<RwLock<WriterState>>,
     maintenance_lock: Mutex<()>,
     automatic_merge_policy: RwLock<Arc<dyn MergePolicy>>,
+    #[cfg(test)]
+    apply_state_timing: ApplyStateTiming,
     #[cfg(test)]
     force_merge_entry_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
     #[cfg(test)]
@@ -1020,6 +1063,8 @@ impl HotEngine {
             maintenance_lock: Mutex::new(()),
             automatic_merge_policy: RwLock::new(automatic_merge_policy),
             #[cfg(test)]
+            apply_state_timing: ApplyStateTiming::default(),
+            #[cfg(test)]
             force_merge_entry_barrier: Mutex::new(None),
             #[cfg(test)]
             force_merge_before_wait_sender: Mutex::new(None),
@@ -1447,6 +1492,10 @@ impl HotEngine {
             .apply_state
             .lock()
             .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+        #[cfg(test)]
+        let _apply_state_timer = self
+            .apply_state_timing
+            .start("sequenced_batch", operations.len());
         #[cfg(feature = "protocol-trace")]
         let trace_copy = crate::protocol_trace::current_open_copy();
         #[cfg(feature = "protocol-trace")]
@@ -2060,6 +2109,10 @@ impl HotEngine {
                         .apply_state
                         .lock()
                         .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+                    #[cfg(test)]
+                    let _apply_state_timer = self
+                        .apply_state_timing
+                        .start("primary_bulk_versions", docs.len());
                     for doc_id in &doc_ids {
                         match initial_versions.entry(doc_id.as_str()) {
                             std::collections::hash_map::Entry::Occupied(_) => created.push(false),
@@ -9382,6 +9435,215 @@ mod tests {
         (dir, engine)
     }
 
+    fn realtime_get_while_apply_state_is_held(
+        engine: Arc<HotEngine>,
+        doc_id: &'static str,
+    ) -> Result<Option<super::super::DocumentRead>> {
+        let state = engine.apply_state.lock().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let get_engine = engine.clone();
+        let get = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(get_engine.get_document_with_metadata(doc_id, true))
+                .unwrap();
+        });
+        started_rx.recv_timeout(TEST_SYNC_TIMEOUT).unwrap();
+        let result = result_rx.recv_timeout(TEST_SYNC_TIMEOUT);
+        drop(state);
+        get.join().unwrap();
+        result.expect("realtime GET must complete before the apply-state mutex is released")
+    }
+
+    #[test]
+    fn realtime_get_map_miss_does_not_wait_for_apply_state() {
+        let (_directory, engine) = create_engine();
+        let receipt = engine
+            .add_document_with_receipt("old", json!({"value": 1}))
+            .unwrap();
+        engine.refresh().unwrap();
+        let document = realtime_get_while_apply_state_is_held(Arc::new(engine), "old")
+            .unwrap()
+            .unwrap();
+        assert_eq!(document.source, json!({"value": 1}));
+        assert_eq!(document.seq_no, receipt.seq_no);
+        assert_eq!(document.primary_term, receipt.primary_term);
+    }
+
+    #[test]
+    fn realtime_get_tombstone_does_not_wait_for_apply_state() {
+        let (_directory, engine) = create_engine();
+        engine.add_document("deleted", json!({"value": 1})).unwrap();
+        engine.refresh().unwrap();
+        engine.delete_document("deleted").unwrap();
+        assert!(
+            realtime_get_while_apply_state_is_held(Arc::new(engine), "deleted")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[ignore = "release-mode continuous GET benchmark; run explicitly on pinned CPUs"]
+    fn continuous_realtime_get_latency_during_bulk() {
+        const DOCUMENTS: usize = 20_000;
+        const ROUNDS: usize = 3;
+        const CADENCE: Duration = Duration::from_millis(1);
+        let mut miss = Vec::new();
+        let mut hit = Vec::new();
+        let mut reader = Vec::new();
+        let mut bulk_seconds = 0.0;
+        for round in 0..ROUNDS {
+            let directory = tempfile::tempdir().unwrap();
+            let engine = Arc::new(
+                super::super::CompositeEngine::new(directory.path(), Duration::from_secs(3600))
+                    .unwrap(),
+            );
+            let old = engine
+                .add_document_with_receipt("old", json!({"v": 1}))
+                .unwrap();
+            engine.refresh().unwrap();
+            let live = engine
+                .add_document_with_receipt("live", json!({"v": 2}))
+                .unwrap();
+            for _ in 0..100 {
+                for (doc_id, realtime, expected) in [
+                    ("old", true, &old),
+                    ("live", true, &live),
+                    ("old", false, &old),
+                ] {
+                    let document = engine
+                        .get_document_with_metadata(doc_id, realtime)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(document.seq_no, expected.seq_no);
+                    assert_eq!(document.primary_term, expected.primary_term);
+                }
+            }
+            engine
+                .text_engine()
+                .apply_state_timing
+                .enabled
+                .store(true, Ordering::Relaxed);
+            let barrier = Arc::new(std::sync::Barrier::new(5));
+            let done = Arc::new(AtomicBool::new(false));
+            let origin = Instant::now();
+            let writer = {
+                let engine = engine.clone();
+                let barrier = barrier.clone();
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    let docs = (0..DOCUMENTS)
+                        .map(|i| {
+                            (
+                                format!("bulk-{i}"),
+                                json!({"field": format!("value {i}"), "i": i}),
+                            )
+                        })
+                        .collect();
+                    barrier.wait();
+                    let start = Instant::now();
+                    engine.bulk_add_documents(docs).unwrap();
+                    let end = Instant::now();
+                    done.store(true, Ordering::Release);
+                    (start, end)
+                })
+            };
+            let readers = [
+                ("miss", "old", true, old.seq_no, old.primary_term, 1),
+                ("hit", "live", true, live.seq_no, live.primary_term, 2),
+                ("reader", "old", false, old.seq_no, old.primary_term, 1),
+            ]
+            .into_iter()
+            .map(|(path, doc_id, realtime, seq_no, primary_term, value)| {
+                let engine = engine.clone();
+                let barrier = barrier.clone();
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let mut samples = Vec::new();
+                    while !done.load(Ordering::Acquire) {
+                        let start = Instant::now();
+                        let document = engine
+                            .get_document_with_metadata(doc_id, realtime)
+                            .unwrap()
+                            .unwrap();
+                        let latency = start.elapsed();
+                        assert_eq!(document.seq_no, seq_no);
+                        assert_eq!(document.primary_term, primary_term);
+                        assert_eq!(document.source, json!({"v": value}));
+                        samples.push((start, latency));
+                        std::thread::sleep(
+                            (start + CADENCE).saturating_duration_since(Instant::now()),
+                        );
+                    }
+                    (path, samples)
+                })
+            })
+            .collect::<Vec<_>>();
+            barrier.wait();
+            let (bulk_start, bulk_end) = writer.join().unwrap();
+            let bulk = bulk_end.duration_since(bulk_start);
+            bulk_seconds += bulk.as_secs_f64();
+            println!(
+                "P3_CONT_BULK,{round},{DOCUMENTS},{},{},{}",
+                bulk_start.duration_since(origin).as_nanos(),
+                bulk_end.duration_since(origin).as_nanos(),
+                bulk.as_nanos()
+            );
+            for get in readers {
+                let (path, samples) = get.join().unwrap();
+                for (start, latency) in samples {
+                    let overlap = start >= bulk_start && start < bulk_end;
+                    println!(
+                        "P3_CONT_SAMPLE,{round},{path},{},{},{overlap}",
+                        start.duration_since(origin).as_nanos(),
+                        latency.as_nanos()
+                    );
+                    if overlap {
+                        match path {
+                            "miss" => miss.push(latency.as_nanos()),
+                            "hit" => hit.push(latency.as_nanos()),
+                            "reader" => reader.push(latency.as_nanos()),
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+            }
+            for (context, operations, held) in engine
+                .text_engine()
+                .apply_state_timing
+                .samples
+                .lock()
+                .unwrap()
+                .iter()
+            {
+                println!(
+                    "P3_CONT_APPLY_HOLD,{round},{context},{operations},{}",
+                    held.as_nanos()
+                );
+            }
+        }
+        for (path, mut samples) in [("miss", miss), ("hit", hit), ("reader", reader)] {
+            samples.sort_unstable();
+            assert!(!samples.is_empty(), "{path} had no reads during the bulk");
+            let p50 = samples[(samples.len() * 50).div_ceil(100) - 1];
+            let p99 = samples[(samples.len() * 99).div_ceil(100) - 1];
+            println!(
+                "P3_CONT_SUMMARY,{path},samples={},p50_ms={:.6},p99_ms={:.6},max_ms={:.6}",
+                samples.len(),
+                p50 as f64 / 1_000_000.0,
+                p99 as f64 / 1_000_000.0,
+                *samples.last().unwrap() as f64 / 1_000_000.0
+            );
+        }
+        println!(
+            "P3_CONT_THROUGHPUT,docs_per_second={:.3},bulk_seconds={bulk_seconds:.6}",
+            (DOCUMENTS * ROUNDS) as f64 / bulk_seconds
+        );
+    }
+
     #[test]
     fn field_registry_excludes_reserved_internal_metadata_fields() {
         let (_dir, engine) = create_engine();
@@ -9598,6 +9860,7 @@ mod tests {
             writer: Arc::new(RwLock::new(WriterState::ready(writer))),
             maintenance_lock: Mutex::new(()),
             automatic_merge_policy: RwLock::new(automatic_merge_policy),
+            apply_state_timing: ApplyStateTiming::default(),
             force_merge_entry_barrier: Mutex::new(None),
             force_merge_before_wait_sender: Mutex::new(None),
             writer_replacement_failure: Mutex::new(None),
