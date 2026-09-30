@@ -318,9 +318,14 @@ pub fn create_router(state: AppState) -> Router {
         // Document operations
         .route("/{index}/_doc", post(index::index_document))
         .route("/{index}/_doc/{id}", put(index::index_document_with_id))
+        .route("/{index}/_doc/{id}", post(index::index_document_with_id))
         .route("/{index}/_doc/{id}", get(index::get_document))
         .route("/{index}/_doc/{id}", delete(index::delete_document))
         .route("/{index}/_update/{id}", post(index::update_document))
+        .route(
+            "/{index}/_create/{id}",
+            put(index::create_document).post(index::create_document),
+        )
         .route("/_sql", post(search::global_sql))
         .route("/_sql/stream", post(search::global_sql_stream))
         // Security control plane (dynamic API keys + custom roles)

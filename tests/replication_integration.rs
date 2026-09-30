@@ -488,6 +488,7 @@ async fn index_and_get_document_via_grpc() {
             shard_id: 0,
             doc_id: "doc-1".into(),
             payload_json: serde_json::to_vec(&payload).unwrap(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -505,6 +506,7 @@ async fn index_and_get_document_via_grpc() {
             index_name: "test-index".into(),
             shard_id: 0,
             doc_id: "doc-1".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -572,6 +574,7 @@ async fn index_and_get_document_via_grpc_with_tls() {
             shard_id: 0,
             doc_id: "tls-doc-1".into(),
             payload_json: serde_json::to_vec(&payload).unwrap(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -585,6 +588,7 @@ async fn index_and_get_document_via_grpc_with_tls() {
             index_name: "tls-index".into(),
             shard_id: 0,
             doc_id: "tls-doc-1".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -631,6 +635,7 @@ async fn primary_write_handlers_reject_non_primary_without_mutation() {
             shard_id: 0,
             doc_id: "doc-1".into(),
             payload_json: serde_json::to_vec(&serde_json::json!({"value": 1})).unwrap(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -649,6 +654,7 @@ async fn primary_write_handlers_reject_non_primary_without_mutation() {
                 }))
                 .unwrap(),
             ],
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -661,6 +667,7 @@ async fn primary_write_handlers_reject_non_primary_without_mutation() {
             index_name: "non-primary-index".into(),
             shard_id: 0,
             doc_id: "doc-1".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -699,6 +706,7 @@ async fn bulk_index_via_grpc() {
             index_name: "bulk-idx".into(),
             shard_id: 0,
             documents_json: documents,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -726,6 +734,7 @@ async fn delete_document_via_grpc() {
             shard_id: 0,
             doc_id: "doomed".into(),
             payload_json: serde_json::to_vec(&payload).unwrap(),
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -735,6 +744,7 @@ async fn delete_document_via_grpc() {
             index_name: "del-idx".into(),
             shard_id: 0,
             doc_id: "doomed".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -748,6 +758,7 @@ async fn delete_document_via_grpc() {
             index_name: "del-idx".into(),
             shard_id: 0,
             doc_id: "doomed".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -794,6 +805,7 @@ async fn replicate_doc_index_via_grpc() {
             index_name: "replica-idx".into(),
             shard_id: 0,
             doc_id: "rep-1".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -847,6 +859,7 @@ async fn out_of_order_replica_delivery_keeps_the_newer_document_value() {
             index_name: "d1-ordering".into(),
             shard_id: 0,
             doc_id: "shared".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -956,6 +969,7 @@ async fn deterministic_reordering_survives_promotion_and_new_write() {
             shard_id: 0,
             doc_id: "post-promotion".into(),
             payload_json: serde_json::to_vec(&serde_json::json!({"value": "promoted"})).unwrap(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -1042,6 +1056,7 @@ async fn replicate_doc_delete_via_grpc() {
             index_name: "rep-del-idx".into(),
             shard_id: 0,
             doc_id: "to-delete".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -1099,6 +1114,7 @@ async fn replicate_bulk_via_grpc() {
                 index_name: "bulk-rep-idx".into(),
                 shard_id: 0,
                 doc_id: format!("bulk-rep-{i}"),
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -1682,6 +1698,7 @@ async fn primary_write_replicates_to_replica_node() {
             shard_id: 0,
             doc_id: "replicated-doc".into(),
             payload_json: serde_json::to_vec(&payload).unwrap(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -1699,6 +1716,7 @@ async fn primary_write_replicates_to_replica_node() {
             index_name: "replicated-idx".into(),
             shard_id: 0,
             doc_id: "replicated-doc".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -1752,6 +1770,7 @@ async fn reserved_source_never_mutates_primary_or_replica() {
             shard_id: 0,
             doc_id: "poison".into(),
             payload_json: serde_json::to_vec(&serde_json::json!({"_seq_no": 999})).unwrap(),
+            ..Default::default()
         }))
         .await
         .unwrap_err();
@@ -1772,6 +1791,7 @@ async fn reserved_source_never_mutates_primary_or_replica() {
                 }))
                 .unwrap(),
             ],
+            ..Default::default()
         }))
         .await
         .unwrap_err();
@@ -1800,6 +1820,7 @@ async fn reserved_source_never_mutates_primary_or_replica() {
             shard_id: 0,
             doc_id: "healthy".into(),
             payload_json: serde_json::to_vec(&serde_json::json!({"value": 1})).unwrap(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -1815,6 +1836,7 @@ async fn reserved_source_never_mutates_primary_or_replica() {
                 index_name: "reserved-source-idx".into(),
                 shard_id: 0,
                 doc_id: "healthy".into(),
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -1858,6 +1880,7 @@ async fn out_of_sync_replica_receives_no_live_writes_and_cannot_fail_them() {
             shard_id: 0,
             doc_id: "not-replicated".into(),
             payload_json: serde_json::to_vec(&serde_json::json!({"value": 1})).unwrap(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -1885,6 +1908,7 @@ async fn out_of_sync_replica_receives_no_live_writes_and_cannot_fail_them() {
             shard_id: 0,
             doc_id: "still-acknowledged".into(),
             payload_json: serde_json::to_vec(&serde_json::json!({"value": 2})).unwrap(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -1925,6 +1949,7 @@ async fn unreachable_in_sync_replica_still_fails_live_write() {
             shard_id: 0,
             doc_id: "must-fail".into(),
             payload_json: serde_json::to_vec(&serde_json::json!({"value": 1})).unwrap(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -1974,6 +1999,7 @@ async fn primary_delete_replicates_to_replica_node() {
             shard_id: 0,
             doc_id: "del-doc".into(),
             payload_json: serde_json::to_vec(&payload).unwrap(),
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -1984,6 +2010,7 @@ async fn primary_delete_replicates_to_replica_node() {
             index_name: "del-repl-idx".into(),
             shard_id: 0,
             doc_id: "del-doc".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -1998,6 +2025,7 @@ async fn primary_delete_replicates_to_replica_node() {
             index_name: "del-repl-idx".into(),
             shard_id: 0,
             doc_id: "del-doc".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -2049,6 +2077,7 @@ async fn primary_bulk_replicates_to_replica_node() {
             index_name: "bulk-repl-idx".into(),
             shard_id: 0,
             documents_json: documents,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -2066,6 +2095,7 @@ async fn primary_bulk_replicates_to_replica_node() {
                 index_name: "bulk-repl-idx".into(),
                 shard_id: 0,
                 doc_id: format!("repl-bulk-{i}"),
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -2100,6 +2130,7 @@ async fn index_doc_with_vectors(
             shard_id,
             doc_id: doc_id.into(),
             payload_json: serde_json::to_vec(&payload).unwrap(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -3334,6 +3365,7 @@ async fn update_document_merges_fields_via_grpc() {
             shard_id: 0,
             doc_id: "doc-1".into(),
             payload_json: serde_json::to_vec(&payload).unwrap(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -3347,6 +3379,7 @@ async fn update_document_merges_fields_via_grpc() {
             index_name: "update-idx".into(),
             shard_id: 0,
             doc_id: "doc-1".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -3371,6 +3404,7 @@ async fn update_document_merges_fields_via_grpc() {
             shard_id: 0,
             doc_id: "doc-1".into(),
             payload_json: serde_json::to_vec(&source).unwrap(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -3384,6 +3418,7 @@ async fn update_document_merges_fields_via_grpc() {
             index_name: "update-idx".into(),
             shard_id: 0,
             doc_id: "doc-1".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -3414,6 +3449,7 @@ async fn update_nonexistent_document_returns_not_found() {
             shard_id: 0,
             doc_id: "exists".into(),
             payload_json: serde_json::to_vec(&payload).unwrap(),
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -3425,6 +3461,7 @@ async fn update_nonexistent_document_returns_not_found() {
             index_name: "update-404-idx".into(),
             shard_id: 0,
             doc_id: "nonexistent".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -3638,6 +3675,7 @@ async fn sequence_state_probe_reports_exact_open_copy_and_activation() {
             shard_id: 0,
             doc_id: "doc".into(),
             payload_json: serde_json::to_vec(&serde_json::json!({"value": 1})).unwrap(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -3710,6 +3748,7 @@ async fn primary_write_advances_global_checkpoint() {
                 shard_id: 0,
                 doc_id: format!("gc-{i}"),
                 payload_json: serde_json::to_vec(&payload).unwrap(),
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -3732,6 +3771,192 @@ async fn primary_write_advances_global_checkpoint() {
         primary_engine.local_checkpoint().unwrap_or(0),
     );
     assert!(!isr.is_empty(), "ISR should contain the replica node");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn writes_regression_conditional_rest_updates_and_mixed_bulk_keep_replica_documents_and_sequences_identical()
+ {
+    let primary_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+    let primary_cm = Arc::new(ClusterManager::new("writes-replicated".into()));
+    let replica_cm = Arc::new(ClusterManager::new("writes-replicated".into()));
+    let primary_sm = Arc::new(ShardManager::new(
+        primary_dir.path(),
+        Duration::from_secs(60),
+    ));
+    let replica_sm = Arc::new(ShardManager::new(
+        replica_dir.path(),
+        Duration::from_secs(60),
+    ));
+    let (replica_addr, replica_server) = start_grpc_server_for_node_with_handle(
+        replica_cm.clone(),
+        replica_sm.clone(),
+        "replica-node",
+    )
+    .await;
+    setup_two_node_cluster_state(
+        &primary_cm,
+        &replica_cm,
+        "writes-replicated",
+        replica_addr.port(),
+    );
+    install_recovered_replica_fixture(&replica_cm, &replica_sm, "writes-replicated");
+    let (primary_addr, primary_server) = start_grpc_server_for_node_with_handle(
+        primary_cm.clone(),
+        primary_sm.clone(),
+        "primary-node",
+    )
+    .await;
+    let mut cluster_state = primary_cm.get_state();
+    cluster_state
+        .nodes
+        .get_mut("primary-node")
+        .unwrap()
+        .transport_port = primary_addr.port();
+    primary_cm.update_state(cluster_state.clone());
+    replica_cm.update_state(cluster_state);
+    let mut primary_client = connect_client(primary_addr).await;
+    primary_client
+        .ping(tonic::Request::new(proto::PingRequest {
+            source_node_id: "primary-node".into(),
+        }))
+        .await
+        .unwrap();
+    let (raft, _) =
+        ferrissearch::consensus::create_raft_instance_mem(1, "writes-replicated".into())
+            .await
+            .unwrap();
+    let state = ferrissearch::api::AppState {
+        cluster_manager: primary_cm,
+        shard_manager: primary_sm.clone(),
+        transport_client: TransportClient::new(),
+        local_node_id: "primary-node".into(),
+        raft: raft.clone(),
+        worker_pools: ferrissearch::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(ferrissearch::tasks::TaskManager::new()),
+        storage_manager: Arc::new(
+            ferrissearch::storage::StorageManager::new_in_path(primary_dir.path()).unwrap(),
+        ),
+        security_manager: Arc::new(ferrissearch::security::SecurityManager::disabled()),
+        remote_store_reader_cache: Arc::new(
+            ferrissearch::engine::remote_store::RemoteSplitReaderCache::default(),
+        ),
+        sql_group_by_scan_limit: 1_000_000,
+        sql_approximate_top_k: false,
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let http_server = tokio::spawn(async move {
+        axum::serve(listener, ferrissearch::api::create_router(state))
+            .await
+            .unwrap();
+    });
+    let client = reqwest::Client::new();
+    let first = client
+        .put(format!("{base}/writes-replicated/_doc/x"))
+        .json(&serde_json::json!({"base": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), reqwest::StatusCode::CREATED);
+    let first: serde_json::Value = first.json().await.unwrap();
+    let term = first["_primary_term"].as_u64().unwrap();
+    let conditional = format!("{base}/writes-replicated/_doc/x?if_seq_no=0&if_primary_term={term}");
+    let second = client
+        .put(&conditional)
+        .json(&serde_json::json!({"base": 2, "before_bulk": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        second.json::<serde_json::Value>().await.unwrap()["_seq_no"],
+        1
+    );
+    let rejected = client
+        .put(&conditional)
+        .json(&serde_json::json!({"wrong": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), reqwest::StatusCode::CONFLICT);
+    let delete_target = client
+        .put(format!("{base}/writes-replicated/_doc/z"))
+        .json(&serde_json::json!({"base": 3}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(delete_target.status(), reqwest::StatusCode::CREATED);
+    let request = format!(
+        "{{\"update\":{{\"_id\":\"x\"}}}}\n{{\"doc\":{{\"bulk\":4}}}}\n\
+         {{\"delete\":{{\"_id\":\"z\"}}}}\n\
+         {{\"create\":{{\"_id\":\"x\"}}}}\n{{\"wrong\":true}}\n\
+         {{\"index\":{{\"_id\":\"x\",\"if_seq_no\":3,\"if_primary_term\":{term}}}}}\n{{\"base\":5,\"bulk\":4}}\n\
+         {{\"update\":{{\"_id\":\"x\"}}}}\n{{\"doc\":{{\"after\":6}}}}\n\
+         {{\"create\":{{\"_id\":\"y\"}}}}\n{{\"base\":7}}\n\
+         {{\"delete\":{{\"_id\":\"y\",\"if_seq_no\":7,\"if_primary_term\":{term}}}}}\n\
+         {{\"update\":{{\"_id\":\"y\"}}}}\n{{\"doc\":{{\"base\":8}},\"doc_as_upsert\":true}}\n\
+         {{\"delete\":{{\"_id\":\"absent\"}}}}\n"
+    );
+    let response = client
+        .post(format!("{base}/writes-replicated/_bulk"))
+        .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
+        .body(request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let response: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(response["items"].as_array().unwrap().len(), 9, "{response}");
+    assert_eq!(response["items"][2]["create"]["status"], 409, "{response}");
+    assert_eq!(response["items"][7]["update"]["result"], "created");
+    assert_eq!(response["items"][8]["delete"]["status"], 404);
+    let primary = primary_sm.get_shard("writes-replicated", 0).unwrap();
+    let replica = replica_sm.get_shard("writes-replicated", 0).unwrap();
+    for id in ["x", "y", "z", "absent"] {
+        assert_eq!(
+            primary.get_document_with_metadata(id, true).unwrap(),
+            replica.get_document_with_metadata(id, true).unwrap(),
+            "replica state differs for {id}"
+        );
+    }
+    let x = primary
+        .get_document_with_metadata("x", true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        x.source,
+        serde_json::json!({"base": 5, "bulk": 4, "after": 6})
+    );
+    assert_eq!((x.seq_no, x.primary_term), (6, term));
+    let y = primary
+        .get_document_with_metadata("y", true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(y.source, serde_json::json!({"base": 8}));
+    assert_eq!((y.seq_no, y.primary_term), (9, term));
+    assert!(
+        primary
+            .get_document_with_metadata("z", true)
+            .unwrap()
+            .is_none()
+    );
+    let wal = |engine: &Arc<dyn ferrissearch::engine::SearchEngine>| {
+        engine
+            .retained_recovery_ops(0, usize::MAX, usize::MAX)
+            .unwrap()
+            .operations
+            .into_iter()
+            .map(|entry| (entry.seq_no, entry.primary_term, entry.op, entry.payload))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(wal(&primary), wal(&replica));
+    assert_eq!(primary.sequence_stats().processed_checkpoint, Some(10));
+    assert_eq!(replica.sequence_stats().processed_checkpoint, Some(10));
+    http_server.abort();
+    primary_server.abort();
+    replica_server.abort();
+    raft.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3773,6 +3998,7 @@ async fn concurrent_primary_receipts_match_primary_and_replica_wal() {
             shard_id: 0,
             doc_id: "seed".into(),
             payload_json: serde_json::to_vec(&serde_json::json!({"message": "seed"})).unwrap(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -3793,6 +4019,7 @@ async fn concurrent_primary_receipts_match_primary_and_replica_wal() {
                             doc_id: id.clone(),
                             payload_json: serde_json::to_vec(&serde_json::json!({"message": id}))
                                 .unwrap(),
+                            ..Default::default()
                         }))
                         .await
                         .unwrap()
@@ -3819,6 +4046,7 @@ async fn concurrent_primary_receipts_match_primary_and_replica_wal() {
                                     .unwrap()
                                 })
                                 .collect(),
+                            ..Default::default()
                         }))
                         .await
                         .unwrap()
@@ -3840,6 +4068,7 @@ async fn concurrent_primary_receipts_match_primary_and_replica_wal() {
                             index_name: index.into(),
                             shard_id: 0,
                             doc_id: id.clone(),
+                            ..Default::default()
                         }))
                         .await
                         .unwrap()
@@ -3988,6 +4217,7 @@ async fn bulk_replication_advances_global_checkpoint() {
             index_name: "bgc-idx".into(),
             shard_id: 0,
             documents_json,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -4040,6 +4270,7 @@ async fn delete_replication_advances_global_checkpoint() {
             shard_id: 0,
             doc_id: "del-1".into(),
             payload_json: serde_json::to_vec(&payload).unwrap(),
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -4055,6 +4286,7 @@ async fn delete_replication_advances_global_checkpoint() {
             index_name: "dgc-idx".into(),
             shard_id: 0,
             doc_id: "del-1".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -4102,6 +4334,7 @@ async fn isr_tracker_updated_after_replication() {
                 shard_id: 0,
                 doc_id: format!("isr-{i}"),
                 payload_json: serde_json::to_vec(&payload).unwrap(),
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -4163,6 +4396,7 @@ async fn get_shard_stats_returns_doc_counts_for_open_shards() {
                 shard_id: 0,
                 doc_id: format!("doc-{i}"),
                 payload_json: serde_json::to_vec(&payload).unwrap(),
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -4205,6 +4439,7 @@ async fn get_shard_stats_returns_multiple_shards() {
                     shard_id: shard,
                     doc_id: format!("s{shard}-doc-{i}"),
                     payload_json: serde_json::to_vec(&payload).unwrap(),
+                    ..Default::default()
                 }))
                 .await
                 .unwrap()

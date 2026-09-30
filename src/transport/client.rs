@@ -263,12 +263,36 @@ impl TransportClient {
         doc_id: &str,
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, anyhow::Error> {
+        self.forward_index_with_condition_to_shard(
+            node,
+            index_name,
+            shard_id,
+            doc_id,
+            payload,
+            crate::engine::WriteCondition::Unconditional,
+        )
+        .await
+    }
+
+    pub async fn forward_index_with_condition_to_shard(
+        &self,
+        node: &NodeInfo,
+        index_name: &str,
+        shard_id: u32,
+        doc_id: &str,
+        payload: &serde_json::Value,
+        condition: crate::engine::WriteCondition,
+    ) -> Result<serde_json::Value, anyhow::Error> {
         let mut client = self.connect(&node.host, node.transport_port).await?;
+        let (if_seq_no, if_primary_term) = condition.expected_version();
         let request = tonic::Request::new(ShardDocRequest {
             index_name: index_name.to_string(),
             shard_id,
             payload_json: serde_json::to_vec(payload)?,
             doc_id: doc_id.to_string(),
+            if_seq_no,
+            if_primary_term,
+            create_only: condition == crate::engine::WriteCondition::Create,
         });
         let response = client.index_doc(request).await?.into_inner();
         decode_shard_doc_response(index_name, shard_id, doc_id, response)
@@ -300,6 +324,7 @@ impl TransportClient {
             index_name: index_name.to_string(),
             shard_id,
             documents_json,
+            ..Default::default()
         });
         let response = client.bulk_index(request).await?.into_inner();
         decode_shard_bulk_response(docs, response)
@@ -313,11 +338,32 @@ impl TransportClient {
         shard_id: u32,
         doc_id: &str,
     ) -> Result<serde_json::Value, anyhow::Error> {
+        self.forward_delete_with_condition_to_shard(
+            node,
+            index_name,
+            shard_id,
+            doc_id,
+            crate::engine::WriteCondition::Unconditional,
+        )
+        .await
+    }
+
+    pub async fn forward_delete_with_condition_to_shard(
+        &self,
+        node: &NodeInfo,
+        index_name: &str,
+        shard_id: u32,
+        doc_id: &str,
+        condition: crate::engine::WriteCondition,
+    ) -> Result<serde_json::Value, anyhow::Error> {
         let mut client = self.connect(&node.host, node.transport_port).await?;
+        let (if_seq_no, if_primary_term) = condition.expected_version();
         let request = tonic::Request::new(ShardDeleteRequest {
             index_name: index_name.to_string(),
             shard_id,
             doc_id: doc_id.to_string(),
+            if_seq_no,
+            if_primary_term,
         });
         let response = client.delete_doc(request).await?.into_inner();
         decode_shard_delete_response(index_name, shard_id, doc_id, response)
@@ -330,22 +376,98 @@ impl TransportClient {
         index_name: &str,
         shard_id: u32,
         doc_id: &str,
-    ) -> Result<Option<serde_json::Value>, anyhow::Error> {
+        realtime: bool,
+    ) -> Result<Option<crate::engine::DocumentRead>, anyhow::Error> {
         let mut client = self.connect(&node.host, node.transport_port).await?;
         let request = tonic::Request::new(ShardGetRequest {
             index_name: index_name.to_string(),
             shard_id,
             doc_id: doc_id.to_string(),
+            realtime: Some(realtime),
         });
         let response = client.get_doc(request).await?.into_inner();
+        if !response.error.is_empty() {
+            anyhow::bail!("Get failed: {}", response.error);
+        }
         if response.found {
             let source: serde_json::Value = serde_json::from_slice(&response.source_json)?;
-            Ok(Some(source))
-        } else if !response.error.is_empty() {
-            Err(anyhow::anyhow!("Get failed: {}", response.error))
+            let seq_no = response.seq_no.ok_or_else(|| {
+                anyhow::anyhow!("found shard GET response is missing its sequence")
+            })?;
+            let primary_term = response
+                .primary_term
+                .filter(|term| *term > 0)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("found shard GET response is missing its primary term")
+                })?;
+            Ok(Some(crate::engine::DocumentRead {
+                source,
+                seq_no,
+                primary_term,
+            }))
         } else {
             Ok(None)
         }
+    }
+
+    pub async fn forward_bulk_operations_to_shard(
+        &self,
+        node: &NodeInfo,
+        index_name: &str,
+        shard_id: u32,
+        docs: &[(String, serde_json::Value, ShardBulkOperation)],
+    ) -> Result<Vec<ShardBulkItemResponse>, anyhow::Error> {
+        let mut client = self.connect(&node.host, node.transport_port).await?;
+        let documents_json = docs
+            .iter()
+            .map(|(doc_id, source, _)| {
+                serde_json::to_vec(&serde_json::json!({"_doc_id": doc_id, "_source": source}))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let response = client
+            .bulk_index(tonic::Request::new(ShardBulkRequest {
+                index_name: index_name.to_string(),
+                shard_id,
+                documents_json,
+                operations: docs.iter().map(|(_, _, operation)| *operation).collect(),
+            }))
+            .await?
+            .into_inner();
+        if !response.success {
+            anyhow::bail!("Shard bulk failed: {}", response.error);
+        }
+        if response.results.len() != docs.len() {
+            anyhow::bail!("shard bulk response has inconsistent item count");
+        }
+        for (item, (doc_id, _, operation)) in response.results.iter().zip(docs) {
+            if item.doc_id != *doc_id {
+                anyhow::bail!("shard bulk response has inconsistent document identities");
+            }
+            if item.error.is_empty() {
+                let expected = match ShardBulkOpKind::try_from(operation.kind)? {
+                    ShardBulkOpKind::Index => matches!(
+                        (item.status, item.result.as_str()),
+                        (201, "created") | (200, "updated")
+                    ),
+                    ShardBulkOpKind::Create => item.status == 201 && item.result == "created",
+                    ShardBulkOpKind::Delete => matches!(
+                        (item.status, item.result.as_str()),
+                        (200, "deleted") | (404, "not_found")
+                    ),
+                };
+                if !expected
+                    || item.seq_no.is_none()
+                    || item.primary_term.is_none_or(|term| term == 0)
+                {
+                    anyhow::bail!(
+                        "shard bulk success has invalid result or missing operation identity"
+                    );
+                }
+            } else if item.status < 400 || item.error_type.is_empty() {
+                anyhow::bail!("shard bulk error has invalid status or missing error type");
+            }
+        }
+        Ok(response.results)
     }
 
     /// Forward a query-string search to a specific shard on a remote node
@@ -1317,7 +1439,7 @@ fn decode_shard_doc_response(
         "_shard": shard_id,
         "_seq_no": seq_no,
         "_primary_term": primary_term,
-        "result": "created"
+        "result": if response.created { "created" } else { "updated" }
     }))
 }
 
@@ -1346,8 +1468,29 @@ fn decode_shard_bulk_response(
             .ok_or_else(|| {
                 anyhow::anyhow!("successful shard bulk response is missing its primary term")
             })?,
+        created: response
+            .results
+            .iter()
+            .map(|item| item.result == "created")
+            .collect(),
     };
     receipt.last_seq_no()?;
+    for (offset, (item, doc_id)) in response.results.iter().zip(&receipt.doc_ids).enumerate() {
+        let expected_seq = receipt
+            .start_seq_no
+            .and_then(|start| start.checked_add(offset as u64));
+        if item.doc_id != *doc_id
+            || !item.error.is_empty()
+            || item.seq_no != expected_seq
+            || item.primary_term != Some(receipt.primary_term)
+            || !matches!(
+                (item.status, item.result.as_str()),
+                (201, "created") | (200, "updated")
+            )
+        {
+            anyhow::bail!("successful shard bulk response has inconsistent item results");
+        }
+    }
     Ok(receipt)
 }
 
@@ -1375,7 +1518,7 @@ fn decode_shard_delete_response(
         "_shard": shard_id,
         "_seq_no": seq_no,
         "_primary_term": primary_term,
-        "result": "deleted"
+        "result": if response.deleted > 0 { "deleted" } else { "not_found" }
     }))
 }
 
@@ -1591,6 +1734,7 @@ mod tests {
                 error: String::new(),
                 seq_no: Some(0),
                 primary_term: Some(7),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1614,6 +1758,7 @@ mod tests {
                         error: String::new(),
                         seq_no: Some(0),
                         primary_term: Some(7),
+                        ..Default::default()
                     },
                 )
                 .is_err()
@@ -1633,6 +1778,7 @@ mod tests {
                 error: String::new(),
                 seq_no: Some(0),
                 primary_term: Some(7),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1649,6 +1795,7 @@ mod tests {
                     error: String::new(),
                     seq_no: None,
                     primary_term: Some(7),
+                    ..Default::default()
                 },
             )
             .is_err()
@@ -1664,6 +1811,7 @@ mod tests {
                     error: String::new(),
                     seq_no: Some(0),
                     primary_term: Some(7),
+                    ..Default::default()
                 },
             )
             .is_err()
@@ -1681,6 +1829,18 @@ mod tests {
                 error: String::new(),
                 start_seq_no: Some(0),
                 primary_term: Some(7),
+                results: ["a", "b"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(offset, doc_id)| ShardBulkItemResponse {
+                        doc_id: doc_id.to_string(),
+                        status: 201,
+                        result: "created".to_string(),
+                        seq_no: Some(offset as u64),
+                        primary_term: Some(7),
+                        ..Default::default()
+                    })
+                    .collect(),
             },
         )
         .unwrap();
@@ -1693,6 +1853,7 @@ mod tests {
                 error: String::new(),
                 start_seq_no: None,
                 primary_term: Some(7),
+                ..Default::default()
             },
             ShardBulkResponse {
                 success: true,
@@ -1700,6 +1861,7 @@ mod tests {
                 error: String::new(),
                 start_seq_no: Some(0),
                 primary_term: Some(7),
+                ..Default::default()
             },
         ] {
             assert!(decode_shard_bulk_response(&docs, response).is_err());
@@ -1713,6 +1875,7 @@ mod tests {
                     error: String::new(),
                     start_seq_no: Some(0),
                     primary_term: Some(7),
+                    ..Default::default()
                 },
             )
             .is_err()

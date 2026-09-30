@@ -1523,6 +1523,407 @@ async fn writes_regression_bulk_delete_and_update_preserve_action_boundaries() -
 }
 
 #[tokio::test]
+async fn writes_regression_realtime_get_survives_delete_and_wal_flush() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_write_contract_index(&harness, "realtime").await?;
+    let (_, first) = harness
+        .put_json("/realtime/_doc/1", json!({"value": 1}))
+        .await?;
+    let (status, document) = harness.get_json("/realtime/_doc/1").await?;
+    assert_eq!(status, StatusCode::OK, "{document}");
+    assert_eq!(document["_source"], json!({"value": 1}));
+    assert_eq!(document["_seq_no"], first["_seq_no"]);
+    assert_eq!(document["_primary_term"], first["_primary_term"]);
+    assert_eq!(
+        harness.get_json("/realtime/_doc/1?realtime=false").await?.0,
+        StatusCode::NOT_FOUND
+    );
+    harness.post_json("/realtime/_refresh", json!({})).await?;
+    let (_, second) = harness
+        .put_json("/realtime/_doc/1", json!({"value": 2}))
+        .await?;
+    assert_eq!(second["result"], "updated");
+    assert_eq!(
+        harness.get_json("/realtime/_doc/1").await?.1["_source"]["value"],
+        2
+    );
+    assert_eq!(
+        harness.get_json("/realtime/_doc/1?realtime=false").await?.1["_source"]["value"],
+        1
+    );
+    let (status, deleted) = harness.delete_json("/realtime/_doc/1").await?;
+    assert_eq!(status, StatusCode::OK, "{deleted}");
+    assert_eq!(
+        harness.get_json("/realtime/_doc/1").await?.0,
+        StatusCode::NOT_FOUND
+    );
+    let (status, recreated) = harness
+        .put_json("/realtime/_doc/1", json!({"value": 3}))
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{recreated}");
+    let (status, flushed) = harness.post_json("/realtime/_flush", json!({})).await?;
+    assert_eq!(status, StatusCode::OK, "{flushed}");
+    assert_eq!(flushed["_shards"]["failed"], 0);
+    let (status, document) = harness.get_json("/realtime/_doc/1").await?;
+    assert_eq!(status, StatusCode::OK, "{document}");
+    assert_eq!(document["_source"], json!({"value": 3}));
+    assert_eq!(document["_seq_no"], recreated["_seq_no"]);
+    assert_eq!(document["_primary_term"], recreated["_primary_term"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn writes_regression_conditions_create_upsert_and_noop() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_write_contract_index(&harness, "conditions").await?;
+    let (status, first) = harness
+        .put_json("/conditions/_create/1", json!({"nested": {"keep": 1}}))
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+    let seq = first["_seq_no"].as_u64().unwrap();
+    let term = first["_primary_term"].as_u64().unwrap();
+    for path in ["/conditions/_create/1", "/conditions/_doc/1?op_type=create"] {
+        let (status, conflict) = harness.put_json(path, json!({"wrong": true})).await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+        assert_eq!(
+            conflict["error"]["type"],
+            "version_conflict_engine_exception"
+        );
+        assert!(
+            conflict["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("document already exists")
+        );
+    }
+    assert_eq!(
+        harness
+            .post_json("/conditions/_create/1", json!({}))
+            .await?
+            .0,
+        StatusCode::CONFLICT
+    );
+    for query in ["if_seq_no=0", "if_primary_term=1"] {
+        let (status, error) = harness
+            .put_json(&format!("/conditions/_doc/1?{query}"), json!({}))
+            .await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert_eq!(error["error"]["type"], "illegal_argument_exception");
+        assert_eq!(
+            harness
+                .delete_json(&format!("/conditions/_doc/1?{query}"))
+                .await?
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let path = format!("/conditions/_doc/1?if_seq_no={seq}&if_primary_term={term}");
+    let (status, second) = harness
+        .put_json(&path, json!({"nested": {"keep": 1}, "value": 2}))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["_seq_no"], seq + 1);
+    let (status, conflict) = harness.put_json(&path, json!({"wrong": true})).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+    assert!(
+        conflict["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("current document has seqNo")
+    );
+    let (status, noop) = harness
+        .post_json("/conditions/_update/1", json!({"doc": {"value": 2}}))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{noop}");
+    assert_eq!(noop["result"], "noop");
+    assert_eq!(noop["_seq_no"], second["_seq_no"]);
+    let (_, updated) = harness
+        .post_json(
+            "/conditions/_update/1",
+            json!({
+                "doc": {"nested": {"added": 3}}, "detect_noop": false
+            }),
+        )
+        .await?;
+    assert_eq!(updated["_seq_no"], seq + 2);
+    let (_, document) = harness.get_json("/conditions/_doc/1").await?;
+    assert_eq!(
+        document["_source"]["nested"],
+        json!({"keep": 1, "added": 3})
+    );
+    let delete = format!(
+        "/conditions/_doc/1?if_seq_no={}&if_primary_term={term}",
+        seq + 2
+    );
+    assert_eq!(harness.delete_json(&delete).await?.0, StatusCode::OK);
+    assert_eq!(harness.delete_json(&delete).await?.0, StatusCode::CONFLICT);
+    let (status, missing_delete) = harness.delete_json("/conditions/_doc/1").await?;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{missing_delete}");
+    assert_eq!(missing_delete["result"], "not_found");
+    assert!(missing_delete.get("error").is_none());
+    let (status, missing) = harness
+        .post_json("/conditions/_update/missing", json!({"doc": {"a": 1}}))
+        .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+    assert_eq!(missing["error"]["type"], "document_missing_exception");
+    let (status, upsert) = harness
+        .post_json(
+            "/conditions/_update/upsert",
+            json!({
+                "doc": {"ignored_on_create": 1}, "upsert": {"from_upsert": 2}
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{upsert}");
+    assert_eq!(upsert["result"], "created");
+    assert_eq!(
+        harness.get_json("/conditions/_doc/upsert").await?.1["_source"],
+        json!({"from_upsert": 2})
+    );
+    let (status, upsert) = harness
+        .post_json(
+            "/conditions/_update/doc-upsert",
+            json!({
+                "doc": {"from_doc": 3}, "doc_as_upsert": true
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{upsert}");
+    for key in ["script", "scripted_upsert", "fields", "_source", "unknown"] {
+        let (status, error) = harness
+            .post_json(
+                "/conditions/_update/upsert",
+                json!({
+                    "doc": {"from_upsert": 4}, (key): true
+                }),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert_eq!(error["error"]["type"], "illegal_argument_exception");
+        assert!(error["error"]["reason"].as_str().unwrap().contains(key));
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_regression_concurrent_updates_preserve_every_acknowledged_field() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_write_contract_index(&harness, "concurrent-updates").await?;
+    harness
+        .put_json("/concurrent-updates/_doc/1", json!({"seed": true}))
+        .await?;
+    let barrier = Arc::new(tokio::sync::Barrier::new(24));
+    let writes = (0..24).map(|id| {
+        let client = harness.client.clone();
+        let url = format!("{}/concurrent-updates/_update/1", harness.base_url);
+        let barrier = barrier.clone();
+        async move {
+            barrier.wait().await;
+            let response = client
+                .post(url)
+                .json(&json!({"doc": {format!("field-{id}"): id}}))
+                .send()
+                .await?;
+            let status = response.status();
+            let body: Value = response.json().await?;
+            Ok::<_, anyhow::Error>((id, status, body))
+        }
+    });
+    let mut acknowledged = Vec::new();
+    for result in futures::future::join_all(writes).await {
+        let (id, status, body) = result?;
+        match status {
+            StatusCode::OK => {
+                assert_eq!(body["result"], "updated", "{body}");
+                acknowledged.push(id);
+            }
+            StatusCode::CONFLICT => {
+                assert_eq!(body["error"]["type"], "version_conflict_engine_exception")
+            }
+            _ => panic!("unexpected update outcome: {status}: {body}"),
+        }
+    }
+    assert!(!acknowledged.is_empty());
+    let (_, document) = harness.get_json("/concurrent-updates/_doc/1").await?;
+    assert_eq!(document["_source"]["seed"], true);
+    assert_eq!(document["_seq_no"], acknowledged.len() as u64);
+    for id in acknowledged {
+        assert_eq!(document["_source"][format!("field-{id}")], id, "{document}");
+    }
+    let retry_writes = (0..12).map(|id| {
+        let client = harness.client.clone();
+        let url = format!(
+            "{}/concurrent-updates/_update/1?retry_on_conflict=24",
+            harness.base_url
+        );
+        async move {
+            let response = client
+                .post(url)
+                .json(&json!({"doc": {format!("retry-{id}"): id}}))
+                .send()
+                .await?;
+            let status = response.status();
+            let body: Value = response.json().await?;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            Ok::<_, anyhow::Error>(())
+        }
+    });
+    for result in futures::future::join_all(retry_writes).await {
+        result?;
+    }
+    let (_, document) = harness.get_json("/concurrent-updates/_doc/1").await?;
+    for id in 0..12 {
+        assert_eq!(document["_source"][format!("retry-{id}")], id, "{document}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn writes_regression_bulk_order_conflicts_and_missing_delete() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_write_contract_index(&harness, "bulk-order").await?;
+    let (_, seed) = harness.put_json("/bulk-order/_doc/seed", json!({})).await?;
+    let term = seed["_primary_term"].as_u64().unwrap();
+    let request = concat!(
+        "{\"index\":{\"_id\":\"x\"}}\n{\"a\":1}\n",
+        "{\"update\":{\"_id\":\"x\",\"retry_on_conflict\":2}}\n{\"doc\":{\"b\":2}}\n",
+        "{\"create\":{\"_id\":\"x\"}}\n{\"wrong\":true}\n",
+        "{\"delete\":{\"_id\":\"x\"}}\n",
+        "{\"create\":{\"_id\":\"x\"}}\n{\"c\":3}\n",
+        "{\"update\":{\"_id\":\"x\"}}\n{\"doc\":{\"d\":4}}\n",
+        "{\"update\":{\"_id\":\"x\"}}\n{\"doc\":{\"d\":4}}\n",
+        "{\"delete\":{\"_id\":\"x\"}}\n",
+        "{\"delete\":{\"_id\":\"x\"}}\n",
+        "{\"index\":{\"_id\":\"x\"}}\n{\"final\":9}\n",
+        "{\"update\":{\"_id\":\"x\"}}\n{\"doc\":{\"retained\":10}}\n"
+    );
+    let (status, response) = harness.post_ndjson("/bulk-order/_bulk", request).await?;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["errors"], true);
+    let actions = [
+        "index", "update", "create", "delete", "create", "update", "update", "delete", "delete",
+        "index", "update",
+    ];
+    let sequences = [
+        Some(1),
+        Some(2),
+        None,
+        Some(3),
+        Some(4),
+        Some(5),
+        Some(5),
+        Some(6),
+        Some(7),
+        Some(8),
+        Some(9),
+    ];
+    assert_eq!(response["items"].as_array().unwrap().len(), actions.len());
+    for (position, (action, seq)) in actions.into_iter().zip(sequences).enumerate() {
+        assert_eq!(
+            response["items"][position][action]["_seq_no"].as_u64(),
+            seq,
+            "{response}"
+        );
+    }
+    assert_eq!(response["items"][2]["create"]["status"], 409);
+    assert_eq!(response["items"][6]["update"]["result"], "noop");
+    assert_eq!(response["items"][8]["delete"]["status"], 404);
+    assert!(response["items"][8]["delete"].get("error").is_none());
+    assert_eq!(
+        harness.get_json("/bulk-order/_doc/x").await?.1["_source"],
+        json!({"final": 9, "retained": 10})
+    );
+    let request = format!(
+        "{{\"index\":{{\"_id\":\"x\",\"if_seq_no\":8,\"if_primary_term\":{term}}}}}\n{{\"wrong\":true}}\n\
+         {{\"update\":{{\"_id\":\"x\",\"if_seq_no\":9,\"if_primary_term\":{term}}}}}\n{{\"doc\":{{\"conditional\":11}}}}\n"
+    );
+    let (_, response) = harness.post_ndjson("/bulk-order/_bulk", &request).await?;
+    assert_eq!(response["items"][0]["index"]["status"], 409, "{response}");
+    assert_eq!(response["items"][1]["update"]["_seq_no"], 10, "{response}");
+    let (_, response) = harness
+        .post_ndjson("/bulk-order/_bulk", "{\"delete\":{\"_id\":\"absent\"}}\n")
+        .await?;
+    assert_eq!(response["errors"], false, "{response}");
+    assert_eq!(response["items"][0]["delete"]["status"], 404);
+    Ok(())
+}
+
+#[tokio::test]
+async fn writes_regression_bulk_rejects_action_errors_without_writing_and_keeps_source_errors()
+-> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_write_contract_index(&harness, "bulk-parse").await?;
+    for malformed in [
+        "not-json",
+        "{\"unknown\":{}}",
+        "{\"index\":{},\"delete\":{}}",
+        "{\"index\":[]}",
+        "[]",
+        "{}",
+    ] {
+        let request =
+            format!("{{\"index\":{{\"_id\":\"must-not-write\"}}}}\n{{\"a\":1}}\n{malformed}\n");
+        let (status, error) = harness.post_ndjson("/bulk-parse/_bulk", &request).await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert_eq!(error["error"]["type"], "illegal_argument_exception");
+        assert!(
+            error["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("line [3]")
+        );
+        assert_eq!(
+            harness.get_json("/bulk-parse/_doc/must-not-write").await?.0,
+            StatusCode::NOT_FOUND
+        );
+    }
+    let (status, error) = harness
+        .post_ndjson(
+            "/bulk-parse/_bulk",
+            "{\"update\":{\"_id\":\"missing-source\"}}\n",
+        )
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+    assert_eq!(error["error"]["type"], "illegal_argument_exception");
+    let (_, response) = harness
+        .post_ndjson(
+            "/bulk-parse/_bulk",
+            concat!(
+                "{\"index\":{\"_id\":\"invalid\"}}\n{broken\n",
+                "{\"index\":{\"_id\":\"valid\"}}\n{\"value\":1}\n"
+            ),
+        )
+        .await?;
+    assert_eq!(response["items"].as_array().unwrap().len(), 2, "{response}");
+    assert_eq!(
+        response["items"][0]["index"]["error"]["type"],
+        "mapper_parsing_exception"
+    );
+    assert_eq!(response["items"][0]["index"]["status"], 400);
+    assert_eq!(response["items"][1]["index"]["_seq_no"], 0);
+    assert_eq!(
+        harness.get_json("/bulk-parse/_doc/valid").await?.1["_source"],
+        json!({"value": 1})
+    );
+    let (_, response) = harness
+        .post_ndjson(
+            "/bulk-parse/_bulk",
+            "{\"index\":{\"_index\":\"bulk-other\",\"_id\":\"override\"}}\n{\"value\":2}\n",
+        )
+        .await?;
+    assert_eq!(response["errors"], false, "{response}");
+    assert_eq!(
+        harness.get_json("/bulk-other/_doc/override").await?.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        harness.get_json("/bulk-parse/_doc/override").await?.0,
+        StatusCode::NOT_FOUND
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn rest_forcemerge_returns_task_and_task_endpoint_reports_completion() -> Result<()> {
     let harness = RestTestHarness::start().await?;
     create_products_index(&harness).await?;
@@ -3378,13 +3779,13 @@ async fn bulk_update_wrapper_reserved_fields_are_isolated_per_item() -> Result<(
     assert_eq!(body["items"][0]["index"]["status"], json!(201), "{body}");
     for position in [1, 2] {
         assert_eq!(
-            body["items"][position]["index"]["status"],
+            body["items"][position]["update"]["status"],
             json!(400),
             "{body}"
         );
         assert_eq!(
-            body["items"][position]["index"]["error"]["type"],
-            json!("mapper_parsing_exception"),
+            body["items"][position]["update"]["error"]["type"],
+            json!("illegal_argument_exception"),
             "{body}"
         );
     }

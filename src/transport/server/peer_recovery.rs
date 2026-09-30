@@ -2941,6 +2941,7 @@ mod tests {
                     shard_id: 0,
                     doc_id: "queued-index".into(),
                     payload_json: serde_json::to_vec(&serde_json::json!({"value": 1})).unwrap(),
+                    ..Default::default()
                 }))
                 .await
         });
@@ -2979,6 +2980,7 @@ mod tests {
                         }))
                         .unwrap(),
                     ],
+                    ..Default::default()
                 }))
                 .await
         });
@@ -3010,6 +3012,7 @@ mod tests {
                     index_name: "idx".into(),
                     shard_id: 0,
                     doc_id: "delete-me".into(),
+                    ..Default::default()
                 }))
                 .await
         });
@@ -3122,6 +3125,7 @@ mod tests {
                     shard_id: 0,
                     doc_id: "stale".into(),
                     payload_json: serde_json::to_vec(&serde_json::json!({"new_field": 1})).unwrap(),
+                    ..Default::default()
                 }))
                 .await
         });
@@ -3250,6 +3254,7 @@ mod tests {
                     shard_id: 0,
                     doc_id: "stale".into(),
                     payload_json: serde_json::to_vec(&serde_json::json!({"new_field": 1})).unwrap(),
+                    ..Default::default()
                 }))
                 .await
         });
@@ -3422,6 +3427,7 @@ mod tests {
                     shard_id: 0,
                     doc_id: "stale".into(),
                     payload_json: serde_json::to_vec(&serde_json::json!({"new_field": 1})).unwrap(),
+                    ..Default::default()
                 }))
                 .await
         });

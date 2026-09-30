@@ -443,7 +443,7 @@ fn classify_index_action(method: &Method, action: &str) -> SecurityAction {
             Method::POST | Method::PUT | Method::DELETE => SecurityAction::IndexWrite,
             _ => SecurityAction::IndexWrite,
         },
-        "_update" | "_bulk" => SecurityAction::IndexWrite,
+        "_update" | "_create" | "_bulk" => SecurityAction::IndexWrite,
         "_search" | "_count" | "_sql" => SecurityAction::IndexRead,
         "_settings" => match *method {
             Method::GET => SecurityAction::IndexRead,

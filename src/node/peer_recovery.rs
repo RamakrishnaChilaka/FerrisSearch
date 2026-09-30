@@ -1427,6 +1427,7 @@ mod tests {
                 shard_id: 0,
                 doc_id: "snapshot-doc".into(),
                 payload_json: serde_json::to_vec(&serde_json::json!({"value": 1})).unwrap(),
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -1624,6 +1625,7 @@ mod tests {
                     doc_id: doc_id.into(),
                     payload_json: serde_json::to_vec(&serde_json::json!({"new_field": value}))
                         .unwrap(),
+                    ..Default::default()
                 }))
                 .await
                 .unwrap()
@@ -2781,6 +2783,7 @@ mod tests {
                         "padding": large_value
                     }))
                     .unwrap(),
+                    ..Default::default()
                 }))
                 .await
                 .unwrap()
@@ -2799,6 +2802,7 @@ mod tests {
                         "value": doc
                     }))
                     .unwrap(),
+                    ..Default::default()
                 }))
                 .await
                 .unwrap()
@@ -2811,6 +2815,7 @@ mod tests {
                 shard_id: 0,
                 doc_id: "delete-me".into(),
                 payload_json: serde_json::to_vec(&serde_json::json!({"value": "delete"})).unwrap(),
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -2827,6 +2832,7 @@ mod tests {
                     "value": "idle-before-recovery"
                 }))
                 .unwrap(),
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -2881,6 +2887,7 @@ mod tests {
                 index_name: "docs".into(),
                 shard_id: 0,
                 doc_id: "delete-me".into(),
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -2901,6 +2908,7 @@ mod tests {
                     doc_id: doc_id.clone(),
                     payload_json: serde_json::to_vec(&serde_json::json!({"value": doc_id}))
                         .unwrap(),
+                    ..Default::default()
                 }))
                 .await
                 .unwrap()
@@ -2923,6 +2931,7 @@ mod tests {
                 doc_id: "post-finalize".into(),
                 payload_json: serde_json::to_vec(&serde_json::json!({"value": "post-finalize"}))
                     .unwrap(),
+                ..Default::default()
             }))
             .await
             .unwrap()

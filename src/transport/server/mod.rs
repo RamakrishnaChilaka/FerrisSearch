@@ -16,6 +16,27 @@ use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, trace};
 
+mod bulk_writes;
+
+fn primary_write_condition(
+    if_seq_no: Option<u64>,
+    if_primary_term: Option<u64>,
+    create_only: bool,
+) -> Result<crate::engine::WriteCondition, Status> {
+    let condition = crate::engine::WriteCondition::from_optional_values(if_seq_no, if_primary_term)
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    if create_only {
+        if condition != crate::engine::WriteCondition::Unconditional {
+            return Err(Status::invalid_argument(
+                "create operations cannot use if_seq_no or if_primary_term",
+            ));
+        }
+        Ok(crate::engine::WriteCondition::Create)
+    } else {
+        Ok(condition)
+    }
+}
+
 /// Shared state for the gRPC transport service.
 #[derive(Clone)]
 pub struct TransportService {
@@ -609,6 +630,8 @@ impl InternalTransport for TransportService {
         request: Request<ShardDocRequest>,
     ) -> Result<Response<ShardDocResponse>, Status> {
         let req = request.into_inner();
+        let condition =
+            primary_write_condition(req.if_seq_no, req.if_primary_term, req.create_only)?;
 
         let activated_primary = match self
             .ensure_primary_activated(&req.index_name, req.shard_id)
@@ -622,6 +645,7 @@ impl InternalTransport for TransportService {
                     error,
                     seq_no: None,
                     primary_term: None,
+                    ..Default::default()
                 }));
             }
         };
@@ -637,6 +661,7 @@ impl InternalTransport for TransportService {
                     error,
                     seq_no: None,
                     primary_term: None,
+                    ..Default::default()
                 }));
             }
         };
@@ -653,6 +678,7 @@ impl InternalTransport for TransportService {
                     error,
                     seq_no: None,
                     primary_term: None,
+                    ..Default::default()
                 }));
             }
         };
@@ -686,6 +712,7 @@ impl InternalTransport for TransportService {
                     error,
                     seq_no: None,
                     primary_term: None,
+                    ..Default::default()
                 }));
             }
         };
@@ -743,10 +770,11 @@ impl InternalTransport for TransportService {
                                             crate::protocol_trace::ApplyOrigin::Primary,
                                             Vec::new(),
                                             || {
-                                                engine.add_document_with_receipt_at_term(
+                                                engine.add_document_with_condition_at_term(
                                                     &doc_id,
                                                     payload,
                                                     primary_term,
+                                                    condition,
                                                 )
                                             },
                                         )
@@ -755,7 +783,12 @@ impl InternalTransport for TransportService {
                             })
                         }
                         #[cfg(not(feature = "protocol-trace"))]
-                        engine.add_document_with_receipt_at_term(&doc_id, payload, primary_term)
+                        engine.add_document_with_condition_at_term(
+                            &doc_id,
+                            payload,
+                            primary_term,
+                            condition,
+                        )
                     })
                     .await
                     .map_err(|e| Status::internal(e.to_string()))?
@@ -771,6 +804,7 @@ impl InternalTransport for TransportService {
 
         match write_result {
             Ok(receipt) => {
+                let created = receipt.created;
                 let id = receipt.doc_id;
                 let seq_no = receipt.seq_no;
                 let primary_term = receipt.primary_term;
@@ -852,6 +886,7 @@ impl InternalTransport for TransportService {
                             ),
                             seq_no: Some(seq_no),
                             primary_term: Some(primary_term),
+                            ..Default::default()
                         }));
                     }
                 }
@@ -862,7 +897,22 @@ impl InternalTransport for TransportService {
                     error: String::new(),
                     seq_no: Some(seq_no),
                     primary_term: Some(primary_term),
+                    created,
                 }))
+            }
+            Err(e) if e.is::<crate::engine::VersionConflictError>() => {
+                #[cfg(feature = "protocol-trace")]
+                if let Some(trace_request) = trace_request.as_ref() {
+                    crate::protocol_trace::record_client_result(
+                        trace_request,
+                        &self.local_node_id,
+                        &activated_primary.index_uuid,
+                        req.shard_id,
+                        "failed",
+                        Some("primary_apply"),
+                    );
+                }
+                Err(Status::already_exists(e.to_string()))
             }
             Err(e) if crate::engine::is_write_validation_error(&e) => {
                 #[cfg(feature = "protocol-trace")]
@@ -922,6 +972,7 @@ impl InternalTransport for TransportService {
                     error: e.to_string(),
                     seq_no: None,
                     primary_term: None,
+                    ..Default::default()
                 }))
             }
         }
@@ -932,6 +983,27 @@ impl InternalTransport for TransportService {
         request: Request<ShardBulkRequest>,
     ) -> Result<Response<ShardBulkResponse>, Status> {
         let req = request.into_inner();
+        if !req.operations.is_empty() {
+            if req.operations.len() != req.documents_json.len() {
+                return Err(Status::invalid_argument(
+                    "bulk operation count does not match document count",
+                ));
+            }
+            for operation in &req.operations {
+                let kind = ShardBulkOpKind::try_from(operation.kind)
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+                primary_write_condition(
+                    operation.if_seq_no,
+                    operation.if_primary_term,
+                    kind == ShardBulkOpKind::Create,
+                )?;
+            }
+            if req.operations.iter().any(|operation| {
+                operation.kind != ShardBulkOpKind::Index as i32 || operation.if_seq_no.is_some()
+            }) {
+                return bulk_writes::execute_ordered_bulk(self, req).await;
+            }
+        }
 
         let activated_primary = match self
             .ensure_primary_activated(&req.index_name, req.shard_id)
@@ -945,6 +1017,7 @@ impl InternalTransport for TransportService {
                     error,
                     start_seq_no: None,
                     primary_term: None,
+                    ..Default::default()
                 }));
             }
         };
@@ -960,6 +1033,7 @@ impl InternalTransport for TransportService {
                     error,
                     start_seq_no: None,
                     primary_term: None,
+                    ..Default::default()
                 }));
             }
         };
@@ -976,6 +1050,7 @@ impl InternalTransport for TransportService {
                     error,
                     start_seq_no: None,
                     primary_term: None,
+                    ..Default::default()
                 }));
             }
         };
@@ -1015,6 +1090,7 @@ impl InternalTransport for TransportService {
                     error,
                     start_seq_no: None,
                     primary_term: None,
+                    ..Default::default()
                 }));
             }
         };
@@ -1105,6 +1181,8 @@ impl InternalTransport for TransportService {
                 let last_seq_no = receipt
                     .last_seq_no()
                     .map_err(|e| Status::internal(e.to_string()))?;
+                let results = bulk_writes::index_batch_results(&receipt)
+                    .map_err(|error| Status::internal(error.to_string()))?;
                 let ids = receipt.doc_ids;
                 let primary_term = receipt.primary_term;
                 let primary_sequence = engine.sequence_stats();
@@ -1115,6 +1193,7 @@ impl InternalTransport for TransportService {
                         error: String::new(),
                         start_seq_no: None,
                         primary_term: Some(primary_term),
+                        results,
                     }));
                 };
                 last_seq_no.ok_or_else(|| {
@@ -1194,6 +1273,7 @@ impl InternalTransport for TransportService {
                             ),
                             start_seq_no: Some(start_seq_no),
                             primary_term: Some(primary_term),
+                            ..Default::default()
                         }));
                     }
                 }
@@ -1205,6 +1285,7 @@ impl InternalTransport for TransportService {
                     error: String::new(),
                     start_seq_no: Some(start_seq_no),
                     primary_term: Some(primary_term),
+                    results,
                 }))
             }
             Err(e) if crate::engine::is_write_validation_error(&e) => {
@@ -1265,6 +1346,7 @@ impl InternalTransport for TransportService {
                     error: e.to_string(),
                     start_seq_no: None,
                     primary_term: None,
+                    ..Default::default()
                 }))
             }
         }
@@ -1275,6 +1357,7 @@ impl InternalTransport for TransportService {
         request: Request<ShardDeleteRequest>,
     ) -> Result<Response<ShardDeleteResponse>, Status> {
         let req = request.into_inner();
+        let condition = primary_write_condition(req.if_seq_no, req.if_primary_term, false)?;
         let activated_primary = match self
             .ensure_primary_activated(&req.index_name, req.shard_id)
             .await
@@ -1372,9 +1455,10 @@ impl InternalTransport for TransportService {
                                             crate::protocol_trace::ApplyOrigin::Primary,
                                             Vec::new(),
                                             || {
-                                                engine.delete_document_with_receipt_at_term(
+                                                engine.delete_document_with_condition_at_term(
                                                     &doc_id,
                                                     primary_term,
+                                                    condition,
                                                 )
                                             },
                                         )
@@ -1383,7 +1467,11 @@ impl InternalTransport for TransportService {
                             })
                         }
                         #[cfg(not(feature = "protocol-trace"))]
-                        engine.delete_document_with_receipt_at_term(&doc_id, primary_term)
+                        engine.delete_document_with_condition_at_term(
+                            &doc_id,
+                            primary_term,
+                            condition,
+                        )
                     })
                     .await
                     .map_err(|e| Status::internal(e.to_string()))?
@@ -1490,6 +1578,20 @@ impl InternalTransport for TransportService {
                     primary_term: Some(primary_term),
                 }))
             }
+            Err(e) if e.is::<crate::engine::VersionConflictError>() => {
+                #[cfg(feature = "protocol-trace")]
+                if let Some(trace_request) = trace_request.as_ref() {
+                    crate::protocol_trace::record_client_result(
+                        trace_request,
+                        &self.local_node_id,
+                        &activated_primary.index_uuid,
+                        req.shard_id,
+                        "failed",
+                        Some("primary_apply"),
+                    );
+                }
+                Err(Status::already_exists(e.to_string()))
+            }
             Err(e) if crate::engine::is_write_validation_error(&e) => {
                 #[cfg(feature = "protocol-trace")]
                 if let Some(trace_request) = trace_request.as_ref() {
@@ -1568,6 +1670,7 @@ impl InternalTransport for TransportService {
                     found: false,
                     source_json: vec![],
                     error: status.message().to_string(),
+                    ..Default::default()
                 }));
             }
         };
@@ -1575,30 +1678,36 @@ impl InternalTransport for TransportService {
             let engine = engine.clone();
             let doc_id = req.doc_id.clone();
             self.worker_pools
-                .spawn_search(move || engine.get_document(&doc_id))
+                .spawn_search(move || {
+                    engine.get_document_with_metadata(&doc_id, req.realtime.unwrap_or(true))
+                })
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?
         };
 
         match doc_result {
-            Ok(Some(source)) => {
-                let source_json = serde_json::to_vec(&source)
+            Ok(Some(document)) => {
+                let source_json = serde_json::to_vec(&document.source)
                     .map_err(|e| Status::internal(format!("serialize get_doc response: {e}")))?;
                 Ok(Response::new(ShardGetResponse {
                     found: true,
                     source_json,
                     error: String::new(),
+                    seq_no: Some(document.seq_no),
+                    primary_term: Some(document.primary_term),
                 }))
             }
             Ok(None) => Ok(Response::new(ShardGetResponse {
                 found: false,
                 source_json: vec![],
                 error: String::new(),
+                ..Default::default()
             })),
             Err(e) => Ok(Response::new(ShardGetResponse {
                 found: false,
                 source_json: vec![],
                 error: e.to_string(),
+                ..Default::default()
             })),
         }
     }

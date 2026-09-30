@@ -726,6 +726,21 @@ impl SearchEngine for CompositeEngine {
         payload: serde_json::Value,
         primary_term: u64,
     ) -> Result<super::IndexWriteReceipt> {
+        self.add_document_with_condition_at_term(
+            doc_id,
+            payload,
+            primary_term,
+            super::WriteCondition::Unconditional,
+        )
+    }
+
+    fn add_document_with_condition_at_term(
+        &self,
+        doc_id: &str,
+        payload: serde_json::Value,
+        primary_term: u64,
+        condition: super::WriteCondition,
+    ) -> Result<super::IndexWriteReceipt> {
         crate::common::validate_document_source(&payload)?;
         let _vector_recovery = self
             .vector_recovery
@@ -734,10 +749,11 @@ impl SearchEngine for CompositeEngine {
         let prepared = self.prepare_vector_mutation(&payload)?;
         let source_for_rebuild = payload.clone();
         let rebuild_vectors = self.prepare_vector_rebuild(false)?;
-        let receipt = match self.text.add_primary_index_with_side_effect(
+        let receipt = match self.text.add_primary_index_with_condition_and_side_effect(
             doc_id,
             payload,
             primary_term,
+            condition,
             |operation| self.apply_prepared_vector_mutation(operation, &prepared),
         ) {
             Ok(receipt) => receipt,
@@ -834,25 +850,40 @@ impl SearchEngine for CompositeEngine {
         doc_id: &str,
         primary_term: u64,
     ) -> Result<super::DeleteWriteReceipt> {
+        self.delete_document_with_condition_at_term(
+            doc_id,
+            primary_term,
+            super::WriteCondition::Unconditional,
+        )
+    }
+
+    fn delete_document_with_condition_at_term(
+        &self,
+        doc_id: &str,
+        primary_term: u64,
+        condition: super::WriteCondition,
+    ) -> Result<super::DeleteWriteReceipt> {
         let _vector_recovery = self
             .vector_recovery
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let rebuild_vectors = self.prepare_vector_rebuild(false)?;
-        let receipt =
-            match self
-                .text
-                .delete_primary_with_side_effect(doc_id, primary_term, |operation| {
-                    self.apply_prepared_vector_mutation(operation, &PreparedVectorMutation::Delete)
-                }) {
-                Ok(receipt) => receipt,
-                Err(error) => {
-                    return Err(self.record_vector_staleness_after_text_failure(
-                        "primary document deletion",
-                        error,
-                    ));
-                }
-            };
+        let receipt = match self.text.delete_primary_with_condition_and_side_effect(
+            doc_id,
+            primary_term,
+            condition,
+            |operation| {
+                self.apply_prepared_vector_mutation(operation, &PreparedVectorMutation::Delete)
+            },
+        ) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                return Err(self.record_vector_staleness_after_text_failure(
+                    "primary document deletion",
+                    error,
+                ));
+            }
+        };
         if rebuild_vectors {
             self.rebuild_vectors_locked()?;
             self.apply_vector_mutation_after_rebuild(
@@ -972,6 +1003,14 @@ impl SearchEngine for CompositeEngine {
 
     fn get_document(&self, doc_id: &str) -> Result<Option<serde_json::Value>> {
         self.text.get_document(doc_id)
+    }
+
+    fn get_document_with_metadata(
+        &self,
+        doc_id: &str,
+        realtime: bool,
+    ) -> Result<Option<super::DocumentRead>> {
+        self.text.get_document_with_metadata(doc_id, realtime)
     }
 
     #[cfg(feature = "protocol-trace")]

@@ -82,11 +82,91 @@ pub(crate) fn is_write_validation_error(error: &anyhow::Error) -> bool {
         || error.is::<crate::wal::WalFrameTooLargeError>()
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WriteCondition {
+    #[default]
+    Unconditional,
+    Create,
+    IfMatch {
+        seq_no: u64,
+        primary_term: u64,
+    },
+}
+
+impl WriteCondition {
+    pub fn expected_version(self) -> (Option<u64>, Option<u64>) {
+        match self {
+            Self::IfMatch {
+                seq_no,
+                primary_term,
+            } => (Some(seq_no), Some(primary_term)),
+            _ => (None, None),
+        }
+    }
+
+    pub fn from_optional_values(seq_no: Option<u64>, primary_term: Option<u64>) -> Result<Self> {
+        match (seq_no, primary_term) {
+            (None, None) => Ok(Self::Unconditional),
+            (Some(seq_no), Some(primary_term)) if primary_term > 0 => Ok(Self::IfMatch {
+                seq_no,
+                primary_term,
+            }),
+            (Some(_), Some(_)) => Err(DocumentValidationError(
+                "if_primary_term must be greater than zero".to_string(),
+            )
+            .into()),
+            _ => Err(DocumentValidationError(
+                "if_seq_no and if_primary_term must be specified together".to_string(),
+            )
+            .into()),
+        }
+    }
+
+    pub(crate) fn check(self, doc_id: &str, current: Option<(u64, u64)>) -> Result<()> {
+        let reason = match self {
+            Self::Unconditional => return Ok(()),
+            Self::Create if current.is_none() => return Ok(()),
+            Self::Create => format!("[{doc_id}]: version conflict, document already exists"),
+            Self::IfMatch {
+                seq_no,
+                primary_term,
+            } if current == Some((seq_no, primary_term)) => return Ok(()),
+            Self::IfMatch {
+                seq_no,
+                primary_term,
+            } => {
+                let actual = match current {
+                    Some((seq, term)) => {
+                        format!("current document has seqNo [{seq}] and primary term [{term}]")
+                    }
+                    None => "but no document was found".to_string(),
+                };
+                format!(
+                    "[{doc_id}]: version conflict, required seqNo [{seq_no}], primary term [{primary_term}]. {actual}"
+                )
+            }
+        };
+        Err(VersionConflictError(reason).into())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct VersionConflictError(pub String);
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocumentRead {
+    pub source: serde_json::Value,
+    pub seq_no: u64,
+    pub primary_term: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexWriteReceipt {
     pub doc_id: String,
     pub seq_no: u64,
     pub primary_term: u64,
+    pub created: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,10 +174,14 @@ pub struct BulkWriteReceipt {
     pub doc_ids: Vec<String>,
     pub start_seq_no: Option<u64>,
     pub primary_term: u64,
+    pub created: Vec<bool>,
 }
 
 impl BulkWriteReceipt {
     pub fn last_seq_no(&self) -> Result<Option<u64>> {
+        if self.created.len() != self.doc_ids.len() {
+            anyhow::bail!("bulk write receipt has inconsistent item results");
+        }
         match (self.start_seq_no, self.doc_ids.len()) {
             (None, 0) => Ok(None),
             (Some(start), count) if count > 0 => start
@@ -374,6 +458,14 @@ pub trait SearchEngine: Send + Sync {
         primary_term: u64,
     ) -> Result<IndexWriteReceipt>;
 
+    fn add_document_with_condition_at_term(
+        &self,
+        doc_id: &str,
+        payload: serde_json::Value,
+        primary_term: u64,
+        condition: WriteCondition,
+    ) -> Result<IndexWriteReceipt>;
+
     /// Bulk-index documents. Each tuple is (doc_id, payload). Returns document IDs.
     fn bulk_add_documents(&self, docs: Vec<(String, serde_json::Value)>) -> Result<Vec<String>> {
         Ok(self.bulk_add_documents_with_receipt(docs)?.doc_ids)
@@ -407,6 +499,13 @@ pub trait SearchEngine: Send + Sync {
         primary_term: u64,
     ) -> Result<DeleteWriteReceipt>;
 
+    fn delete_document_with_condition_at_term(
+        &self,
+        doc_id: &str,
+        primary_term: u64,
+        condition: WriteCondition,
+    ) -> Result<DeleteWriteReceipt>;
+
     fn apply_replica_operation(&self, operation: SequencedOperation)
     -> Result<ReplicaApplyReceipt>;
 
@@ -429,6 +528,12 @@ pub trait SearchEngine: Send + Sync {
 
     /// Retrieve a document by its `_id`. Returns the `_source` JSON if found.
     fn get_document(&self, doc_id: &str) -> Result<Option<serde_json::Value>>;
+
+    fn get_document_with_metadata(
+        &self,
+        doc_id: &str,
+        realtime: bool,
+    ) -> Result<Option<DocumentRead>>;
 
     #[cfg(feature = "protocol-trace")]
     fn protocol_trace_documents(&self) -> Result<Vec<(String, serde_json::Value, u64, u64)>> {
@@ -670,6 +775,7 @@ mod tests {
             doc_ids: vec!["a".into(), "b".into()],
             start_seq_no: Some(0),
             primary_term: 1,
+            created: vec![true, true],
         };
         assert_eq!(receipt.last_seq_no().unwrap(), Some(1));
         assert!(
@@ -677,6 +783,7 @@ mod tests {
                 doc_ids: vec!["a".into()],
                 start_seq_no: None,
                 primary_term: 1,
+                created: vec![true],
             }
             .last_seq_no()
             .is_err()
@@ -686,6 +793,7 @@ mod tests {
                 doc_ids: vec!["a".into(), "b".into()],
                 start_seq_no: Some(u64::MAX),
                 primary_term: 1,
+                created: vec![true, true],
             }
             .last_seq_no()
             .is_err()
@@ -695,6 +803,7 @@ mod tests {
                 doc_ids: vec![],
                 start_seq_no: None,
                 primary_term: 1,
+                created: vec![],
             }
             .last_seq_no()
             .unwrap(),

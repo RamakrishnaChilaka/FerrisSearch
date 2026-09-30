@@ -2031,6 +2031,7 @@ async fn first_write_after_transport_restart_reactivates_primary() {
                 shard_id: 0,
                 payload_json: serde_json::to_vec(&serde_json::json!({"value": doc_id})).unwrap(),
                 doc_id: doc_id.into(),
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -2062,6 +2063,7 @@ async fn first_write_after_transport_restart_reactivates_primary() {
             payload_json: serde_json::to_vec(&serde_json::json!({"value": "after-restart"}))
                 .unwrap(),
             doc_id: "after-restart".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()

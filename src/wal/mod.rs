@@ -451,6 +451,12 @@ pub trait WriteAheadLog: Send + Sync {
     /// range metadata rather than scanning the full WAL.
     fn find_entry(&self, seq_no: u64) -> Result<Option<TranslogEntry>>;
 
+    fn find_entry_position(&self, seq_no: u64, primary_term: u64) -> Result<Option<WalCursor>>;
+
+    fn entry_positions(&self, start: WalCursor, count: usize) -> Result<Vec<WalCursor>>;
+
+    fn read_entry_at(&self, position: WalCursor) -> Result<Option<TranslogEntry>>;
+
     /// Read entries with seq_no > the given checkpoint (for replica recovery).
     fn read_from(&self, after_seq_no: u64) -> Result<Vec<TranslogEntry>>;
 
@@ -489,6 +495,12 @@ pub trait WriteAheadLog: Send + Sync {
         &self,
         min_seq_no: u64,
         callback: &mut dyn FnMut(TranslogEntry) -> Result<()>,
+    ) -> Result<u64>;
+
+    fn for_each_from_at(
+        &self,
+        min_seq_no: u64,
+        callback: &mut dyn FnMut(WalCursor, TranslogEntry) -> Result<()>,
     ) -> Result<u64>;
 
     /// Read a bounded ordered range from the live generation state.
@@ -692,15 +704,24 @@ fn decode_entries_streaming<R: Read>(
     file_len: Option<u64>,
     mut callback: impl FnMut(TranslogEntry) -> Result<()>,
 ) -> Result<()> {
+    decode_entries_streaming_at(reader, file_len, |_, entry| callback(entry))
+}
+
+fn decode_entries_streaming_at<R: Read>(
+    reader: &mut R,
+    file_len: Option<u64>,
+    mut callback: impl FnMut(u64, TranslogEntry) -> Result<()>,
+) -> Result<()> {
     let mut consumed = 0u64;
     while let Some((entry, frame_bytes)) = read_next_entry(
         reader,
         file_len.map(|length| length.saturating_sub(consumed)),
     )? {
+        let position = consumed;
         consumed = consumed
             .checked_add(frame_bytes as u64)
             .ok_or_else(|| anyhow::anyhow!("translog decode offset overflow"))?;
-        callback(entry)?;
+        callback(position, entry)?;
     }
     Ok(())
 }
@@ -1895,6 +1916,47 @@ impl HotTranslog {
     }
 }
 
+impl HotTranslog {
+    fn find_entry_with_position(
+        &self,
+        seq_no: u64,
+        primary_term: Option<u64>,
+    ) -> Result<Option<(WalCursor, TranslogEntry)>> {
+        let generations = recover_lock(&self.state, "state").generations.clone();
+        for generation in generations.into_iter().filter(|generation| {
+            generation
+                .min_seq_no
+                .is_some_and(|minimum| minimum <= seq_no)
+                && generation
+                    .max_seq_no
+                    .is_some_and(|maximum| seq_no <= maximum)
+        }) {
+            let mut reader = BufReader::new(File::open(&generation.path)?);
+            let mut byte_offset = 0u64;
+            while let Some((entry, frame_bytes)) = read_next_entry(
+                &mut reader,
+                Some(generation.size_bytes.saturating_sub(byte_offset)),
+            )? {
+                if entry.seq_no == seq_no
+                    && primary_term.is_none_or(|term| entry.primary_term == term)
+                {
+                    return Ok(Some((
+                        WalCursor {
+                            generation_id: generation.id,
+                            byte_offset,
+                        },
+                        entry,
+                    )));
+                }
+                byte_offset = byte_offset
+                    .checked_add(frame_bytes as u64)
+                    .ok_or_else(|| wal_corruption("WAL lookup offset overflows"))?;
+            }
+        }
+        Ok(None)
+    }
+}
+
 impl WriteAheadLog for HotTranslog {
     fn append(
         &self,
@@ -2171,31 +2233,81 @@ impl WriteAheadLog for HotTranslog {
     }
 
     fn find_entry(&self, seq_no: u64) -> Result<Option<TranslogEntry>> {
-        let generations = recover_lock(&self.state, "state").generations.clone();
-        for generation in generations.into_iter().filter(|generation| {
-            generation
-                .min_seq_no
-                .is_some_and(|minimum| minimum <= seq_no)
-                && generation
-                    .max_seq_no
-                    .is_some_and(|maximum| seq_no <= maximum)
-        }) {
-            let file = File::open(&generation.path)?;
-            let mut reader = BufReader::new(file);
-            while reader.stream_position()? < generation.size_bytes {
-                let mut len_buf = [0u8; 4];
-                reader.read_exact(&mut len_buf)?;
-                let payload_len = u32::from_le_bytes(len_buf) as usize;
-                checked_frame_bytes(payload_len, MAX_WAL_FRAME_BYTES)?;
-                let mut payload = vec![0u8; payload_len];
-                reader.read_exact(&mut payload)?;
-                let entry = decode_wire_entry(&payload)?.into_translog()?;
-                if entry.seq_no == seq_no {
-                    return Ok(Some(entry));
-                }
-            }
+        Ok(self
+            .find_entry_with_position(seq_no, None)?
+            .map(|(_, entry)| entry))
+    }
+
+    fn find_entry_position(&self, seq_no: u64, primary_term: u64) -> Result<Option<WalCursor>> {
+        Ok(self
+            .find_entry_with_position(seq_no, Some(primary_term))?
+            .map(|(position, _)| position))
+    }
+
+    fn entry_positions(&self, start: WalCursor, count: usize) -> Result<Vec<WalCursor>> {
+        if count == 0 {
+            return Ok(Vec::new());
         }
-        Ok(None)
+        let generation = recover_lock(&self.state, "state")
+            .generations
+            .iter()
+            .find(|generation| generation.id == start.generation_id)
+            .cloned()
+            .ok_or_else(|| wal_corruption("appended WAL generation is missing"))?;
+        let mut reader = BufReader::new(File::open(&generation.path)?);
+        reader.seek(SeekFrom::Start(start.byte_offset))?;
+        let mut positions = Vec::with_capacity(count);
+        for _ in 0..count {
+            let byte_offset = reader.stream_position()?;
+            let mut len = [0u8; 4];
+            reader.read_exact(&mut len)?;
+            let payload_len = u32::from_le_bytes(len) as usize;
+            let frame_bytes = checked_frame_bytes(payload_len, MAX_WAL_FRAME_BYTES)?;
+            let end = byte_offset
+                .checked_add(frame_bytes as u64)
+                .ok_or_else(|| wal_corruption("WAL position overflows"))?;
+            if end > generation.size_bytes {
+                return Err(wal_corruption(
+                    "appended WAL frame exceeds generation boundary",
+                ));
+            }
+            positions.push(WalCursor {
+                generation_id: generation.id,
+                byte_offset,
+            });
+            reader.seek(SeekFrom::Start(end))?;
+        }
+        Ok(positions)
+    }
+
+    fn read_entry_at(&self, position: WalCursor) -> Result<Option<TranslogEntry>> {
+        let generation = recover_lock(&self.state, "state")
+            .generations
+            .iter()
+            .find(|generation| generation.id == position.generation_id)
+            .cloned();
+        let Some(generation) = generation else {
+            return Ok(None);
+        };
+        if position.byte_offset >= generation.size_bytes {
+            return Ok(None);
+        }
+        let mut reader = BufReader::new(File::open(&generation.path)?);
+        reader.seek(SeekFrom::Start(position.byte_offset))?;
+        let mut len = [0u8; 4];
+        reader.read_exact(&mut len)?;
+        let payload_len = u32::from_le_bytes(len) as usize;
+        let frame_bytes = checked_frame_bytes(payload_len, MAX_WAL_FRAME_BYTES)?;
+        if position
+            .byte_offset
+            .checked_add(frame_bytes as u64)
+            .is_none_or(|end| end > generation.size_bytes)
+        {
+            return Err(wal_corruption("WAL frame exceeds generation boundary"));
+        }
+        let mut payload = vec![0u8; payload_len];
+        reader.read_exact(&mut payload)?;
+        Ok(Some(decode_wire_entry(&payload)?.into_translog()?))
     }
 
     fn read_from(&self, after_seq_no: u64) -> Result<Vec<TranslogEntry>> {
@@ -2308,6 +2420,14 @@ impl WriteAheadLog for HotTranslog {
         min_seq_no: u64,
         callback: &mut dyn FnMut(TranslogEntry) -> Result<()>,
     ) -> Result<u64> {
+        self.for_each_from_at(min_seq_no, &mut |_, entry| callback(entry))
+    }
+
+    fn for_each_from_at(
+        &self,
+        min_seq_no: u64,
+        callback: &mut dyn FnMut(WalCursor, TranslogEntry) -> Result<()>,
+    ) -> Result<u64> {
         let mut count: u64 = 0;
 
         for generation in self
@@ -2327,10 +2447,16 @@ impl WriteAheadLog for HotTranslog {
             };
             let file_len = file.metadata()?.len();
             let mut reader = BufReader::new(file);
-            decode_entries_streaming(&mut reader, Some(file_len), |entry| {
+            decode_entries_streaming_at(&mut reader, Some(file_len), |byte_offset, entry| {
                 if entry.seq_no >= min_seq_no {
                     count += 1;
-                    callback(entry)?;
+                    callback(
+                        WalCursor {
+                            generation_id: generation.id,
+                            byte_offset,
+                        },
+                        entry,
+                    )?;
                 }
                 Ok(())
             })?;

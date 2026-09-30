@@ -109,6 +109,9 @@ message ShardDocRequest {
     uint32 shard_id = 2;
     bytes payload_json = 3;   // JSON document as bytes (avoids double-encode)
     string doc_id = 4;        // document _id
+    optional uint64 if_seq_no = 5;
+    optional uint64 if_primary_term = 6;
+    bool create_only = 7;
 }
 
 message ShardDocResponse {
@@ -117,12 +120,15 @@ message ShardDocResponse {
     string error = 3;         // empty on success
     optional uint64 seq_no = 4;
     optional uint64 primary_term = 5;
+    bool created = 6;
 }
 
 message ShardDeleteRequest {
     string index_name = 1;
     uint32 shard_id = 2;
     string doc_id = 3;
+    optional uint64 if_seq_no = 4;
+    optional uint64 if_primary_term = 5;
 }
 
 message ShardDeleteResponse {
@@ -137,18 +143,46 @@ message ShardGetRequest {
     string index_name = 1;
     uint32 shard_id = 2;
     string doc_id = 3;
+    optional bool realtime = 4; // defaults to true
 }
 
 message ShardGetResponse {
     bool found = 1;
     bytes source_json = 2;    // _source as JSON bytes (empty if not found)
     string error = 3;
+    optional uint64 seq_no = 4;
+    optional uint64 primary_term = 5;
+}
+
+enum ShardBulkOpKind {
+    INDEX = 0;
+    CREATE = 1;
+    DELETE = 2;
+}
+
+message ShardBulkOperation {
+    ShardBulkOpKind kind = 1;
+    optional uint64 if_seq_no = 2;
+    optional uint64 if_primary_term = 3;
+}
+
+message ShardBulkItemResponse {
+    string doc_id = 1;
+    uint32 status = 2;
+    string result = 3;
+    string error = 4;
+    string error_type = 5;
+    optional uint64 seq_no = 6;
+    optional uint64 primary_term = 7;
 }
 
 message ShardBulkRequest {
     string index_name = 1;
     uint32 shard_id = 2;
     repeated bytes documents_json = 3; // each element is a JSON doc as bytes
+    // Empty operations means a homogeneous unconditional index batch.
+    // Otherwise one operation must accompany each document, in the same order.
+    repeated ShardBulkOperation operations = 4;
 }
 
 message ShardBulkResponse {
@@ -157,6 +191,7 @@ message ShardBulkResponse {
     string error = 3;
     optional uint64 start_seq_no = 4; // absent for an empty batch
     optional uint64 primary_term = 5;
+    repeated ShardBulkItemResponse results = 6;
 }
 
 message ShardSearchRequest {

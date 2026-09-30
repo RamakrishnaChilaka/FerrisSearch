@@ -197,6 +197,7 @@ async fn index_document(
             shard_id: SHARD,
             doc_id: doc_id.to_string(),
             payload_json: serde_json::to_vec(&serde_json::json!({"value": value}))?,
+            ..Default::default()
         }))
         .await?
         .into_inner())
@@ -1007,6 +1008,7 @@ impl RandomTraceCluster {
                 index_name: INDEX.to_string(),
                 shard_id: SHARD,
                 doc_id: "d0".to_string(),
+                ..Default::default()
             }))
             .await?
             .into_inner();
@@ -1273,6 +1275,7 @@ async fn execute_planned_request(
                     index_name: INDEX.to_string(),
                     shard_id: SHARD,
                     doc_id: doc_id.clone(),
+                    ..Default::default()
                 }))
                 .await?
                 .into_inner();
@@ -1310,6 +1313,7 @@ async fn execute_planned_request(
                             }))
                         })
                         .collect::<serde_json::Result<Vec<_>>>()?,
+                    ..Default::default()
                 }))
                 .await?
                 .into_inner();
@@ -1814,6 +1818,7 @@ async fn seeded_three_node_fault_trace() -> Result<()> {
                             "_source": {"value": 40}
                         }))?,
                     ],
+                    ..Default::default()
                 }))
                 .await?
                 .into_inner(),
@@ -1991,6 +1996,7 @@ async fn seeded_three_node_fault_trace() -> Result<()> {
                 index_name: INDEX.to_string(),
                 shard_id: SHARD,
                 doc_id: "after-gap".to_string(),
+                ..Default::default()
             }))
             .await?
             .into_inner();
