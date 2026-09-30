@@ -942,6 +942,10 @@ impl ShardManager {
     }
 
     fn record_copy_io_failure(&self, key: ShardCopyIoKey, error: anyhow::Error) -> anyhow::Error {
+        if !Self::is_retryable_io_failure(&error) {
+            self.clear_copy_io_failure(&key);
+            return error;
+        }
         let now = Instant::now();
         let operation = key.operation;
         let policy = *self
@@ -1408,6 +1412,41 @@ impl ShardManager {
         }
         self.cache_copy_identity(key, identity.clone());
         Ok(identity)
+    }
+
+    fn ensure_collision_quarantine_not_active(
+        &self,
+        key: &ShardKey,
+        shard_dir: &std::path::Path,
+        index_uuid: &str,
+        allocation_id: AllocationId,
+    ) -> Result<()> {
+        if let Some(identity) = self
+            .copy_identities
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(key)
+            .cloned()
+        {
+            identity.validate_expected(index_uuid, allocation_id)?;
+            return Ok(());
+        }
+
+        let identity_path = Self::copy_identity_path(shard_dir);
+        if !identity_path.try_exists()? {
+            return Ok(());
+        }
+        let identity = Self::load_copy_identity(shard_dir)?;
+        identity.validate_binding(index_uuid, allocation_id)?;
+        if identity.collision_quarantined {
+            self.cache_copy_identity(key, identity.clone());
+            return Err(CollisionQuarantinedShardCopy {
+                index_uuid: identity.index_uuid,
+                allocation_id: identity.allocation_id,
+            }
+            .into());
+        }
+        Ok(())
     }
 
     fn ensure_local_test_identity(
@@ -2127,11 +2166,27 @@ impl ShardManager {
             assignment.allocation_id,
             ShardCopyIoOperation::PendingMarker,
         );
+        let key = ShardKey::new(index, shard_id);
         let attempt_lock = self.copy_io_attempt_lock(&retry_key);
         let _attempt_guard = attempt_lock
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let per_shard_lock = self.shard_open_lock(&key);
+        let quarantine_guard = per_shard_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let shard_dir = self
+            .data_dir
+            .join(index_uuid)
+            .join(format!("shard_{shard_id}"));
+        self.ensure_collision_quarantine_not_active(
+            &key,
+            &shard_dir,
+            index_uuid,
+            assignment.allocation_id,
+        )?;
         self.ensure_copy_io_attempt_allowed(&retry_key)?;
+        drop(quarantine_guard);
         #[cfg(test)]
         if let Err(error) = self.maybe_inject_assigned_open_io_failure() {
             return Err(self.record_copy_io_failure(retry_key, error));

@@ -78,7 +78,9 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > same UUID, allocation, and term. A term/sequence collision durably marks the
 > exact allocation as quarantined before closing it; the copy cannot reopen or
 > accept replication until Raft removes it and fresh peer recovery installs a
-> new allocation identity. Text-only writer replay durably marks vector state
+> new allocation identity. The marker is checked before open-I/O backoff, so
+> every later single or bulk replication attempt remains `DATA_LOSS`.
+> Text-only writer replay durably marks vector state
 > stale; write, maintenance, recovery-snapshot, barrier, activation, startup,
 > and recovery-finalization paths rebuild and fsync vectors before clearing the
 > marker. Rebuilds scan every live Tantivy document segment-by-segment in

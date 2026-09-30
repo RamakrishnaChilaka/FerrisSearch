@@ -93,6 +93,10 @@ pub struct ShardManager {
 - A collision-quarantined identity cannot open or accept replica apply for the
   same allocation. The marker remains until routing removes that allocation
   and peer recovery installs a fresh identity for a new allocation.
+- Assigned open checks cached and durable collision quarantine under the
+  shard-open lock before consulting I/O retry backoff. Definitive errors,
+  including active collision quarantine, never arm or retain copy-I/O retry
+  state.
 - `fence_max_seq_no` is captured and persisted only when a copy fence advances
   (or when peer recovery creates a new identity). Ordinary assigned-copy open
   validates and reconciles that value but never rewrites it.

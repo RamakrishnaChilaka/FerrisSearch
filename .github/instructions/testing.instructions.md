@@ -323,6 +323,9 @@ cargo test -- test_name                         # Single test by name
   rebuild failure remaining reportable under the Apply budget, and successful
   write responses remaining independent of a blocked or slow
   `MarkPrimaryAvailable` report.
+- Collision quarantine regressions must assert repeated immediate single and
+  bulk replication attempts remain `DATA_LOSS`; a definitive marker must never
+  be masked by copy-I/O backoff.
 - Round-6 storage regressions use a real Tantivy commit failure to prove the
   writer is removed, the persisted checkpoint does not advance, five later
   acknowledged writes survive the next commit and restart, and a failed

@@ -5193,6 +5193,36 @@ async fn collision_quarantine_rejects_reopen_and_follow_up_replication() {
     );
     assert!(shards.get_shard("idx", 0).is_none());
 
+    let second_follow_up = service
+        .replicate_doc(Request::new(request(7)))
+        .await
+        .unwrap_err();
+    assert_eq!(second_follow_up.code(), tonic::Code::DataLoss);
+    assert!(
+        second_follow_up
+            .message()
+            .contains("collision quarantine is active")
+    );
+
+    let bulk_follow_up = service
+        .replicate_bulk(Request::new(ReplicateBulkRequest {
+            index_name: "idx".into(),
+            shard_id: 0,
+            ops: vec![request(8)],
+            index_uuid: "uuid-1".into(),
+            primary_term: Some(2),
+            target_allocation_id: Some(allocation_id),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(bulk_follow_up.code(), tonic::Code::DataLoss);
+    assert!(
+        bulk_follow_up
+            .message()
+            .contains("collision quarantine is active")
+    );
+    assert!(shards.get_shard("idx", 0).is_none());
+
     drop(service);
     drop(shards);
     let restarted = ShardManager::new(dir.path(), Duration::from_secs(60));
