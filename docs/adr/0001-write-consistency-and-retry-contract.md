@@ -293,12 +293,24 @@ Current post-write refresh dispatch remains coordinator-local.
 
 **Status (2026-09-30):** Implemented for `local_shards`. Primary, replica,
 replay, and recovery index applies retain physical WAL cursors in the existing
-live version map. Realtime GET holds the translog mutex while resolving the
-source. Flush publishes its reader before truncating under that mutex; a
-missing cursor can therefore fall back to a reader covering the live version.
-A behind or missing fallback fails explicitly, rather than returning stale
-data. Replay carries cursors from the streaming decoder without rescanning
-the WAL per document.
+live version map. Realtime GET checks map completeness and the document entry
+under one apply-state lock. A complete-map miss reads from the reader without
+the translog mutex, acquiring the searcher after the map lookup. A complete-map
+tombstone returns not found without that mutex. Index hits still hold the
+translog mutex while resolving the source. Flush publishes its reader before
+truncating under that mutex; a missing cursor can therefore fall back to a
+reader covering the live version. A behind or missing fallback fails
+explicitly, rather than returning stale data. Replay carries cursors from the
+streaming decoder without rescanning the WAL per document.
+
+Replay clears completeness with the map reset and restores it only after the
+successful final reader reload, or after a successful empty replay. A realtime
+GET that observes an incomplete map waits for the translog mutex. If the map
+remains incomplete, GET returns `503 shard_not_available_exception` with the
+replay failure cause. Single and bulk update propagate that failure instead
+of merging stale source or treating the document as missing. Search and
+`realtime=false` keep their reader-only semantics. Conditional writes, create,
+and upsert still complete replay before checking the document version.
 
 **Index-incarnation status (2026-09-30):** GET also returns `_index_uuid`,
 including when the document is missing. Coordinator update pins the serving
@@ -322,7 +334,8 @@ operator setting and add `_mget`. Neither is part of this implementation.
 - **Realtime GET:** checks the map first. A tombstone returns not found, and a
   changed document is read from its WAL entry, which stores the full `_source`.
   If that WAL position has been truncated, or the entry is absent, GET reads the
-  refreshed reader.
+  refreshed reader. These fallbacks require a complete map; an incomplete map
+  never authorizes a reader miss or stale version.
 - **`_update`:** the coordinating node performs a realtime GET from the
   primary, recursively merges `doc`, and sends a primary conditional index
   write using the index UUID, `seq_no`, and term it read. The primary compares and appends

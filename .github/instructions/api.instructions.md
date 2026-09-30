@@ -212,8 +212,11 @@ header and the internal `_doc_id` / `_source` wrapper. The usable JSON document
 body is therefore slightly smaller and depends on its ID and serialized shape.
 Oversized single/delete writes return a validation error before mutation;
 oversized bulk documents remain attributable item failures.
-Retryable gRPC `ABORTED` write failures map to HTTP 503
+Retryable gRPC `ABORTED` document-operation failures map to HTTP 503
 `shard_not_available_exception` with the underlying cause preserved.
+Realtime GET returns this status when WAL replay leaves the live map
+incomplete. Single `_update` propagates the GET failure; bulk `update` returns
+an item-level 503 and sets `errors: true`, rather than attempting a CAS or upsert.
 Only `RESOURCE_EXHAUSTED` statuses carrying the stable version-map-capacity
 marker map to HTTP 429 `version_map_capacity_exceeded`; unrelated resource
 exhaustion remains a 500 forwarding failure.

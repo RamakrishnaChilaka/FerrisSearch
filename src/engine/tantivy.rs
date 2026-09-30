@@ -72,6 +72,7 @@ struct ApplyState {
     checkpoints: LocalCheckpointTracker,
     term_sequences: PrimaryTermSequenceState,
     versions: LiveVersionMap,
+    version_map_complete: bool,
     max_seq_no_of_updates_or_deletes: Option<u64>,
 }
 
@@ -93,6 +94,7 @@ impl ApplyState {
             checkpoints: LocalCheckpointTracker::new(committed.clone())?,
             term_sequences,
             versions: LiveVersionMap::new(DEFAULT_VERSION_MAP_MAX_BYTES),
+            version_map_complete: true,
             max_seq_no_of_updates_or_deletes: committed.max_seq_no_of_updates_or_deletes,
         })
     }
@@ -105,6 +107,7 @@ impl ApplyState {
             &committed,
         )?;
         self.versions.reset();
+        self.version_map_complete = false;
         self.max_seq_no_of_updates_or_deletes = committed.max_seq_no_of_updates_or_deletes;
         Ok(())
     }
@@ -2308,17 +2311,32 @@ impl HotEngine {
                     .apply_state
                     .lock()
                     .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
-                state.versions.rotate_current_into_old()?;
+                if let Err(error) = state.versions.rotate_current_into_old() {
+                    state.version_map_complete = false;
+                    drop(state);
+                    writer_state.fail(format!(
+                        "version map rotation failed during refresh: {error:#}"
+                    ));
+                    return Err(error);
+                }
             }
             let boundary = self.current_committed_boundary()?;
             match self.commit_writer_at_boundary(&mut writer_state, "refresh", boundary) {
                 Ok(boundary) => Ok(boundary),
                 Err(error) => {
-                    self.apply_state
+                    let mut state = self
+                        .apply_state
                         .lock()
-                        .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
-                        .versions
-                        .rollback_refresh()?;
+                        .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+                    if let Err(rollback_error) = state.versions.rollback_refresh() {
+                        state.version_map_complete = false;
+                        drop(state);
+                        let context = format!(
+                            "version map rollback failed after refresh commit failure: {error:#}"
+                        );
+                        writer_state.fail(format!("{context}: {rollback_error:#}"));
+                        return Err(rollback_error).context(context);
+                    }
                     Err(error)
                 }
             }
@@ -2363,11 +2381,8 @@ impl HotEngine {
         context: &str,
     ) -> Result<u64> {
         let committed = self.load_committed_boundary()?;
-        // Publish the committed state to the reader before clearing the live
-        // version map. Otherwise a realtime GET or primary condition that
-        // misses the map falls back to an older reader. Some paths commit
-        // without reloading, such as the peer-recovery snapshot, and rely on
-        // the delayed commit watcher.
+        // Publish the commit before resetting the map, including empty replay.
+        // Completeness remains false until the acknowledged suffix is restored.
         self.reader
             .reload()
             .with_context(|| format!("reader reload failed before {context} replay"))?;
@@ -2407,6 +2422,10 @@ impl HotEngine {
             if trace_replay && let Some(copy) = trace_copy.as_ref() {
                 crate::protocol_trace::record_replay_finished(copy, "completed")?;
             }
+            self.apply_state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
+                .version_map_complete = true;
             return Ok(0);
         }
 
@@ -2538,6 +2557,10 @@ impl HotEngine {
             if trace_replay && let Some(copy) = trace_copy.as_ref() {
                 crate::protocol_trace::record_replay_finished(copy, "completed")?;
             }
+            self.apply_state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
+                .version_map_complete = true;
             return Ok(0);
         }
         flush_batch(&mut batch)?;
@@ -2563,14 +2586,17 @@ impl HotEngine {
                 format!("committed checkpoint persistence failed after {context}")
             });
         }
-        self.apply_state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
-            .versions
-            .complete_reader_reload(
+        {
+            let mut state = self
+                .apply_state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+            state.versions.complete_reader_reload(
                 committed_boundary.processed_checkpoint,
                 self.delete_tombstone_retention,
             );
+            state.version_map_complete = true;
+        }
         tracing::info!(
             "Translog replay during {} recovered {} operations.",
             context,
@@ -7899,10 +7925,44 @@ impl super::SearchEngine for HotEngine {
         if !realtime {
             return self.read_refreshed_document(doc_id);
         }
+        let (complete, version) = {
+            let state = self
+                .apply_state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+            (
+                state.version_map_complete,
+                if state.version_map_complete {
+                    state.versions.lookup(doc_id)?
+                } else {
+                    None
+                },
+            )
+        };
+        if complete {
+            match version {
+                None => return self.read_refreshed_document(doc_id),
+                Some(VersionValue::Delete(_)) => return Ok(None),
+                Some(VersionValue::Index(_)) => {}
+            }
+        }
         self.with_translog("realtime GET", |translog| {
-            let version = self.apply_state.lock()
-                .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
-                .versions.lookup(doc_id)?;
+            let version = {
+                let state = self.apply_state.lock()
+                    .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+                if !state.version_map_complete {
+                    drop(state);
+                    let writer_state = self.writer.read()
+                        .unwrap_or_else(|error| error.into_inner());
+                    return Err(TantivyWriterUnavailableError {
+                        context: "realtime GET".to_string(),
+                        reason: format!("live version map is incomplete; WAL replay must complete: {}",
+                            writer_state.failure.as_deref()
+                                .unwrap_or("WAL replay has not completed")),
+                    }.into());
+                }
+                state.versions.lookup(doc_id)?
+            };
             let Some(VersionValue::Index(version)) = version else {
                 return if version.is_some() { Ok(None) } else { self.read_refreshed_document(doc_id) };
             };
@@ -10782,6 +10842,112 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn realtime_get_index_hit_keeps_translog_serialization() {
+        let (_dir, engine) = create_engine();
+        let engine = Arc::new(engine);
+        let receipt = engine
+            .add_document_with_receipt("live", json!({"value": 1}))
+            .unwrap();
+        let translog = engine.translog.lock().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let get_engine = engine.clone();
+        let get = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(get_engine.get_document_with_metadata("live", true))
+                .unwrap();
+        });
+        started_rx.recv_timeout(TEST_SYNC_TIMEOUT).unwrap();
+        let early = result_rx.recv_timeout(Duration::from_millis(100));
+        drop(translog);
+        get.join().unwrap();
+        assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
+        let document = result_rx
+            .recv_timeout(TEST_SYNC_TIMEOUT)
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(document.source, json!({"value": 1}));
+        assert_eq!(document.seq_no, receipt.seq_no);
+        assert_eq!(document.primary_term, receipt.primary_term);
+    }
+
+    #[test]
+    fn realtime_get_after_empty_replay_uses_published_reader_without_translog() {
+        let (directory, engine) = create_engine();
+        engine.add_document("old", json!({"value": 1})).unwrap();
+        engine.refresh().unwrap();
+        let receipt = engine
+            .add_document_with_receipt("old", json!({"value": 2}))
+            .unwrap();
+        drop(
+            engine
+                .prepare_peer_recovery_snapshot(&directory.path().join("snapshot"))
+                .unwrap(),
+        );
+        assert!(
+            engine
+                .prepare_primary_activation(receipt.primary_term + 1)
+                .unwrap()
+                .is_empty()
+        );
+        let document = realtime_get_while_translog_is_held(Arc::new(engine), "old")
+            .unwrap()
+            .unwrap();
+        assert_eq!(document.source, json!({"value": 2}));
+        assert_eq!(document.seq_no, receipt.seq_no);
+        assert_eq!(document.primary_term, receipt.primary_term);
+    }
+
+    #[test]
+    fn realtime_get_after_refresh_rotation_failure_fails_closed() {
+        let (_dir, engine) = create_engine();
+        engine
+            .add_document("collision", json!({"value": 1}))
+            .unwrap();
+        engine
+            .apply_state
+            .lock()
+            .unwrap()
+            .versions
+            .rotate_current_into_old()
+            .unwrap();
+        let receipt = engine
+            .add_document_with_receipt("unrelated", json!({"value": 2}))
+            .unwrap();
+        {
+            let mut state = engine.apply_state.lock().unwrap();
+            let Some(VersionValue::Index(version)) = state.versions.lookup("collision").unwrap()
+            else {
+                panic!("collision setup requires a live index version");
+            };
+            state.versions.apply_index_at(
+                "collision",
+                version.seq_no,
+                version.primary_term + 1,
+                version.wal_position.unwrap(),
+            );
+        }
+        let error = engine.refresh().unwrap_err();
+        assert!(error.is::<super::super::version_map::VersionMapCollisionError>());
+        assert!(engine.writer_is_failed_for_test());
+        let error = engine
+            .get_document_with_metadata("unrelated", true)
+            .unwrap_err();
+        assert!(error.is::<TantivyWriterUnavailableError>(), "{error:#}");
+        assert!(format!("{error:#}").contains("rotation failed"));
+        engine.refresh().unwrap();
+        let document = engine
+            .get_document_with_metadata("unrelated", true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(document.source, json!({"value": 2}));
+        assert_eq!(document.seq_no, receipt.seq_no);
+        assert_eq!(document.primary_term, receipt.primary_term);
     }
 
     #[test]

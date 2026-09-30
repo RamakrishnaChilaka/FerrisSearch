@@ -100,6 +100,11 @@ pub async fn replicate_bulk(
   coordinated through realtime GET plus CAS. Every applied index records its
   local physical WAL cursor for realtime reads; never copy a primary cursor
   into replica storage.
+  Complete-map misses and tombstones do not take the translog mutex. Index
+  hits still serialize cursor reads with WAL truncation. Replay marks the map
+  incomplete until it publishes the full suffix; failed replay makes realtime
+  reads fail rather than report stale state. Conditional writes still finish
+  replay before evaluating presence or versions.
 - **Synchronous replication**: primary waits for every authoritative in-sync replica before ACK
 - **Concurrent fan-out**: replicas are contacted in parallel via `tokio::spawn` + `join_all` — write latency = max(replica RTTs), not sum
 - Bulk replication resolves the captured routing term and authoritative targets
@@ -152,8 +157,10 @@ pub async fn replicate_bulk(
   per-copy count/time retry state and exponential backoff. Persistent replica
   I/O eventually fails the allocation; persistent primary I/O can only request
   promote-only failover when an in-sync replacement exists.
-- Apply-level escalation leaves the open engine readable and does not trigger
-  runtime WAL replay. A single-copy primary is marked unavailable without
+- Apply-level escalation leaves search and non-realtime reads open and does
+  not trigger runtime WAL replay. Realtime reads also remain open while the
+  live map is complete, but fail closed after partial replay failure.
+  A single-copy primary is marked unavailable without
   changing authority; the first later successful local write conditionally
   clears that status at the same term. Definitive and open-level failures may
   quarantine and require fresh activation after repair.

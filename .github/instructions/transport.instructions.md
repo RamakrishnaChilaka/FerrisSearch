@@ -155,6 +155,8 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   getter. Both found and missing-document responses require the serving index
   UUID. Verify the incarnation again after the read and fail decoding on a
   missing UUID or malformed found receipt.
+  An incomplete live map after failed WAL replay returns `ABORTED` with the
+  engine's full failure cause, not a missing-document response.
 - `ShardBulkRequest.operations` is either empty for an unconditional index
   batch or matches `documents_json` one-for-one. Reject invalid kinds/counts
   before mutation. Preserve item order. Index-only runs keep engine batching;

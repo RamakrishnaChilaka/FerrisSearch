@@ -61,7 +61,7 @@ fn document_write_error_response(
     {
         return crate::api::error_response(status, error_type, error.message());
     }
-    crate::api::error_response(status, error_type, format!("{operation} failed: {error}"))
+    crate::api::error_response(status, error_type, format!("{operation} failed: {error:#}"))
 }
 
 fn mapper_parsing_error_response(error: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
@@ -1293,9 +1293,9 @@ pub async fn get_document(
             ),
         },
         Err(error)
-            if error
-                .downcast_ref::<tonic::Status>()
-                .is_some_and(|status| status.code() == tonic::Code::NotFound) =>
+            if error.downcast_ref::<tonic::Status>().is_some_and(|status| {
+                matches!(status.code(), tonic::Code::NotFound | tonic::Code::Aborted)
+            }) =>
         {
             document_write_error_response("Get", error)
         }
@@ -1457,9 +1457,9 @@ async fn execute_update(
         {
             Ok(document) => document,
             Err(error)
-                if error
-                    .downcast_ref::<tonic::Status>()
-                    .is_some_and(|status| status.code() == tonic::Code::NotFound) =>
+                if error.downcast_ref::<tonic::Status>().is_some_and(|status| {
+                    matches!(status.code(), tonic::Code::NotFound | tonic::Code::Aborted)
+                }) =>
             {
                 return document_write_error_response("Get", error);
             }
