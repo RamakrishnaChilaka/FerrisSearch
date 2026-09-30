@@ -225,6 +225,49 @@ impl HotEnginePurpose {
 
 const SEQ_NO_FIELD_NAME: &str = "_seq_no";
 const PRIMARY_TERM_FIELD_NAME: &str = "_primary_term";
+const VECTOR_REBUILD_BATCH_SIZE: usize = 1_024;
+
+#[cfg(test)]
+thread_local! {
+    static VECTOR_REBUILD_BATCH_SIZE_OVERRIDE: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+fn vector_rebuild_batch_size() -> usize {
+    #[cfg(test)]
+    if let Some(batch_size) = VECTOR_REBUILD_BATCH_SIZE_OVERRIDE.with(|value| {
+        let value = value.get();
+        (value > 0).then_some(value)
+    }) {
+        return batch_size;
+    }
+    VECTOR_REBUILD_BATCH_SIZE
+}
+
+#[cfg(test)]
+pub(crate) struct VectorRebuildBatchSizeGuard {
+    previous: usize,
+}
+
+#[cfg(test)]
+impl Drop for VectorRebuildBatchSizeGuard {
+    fn drop(&mut self) {
+        VECTOR_REBUILD_BATCH_SIZE_OVERRIDE.with(|value| value.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn override_vector_rebuild_batch_size_for_test(
+    batch_size: usize,
+) -> VectorRebuildBatchSizeGuard {
+    assert!(batch_size > 0);
+    let previous = VECTOR_REBUILD_BATCH_SIZE_OVERRIDE.with(|value| {
+        let previous = value.get();
+        value.set(batch_size);
+        previous
+    });
+    VectorRebuildBatchSizeGuard { previous }
+}
 
 struct WriterState {
     writer: Option<IndexWriter>,
@@ -3551,60 +3594,68 @@ impl HotEngine {
             .max(1)
     }
 
-    pub(crate) fn vector_rebuild_documents(
+    pub(crate) fn for_each_vector_rebuild_batch(
         &self,
-    ) -> Result<Vec<(String, serde_json::Value, u64, u64)>> {
+        mut consume: impl FnMut(Vec<(String, serde_json::Value, u64, u64)>) -> Result<()>,
+    ) -> Result<()> {
         let searcher = self.reader.searcher();
-        let top_docs = searcher.search(&tantivy::query::AllQuery, &TopDocs::with_limit(100_000))?;
         let registry = self
             .field_registry
             .read()
             .unwrap_or_else(|error| error.into_inner());
-        let mut documents = Vec::with_capacity(top_docs.len());
-        for (_, address) in top_docs {
-            let stored = searcher.doc::<TantivyDocument>(address)?;
-            let doc_id = stored
-                .get_all(registry.id_field)
-                .next()
-                .and_then(|value| value.as_str())
-                .ok_or_else(|| anyhow::anyhow!("vector rebuild document has no _id"))?
-                .to_string();
-            let source = stored
-                .get_all(registry.source_field)
-                .next()
-                .and_then(|value| value.as_str())
-                .and_then(|source| Self::decode_stored_source_with_registry(&registry, source))
-                .ok_or_else(|| anyhow::anyhow!("vector rebuild document has no valid _source"))?;
-            let segment = &searcher.segment_readers()[address.segment_ord as usize];
-            let sequence = match (
-                segment.fast_fields().u64(SEQ_NO_FIELD_NAME),
-                segment.fast_fields().u64(PRIMARY_TERM_FIELD_NAME),
-            ) {
-                (Ok(seq_column), Ok(term_column)) => {
-                    let seq_no = seq_column.first(address.doc_id).ok_or_else(|| {
-                        anyhow::Error::new(InternalSequenceFieldError {
-                            message: format!("document [{doc_id}] has no {SEQ_NO_FIELD_NAME}"),
-                        })
+        let batch_size = vector_rebuild_batch_size();
+        let mut batch = Vec::with_capacity(batch_size);
+        for (segment_ord, segment) in searcher.segment_readers().iter().enumerate() {
+            let seq_column = segment.fast_fields().u64(SEQ_NO_FIELD_NAME).ok();
+            let term_column = segment.fast_fields().u64(PRIMARY_TERM_FIELD_NAME).ok();
+            for doc_id in segment.doc_ids_alive() {
+                let address = tantivy::DocAddress::new(segment_ord as u32, doc_id);
+                let stored = searcher.doc::<TantivyDocument>(address)?;
+                let document_id = stored
+                    .get_all(registry.id_field)
+                    .next()
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("vector rebuild document has no _id"))?
+                    .to_string();
+                let source = stored
+                    .get_all(registry.source_field)
+                    .next()
+                    .and_then(|value| value.as_str())
+                    .and_then(|source| Self::decode_stored_source_with_registry(&registry, source))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("vector rebuild document has no valid _source")
                     })?;
-                    let primary_term = term_column.first(address.doc_id).ok_or_else(|| {
-                        anyhow::Error::new(InternalSequenceFieldError {
-                            message: format!(
-                                "document [{doc_id}] has no {PRIMARY_TERM_FIELD_NAME}"
-                            ),
-                        })
-                    })?;
-                    (seq_no, primary_term)
-                }
-                _ => {
+                let (Some(seq_column), Some(term_column)) = (&seq_column, &term_column) else {
                     return Err(crate::common::unsupported_index_format(
                         "local shard Tantivy segment",
-                        format!("document [{doc_id}] is missing vector version fields"),
+                        format!("document [{document_id}] is missing vector version fields"),
                     ));
+                };
+                let seq_no = seq_column.first(doc_id).ok_or_else(|| {
+                    anyhow::Error::new(InternalSequenceFieldError {
+                        message: format!("document [{document_id}] has no {SEQ_NO_FIELD_NAME}"),
+                    })
+                })?;
+                let primary_term = term_column.first(doc_id).ok_or_else(|| {
+                    anyhow::Error::new(InternalSequenceFieldError {
+                        message: format!(
+                            "document [{document_id}] has no {PRIMARY_TERM_FIELD_NAME}"
+                        ),
+                    })
+                })?;
+                batch.push((document_id, source, seq_no, primary_term));
+                if batch.len() == batch_size {
+                    consume(std::mem::replace(
+                        &mut batch,
+                        Vec::with_capacity(batch_size),
+                    ))?;
                 }
-            };
-            documents.push((doc_id, source, sequence.0, sequence.1));
+            }
         }
-        Ok(documents)
+        if !batch.is_empty() {
+            consume(batch)?;
+        }
+        Ok(())
     }
 
     pub fn missing_sequence_intervals_through(

@@ -121,6 +121,10 @@ tokio::select! {
 - `rebuild_vectors()` constructs a replacement USearch index from the
   authoritative Tantivy document view, persists and fsyncs it, atomically swaps
   it into memory, and only then clears `vectors.stale`.
+- Vector rebuild enumerates every live document directly from each Tantivy
+  segment and feeds the replacement index in bounded batches. Never use
+  `TopDocs` or a search-result limit for rebuild input; deleted documents must
+  remain excluded and shards above 100,000 live documents must rebuild fully.
 - A text apply failure after WAL persistence durably creates `vectors.stale`.
   Its temporary file also means stale on restart. Primary writes, replica
   apply, refresh, flush, force merge, peer-snapshot preparation, recovery
@@ -214,7 +218,10 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
 - `force_merge(0)` is invalid. Successful force merge must verify the final
   searchable segment count is at most the requested positive bound while
   preserving document values, deletes, and the committed WAL boundary.
-- `rebuild_vectors()` is only called when the index has `KnnVector` fields in its mappings. The shard manager gates this check; the composite engine's `rebuild_vectors()` itself is still a 100K-doc MatchAll scan, so never call it unconditionally.
+- `rebuild_vectors()` is only called when the index has `KnnVector` fields in
+  its mappings. The shard manager gates this check because the full
+  segment/alive-document scan is proportional to shard size; never call it
+  unconditionally.
 - Even the direct `HotEngine::start_refresh_loop()` path must offload `refresh()` through Tokio's blocking pool if it is used; never run Tantivy commit/reload inline on an async interval task
 - Replica/recovery writes use explicit-sequence append APIs, including
   arbitrary ordered batches, so persisted WAL operation identities match the

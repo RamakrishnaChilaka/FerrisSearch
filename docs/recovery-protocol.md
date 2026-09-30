@@ -81,7 +81,9 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > new allocation identity. Text-only writer replay durably marks vector state
 > stale; write, maintenance, recovery-snapshot, barrier, activation, startup,
 > and recovery-finalization paths rebuild and fsync vectors before clearing the
-> marker. Intermediate replay commits may persist a committed maximum below the
+> marker. Rebuilds scan every live Tantivy document segment-by-segment in
+> bounded batches rather than through a capped search result. Intermediate
+> replay commits may persist a committed maximum below the
 > durable term-start fence maximum until later WAL batches are replayed; this is
 > valid sequence state, not corruption. A stalled empty catch-up response at an
 > unchanged physical cursor returns to the exclusive finalize path, including

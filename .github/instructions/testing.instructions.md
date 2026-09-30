@@ -334,6 +334,10 @@ cargo test -- test_name                         # Single test by name
 - D1 vector recovery regressions must cover a failed post-WAL text apply
   followed by refresh or primary activation before the next write, plus
   restart persistence and successful clearing of `vectors.stale`.
+- Vector rebuild coverage must include a test-only small batch size crossing
+  multiple batch boundaries with a deleted document, plus an explicit
+  greater-than-100,000-document activation regression proving vector count,
+  last-document version state, text visibility, and kNN visibility.
 - Promotion NoOp coverage must include a real source activation, an initial
   failed gRPC fan-out, a later lifecycle activation, and value-level proof that
   the replica durably received the original term/sequence NoOp and closed its

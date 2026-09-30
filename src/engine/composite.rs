@@ -639,27 +639,33 @@ impl CompositeEngine {
     }
 
     fn rebuild_vectors_locked(&self) -> Result<()> {
-        let docs = self.text.vector_rebuild_documents()?;
         let mut rebuilt = None;
         let mut vector_count = 0;
-        for (doc_id, source, seq_no, primary_term) in docs {
-            let expected_dimensions = rebuilt.as_ref().map(VectorIndex::dimensions);
-            let prepared = self.detect_vector_mutation(&source, expected_dimensions)?;
-            if let PreparedVectorMutation::Index { vector } = &prepared
-                && rebuilt.is_none()
-            {
-                rebuilt = Some(VectorIndex::new(
-                    vector.len(),
-                    usearch::ffi::MetricKind::Cos,
-                )?);
+        self.text.for_each_vector_rebuild_batch(|documents| {
+            for (doc_id, source, seq_no, primary_term) in documents {
+                let expected_dimensions = rebuilt.as_ref().map(VectorIndex::dimensions);
+                let prepared = self.detect_vector_mutation(&source, expected_dimensions)?;
+                if let PreparedVectorMutation::Index { vector } = &prepared
+                    && rebuilt.is_none()
+                {
+                    rebuilt = Some(VectorIndex::new(
+                        vector.len(),
+                        usearch::ffi::MetricKind::Cos,
+                    )?);
+                }
+                let operation = super::SequencedOperation {
+                    seq_no,
+                    primary_term,
+                    mutation: super::DocumentMutation::Index { doc_id, source },
+                };
+                Self::apply_prepared_vector_mutation_to_index(
+                    rebuilt.as_ref(),
+                    &operation,
+                    &prepared,
+                )?;
             }
-            let operation = super::SequencedOperation {
-                seq_no,
-                primary_term,
-                mutation: super::DocumentMutation::Index { doc_id, source },
-            };
-            Self::apply_prepared_vector_mutation_to_index(rebuilt.as_ref(), &operation, &prepared)?;
-        }
+            Ok(())
+        })?;
 
         if let Some(index) = rebuilt.as_ref() {
             vector_count = index.len();
@@ -1753,6 +1759,76 @@ mod tests {
             .as_ref()
             .and_then(|index| index.version_for_test("doc"));
         assert_eq!(vector_version.map(|version| version.seq_no), Some(1));
+    }
+
+    #[test]
+    fn vector_rebuild_crosses_small_batches_and_skips_deleted_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = vector_engine(dir.path());
+        let _batch_size = super::super::tantivy::override_vector_rebuild_batch_size_for_test(7);
+        let docs = (0..17)
+            .map(|index| {
+                (
+                    format!("d{index}"),
+                    json!({"emb": [1.0, index as f32, 0.0]}),
+                )
+            })
+            .collect();
+        engine.bulk_add_documents_with_receipt(docs).unwrap();
+        engine.delete_document_with_receipt("d5").unwrap();
+        engine.refresh().unwrap();
+
+        engine.prepare_primary_activation(1).unwrap();
+
+        let vectors = engine.vector.read().unwrap();
+        let vectors = vectors.as_ref().expect("vector index should be rebuilt");
+        assert_eq!(vectors.len(), 16);
+        assert!(vectors.version_for_test("d5").is_none());
+        assert!(vectors.version_for_test("d16").is_some());
+    }
+
+    #[test]
+    #[ignore = "large >100k vector rebuild regression"]
+    fn review_r8_activation_rebuild_keeps_all_vectors_above_100k() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = vector_engine(dir.path());
+        let total = 100_010usize;
+        for start in (0..total).step_by(10_000) {
+            let end = (start + 10_000).min(total);
+            let docs = (start..end)
+                .map(|index| {
+                    let x = (index % 997) as f32 + 1.0;
+                    (
+                        format!("d{index}"),
+                        json!({"emb": [x, 1.0, (index % 13) as f32]}),
+                    )
+                })
+                .collect();
+            engine.bulk_add_documents_with_receipt(docs).unwrap();
+        }
+        engine.refresh().unwrap();
+        assert_eq!(
+            engine.vector.read().unwrap().as_ref().map(VectorIndex::len),
+            Some(total)
+        );
+
+        let last_id = format!("d{}", total - 1);
+        engine.prepare_primary_activation(1).unwrap();
+
+        {
+            let vectors = engine.vector.read().unwrap();
+            let vectors = vectors.as_ref().expect("vector index should be rebuilt");
+            assert_eq!(vectors.len(), total);
+            assert!(vectors.version_for_test(&last_id).is_some());
+        }
+        assert!(engine.get_document(&last_id).unwrap().is_some());
+        let last_vector = [
+            ((total - 1) % 997) as f32 + 1.0,
+            1.0,
+            ((total - 1) % 13) as f32,
+        ];
+        let hits = engine.search_knn("emb", &last_vector, 100).unwrap();
+        assert!(hits.iter().any(|hit| hit["_id"] == json!(last_id)));
     }
 
     #[test]
