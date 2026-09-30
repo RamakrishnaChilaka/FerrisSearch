@@ -151,7 +151,7 @@ pub(super) fn route_bulk_doc(
 async fn forward_bulk_batches(
     state: &AppState,
     cluster_state: &crate::cluster::state::ClusterState,
-    routed_docs: &[RoutedBulkDoc],
+    routed_docs: &mut [RoutedBulkDoc],
 ) -> BulkTargetResults {
     let mut shard_batches: HashMap<BulkTargetKey, Vec<(String, Value)>> = HashMap::new();
     for doc in routed_docs {
@@ -162,7 +162,7 @@ async fn forward_bulk_batches(
                 doc.shard_id,
             ))
             .or_default()
-            .push((doc.doc_id.clone(), doc.payload.clone()));
+            .push((doc.doc_id.clone(), doc.payload.take()));
     }
 
     let mut futures = Vec::new();
@@ -306,18 +306,14 @@ pub(super) fn parse_bulk_ndjson(text: &str) -> Vec<BulkDoc> {
                 .and_then(|object| object.keys().next())
                 .cloned()
                 .unwrap_or_else(|| "index".to_string());
-            let action_meta = parsed_action.and_then(|action| {
-                action
-                    .as_object()
-                    .and_then(|obj| obj.values().next().cloned())
-            });
-
-            let action_id = action_meta
+            let action_meta = parsed_action
                 .as_ref()
-                .and_then(|m| m.get("_id").and_then(|v| v.as_str().map(String::from)));
+                .and_then(|action| action.as_object().and_then(|obj| obj.values().next()));
+
+            let action_id =
+                action_meta.and_then(|m| m.get("_id").and_then(|v| v.as_str().map(String::from)));
 
             let action_index = action_meta
-                .as_ref()
                 .and_then(|m| m.get("_index").and_then(|v| v.as_str().map(String::from)));
 
             let doc_id = action_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -505,7 +501,7 @@ pub async fn bulk_index_global(
         }
     }
 
-    let outcomes = forward_bulk_batches(&state, &cluster_state, &routed_docs).await;
+    let outcomes = forward_bulk_batches(&state, &cluster_state, &mut routed_docs).await;
     if outcomes.values().any(Result::is_err) {
         has_errors = true;
     }
@@ -641,7 +637,7 @@ pub async fn bulk_index(
         }
     }
 
-    let outcomes = forward_bulk_batches(&state, &cluster_state, &routed_docs).await;
+    let outcomes = forward_bulk_batches(&state, &cluster_state, &mut routed_docs).await;
     if outcomes.values().any(Result::is_err) {
         has_errors = true;
     }

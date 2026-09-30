@@ -1188,7 +1188,7 @@ pub async fn get_document(
 pub async fn update_document(
     State(state): State<AppState>,
     Path((index_name, doc_id)): Path<(crate::common::IndexName, String)>,
-    Json(body): Json<Value>,
+    Json(mut body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     // IndexName is validated at extraction time
 
@@ -1203,8 +1203,8 @@ pub async fn update_document(
         return response;
     }
 
-    let partial = match body.get("doc") {
-        Some(d) if d.is_object() => d.clone(),
+    let partial = match body.get_mut("doc") {
+        Some(d) if d.is_object() => d.take(),
         _ => {
             return crate::api::error_response(
                 StatusCode::BAD_REQUEST,
@@ -1276,16 +1276,12 @@ pub async fn update_document(
     };
 
     // 2. Merge: overlay partial fields onto existing _source
-    let merged = if let (Some(existing_obj), Some(partial_obj)) =
-        (existing.as_object(), partial.as_object())
-    {
-        let mut merged_obj = existing_obj.clone();
-        for (key, value) in partial_obj {
-            merged_obj.insert(key.clone(), value.clone());
+    let merged = match (existing, partial) {
+        (Value::Object(mut existing_obj), Value::Object(partial_obj)) => {
+            existing_obj.extend(partial_obj);
+            Value::Object(existing_obj)
         }
-        serde_json::Value::Object(merged_obj)
-    } else {
-        partial
+        (_, partial) => partial,
     };
     if let Err(response) = validate_document_source_for_api(&merged) {
         return response;
