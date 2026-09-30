@@ -359,6 +359,10 @@ EVENT_FIELDS = {
         "outcome",
     },
 }
+EVENT_OPTIONAL_FIELDS = {
+    "operation_processed": {"batch_max_seq_no"},
+    "replay_entry": {"batch_max_seq_no"},
+}
 COMMON_FIELDS = {"schema", "run_id", "step", "event"}
 CHECKPOINT_FIELDS = {"processed", "persisted", "max_seq_no"}
 TERM_STATE_FIELDS = {
@@ -395,8 +399,14 @@ def fail(line: int, message: str) -> None:
     raise TraceSchemaError(f"line {line}: {message}")
 
 
-def exact_fields(value: dict[str, Any], expected: set[str], line: int) -> None:
-    unknown = sorted(set(value) - expected)
+def exact_fields(
+    value: dict[str, Any],
+    expected: set[str],
+    line: int,
+    optional: set[str] | None = None,
+) -> None:
+    optional = optional or set()
+    unknown = sorted(set(value) - expected - optional)
     missing = sorted(expected - set(value))
     if unknown:
         fail(line, f"unknown field(s): {', '.join(unknown)}")
@@ -558,7 +568,12 @@ def validate_event(
     event = value.get("event")
     if event not in EVENT_FIELDS:
         fail(line, f"unknown event {event!r}")
-    exact_fields(value, COMMON_FIELDS | EVENT_FIELDS[event], line)
+    exact_fields(
+        value,
+        COMMON_FIELDS | EVENT_FIELDS[event],
+        line,
+        EVENT_OPTIONAL_FIELDS.get(event),
+    )
     if value["schema"] != SCHEMA:
         fail(line, f"unsupported schema {value['schema']!r}; expected {SCHEMA!r}")
     if value["run_id"] != start["run_id"]:
@@ -608,6 +623,15 @@ def validate_event(
             fail(line, "content_hash must be lowercase SHA-256")
     if "checkpoints" in value:
         checkpoints(value["checkpoints"], line)
+    if "batch_max_seq_no" in value:
+        batch_max_seq_no = integer(
+            value["batch_max_seq_no"],
+            line,
+            "batch_max_seq_no",
+            nullable=True,
+        )
+        if batch_max_seq_no != value["checkpoints"]["max_seq_no"]:
+            fail(line, "batch_max_seq_no must equal checkpoints.max_seq_no")
     if "durable" in value:
         boolean(value["durable"], line, "durable")
 
@@ -1435,6 +1459,9 @@ def load_trace(path: Path) -> LoadedTrace:
                     event["_message_id"] = message_id
 
         elif kind == "operation_processed":
+            event["_batch_max_seq_no"] = event.get(
+                "batch_max_seq_no", event["checkpoints"]["max_seq_no"]
+            )
             receipt = event["receipt_id"]
             register_receipt(receipt, ident, line)
             if copy_key := attempt_by_receipt_target.get(
@@ -1882,6 +1909,9 @@ def load_trace(path: Path) -> LoadedTrace:
             replay_next_position[event["node"]] = 1
 
         elif kind == "replay_entry":
+            event["_batch_max_seq_no"] = event.get(
+                "batch_max_seq_no", event["checkpoints"]["max_seq_no"]
+            )
             if replay_active.get(event["node"]) != event["replay_id"]:
                 fail(line, "replay_entry has no active replay")
             expected = replay_ordinal[event["node"]]

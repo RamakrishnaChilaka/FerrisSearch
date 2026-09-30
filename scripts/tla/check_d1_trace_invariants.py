@@ -84,6 +84,19 @@ def check_checkpoint_event(event: dict[str, Any], copy: CopyState) -> None:
         )
 
 
+def observe_batch_max(event: dict[str, Any], copy: CopyState) -> None:
+    observed = event.get("batch_max_seq_no", event["checkpoints"]["max_seq_no"])
+    if observed != event["checkpoints"]["max_seq_no"]:
+        fail(event, "batch maximum differs from the engine checkpoint maximum")
+    if (
+        copy.max_seq_no is not None
+        and observed is not None
+        and observed < copy.max_seq_no
+    ):
+        fail(event, "batch maximum regressed")
+    copy.max_seq_no = observed
+
+
 def apply_observed_operation(
     event: dict[str, Any],
     copy: CopyState,
@@ -108,8 +121,26 @@ def apply_observed_operation(
 
     completes = event["outcome"] in {"applied_newer", "stale", "noop"}
     if event["outcome"] == "redelivery":
-        if previous is None or observed.seq_no not in copy.processed:
+        current = copy.documents.get(observed.doc) if observed.doc is not None else None
+        exact_document_redelivery = current == (
+            "deleted" if observed.op == "delete" else "live",
+            observed.seq_no,
+            observed.term,
+            observed.content_hash,
+        )
+        replay_wal_redelivery = (
+            replay
+            and observed in copy.wal
+        )
+        if (
+            previous is None or observed.seq_no not in copy.processed
+        ) and not exact_document_redelivery and not replay_wal_redelivery:
             fail(event, "redelivery names a sequence that was not already processed")
+        if observed.seq_no not in copy.processed:
+            copy.identities.setdefault(observed.seq_no, observed)
+            copy.processed.add(observed.seq_no)
+            copy.persisted.add(observed.seq_no)
+            copy.max_seq_no = max(copy.max_seq_no or 0, observed.seq_no)
     elif completes:
         copy.identities.setdefault(observed.seq_no, observed)
         copy.processed.add(observed.seq_no)
@@ -118,7 +149,19 @@ def apply_observed_operation(
         if durable:
             copy.persisted.add(observed.seq_no)
 
-    if event["outcome"] == "applied_newer" and observed.doc is not None:
+    if (
+        event["outcome"] == "stale"
+        and observed.doc is not None
+        and event.get("origin") != "replay"
+    ):
+        current = copy.documents.get(observed.doc)
+        if (
+            current is None
+            or current[1] < observed.seq_no
+            or current[1] == observed.seq_no
+        ):
+            fail(event, "stale operation has no newer document version")
+    elif event["outcome"] == "applied_newer" and observed.doc is not None:
         current = copy.documents.get(observed.doc)
         if current is not None and current[1] > observed.seq_no:
             fail(
@@ -362,6 +405,7 @@ def check_trace(
     request_status: dict[str, str] = {}
     receipt_identity: dict[str, Identity] = {}
     wal_durable: dict[tuple[str, str], bool] = {}
+    primary_wal_requests: set[str] = set()
     messages: dict[str, dict[str, Any]] = {}
     required_messages: dict[str, set[str]] = {}
     message_results: dict[str, str] = {}
@@ -385,11 +429,19 @@ def check_trace(
             request_status[request_id] = "routed"
         elif kind == "wal_appended":
             observed = identity(event)
-            copies.setdefault(event["node"], CopyState()).wal.append(observed)
+            copy = copies.setdefault(event["node"], CopyState())
+            if (
+                event["origin"] in {"primary", "live_replication", "promotion"}
+                and event["term"] < copy.fence_term
+            ):
+                fail(event, "WAL append was accepted below the durable fence")
+            copy.wal.append(observed)
             prior = receipt_identity.setdefault(event["receipt_id"], observed)
             if prior != observed:
                 fail(event, "receipt identity changed at WAL append")
             wal_durable[(event["node"], event["receipt_id"])] = event["durable"]
+            if event["origin"] == "primary" and event["request_id"] is not None:
+                primary_wal_requests.add(event["request_id"])
         elif kind == "wal_truncated":
             copy = copies.setdefault(event["node"], CopyState())
             copy.wal = [
@@ -399,6 +451,12 @@ def check_trace(
             ]
         elif kind == "operation_processed":
             copy = copies.setdefault(event["node"], CopyState())
+            if (
+                event["origin"] in {"primary", "live_replication", "promotion"}
+                and event["term"] < copy.fence_term
+            ):
+                fail(event, "operation was processed below the durable fence")
+            observe_batch_max(event, copy)
             observed = identity(event)
             prior = receipt_identity.setdefault(event["receipt_id"], observed)
             if prior != observed:
@@ -509,6 +567,12 @@ def check_trace(
         elif kind == "client_result":
             request_id = event["request_id"]
             if event["outcome"] == "acknowledged":
+                if request_id not in request_operations:
+                    fail(event, "client ack has no primary apply")
+                if request_id not in primary_wal_requests:
+                    fail(event, "client ack has no primary WAL append")
+                if request_id not in required_messages:
+                    fail(event, "client ack has no replication start")
                 missing = [
                     message_id
                     for message_id in required_messages.get(request_id, set())
@@ -637,6 +701,7 @@ def check_trace(
                 event, copies.setdefault(node, CopyState()), persisted_commits.get(node)
             )
         elif kind == "replay_entry":
+            observe_batch_max(event, copies[event["node"]])
             if event["outcome"] == "skip_committed":
                 check_checkpoint_event(event, copies[event["node"]])
             else:

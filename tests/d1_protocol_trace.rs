@@ -378,10 +378,12 @@ impl RandomSchedule {
             ("delay", 0usize),
             ("drop_request", 0usize),
             ("drop_response", 0usize),
+            ("hold_until_applied", 0usize),
         ]);
         for fault in &self.faults {
             let label = match fault.action {
                 FaultAction::DelayRequest { .. } => "delay",
+                FaultAction::HoldRequestUntilApplied { .. } => "hold_until_applied",
                 FaultAction::DropRequest => "drop_request",
                 FaultAction::DropResponse => "drop_response",
             };
@@ -398,6 +400,12 @@ impl RandomSchedule {
                 let action = match fault.action {
                     FaultAction::DelayRequest { millis } => {
                         serde_json::json!({"kind": "delay", "millis": millis})
+                    }
+                    FaultAction::HoldRequestUntilApplied { seq_no } => {
+                        serde_json::json!({
+                            "kind": "hold_until_applied",
+                            "seq_no": seq_no,
+                        })
                     }
                     FaultAction::DropRequest => serde_json::json!({"kind": "drop_request"}),
                     FaultAction::DropResponse => serde_json::json!({"kind": "drop_response"}),
@@ -637,9 +645,7 @@ fn build_random_schedule(seed: u64) -> RandomSchedule {
     let mut faults = vec![FaultRule {
         target: "q".to_string(),
         seq_no: 0,
-        action: FaultAction::DelayRequest {
-            millis: rng.inclusive(150, 200) as u64,
-        },
+        action: FaultAction::HoldRequestUntilApplied { seq_no: 1 },
     }];
     for (index, seq_no) in request_starts
         .iter()
@@ -1745,9 +1751,7 @@ async fn seeded_three_node_fault_trace() -> Result<()> {
             FaultRule {
                 target: "q".to_string(),
                 seq_no: 0,
-                action: FaultAction::DelayRequest {
-                    millis: 150 + seed % 31,
-                },
+                action: FaultAction::HoldRequestUntilApplied { seq_no: 1 },
             },
             FaultRule {
                 target: "q".to_string(),

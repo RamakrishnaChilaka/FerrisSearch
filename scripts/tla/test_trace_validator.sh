@@ -90,6 +90,7 @@ run_valid b2 b2-bulk-faithful-order-batch-final.jsonl
 run_valid b2c b2c-bulk-faithful-order-item-local.jsonl
 run_valid b3 b3-bulk-receipts-first-batch-final.jsonl
 run_valid b3c b3c-bulk-receipts-first-item-local.jsonl
+run_invalid e4-mid-batch invalid-unobservable-mid-batch-maximum.jsonl 5 operation_processed
 run_invalid a2-overstated-response invalid-replica-response-overstates-persisted.jsonl 15 replica_result
 run_valid v1 v1-failover-after-replicated-write.jsonl
 run_invalid v2 v2-recovery-duplicate-catchup-redelivery.jsonl 33 operation_processed

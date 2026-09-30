@@ -1385,8 +1385,6 @@ impl HotEngine {
         #[cfg(not(feature = "protocol-trace"))]
         let seq_only_redelivery = false;
         let planning_snapshot = state.planning_snapshot();
-        #[cfg(feature = "protocol-trace")]
-        let mut trace_checkpoints = planning_snapshot.checkpoints.clone();
         let mut planned = Vec::with_capacity(operations.len());
         let mut shadow_versions = HashMap::<String, CurrentVersion>::new();
         #[cfg(feature = "protocol-trace")]
@@ -1541,16 +1539,16 @@ impl HotEngine {
             Ok::<(), anyhow::Error>(())
         })();
         if let Err(error) = planning_result {
+            state.restore_planning_snapshot(planning_snapshot);
             #[cfg(feature = "protocol-trace")]
             let trace_collision_result = match (trace_copy.as_ref(), collision_operation.as_ref()) {
                 (Some(copy), Some(operation)) => crate::protocol_trace::record_operation_collision(
                     copy,
                     operation,
-                    trace_checkpoints.stats(),
+                    state.checkpoints.stats(),
                 ),
                 _ => Ok(()),
             };
-            state.restore_planning_snapshot(planning_snapshot);
             #[cfg(feature = "protocol-trace")]
             trace_collision_result.context("record protocol trace operation collision")?;
             if wal_disposition.is_already_in_local_wal() {
@@ -1701,27 +1699,11 @@ impl HotEngine {
                 }
                 #[cfg(feature = "protocol-trace")]
                 if let Some(copy) = trace_copy.as_ref() {
-                    if planned_operation.complete {
-                        trace_checkpoints.advance_max_seq_no(planned_operation.operation.seq_no);
-                        trace_checkpoints.mark_processed(planned_operation.operation.seq_no);
-                        if matches!(self.durability, TranslogDurability::Request)
-                            || wal_disposition.is_persisted()
-                        {
-                            trace_checkpoints.mark_persisted(planned_operation.operation.seq_no);
-                        }
-                    }
-                    let trace_outcome = if planned_operation.complete
-                        && planned_operation.outcome == super::ApplyOutcome::Redelivery
-                    {
-                        super::ApplyOutcome::Stale
-                    } else {
-                        planned_operation.outcome
-                    };
                     crate::protocol_trace::record_operation_processed(
                         copy,
                         &planned_operation.operation,
-                        trace_outcome,
-                        trace_checkpoints.stats(),
+                        planned_operation.outcome,
+                        state.checkpoints.stats(),
                     )?;
                 }
             }

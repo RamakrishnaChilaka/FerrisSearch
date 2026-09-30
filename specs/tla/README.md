@@ -67,6 +67,14 @@ schema-v4 trace plus the `arrival-order` and `seq-only-redelivery` mutations.
 The independent invariant checker and TLC accept the 158-event correct trace
 and reject the mutations at `operation_processed` steps 27 and 117.
 
+The Rust trace evidence currently scopes out periodic refresh, automatic or
+API-driven flush, force merge, and their WAL truncation. The harness sets a
+long refresh interval and disables automatic flush because those background
+maintenance callbacks do not yet carry an engine-owned trace copy identity.
+Replay, activation, recovery, and final-state capture commits remain covered.
+Do not use these traces as evidence for maintenance/flush interleavings until
+that follow-up instrumentation and randomized scheduling are implemented.
+
 `test_d1_protocol_trace_ci.sh` adds randomized correct-code seeds
 `16,44,102,149,160`. The fixed set spans 20 to 60 document operations, 277 to
 737 trace events, request delay and drop variation, replica restart with WAL

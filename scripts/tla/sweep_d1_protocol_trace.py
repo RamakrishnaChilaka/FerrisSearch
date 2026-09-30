@@ -117,6 +117,7 @@ def schedule_summary(schedule_path: Path) -> tuple[dict[str, int], list[str]]:
         "delay": 0,
         "drop_request": 0,
         "drop_response": 0,
+        "hold_until_applied": 0,
     }
     for fault in schedule["faults"]:
         faults[fault["action"]["kind"]] += 1

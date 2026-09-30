@@ -448,6 +448,23 @@ D1ClientWriteFrom(coordinator, doc, kind) ==
 D1ClientWrite(doc, kind) ==
     D1ClientWriteFrom(PrimaryNode, doc, kind)
 
+D1ObserveBatchPlan(node, plannedMaxNext) ==
+    /\ node \in Nodes
+    /\ plannedMaxNext \in 0..MaxWrites
+    /\ plannedMaxNext > maxSeqNext[node]
+    /\ maxSeqNext' =
+          [maxSeqNext EXCEPT ![node] = plannedMaxNext]
+    /\ UNCHANGED
+          <<vars, walOrder, noopTerm, processedSeqs, processedNext,
+            persistedSeqs, persistedNext, persistedProcessedNext,
+            persistedCommittedNext, persistedMaxSeqNext, d1FenceTerm,
+            fenceMaxSeqNext, processedTerm, docSeqNext, tombstoneSeqNext,
+            tombstoneOld, persistedOps, persistedDocValue,
+            persistedDocSeqNext, persistedTombstoneSeqNext, replaying,
+            replayPos, replayBoundary, replayComplete, replaySafe, commitDone,
+            crashDone, duplicateSent, tombstonePruneSafe, pruneDone,
+            PeerRecoveryVars, FaultVars>>
+
 D1PrimaryAccept(writeId) ==
     LET primaryNode == writeTarget[writeId]
         sequenceNumber == nextSeq[primaryNode]
@@ -474,7 +491,9 @@ D1PrimaryAccept(writeId) ==
           [persistedNext EXCEPT
               ![primaryNode] = ContiguousNext(nextPersisted)]
     /\ maxSeqNext' =
-          [maxSeqNext EXCEPT ![primaryNode] = sequenceNumber + 1]
+          [maxSeqNext EXCEPT
+              ![primaryNode] =
+                  IF @ < sequenceNumber + 1 THEN sequenceNumber + 1 ELSE @]
     /\ processedTerm' =
           [processedTerm EXCEPT
               ![primaryNode][sequenceNumber] = views[primaryNode].term]

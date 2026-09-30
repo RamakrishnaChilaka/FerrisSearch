@@ -766,6 +766,13 @@ HiddenReplayAction(event) ==
     /\ event.walPosition > replayPos[event.node]
     /\ D1SkipTruncatedReplayPrefix(event.node, event.walPosition)
 
+HiddenBatchPlanning(event) ==
+    /\ event.kind \in {"operation_processed", "replay_entry"}
+    /\ event.outcome # "collision"
+    /\ event.maxNext > maxSeqNext[event.node]
+    /\ D1ObserveBatchPlan(event.node, event.maxNext)
+    /\ UNCHANGED AuxVars
+
 HiddenCoreMaintenance(event) ==
     /\ ~TraceCombined
     /\ \/ /\ event.kind \in {"node_crashed", "copy_state"}
@@ -874,6 +881,7 @@ HiddenRecoveryAction(event) ==
               /\ RecoveryObserveAdmission(ObserveAdmission(target))
 
 HiddenD1Action(event) ==
+    \/ HiddenBatchPlanning(event)
     \/ HiddenReplayAction(event)
     \/ HiddenCoreMaintenance(event)
     \/ HiddenPromotionAction(event)

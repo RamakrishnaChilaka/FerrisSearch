@@ -61,6 +61,7 @@ pub enum MutationMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FaultAction {
     DelayRequest { millis: u64 },
+    HoldRequestUntilApplied { seq_no: u64 },
     DropRequest,
     DropResponse,
 }
@@ -282,6 +283,8 @@ struct TraceState {
     known_documents: BTreeSet<String>,
     copy_documents: HashMap<TraceCopy, BTreeMap<String, LogicalDocument>>,
     actual_copies: HashMap<String, TraceActualCopy>,
+    applied_operations: BTreeSet<(String, u64)>,
+    applied_notify: std::sync::Arc<tokio::sync::Notify>,
     omit_wal_append_node: Option<String>,
     wal_append_omitted: bool,
 }
@@ -457,6 +460,8 @@ pub fn start(config: TraceConfig) -> Result<TraceSession> {
         known_documents: BTreeSet::new(),
         copy_documents: HashMap::new(),
         actual_copies: HashMap::new(),
+        applied_operations: BTreeSet::new(),
+        applied_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
         omit_wal_append_node: std::env::var("D1_TRACE_OMIT_WAL_APPEND_ONCE")
             .ok()
             .map(|node| {
@@ -712,10 +717,16 @@ fn operation_for_apply(
     origin: ApplyOrigin,
 ) -> Result<OperationState> {
     let key = operation_key(copy, operation);
-    if let Some(existing) = state.operations.get(&key) {
-        return Ok(existing.clone());
-    }
     let (doc, op, content_hash) = operation_parts(operation);
+    if origin != ApplyOrigin::Primary
+        && let Some(existing) = state.operations.get(&key)
+    {
+        let mut observed = existing.clone();
+        observed.doc = doc;
+        observed.op = op.to_string();
+        observed.content_hash = content_hash;
+        return Ok(observed);
+    }
     let request_id = if origin == ApplyOrigin::Primary {
         let request_id = take_request_token()
             .map(|token| token.request_id)
@@ -875,8 +886,15 @@ pub fn record_operation_processed(
                 "origin": apply_origin_name(origin),
                 "outcome": outcome_name(outcome),
                 "checkpoints": checkpoints_value(stats),
+                "batch_max_seq_no": stats.max_seq_no,
             }),
         );
+        if outcome == ApplyOutcome::Applied {
+            state
+                .applied_operations
+                .insert((copy.node.clone(), operation.seq_no));
+            state.applied_notify.notify_waiters();
+        }
         Ok(())
     }) {
         Some(result) => result,
@@ -921,6 +939,7 @@ pub fn record_operation_collision(
                 "origin": apply_origin_name(origin),
                 "outcome": "collision",
                 "checkpoints": checkpoints_value(stats),
+                "batch_max_seq_no": stats.max_seq_no,
             }),
         );
         Ok(())
@@ -1121,7 +1140,10 @@ pub fn message_for(key: &OperationKey, target: &str) -> Option<TraceMessage> {
     .flatten()
 }
 
-fn take_fault(message_id: &str, accepts: impl Fn(FaultAction) -> bool) -> Option<FaultAction> {
+fn take_fault(
+    message_id: &str,
+    accepts: impl Fn(FaultAction) -> bool,
+) -> Option<(String, FaultAction)> {
     with_state(|state| {
         let message = state.messages.get(message_id)?;
         let rule = state.faults.iter_mut().find(|fault| {
@@ -1131,31 +1153,65 @@ fn take_fault(message_id: &str, accepts: impl Fn(FaultAction) -> bool) -> Option
                 && accepts(fault.rule.action)
         })?;
         rule.used = true;
-        Some(rule.rule.action)
+        Some((message.message.target.clone(), rule.rule.action))
     })
     .flatten()
+}
+
+async fn wait_until_applied(node: &str, seq_no: u64) {
+    loop {
+        let notified = {
+            let guard = lock_trace_state();
+            let state = guard
+                .as_ref()
+                .expect("protocol trace causal hold requires an active trace");
+            if state
+                .applied_operations
+                .contains(&(node.to_string(), seq_no))
+            {
+                return;
+            }
+            state.applied_notify.clone().notified_owned()
+        };
+        notified.await;
+    }
 }
 
 pub async fn apply_request_fault(message_id: &str) -> bool {
     match take_fault(message_id, |action| {
         matches!(
             action,
-            FaultAction::DelayRequest { .. } | FaultAction::DropRequest
+            FaultAction::DelayRequest { .. }
+                | FaultAction::HoldRequestUntilApplied { .. }
+                | FaultAction::DropRequest
         )
     }) {
-        Some(FaultAction::DelayRequest { millis }) => {
+        Some((_, FaultAction::DelayRequest { millis })) => {
             tokio::time::sleep(Duration::from_millis(millis)).await;
             false
         }
-        Some(FaultAction::DropRequest) => true,
-        Some(FaultAction::DropResponse) | None => false,
+        Some((target, FaultAction::HoldRequestUntilApplied { seq_no })) => {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                wait_until_applied(&target, seq_no),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "protocol trace causal hold timed out waiting for {target} to apply seq {seq_no}"
+                )
+            });
+            false
+        }
+        Some((_, FaultAction::DropRequest)) => true,
+        Some((_, FaultAction::DropResponse)) | None => false,
     }
 }
 
 pub fn should_drop_response(message_id: &str) -> bool {
     matches!(
         take_fault(message_id, |action| action == FaultAction::DropResponse),
-        Some(FaultAction::DropResponse)
+        Some((_, FaultAction::DropResponse))
     )
 }
 
@@ -1176,7 +1232,8 @@ pub fn record_replica_received(copy: &TraceCopy, operation: &SequencedOperation)
             .get(&message.message.key)
             .cloned()
             .context("replica receipt operation is unknown")?;
-        let event = if operation_state.op == "noop" {
+        let (doc, op, content_hash) = operation_parts(operation);
+        let event = if op == "noop" {
             "promotion_noop_received"
         } else {
             "replica_received"
@@ -1192,12 +1249,12 @@ pub fn record_replica_received(copy: &TraceCopy, operation: &SequencedOperation)
             "receipt_id": operation_state.receipt_id,
             "term": operation.primary_term,
             "seq_no": operation.seq_no,
-            "content_hash": operation_state.content_hash,
+            "content_hash": content_hash,
         });
         if event == "replica_received" {
             let fields = fields.as_object_mut().unwrap();
-            fields.insert("doc".to_string(), json!(operation_state.doc));
-            fields.insert("op".to_string(), json!(operation_state.op));
+            fields.insert("doc".to_string(), json!(doc));
+            fields.insert("op".to_string(), json!(op));
         } else {
             fields
                 .as_object_mut()
@@ -1748,6 +1805,7 @@ fn record_replay_entry(
             .get(&key)
             .cloned()
             .context("replay operation is unknown")?;
+        let (doc, op, content_hash) = operation_parts(operation);
         let replay = state
             .replays
             .get_mut(copy)
@@ -1769,11 +1827,12 @@ fn record_replay_entry(
                 "receipt_id": metadata.receipt_id,
                 "term": operation.primary_term,
                 "seq_no": operation.seq_no,
-                "doc": metadata.doc,
-                "op": metadata.op,
-                "content_hash": metadata.content_hash,
+                "doc": doc,
+                "op": op,
+                "content_hash": content_hash,
                 "outcome": outcome_name(outcome),
                 "checkpoints": checkpoints_value(stats),
+                "batch_max_seq_no": stats.max_seq_no,
             }),
         );
         Ok(())
@@ -1795,6 +1854,7 @@ pub fn record_replay_skip(
             .get(&key)
             .cloned()
             .context("skipped replay operation is unknown")?;
+        let (doc, op, content_hash) = operation_parts(operation);
         let replay = state
             .replays
             .get_mut(copy)
@@ -1815,11 +1875,12 @@ pub fn record_replay_skip(
                 "receipt_id": metadata.receipt_id,
                 "term": operation.primary_term,
                 "seq_no": operation.seq_no,
-                "doc": metadata.doc,
-                "op": metadata.op,
-                "content_hash": metadata.content_hash,
+                "doc": doc,
+                "op": op,
+                "content_hash": content_hash,
                 "outcome": "skip_committed",
                 "checkpoints": checkpoints_value(stats),
+                "batch_max_seq_no": stats.max_seq_no,
             }),
         );
         Ok(())
@@ -2135,8 +2196,9 @@ pub fn record_copy_state(copy: &TraceCopy, reason: &str, live: Vec<(String, u64,
             })
             .collect::<BTreeMap<_, _>>();
         let tracked = state.copy_documents.get(copy).cloned().unwrap_or_default();
-        let documents = state
-            .known_documents
+        let mut observed_documents = state.known_documents.clone();
+        observed_documents.extend(live.keys().cloned());
+        let documents = observed_documents
             .iter()
             .map(|doc| {
                 if let Some(document) = live.get(doc) {
@@ -2368,6 +2430,138 @@ mod tests {
             .filter(|record| record["event"] == "wal_appended")
             .count();
         assert_eq!(appended, 2);
+    }
+
+    #[test]
+    fn replica_events_use_the_applied_operation_identity() {
+        let _guard = test_trace_guard();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("applied-identity.jsonl");
+        let session = start(config(&path)).unwrap();
+        let primary = TraceCopy {
+            node: "p".into(),
+            index_uuid: "idx".into(),
+            shard: 0,
+            allocation: 1,
+        };
+        let replica = TraceCopy {
+            node: "r".into(),
+            index_uuid: "idx".into(),
+            shard: 0,
+            allocation: 2,
+        };
+        let primary_operation = SequencedOperation {
+            seq_no: 0,
+            primary_term: 1,
+            mutation: DocumentMutation::Index {
+                doc_id: "x".into(),
+                source: json!({"value": "primary"}),
+            },
+        };
+        let replica_operation = SequencedOperation {
+            seq_no: 0,
+            primary_term: 1,
+            mutation: DocumentMutation::Index {
+                doc_id: "y".into(),
+                source: json!({"value": "replica"}),
+            },
+        };
+        let token =
+            route_client_write("p", "idx", 0, "p", "x", &primary_operation.mutation).unwrap();
+        with_request_tokens(vec![token], || {
+            with_apply_scope(
+                ApplyOrigin::Primary,
+                vec![primary_operation.clone()],
+                || {
+                    record_wal_appended(&primary, &primary_operation, true).unwrap();
+                    record_operation_processed(
+                        &primary,
+                        &primary_operation,
+                        ApplyOutcome::Applied,
+                        SequenceStats {
+                            processed_checkpoint: Some(0),
+                            persisted_checkpoint: Some(0),
+                            max_seq_no: Some(0),
+                        },
+                    )
+                    .unwrap();
+                },
+            )
+        });
+        with_apply_scope(
+            ApplyOrigin::LiveReplication,
+            vec![replica_operation.clone()],
+            || {
+                record_wal_appended(&replica, &replica_operation, true).unwrap();
+                record_operation_processed(
+                    &replica,
+                    &replica_operation,
+                    ApplyOutcome::Applied,
+                    SequenceStats {
+                        processed_checkpoint: Some(0),
+                        persisted_checkpoint: Some(0),
+                        max_seq_no: Some(0),
+                    },
+                )
+                .unwrap();
+            },
+        );
+        session.finish(false).unwrap();
+
+        let records = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let replica_events = records
+            .iter()
+            .filter(|record| {
+                record["node"] == "r"
+                    && matches!(
+                        record["event"].as_str(),
+                        Some("wal_appended" | "operation_processed")
+                    )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(replica_events.len(), 2);
+        for event in replica_events {
+            assert_eq!(event["doc"], "y");
+            assert_eq!(event["op"], "index");
+            assert_eq!(
+                event["content_hash"],
+                content_hash(&replica_operation.mutation)
+            );
+        }
+    }
+
+    #[test]
+    fn copy_state_includes_live_documents_unknown_to_trace_history() {
+        let _guard = test_trace_guard();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("unknown-live-document.jsonl");
+        let session = start(config(&path)).unwrap();
+        record_copy_state(
+            &TraceCopy {
+                node: "p".into(),
+                index_uuid: "idx".into(),
+                shard: 0,
+                allocation: 1,
+            },
+            "trace_end",
+            vec![(
+                "untraced".into(),
+                7,
+                2,
+                content_hash(&DocumentMutation::Index {
+                    doc_id: "untraced".into(),
+                    source: json!({"value": 7}),
+                }),
+            )],
+        );
+        session.finish(false).unwrap();
+
+        let records = std::fs::read_to_string(path).unwrap();
+        assert!(records.contains("\"doc\":\"untraced\""));
     }
 
     #[test]
