@@ -53,6 +53,10 @@ def checkpoint(values: set[int]) -> int | None:
     return next_seq - 1 if next_seq else None
 
 
+def checkpoint_next(value: int | None) -> int:
+    return 0 if value is None else value + 1
+
+
 def expected_checkpoints(copy: CopyState) -> dict[str, int | None]:
     return {
         "processed": checkpoint(copy.processed),
@@ -419,6 +423,9 @@ def check_trace(
                     message = matching[0]
                     if not message["received"]:
                         fail(event, "live operation was processed before replica receipt")
+                    message["item_persisted_checkpoint"] = event["checkpoints"][
+                        "persisted"
+                    ]
                     message["phase"] = (
                         "nack"
                         if event["outcome"] in {"collision", "apply_failed"}
@@ -485,12 +492,19 @@ def check_trace(
                 fail(event, "replica result message phase does not match observed delivery")
             message_results[message_id] = event["outcome"]
             message["phase"] = None
-            if event["outcome"] in {"acknowledged", "failed"}:
-                expected_persisted = checkpoint(copies[event["replica"]].persisted)
-                if event["persisted_checkpoint"] != expected_persisted:
+            if event["outcome"] == "acknowledged":
+                item_persisted = message.get("item_persisted_checkpoint")
+                current_persisted = checkpoint(copies[event["replica"]].persisted)
+                response_persisted = event["persisted_checkpoint"]
+                if not (
+                    checkpoint_next(item_persisted)
+                    <= checkpoint_next(response_persisted)
+                    <= checkpoint_next(current_persisted)
+                ):
                     fail(
                         event,
-                        "replica response persisted checkpoint does not match applied state",
+                        "replica response persisted checkpoint is outside "
+                        "the item-local/current replica bounds",
                     )
         elif kind == "client_result":
             request_id = event["request_id"]
@@ -557,6 +571,12 @@ def check_trace(
                 fail(event, f"NoOp result references unknown message {message_id}")
             if event["message_phase"] != (message["phase"] or "none"):
                 fail(event, "NoOp result phase does not match observed delivery")
+            if (
+                event["outcome"] == "acknowledged"
+                and checkpoint_next(event["persisted_checkpoint"])
+                > checkpoint_next(checkpoint(copies[event["replica"]].persisted))
+            ):
+                fail(event, "NoOp response overstates the replica persisted checkpoint")
             message["phase"] = None
         elif kind == "commit_captured":
             copy = copies.setdefault(event["node"], CopyState())
