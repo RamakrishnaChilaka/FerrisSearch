@@ -2266,3 +2266,266 @@ async fn idle_primary_restart_activates_and_resolves_pending_target() {
         tokio::task::yield_now().await;
     }
 }
+
+#[tokio::test]
+async fn failed_lifecycle_report_keeps_unpersisted_collision_quarantine() {
+    let (raft, state_handle) =
+        crate::consensus::create_raft_instance_mem(1, "collision-quarantine".into())
+            .await
+            .unwrap();
+    crate::consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:0".into())
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !raft.is_leader() {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        raft.client_write(ClusterCommand::CreateIndex {
+            metadata: IndexMetadata {
+                name: "idx".into(),
+                uuid: IndexUuid::new("idx-uuid"),
+                number_of_shards: 1,
+                number_of_replicas: 1,
+                shard_routing: HashMap::from([(
+                    0,
+                    ShardRoutingEntry {
+                        primary: "node-1".into(),
+                        primary_term: 1,
+                        replicas: vec!["node-2".into()],
+                        in_sync_replicas: Vec::new(),
+                        unassigned_replicas: 0,
+                    },
+                )]),
+                mappings: HashMap::new(),
+                dynamic: Default::default(),
+                settings: IndexSettings::default(),
+            },
+        })
+        .await
+        .unwrap()
+        .data,
+        ClusterResponse::Ok
+    );
+    let primary_allocation = state_handle
+        .read()
+        .unwrap()
+        .primary_allocation_id("idx", 0)
+        .unwrap();
+    let allocation_id = state_handle
+        .read()
+        .unwrap()
+        .shard_allocation_id("idx", 0, "node-2")
+        .unwrap();
+    assert_eq!(
+        raft.client_write(ClusterCommand::ActivatePrimary {
+            index_name: "idx".into(),
+            index_uuid: "idx-uuid".into(),
+            shard_id: 0,
+            primary: "node-1".into(),
+            allocation_id: primary_allocation,
+            expected_term: 1,
+        })
+        .await
+        .unwrap()
+        .data,
+        ClusterResponse::Ok
+    );
+    assert_eq!(
+        raft.client_write(ClusterCommand::MarkReplicaInSync {
+            index_name: "idx".into(),
+            index_uuid: "idx-uuid".into(),
+            shard_id: 0,
+            replica: "node-2".into(),
+            allocation_id,
+            primary: "node-1".into(),
+            primary_term: 2,
+        })
+        .await
+        .unwrap()
+        .data,
+        ClusterResponse::Ok
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    shard_manager.set_copy_retry_policy_for_test(3, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+    let engine = shard_manager
+        .open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &IndexSettings::default(),
+            "idx-uuid",
+            crate::shard::AssignedShardOpen {
+                allocation_id,
+                primary_term: 2,
+                allow_empty_creation: true,
+            },
+        )
+        .unwrap();
+    for seq_no in 0..=5 {
+        apply_index(
+            &engine,
+            &format!("doc-{seq_no}"),
+            serde_json::json!({"term": 2, "seq": seq_no}),
+            seq_no,
+            2,
+        );
+    }
+    engine.refresh().unwrap();
+    drop(engine);
+
+    let cluster_manager = Arc::new(ClusterManager::with_shared_state(state_handle.clone()));
+    let remote_store_resources = crate::transport::server::RemoteStoreTransportResources {
+        storage_manager: Arc::new(crate::storage::StorageManager::new_in_path(dir.path()).unwrap()),
+        remote_store_reader_cache: Arc::new(
+            crate::engine::remote_store::RemoteSplitReaderCache::default(),
+        ),
+    };
+    let (_transport_server, transport_service) =
+        crate::transport::server::create_transport_service_with_raft_and_storage_handle(
+            cluster_manager.clone(),
+            shard_manager.clone(),
+            TransportClient::new(),
+            raft.clone(),
+            Arc::new(crate::tasks::TaskManager::new()),
+            remote_store_resources,
+            "node-2".into(),
+        );
+    let replicate = |doc_id: &str, seq_no: u64| crate::transport::proto::ReplicateDocRequest {
+        index_name: "idx".into(),
+        shard_id: 0,
+        doc_id: doc_id.into(),
+        payload_json: serde_json::to_vec(&serde_json::json!({"term": 3, "seq": seq_no})).unwrap(),
+        op: "index".into(),
+        seq_no,
+        index_uuid: "idx-uuid".into(),
+        primary_term: Some(3),
+        target_allocation_id: Some(allocation_id),
+    };
+
+    // ENOSPC exactly once, while persisting the collision marker.
+    shard_manager.inject_collision_quarantine_persist_failures(28, 1);
+    let collision = transport_service
+        .replicate_doc(tonic::Request::new(replicate("doc-5", 5)))
+        .await
+        .unwrap_err();
+    assert_eq!(collision.code(), tonic::Code::DataLoss);
+    let identity_path = dir
+        .path()
+        .join("idx-uuid/shard_0")
+        .join(crate::shard::SHARD_COPY_IDENTITY_FILE);
+    let durable: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&identity_path).unwrap()).unwrap();
+    assert_ne!(
+        durable["collision_quarantined"], true,
+        "marker write was injected to fail"
+    );
+    assert!(
+        shard_manager
+            .copy_identity("idx", 0)
+            .expect("253b583 keeps the marked identity in memory")
+            .collision_quarantined
+    );
+    assert!(shard_manager.get_shard("idx", 0).is_none());
+    assert!(
+        state_handle.read().unwrap().indices["idx"].shard_routing[&0].is_replica_in_sync("node-2"),
+        "the replica's lagging-view transport report is skipped, so the copy is still in sync"
+    );
+
+    // First lifecycle tick: open is rejected by the cached marker and the
+    // failure is reportable.
+    let current_state = state_handle.read().unwrap().clone();
+    let first_tick = open_local_assigned_shards(
+        &current_state,
+        "node-2",
+        &shard_manager,
+        &std::sync::Mutex::new(std::collections::HashSet::new()),
+    );
+    assert_eq!(first_tick.len(), 1);
+    assert!(
+        first_tick[0]
+            .reason
+            .contains("collision quarantine is active")
+    );
+    assert!(
+        !first_tick[0].quarantine,
+        "collision quarantine must not fall back to generic quarantine"
+    );
+
+    // The report cannot be applied during this tick (no Raft leader known).
+    let mut leaderless_state = current_state.clone();
+    leaderless_state.master_node = None;
+    let leaderless_manager =
+        ClusterManager::with_shared_state(Arc::new(std::sync::RwLock::new(leaderless_state)));
+    let (follower_raft, _) =
+        crate::consensus::create_raft_instance_mem(2, "collision-quarantine-follower".into())
+            .await
+            .unwrap();
+    assert!(!follower_raft.is_leader());
+    let mut recent_reports = HashMap::new();
+    report_failed_shard_copies(
+        first_tick,
+        &leaderless_manager,
+        &shard_manager,
+        &TransportClient::new(),
+        follower_raft.as_ref(),
+        &mut recent_reports,
+    )
+    .await;
+    assert!(
+        state_handle.read().unwrap().indices["idx"].shard_routing[&0].is_replica_in_sync("node-2"),
+        "the failed report leaves the allocation in sync"
+    );
+    let cached_after_report = shard_manager
+        .copy_identity("idx", 0)
+        .map(|identity| identity.collision_quarantined);
+    assert_eq!(
+        cached_after_report,
+        Some(true),
+        "a failed lifecycle report must keep the in-memory collision marker"
+    );
+
+    // Second lifecycle tick, same process, marker still not durable.
+    let second_tick = open_local_assigned_shards(
+        &current_state,
+        "node-2",
+        &shard_manager,
+        &std::sync::Mutex::new(std::collections::HashSet::new()),
+    );
+    assert_eq!(
+        second_tick.len(),
+        1,
+        "the quarantined copy must fail its next open and be reported again"
+    );
+    assert!(
+        second_tick[0]
+            .reason
+            .contains("collision quarantine is active")
+    );
+    assert!(!second_tick[0].quarantine);
+    assert!(
+        shard_manager.get_shard("idx", 0).is_none(),
+        "the divergent copy must stay closed"
+    );
+
+    let follow_up = transport_service
+        .replicate_doc(tonic::Request::new(replicate("doc-6", 6)))
+        .await;
+    match follow_up {
+        Err(status) => assert_eq!(status.code(), tonic::Code::DataLoss, "{status:?}"),
+        Ok(response) => panic!(
+            "replication to a quarantined copy must fail closed: {:?}",
+            response.get_ref()
+        ),
+    }
+    assert!(shard_manager.get_shard("idx", 0).is_none());
+    let durable: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&identity_path).unwrap()).unwrap();
+    assert_eq!(
+        durable["collision_quarantined"], true,
+        "the next rejection must persist the collision marker"
+    );
+}

@@ -1627,6 +1627,13 @@ impl ShardManager {
     }
 
     pub(crate) fn should_quarantine_copy_failure(error: &anyhow::Error) -> bool {
+        if error.chain().any(|cause| {
+            cause
+                .downcast_ref::<CollisionQuarantinedShardCopy>()
+                .is_some()
+        }) {
+            return false;
+        }
         if Self::is_definitive_copy_failure(error) {
             return true;
         }
@@ -2382,6 +2389,12 @@ impl ShardManager {
         };
 
         let mut prepared_identity = if let Some(assignment) = assignment {
+            self.ensure_collision_quarantine_not_active(
+                &key,
+                &shard_dir,
+                index_uuid,
+                assignment.allocation_id,
+            )?;
             Some(self.prepare_assigned_copy_identity(&key, &shard_dir, index_uuid, assignment)?)
         } else {
             None
@@ -5227,6 +5240,101 @@ mod tests {
             Err(error) => error,
         };
         assert!(reopen.is::<CollisionQuarantinedShardCopy>(), "{reopen:#}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_racing_unpersisted_collision_marker_stays_quarantined() {
+        let runtime = tokio::runtime::Handle::current();
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+        let assignment = AssignedShardOpen {
+            allocation_id: 7,
+            primary_term: 2,
+            allow_empty_creation: true,
+        };
+        manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                assignment,
+            )
+            .unwrap();
+        // The copy is closed (for example evicted by an earlier failure) but
+        // not marked, so a concurrent assigned open passes the marker check.
+        manager.quarantine_shard_copy("idx", 0);
+        assert!(manager.get_shard("idx", 0).is_none());
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *manager.open_before_lock_sender.lock().unwrap() = Some(entered_tx);
+        *manager.open_before_lock_release.lock().unwrap() = Some(release_rx);
+        let open_manager = manager.clone();
+        let open = std::thread::spawn(move || {
+            let _runtime = runtime.enter();
+            open_manager.open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 2,
+                    allow_empty_creation: false,
+                },
+            )
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // A collision is detected concurrently; its marker write fails.
+        manager.inject_collision_quarantine_persist_failures(28, 1);
+        let quarantine_error = manager
+            .quarantine_sequence_collision("idx", 0, "uuid-1", 7)
+            .unwrap_err();
+        assert!(ShardManager::should_report_copy_failure(&quarantine_error));
+        assert!(
+            manager
+                .copy_identity("idx", 0)
+                .unwrap()
+                .collision_quarantined
+        );
+        release_tx.send(()).unwrap();
+
+        let opened = open.join().unwrap();
+        assert!(
+            opened
+                .as_ref()
+                .is_err_and(|error| error.is::<CollisionQuarantinedShardCopy>()),
+            "the racing open must not serve a collision-quarantined copy"
+        );
+        assert!(manager.get_shard("idx", 0).is_none());
+        assert!(
+            manager
+                .copy_identity("idx", 0)
+                .unwrap()
+                .collision_quarantined
+        );
+        let later = manager.open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &IndexSettings::default(),
+            "uuid-1",
+            AssignedShardOpen {
+                allocation_id: 7,
+                primary_term: 2,
+                allow_empty_creation: false,
+            },
+        );
+        assert!(
+            later
+                .as_ref()
+                .is_err_and(|error| error.is::<CollisionQuarantinedShardCopy>()),
+            "a later open must stay collision-quarantined"
+        );
     }
 
     #[test]
