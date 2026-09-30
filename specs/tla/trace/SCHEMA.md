@@ -10,7 +10,9 @@ shims.
 
 `scripts/tla/trace_to_tla.py` validates the JSON Lines contract, derives finite
 constants, and generates `TraceInput.tla`. TLC then searches for a behavior of
-the real D1 `Next` relation that consumes every observation.
+the selected trace composition that consumes every observation. Each
+composition reuses the applicable D1, authority, collision, or recovery model
+actions; there is no single shared D1 `Next` relation.
 
 The converter infers one composition from the event vocabulary:
 
@@ -93,6 +95,20 @@ Every completed trace ends with `copy_state` immediately before `trace_end`.
 When `quiescent` is true, no replay may remain active and every copy still
 available at the end must have a final `copy_state` after the last
 state-changing event.
+
+Rust harness traces also write `<trace-stem>.actual.json`. This sidecar uses
+schema `ferrissearch.d1.trace.actual/v1` and the same `run_id`. It contains one
+final record per observed copy:
+
+- exact copy identity;
+- actual live and retained-delete document identities after refresh; and
+- every retained physical WAL entry in on-disk scan order.
+
+The sidecar is evidence, not a source of model choices.
+`check_d1_trace_invariants.py` reconstructs document state from trace effects
+and physical WAL from `wal_appended` plus `wal_truncated`, then requires exact
+agreement with the sidecar. Missing and invented events both fail. Fixtures do
+not require a sidecar; every Rust fault-harness run does.
 
 ## Shared value contracts
 
@@ -182,6 +198,14 @@ process-global synchronous trace-state mutex that owns:
 
 Do not use asynchronous `tracing` output as protocol evidence.
 
+The emitter must not suppress or deduplicate production effects. When a trace
+session is active, `record_wal_appended`, `record_operation_processed`, and
+`record_operation_collision` fail the operation if no apply scope is active.
+Repeated production effects produce repeated records. Every invocation of
+`HotEngine::replay_translog_suffix_locked` produces one replay lifecycle,
+including activation, refresh/rebuild, startup, and recovery-triggered writer
+rebuilds.
+
 For a state mutation:
 
 1. acquire the existing lock that protects the effect;
@@ -211,8 +235,8 @@ The field lists below are in addition to `schema`, `run_id`, `step`, and
 | Event | Required fields | Emit in current Rust code | Required lock and ordering |
 | --- | --- | --- | --- |
 | `client_write_routed` | `node`, `index_uuid`, `shard`, `request_id`, `target_node`, `doc`, `op`, `content_hash` | `TransportService::index_doc`, `TransportService::delete_doc`, and per-item in `TransportService::bulk_index`, after `validated_primary_write_state` selects the target and before the write-pool task is submitted. | Hold the peer-recovery write guard and the test scheduler's shared operation gate. The routing snapshot and request identity are immutable inputs to the event. |
-| `wal_appended` | `node`, `index_uuid`, `shard`, `allocation`, nullable `request_id`, `receipt_id`, `term`, `seq_no`, nullable `doc`, `op`, `content_hash`, `origin`, `durable` | `HotEngine::apply_sequenced_batch_locked`, after `append_batch_with_seq` and required `sync` have succeeded, before engine mutation. Emit batch entries in append order. | Hold the engine translog lock and `apply_state` mutex. `origin` is `primary`, `live_replication`, or `recovery`. |
-| `operation_processed` | All operation identity fields above, `origin`, `outcome`, `checkpoints` | `HotEngine::apply_sequenced_batch_locked`, after the planner effect, `complete_operation`, and any persisted-checkpoint update. Emit a collision before returning its typed error. | Hold `apply_state`. The allowed outcomes are `applied_newer`, `stale`, `redelivery`, `noop`, `collision`, and `apply_failed`. For live transport, atomically change the trace message phase from `request` to `ack` or `nack`. |
+| `wal_appended` | `node`, `index_uuid`, `shard`, `allocation`, nullable `request_id`, `receipt_id`, `term`, `seq_no`, nullable `doc`, `op`, `content_hash`, `origin`, `durable` | For primary single writes, `HotEngine::add_primary_index_with_side_effect` and `HotEngine::delete_primary_with_side_effect`, immediately after `HotTranslog::append`; for primary bulk, `HotEngine::add_primary_bulk_with_side_effect`, immediately after `write_bulk_with_receipt` and operation construction; for replica, recovery, and promotion writes, `HotEngine::apply_sequenced_batch_locked`, immediately after `append_batch_with_seq`. Emit batch entries in physical append order and before engine mutation. Replay does not append and therefore emits no `wal_appended`. | Hold the engine translog lock and the active apply scope. The replica/recovery/promotion path also holds `apply_state`. `origin` is `primary`, `live_replication`, `recovery`, or `promotion`. |
+| `operation_processed` | All operation identity fields above, `origin`, `outcome`, `checkpoints` | `HotEngine::apply_sequenced_batch_locked`, after the planner effect, `complete_operation`, and any persisted-checkpoint update. Emit a collision before returning its typed error. Promotion NoOp fill emits the physical `promotion` processing effect before the summary `promotion_noop_fill`. Replay uses `replay_entry` instead. | Hold `apply_state` and the active apply scope. The allowed outcomes are `applied_newer`, `stale`, `redelivery`, `noop`, `collision`, and `apply_failed`. For live transport, atomically change the trace message phase from `request` to `ack` or `nack`. |
 | `primary_replication_started` | `node`, `index_uuid`, `shard`, `allocation`, `source_incarnation`, `request_id`, `receipt_id`, `term`, `seq_no`, sorted `required_replicas`, `routing_version` | `replicate_write_with_durability` or `replicate_explicit_batch_with_durability`, after validating the immutable `ClusterState` snapshot and constructing every target request, immediately before spawning RPC futures. | Acquire the trace-state mutex once for the complete target set. Register every `message_id` in phase `request` before any RPC can run. |
 | `client_result` | `node`, `index_uuid`, `shard`, `request_id`, `outcome`, nullable `failure_stage` | `TransportService::index_doc`, `delete_doc`, or `bulk_index`, immediately before the terminal response is returned. | Hold the trace-state mutex. `acknowledged` requires every replica in the captured required set to have acknowledged; `failed` names a non-null stage. |
 
@@ -236,7 +260,7 @@ the write pool in a different order.
 | Event | Required fields | Emit in current Rust code | Required lock and ordering |
 | --- | --- | --- | --- |
 | `commit_captured` | `node`, `index_uuid`, `shard`, `allocation`, `commit_id`, `checkpoints`, `term_state` | `HotEngine::commit_writer_at_boundary`, after the successful Tantivy commit and after the immutable `CommittedBoundaryRecord` is derived. | Hold the writer lock and `apply_state`. `term_state` contains `current_term`, nullable `max_seq_no_at_term_start`, and sorted `processed_in_current_term_below_start_max`. |
-| `commit_persisted` | `node`, `index_uuid`, `shard`, `allocation`, `commit_id` | `HotEngine::persist_committed_boundary`, after `CommittedBoundaryRecord::persist` has fsynced the temporary file, renamed it, and fsynced the parent directory. | Carry the immutable `commit_id`; do not reread checkpoints. |
+| `commit_persisted` | `node`, `index_uuid`, `shard`, `allocation`, `commit_id` | `HotEngine::persist_committed_boundary`, after every successful `CommittedBoundaryRecord::persist` call has fsynced the temporary file, renamed it, and fsynced the parent directory. | Carry the immutable `commit_id`; do not reread checkpoints. Re-persisting the same captured boundary emits another event with the same `commit_id`. |
 | `wal_truncated` | `node`, `index_uuid`, `shard`, `allocation`, `truncate_through` | `HotTranslog::truncate_below`, after the rolled manifest and sequence high-watermark are persisted and generation deletion attempts finish. | The translog state mutex linearizes manifest mutation. Emit after deletion attempts so the event describes the completed truncation operation. |
 
 Capture and persistence are separate events because a fence or write may occur
@@ -248,7 +272,7 @@ between them. Truncation may not exceed the persisted processed checkpoint.
 | --- | --- | --- | --- |
 | `node_crashed` | `node`, `incarnation`, `outcome`, sorted `failed_request_ids`, sorted `dropped_messages` | The seeded fault harness crash function, after it has exclusively stopped ingress and trace-producing tasks for that incarnation. | Hold the scheduler's exclusive operation gate and trace-state mutex. Compute, do not guess, both exact sets from trace state before clearing them. `outcome` is `clean` or `unclean`. |
 | `node_restarted` | `node`, new `incarnation`, `index_uuid`, `shard`, `allocation`, `checkpoints` | Inside `HotEngine::new_with_mappings_mode`, after the startup `ApplyState` is initialized from `translog.committed` and immediately before `engine.replay_translog()`. | No replay entry may run first. Allocate the new incarnation and stamp while startup still has exclusive ownership of the engine. |
-| `replay_started` | `node`, `index_uuid`, `shard`, `allocation`, `replay_id`, `checkpoints` | `HotEngine::replay_translog_suffix_locked`, immediately after `reset_apply_state_to_commit` and before scanning the WAL. | Hold translog, writer, and `apply_state` locks. |
+| `replay_started` | `node`, `index_uuid`, `shard`, `allocation`, `replay_id`, `checkpoints` | Every invocation of `HotEngine::replay_translog_suffix_locked`, immediately after `reset_apply_state_to_commit` and before scanning the WAL. | Hold translog, writer, and `apply_state` locks. Emit even when the scan is empty or was triggered by activation, refresh, rebuild, or recovery rather than process restart. |
 | `replay_entry` | `node`, `index_uuid`, `shard`, `allocation`, `replay_id`, `ordinal`, `receipt_id`, operation identity fields, `outcome`, `checkpoints` | The replay path through `HotEngine::apply_sequenced_batch_locked`, after one physical WAL entry is classified and its checkpoint effect is complete. | Hold translog and `apply_state`. `ordinal` starts at 0 and follows physical WAL scan order. Outcomes are `skip_committed`, `applied_newer`, `stale`, `redelivery`, or `noop`. |
 | `replay_finished` | `node`, `index_uuid`, `shard`, `allocation`, `replay_id`, `outcome` | `HotEngine::replay_translog_suffix_locked`, after successful reader reload and committed-boundary persistence, or after a terminal replay error marks the writer/copy failed. | Emit exactly once per replay ID. `outcome` is `completed` or `failed`. |
 
@@ -320,18 +344,24 @@ contains:
 `absent`.
 
 `ShardManager::capture_protocol_trace_copy_state` performs the refresh and
-captures the immutable live-document snapshot. The harness emits all final
-`copy_state` records only after every available copy has been captured, so a
-later copy's commit events cannot make an earlier observation stale.
+captures the immutable live-document snapshot, retained delete versions, and
+physical WAL while the copy remains quiescent. `record_copy_snapshot` stores
+that independent evidence in the actual-state sidecar and emits `copy_state`.
+The harness emits all final `copy_state` records only after every available
+copy has been captured, so a later copy's commit events cannot make an earlier
+observation stale.
 
 The fault harness must:
 
 1. hold the scheduler's exclusive operation gate;
 2. call `SearchEngine::refresh` (`HotEngine::refresh_with_pruned_tombstones`);
 3. use one reader snapshot to enumerate live documents;
-4. combine it with trace-owned processed delete identity, not the expiring
-   version-map tombstone cache; and
-5. append `copy_state` before releasing the gate.
+4. capture retained delete identities from `LiveVersionMap` and physical WAL
+   entries from the live `WriteAheadLog`;
+5. emit `copy_state` from live data plus trace-known absent/delete identities;
+6. write the independent actual-state evidence; and
+7. run `check_d1_trace_invariants.py --completeness-only` before declaring the
+   harness run successful.
 
 Refreshing first is mandatory. A pre-refresh read is not valid evidence.
 
@@ -355,7 +385,7 @@ Before TLC, `trace_to_tla.py` rejects, among other structural failures:
 - quiescent traces with active replay or pending messages; and
 - traces without final `copy_state` for each available copy.
 
-The generated trace modules still compose observations with the real D1,
+The generated trace modules compose observations with the applicable D1,
 authority, collision, and recovery actions. Outcome labels and converter
 bookkeeping do not replace model transitions.
 

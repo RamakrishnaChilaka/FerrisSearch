@@ -1303,6 +1303,7 @@ mod tests {
 
         let (next_cursor, applied) = apply_recovery_operations_cursor(
             engine,
+            None,
             cursor,
             cursor,
             Some(7),

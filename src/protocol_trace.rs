@@ -72,7 +72,7 @@ pub struct FaultRule {
     pub action: FaultAction,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct TraceCopy {
     pub node: String,
     pub index_uuid: String,
@@ -84,6 +84,33 @@ pub struct TraceCopy {
 pub struct TraceCopySnapshot {
     pub copy: TraceCopy,
     pub live_documents: Vec<(String, u64, u64, String)>,
+    pub actual_documents: Vec<TraceActualDocument>,
+    pub wal_entries: Vec<TraceWalEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TraceActualDocument {
+    pub doc: String,
+    pub state: &'static str,
+    pub seq_no: Option<u64>,
+    pub term: Option<u64>,
+    pub content_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TraceWalEntry {
+    pub seq_no: u64,
+    pub term: u64,
+    pub doc: Option<String>,
+    pub op: &'static str,
+    pub content_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TraceActualCopy {
+    copy: TraceCopy,
+    documents: Vec<TraceActualDocument>,
+    wal: Vec<TraceWalEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -246,16 +273,17 @@ struct TraceState {
     requests: HashMap<String, RequestState>,
     request_order: Vec<String>,
     operations: HashMap<OperationKey, OperationState>,
-    wal_by_copy: HashSet<(OperationKey, String)>,
     messages: HashMap<String, MessageState>,
     message_by_copy_operation: HashMap<(OperationKey, String), String>,
     faults: Vec<FaultState>,
     replays: HashMap<TraceCopy, ActiveReplay>,
-    restart_replays: HashSet<String>,
     pending_commits: HashMap<TraceCopy, String>,
     recovery_snapshots: HashMap<String, RecoverySnapshotState>,
     known_documents: BTreeSet<String>,
     copy_documents: HashMap<TraceCopy, BTreeMap<String, LogicalDocument>>,
+    actual_copies: HashMap<String, TraceActualCopy>,
+    omit_wal_append_node: Option<String>,
+    wal_append_omitted: bool,
 }
 
 static TRACE_STATE: OnceLock<Mutex<Option<TraceState>>> = OnceLock::new();
@@ -294,26 +322,64 @@ impl TraceSession {
             "quiescent": quiescent,
             "records_before_end": records_before_end,
         }));
-        if let Some(parent) = state.output.parent() {
-            std::fs::create_dir_all(parent)?;
+        if state.omit_wal_append_node.is_some() && !state.wal_append_omitted {
+            anyhow::bail!("requested WAL-append trace omission did not occur");
         }
-        let temp = state.output.with_extension("jsonl.tmp");
-        let file = File::create(&temp)
-            .with_context(|| format!("create protocol trace temporary file {temp:?}"))?;
-        let mut writer = BufWriter::new(file);
-        for record in &state.records {
-            serde_json::to_writer(&mut writer, record)?;
-            writer.write_all(b"\n")?;
-        }
-        writer.flush()?;
-        writer.get_ref().sync_all()?;
-        std::fs::rename(&temp, &state.output)?;
-        if let Some(parent) = state.output.parent() {
-            File::open(parent)?.sync_all()?;
-        }
+        write_trace_records(&state.output, &state.records)?;
+        let mut copies = state.actual_copies.into_values().collect::<Vec<_>>();
+        copies.sort_by(|left, right| left.copy.node.cmp(&right.copy.node));
+        let actual_path = state.output.with_extension("actual.json");
+        write_json_file(
+            &actual_path,
+            &json!({
+                "schema": "ferrissearch.d1.trace.actual/v1",
+                "run_id": state.run_id,
+                "copies": copies,
+            }),
+        )?;
         self.finished = true;
         Ok(state.output)
     }
+}
+
+fn write_trace_records(path: &PathBuf, records: &[Value]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temp = path.with_extension("jsonl.tmp");
+    let file = File::create(&temp)
+        .with_context(|| format!("create protocol trace temporary file {temp:?}"))?;
+    let mut writer = BufWriter::new(file);
+    for record in records {
+        serde_json::to_writer(&mut writer, record)?;
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    std::fs::rename(&temp, path)?;
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn write_json_file(path: &PathBuf, value: &Value) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temp = path.with_extension("json.tmp");
+    let file = File::create(&temp)
+        .with_context(|| format!("create protocol trace actual file {temp:?}"))?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, value)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    std::fs::rename(&temp, path)?;
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 impl Drop for TraceSession {
@@ -379,7 +445,6 @@ pub fn start(config: TraceConfig) -> Result<TraceSession> {
         requests: HashMap::new(),
         request_order: Vec::new(),
         operations: HashMap::new(),
-        wal_by_copy: HashSet::new(),
         messages: HashMap::new(),
         message_by_copy_operation: HashMap::new(),
         faults: faults
@@ -387,11 +452,21 @@ pub fn start(config: TraceConfig) -> Result<TraceSession> {
             .map(|rule| FaultState { rule, used: false })
             .collect(),
         replays: HashMap::new(),
-        restart_replays: HashSet::new(),
         pending_commits: HashMap::new(),
         recovery_snapshots: HashMap::new(),
         known_documents: BTreeSet::new(),
         copy_documents: HashMap::new(),
+        actual_copies: HashMap::new(),
+        omit_wal_append_node: std::env::var("D1_TRACE_OMIT_WAL_APPEND_ONCE")
+            .ok()
+            .map(|node| {
+                if node.is_empty() {
+                    "*".to_string()
+                } else {
+                    node
+                }
+            }),
+        wal_append_omitted: false,
     });
     Ok(TraceSession {
         run_id: guard.as_ref().unwrap().run_id.clone(),
@@ -530,7 +605,9 @@ fn canonical_json(value: &Value) -> Value {
     }
 }
 
-fn operation_parts(operation: &SequencedOperation) -> (Option<String>, &'static str, String) {
+pub(crate) fn operation_parts(
+    operation: &SequencedOperation,
+) -> (Option<String>, &'static str, String) {
     match &operation.mutation {
         DocumentMutation::Index { doc_id, .. } => (
             Some(doc_id.clone()),
@@ -651,9 +728,13 @@ fn operation_for_apply(
     } else {
         None
     };
-    let receipt_id = match &request_id {
-        Some(request_id) => format!("receipt-{request_id}"),
-        None => format!(
+    let receipt_id = match (&request_id, origin) {
+        (Some(request_id), _) => format!("receipt-{request_id}"),
+        (None, ApplyOrigin::Promotion) => format!(
+            "noop-receipt-{}-{}-{}",
+            copy.node, operation.primary_term, operation.seq_no
+        ),
+        (None, _) => format!(
             "receipt-{}-{}-{}-{}",
             copy.node, copy.shard, operation.primary_term, operation.seq_no
         ),
@@ -670,21 +751,43 @@ fn operation_for_apply(
     Ok(operation_state)
 }
 
+fn apply_origin_for_effect(effect: &str) -> Result<Option<ApplyOrigin>> {
+    if let Some(origin) = current_apply_origin() {
+        return Ok(Some(origin));
+    }
+    if is_active() {
+        anyhow::bail!("protocol trace {effect} occurred outside an apply scope");
+    }
+    Ok(None)
+}
+
+fn apply_origin_name(origin: ApplyOrigin) -> &'static str {
+    match origin {
+        ApplyOrigin::Primary => "primary",
+        ApplyOrigin::LiveReplication => "live_replication",
+        ApplyOrigin::Recovery => "recovery",
+        ApplyOrigin::Replay => "replay",
+        ApplyOrigin::Promotion => "promotion",
+    }
+}
+
 pub fn record_wal_appended(
     copy: &TraceCopy,
     operation: &SequencedOperation,
     durable: bool,
 ) -> Result<()> {
-    let Some(origin) = current_apply_origin() else {
+    let Some(origin) = apply_origin_for_effect("WAL append")? else {
         return Ok(());
     };
-    if matches!(origin, ApplyOrigin::Replay | ApplyOrigin::Promotion) {
-        return Ok(());
-    }
     match with_state(|state| -> Result<()> {
-        let key = operation_key(copy, operation);
         let metadata = operation_for_apply(state, copy, operation, origin)?;
-        if !state.wal_by_copy.insert((key, copy.node.clone())) {
+        if state
+            .omit_wal_append_node
+            .as_deref()
+            .is_some_and(|node| node == "*" || node == copy.node)
+            && !state.wal_append_omitted
+        {
+            state.wal_append_omitted = true;
             return Ok(());
         }
         push_event(
@@ -702,12 +805,7 @@ pub fn record_wal_appended(
                 "doc": metadata.doc,
                 "op": metadata.op,
                 "content_hash": metadata.content_hash,
-                "origin": match origin {
-                    ApplyOrigin::Primary => "primary",
-                    ApplyOrigin::LiveReplication => "live_replication",
-                    ApplyOrigin::Recovery => "recovery",
-                    ApplyOrigin::Replay | ApplyOrigin::Promotion => unreachable!(),
-                },
+                "origin": apply_origin_name(origin),
                 "durable": durable,
             }),
         );
@@ -733,12 +831,9 @@ pub fn record_operation_processed(
     outcome: ApplyOutcome,
     stats: SequenceStats,
 ) -> Result<()> {
-    let Some(origin) = current_apply_origin() else {
+    let Some(origin) = apply_origin_for_effect("operation processing")? else {
         return Ok(());
     };
-    if origin == ApplyOrigin::Promotion {
-        return Ok(());
-    }
     if origin == ApplyOrigin::Replay {
         return record_replay_entry(copy, operation, outcome, stats);
     }
@@ -777,12 +872,7 @@ pub fn record_operation_processed(
                 "doc": metadata.doc,
                 "op": metadata.op,
                 "content_hash": metadata.content_hash,
-                "origin": match origin {
-                    ApplyOrigin::Primary => "primary",
-                    ApplyOrigin::LiveReplication => "live_replication",
-                    ApplyOrigin::Recovery => "recovery",
-                    ApplyOrigin::Replay | ApplyOrigin::Promotion => unreachable!(),
-                },
+                "origin": apply_origin_name(origin),
                 "outcome": outcome_name(outcome),
                 "checkpoints": checkpoints_value(stats),
             }),
@@ -799,7 +889,7 @@ pub fn record_operation_collision(
     operation: &SequencedOperation,
     stats: SequenceStats,
 ) -> Result<()> {
-    let Some(origin) = current_apply_origin() else {
+    let Some(origin) = apply_origin_for_effect("operation collision")? else {
         return Ok(());
     };
     match with_state(|state| -> Result<()> {
@@ -828,7 +918,7 @@ pub fn record_operation_collision(
                 "doc": metadata.doc,
                 "op": metadata.op,
                 "content_hash": metadata.content_hash,
-                "origin": "live_replication",
+                "origin": apply_origin_name(origin),
                 "outcome": "collision",
                 "checkpoints": checkpoints_value(stats),
             }),
@@ -1259,30 +1349,27 @@ pub fn record_promotion_noop_fill(
     if operations.is_empty() {
         return Ok(());
     }
-    with_state(|state| {
+    match with_state(|state| -> Result<()> {
         let batch_id = format!("noop-batch-{}", state.next_batch);
         state.next_batch += 1;
         let mut noops = Vec::with_capacity(operations.len());
         for operation in operations {
             let key = operation_key(copy, operation);
             let (_, op, content_hash) = operation_parts(operation);
-            let receipt_id = format!(
-                "noop-receipt-{}-{}-{}",
-                copy.node, operation.primary_term, operation.seq_no
-            );
-            state.operations.insert(
-                key,
-                OperationState {
-                    request_id: None,
-                    receipt_id: receipt_id.clone(),
-                    doc: None,
-                    op: op.to_string(),
-                    content_hash: content_hash.clone(),
-                    batch_id: Some(batch_id.clone()),
-                },
-            );
+            let operation_state = state
+                .operations
+                .get_mut(&key)
+                .context("promotion NoOp fill has no emitted apply identity")?;
+            if operation_state.request_id.is_some()
+                || operation_state.doc.is_some()
+                || operation_state.op != op
+                || operation_state.content_hash != content_hash
+            {
+                anyhow::bail!("promotion NoOp fill identity differs from its emitted apply");
+            }
+            operation_state.batch_id = Some(batch_id.clone());
             noops.push(json!({
-                "receipt_id": receipt_id,
+                "receipt_id": operation_state.receipt_id,
                 "seq_no": operation.seq_no,
                 "content_hash": content_hash,
             }));
@@ -1301,8 +1388,11 @@ pub fn record_promotion_noop_fill(
                 "checkpoints": checkpoints_value(stats),
             }),
         );
-    });
-    Ok(())
+        Ok(())
+    }) {
+        Some(result) => result,
+        None => Ok(()),
+    }
 }
 
 pub fn record_primary_activated(copy: &TraceCopy, term: u64) {
@@ -1528,7 +1618,6 @@ pub fn record_node_restarted(copy: &TraceCopy, stats: SequenceStats) {
         if !state.restart_pending.remove(&copy.node) {
             return;
         }
-        state.restart_replays.insert(copy.node.clone());
         let incarnation = state.nodes[&copy.node];
         push_event(
             state,
@@ -1545,10 +1634,10 @@ pub fn record_node_restarted(copy: &TraceCopy, stats: SequenceStats) {
     });
 }
 
-pub fn record_replay_started(copy: &TraceCopy, stats: SequenceStats) -> Option<String> {
-    with_state(|state| {
-        if !state.restart_replays.remove(&copy.node) {
-            return None;
+pub fn record_replay_started(copy: &TraceCopy, stats: SequenceStats) -> Result<Option<String>> {
+    match with_state(|state| -> Result<String> {
+        if state.replays.contains_key(copy) {
+            anyhow::bail!("protocol trace replay started while another replay is active");
         }
         let replay_id = format!("replay-{}", state.next_replay);
         state.next_replay += 1;
@@ -1571,9 +1660,11 @@ pub fn record_replay_started(copy: &TraceCopy, stats: SequenceStats) -> Option<S
                 "checkpoints": checkpoints_value(stats),
             }),
         );
-        Some(replay_id)
-    })
-    .flatten()
+        Ok(replay_id)
+    }) {
+        Some(result) => result.map(Some),
+        None => Ok(None),
+    }
 }
 
 fn record_replay_entry(
@@ -1670,11 +1761,12 @@ pub fn record_replay_skip(
     }
 }
 
-pub fn record_replay_finished(copy: &TraceCopy, outcome: &str) {
-    let _ = with_state(|state| {
-        let Some(replay) = state.replays.remove(copy) else {
-            return;
-        };
+pub fn record_replay_finished(copy: &TraceCopy, outcome: &str) -> Result<()> {
+    match with_state(|state| -> Result<()> {
+        let replay = state
+            .replays
+            .remove(copy)
+            .context("protocol trace replay finished without an active replay")?;
         push_event(
             state,
             "replay_finished",
@@ -1687,7 +1779,11 @@ pub fn record_replay_finished(copy: &TraceCopy, outcome: &str) {
                 "outcome": outcome,
             }),
         );
-    });
+        Ok(())
+    }) {
+        Some(result) => result,
+        None => Ok(()),
+    }
 }
 
 pub fn record_commit_captured(
@@ -1727,11 +1823,13 @@ pub fn record_commit_captured(
     })
 }
 
-pub fn record_commit_persisted(copy: &TraceCopy) {
-    let _ = with_state(|state| {
-        let Some(commit_id) = state.pending_commits.remove(copy) else {
-            return;
-        };
+pub fn record_commit_persisted(copy: &TraceCopy) -> Result<()> {
+    match with_state(|state| -> Result<()> {
+        let commit_id = state
+            .pending_commits
+            .get(copy)
+            .cloned()
+            .context("protocol trace commit persistence has no matching capture")?;
         push_event(
             state,
             "commit_persisted",
@@ -1743,7 +1841,11 @@ pub fn record_commit_persisted(copy: &TraceCopy) {
                 "commit_id": commit_id,
             }),
         );
-    });
+        Ok(())
+    }) {
+        Some(result) => result,
+        None => Ok(()),
+    }
 }
 
 pub fn record_wal_truncated(copy: &TraceCopy, truncate_through: u64) {
@@ -2013,6 +2115,32 @@ pub fn record_copy_state(copy: &TraceCopy, reason: &str, live: Vec<(String, u64,
     });
 }
 
+pub fn record_copy_snapshot(snapshot: TraceCopySnapshot, reason: &str) -> Result<()> {
+    let TraceCopySnapshot {
+        copy,
+        live_documents,
+        mut actual_documents,
+        wal_entries,
+    } = snapshot;
+    actual_documents.sort_by(|left, right| left.doc.cmp(&right.doc));
+    match with_state(|state| -> Result<()> {
+        state.actual_copies.insert(
+            copy.node.clone(),
+            TraceActualCopy {
+                copy: copy.clone(),
+                documents: actual_documents,
+                wal: wal_entries,
+            },
+        );
+        Ok(())
+    }) {
+        Some(result) => result?,
+        None => return Ok(()),
+    }
+    record_copy_state(&copy, reason, live_documents);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2107,6 +2235,106 @@ mod tests {
             source: json!({"b": {"d": 3, "c": 2}, "a": 1}),
         };
         assert_eq!(content_hash(&left), content_hash(&right));
+    }
+
+    #[test]
+    fn traced_apply_effect_without_scope_is_an_error() {
+        let _guard = test_trace_guard();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("missing-scope.jsonl");
+        let session = start(config(&path)).unwrap();
+        let error = record_wal_appended(
+            &TraceCopy {
+                node: "p".into(),
+                index_uuid: "idx".into(),
+                shard: 0,
+                allocation: 1,
+            },
+            &SequencedOperation {
+                seq_no: 0,
+                primary_term: 1,
+                mutation: DocumentMutation::Index {
+                    doc_id: "d".into(),
+                    source: json!({"value": 1}),
+                },
+            },
+            true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("outside an apply scope"));
+        session.finish(false).unwrap();
+    }
+
+    #[test]
+    fn repeated_wal_effects_are_not_deduplicated() {
+        let _guard = test_trace_guard();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("duplicate-wal.jsonl");
+        let session = start(config(&path)).unwrap();
+        let copy = TraceCopy {
+            node: "p".into(),
+            index_uuid: "idx".into(),
+            shard: 0,
+            allocation: 1,
+        };
+        let operation = SequencedOperation {
+            seq_no: 0,
+            primary_term: 1,
+            mutation: DocumentMutation::Index {
+                doc_id: "d".into(),
+                source: json!({"value": 1}),
+            },
+        };
+        let token = route_client_write("p", "idx", 0, "p", "d", &operation.mutation).unwrap();
+        with_request_tokens(vec![token], || {
+            with_apply_scope(ApplyOrigin::Primary, vec![operation.clone()], || {
+                record_wal_appended(&copy, &operation, true).unwrap();
+                record_wal_appended(&copy, &operation, true).unwrap();
+            })
+        });
+        session.finish(false).unwrap();
+        let appended = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|record| record["event"] == "wal_appended")
+            .count();
+        assert_eq!(appended, 2);
+    }
+
+    #[test]
+    fn every_replay_session_is_emitted() {
+        let _guard = test_trace_guard();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("replay.jsonl");
+        let session = start(config(&path)).unwrap();
+        let copy = TraceCopy {
+            node: "p".into(),
+            index_uuid: "idx".into(),
+            shard: 0,
+            allocation: 1,
+        };
+        assert!(
+            record_replay_started(
+                &copy,
+                SequenceStats {
+                    processed_checkpoint: None,
+                    persisted_checkpoint: None,
+                    max_seq_no: None,
+                },
+            )
+            .unwrap()
+            .is_some()
+        );
+        record_replay_finished(&copy, "completed").unwrap();
+        session.finish(false).unwrap();
+        let events = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap()["event"].clone())
+            .collect::<Vec<_>>();
+        assert!(events.contains(&json!("replay_started")));
+        assert!(events.contains(&json!("replay_finished")));
     }
 
     #[test]

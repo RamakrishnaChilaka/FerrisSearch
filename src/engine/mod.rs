@@ -435,6 +435,17 @@ pub trait SearchEngine: Send + Sync {
         )
     }
 
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_copy_evidence(
+        &self,
+    ) -> Result<(
+        Vec<(String, serde_json::Value, u64, u64)>,
+        Vec<crate::protocol_trace::TraceActualDocument>,
+        Vec<crate::protocol_trace::TraceWalEntry>,
+    )> {
+        anyhow::bail!("protocol trace copy evidence is not supported by this engine")
+    }
+
     /// Commit in-memory buffer and reload the reader so new docs become searchable.
     fn refresh(&self) -> Result<()>;
 

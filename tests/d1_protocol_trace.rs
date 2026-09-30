@@ -21,6 +21,7 @@ use ferrissearch::transport::server::{
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -249,6 +250,27 @@ fn capture_final_copy_state(
         ));
     }
     Ok(None)
+}
+
+fn assert_trace_completeness(trace_path: &Path) -> Result<()> {
+    let actual_path = trace_path.with_extension("actual.json");
+    let checker =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/tla/check_d1_trace_invariants.py");
+    let output = Command::new("python3")
+        .arg(checker)
+        .arg(trace_path)
+        .arg("--actual")
+        .arg(&actual_path)
+        .arg("--completeness-only")
+        .output()
+        .context("run D1 trace completeness checker")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "D1 trace completeness check failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -619,10 +641,11 @@ async fn seeded_three_node_fault_trace() -> Result<()> {
             capture_final_copy_state(&r_sm)?,
         ];
         for snapshot in snapshots.into_iter().flatten() {
-            protocol_trace::record_copy_state(&snapshot.copy, "trace_end", snapshot.live_documents);
+            protocol_trace::record_copy_snapshot(snapshot, "trace_end")?;
         }
     }
     let output = trace.finish(true)?;
+    assert_trace_completeness(&output)?;
     assert!(Path::new(&output).is_file());
     println!("D1 protocol trace: {}", output.display());
 

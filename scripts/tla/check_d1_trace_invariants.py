@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA = "ferrissearch.d1.trace/v4"
+ACTUAL_SCHEMA = "ferrissearch.d1.trace.actual/v1"
 
 
 class InvariantViolation(Exception):
@@ -36,6 +37,7 @@ class CopyState:
     max_seq_no: int | None = None
     documents: dict[str, tuple[str, int, int, str]] = field(default_factory=dict)
     identities: dict[int, Identity] = field(default_factory=dict)
+    wal: list[Identity] = field(default_factory=list)
     fence_term: int = 0
     last_effect_step: int = 0
 
@@ -173,7 +175,174 @@ def load_trace(path: Path) -> list[dict[str, Any]]:
     return events
 
 
-def check_trace(events: list[dict[str, Any]]) -> None:
+def load_actual(path: Path, run_id: str) -> dict[str, dict[str, Any]]:
+    try:
+        actual = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise InvariantViolation(0, "actual_state", f"cannot read {path}: {error}") from error
+    if actual.get("schema") != ACTUAL_SCHEMA:
+        raise InvariantViolation(
+            0,
+            "actual_state",
+            f"unsupported actual-state schema {actual.get('schema')!r}",
+        )
+    if actual.get("run_id") != run_id:
+        raise InvariantViolation(
+            0,
+            "actual_state",
+            f"actual-state run_id {actual.get('run_id')!r} does not match {run_id!r}",
+        )
+    copies: dict[str, dict[str, Any]] = {}
+    for copy in actual.get("copies", []):
+        node = copy.get("copy", {}).get("node")
+        if not isinstance(node, str) or node in copies:
+            raise InvariantViolation(
+                0, "actual_state", f"actual-state copy has invalid node {node!r}"
+            )
+        copies[node] = copy
+    return copies
+
+
+def reset_to_persisted_commit(
+    event: dict[str, Any],
+    copy: CopyState,
+    persisted: dict[str, Any] | None,
+) -> None:
+    expected = (
+        persisted["checkpoints"]
+        if persisted is not None
+        else {"processed": None, "persisted": None, "max_seq_no": None}
+    )
+    if event["checkpoints"] != expected:
+        fail(event, f"replay reset checkpoints are {event['checkpoints']}, expected {expected}")
+    processed_checkpoint = event["checkpoints"]["processed"]
+    persisted_checkpoint = event["checkpoints"]["persisted"]
+    copy.processed = (
+        set(range(processed_checkpoint + 1))
+        if processed_checkpoint is not None
+        else set()
+    )
+    copy.persisted = (
+        set(range(persisted_checkpoint + 1))
+        if persisted_checkpoint is not None
+        else set()
+    )
+    copy.max_seq_no = event["checkpoints"]["max_seq_no"]
+    copy.documents = dict(persisted["documents"]) if persisted is not None else {}
+    copy.identities = (
+        {
+            seq_no: observed
+            for seq_no, observed in persisted["identities"].items()
+            if seq_no in copy.processed
+        }
+        if persisted is not None
+        else {}
+    )
+
+
+def actual_identity(entry: dict[str, Any]) -> Identity:
+    return Identity(
+        term=entry["term"],
+        seq_no=entry["seq_no"],
+        doc=entry["doc"],
+        op=entry["op"],
+        content_hash=entry["content_hash"],
+    )
+
+
+def check_actual_state(
+    events: list[dict[str, Any]],
+    copies: dict[str, CopyState],
+    final_copy_states: dict[str, tuple[int, int, dict[str, tuple[Any, ...]]]],
+    actual_copies: dict[str, dict[str, Any]],
+) -> None:
+    expected_nodes = set(final_copy_states)
+    if set(actual_copies) != expected_nodes:
+        raise InvariantViolation(
+            events[-1]["step"],
+            "actual_state",
+            "actual-state copies "
+            f"{sorted(actual_copies)} do not match final copy_state nodes {sorted(expected_nodes)}",
+        )
+    for node, actual_copy in actual_copies.items():
+        copy_identity = actual_copy["copy"]
+        copy_step, allocation, final_documents = final_copy_states[node]
+        if copy_identity["allocation"] != allocation:
+            raise InvariantViolation(
+                copy_step,
+                "actual_state",
+                f"actual allocation for {node} is {copy_identity['allocation']}, expected {allocation}",
+            )
+        actual_documents = normalized_documents(actual_copy["documents"])
+        all_docs = set(actual_documents) | set(final_documents)
+        for doc in all_docs:
+            observed = actual_documents.get(doc, ("absent", None, None, None))
+            expected = final_documents.get(doc, ("absent", None, None, None))
+            if observed != expected:
+                raise InvariantViolation(
+                    copy_step,
+                    "actual_state",
+                    f"actual document state for {node} document {doc!r} is {observed}, expected {expected}",
+                )
+        actual_wal = [actual_identity(entry) for entry in actual_copy["wal"]]
+        if actual_wal != copies[node].wal:
+            mismatch = next(
+                (
+                    offset
+                    for offset, (observed, expected) in enumerate(
+                        zip(actual_wal, copies[node].wal)
+                    )
+                    if observed != expected
+                ),
+                min(len(actual_wal), len(copies[node].wal)),
+            )
+            raise InvariantViolation(
+                copy_step,
+                "actual_state",
+                f"actual WAL for {node} differs from emitted WAL at physical offset {mismatch}: "
+                f"actual={actual_wal[mismatch:mismatch + 1]}, "
+                f"emitted={copies[node].wal[mismatch:mismatch + 1]}",
+            )
+
+
+def check_completeness(
+    events: list[dict[str, Any]], actual_copies: dict[str, dict[str, Any]]
+) -> None:
+    start = events[0]
+    copies = {
+        entry["node"]: CopyState(fence_term=entry["fence_term"])
+        for entry in start["shard_state"]["copies"]
+        if entry["exists"]
+    }
+    final_copy_states: dict[
+        str, tuple[int, int, dict[str, tuple[Any, ...]]]
+    ] = {}
+    for event in events[1:-1]:
+        kind = event["event"]
+        if kind == "wal_appended":
+            copies.setdefault(event["node"], CopyState()).wal.append(identity(event))
+        elif kind == "wal_truncated":
+            copy = copies.setdefault(event["node"], CopyState())
+            copy.wal = [
+                entry
+                for entry in copy.wal
+                if entry.seq_no > event["truncate_through"]
+            ]
+        elif kind == "recovery_installed":
+            copies.setdefault(event["target_node"], CopyState()).wal.clear()
+        elif kind == "copy_state":
+            final_copy_states[event["node"]] = (
+                event["step"],
+                event["allocation"],
+                normalized_documents(event["documents"]),
+            )
+    check_actual_state(events, copies, final_copy_states, actual_copies)
+
+
+def check_trace(
+    events: list[dict[str, Any]],
+    actual_copies: dict[str, dict[str, Any]] | None = None,
+) -> None:
     start = events[0]
     nodes = {entry["node"]: entry["incarnation"] for entry in start["nodes"]}
     alive = {node: True for node in nodes}
@@ -194,7 +363,9 @@ def check_trace(events: list[dict[str, Any]]) -> None:
     message_results: dict[str, str] = {}
     pending_commits: dict[str, dict[str, Any]] = {}
     persisted_commits: dict[str, dict[str, Any]] = {}
-    final_copy_states: dict[str, tuple[int, dict[str, tuple[Any, ...]]]] = {}
+    final_copy_states: dict[
+        str, tuple[int, int, dict[str, tuple[Any, ...]]]
+    ] = {}
 
     for event in events[1:-1]:
         kind = event["event"]
@@ -210,10 +381,18 @@ def check_trace(events: list[dict[str, Any]]) -> None:
             request_status[request_id] = "routed"
         elif kind == "wal_appended":
             observed = identity(event)
+            copies.setdefault(event["node"], CopyState()).wal.append(observed)
             prior = receipt_identity.setdefault(event["receipt_id"], observed)
             if prior != observed:
                 fail(event, "receipt identity changed at WAL append")
             wal_durable[(event["node"], event["receipt_id"])] = event["durable"]
+        elif kind == "wal_truncated":
+            copy = copies.setdefault(event["node"], CopyState())
+            copy.wal = [
+                entry
+                for entry in copy.wal
+                if entry.seq_no > event["truncate_through"]
+            ]
         elif kind == "operation_processed":
             copy = copies.setdefault(event["node"], CopyState())
             observed = identity(event)
@@ -347,7 +526,7 @@ def check_trace(events: list[dict[str, Any]]) -> None:
                 "identities": dict(copy.identities),
             }
         elif kind == "commit_persisted":
-            capture = pending_commits.pop(event["commit_id"], None)
+            capture = pending_commits.get(event["commit_id"])
             if capture is None or capture["node"] != event["node"]:
                 fail(event, "commit persistence has no matching capture")
             persisted_commits[event["node"]] = capture
@@ -387,35 +566,14 @@ def check_trace(events: list[dict[str, Any]]) -> None:
             alive[node] = True
             copy = copies.setdefault(node, CopyState())
             persisted = persisted_commits.get(node)
-            if persisted is not None and event["checkpoints"] != persisted["checkpoints"]:
-                fail(event, "restart checkpoints differ from the last persisted commit")
-            processed_checkpoint = event["checkpoints"]["processed"]
-            persisted_checkpoint = event["checkpoints"]["persisted"]
-            copy.processed = (
-                set(range(processed_checkpoint + 1))
-                if processed_checkpoint is not None
-                else set()
-            )
-            copy.persisted = (
-                set(range(persisted_checkpoint + 1))
-                if persisted_checkpoint is not None
-                else set()
-            )
-            copy.max_seq_no = event["checkpoints"]["max_seq_no"]
-            copy.documents = (
-                dict(persisted["documents"]) if persisted is not None else {}
-            )
-            copy.identities = (
-                {
-                    seq_no: observed
-                    for seq_no, observed in persisted["identities"].items()
-                    if seq_no in copy.processed
-                }
-                if persisted is not None
-                else {}
-            )
+            reset_to_persisted_commit(event, copy, persisted)
+        elif kind == "recovery_installed":
+            copies.setdefault(event["target_node"], CopyState()).wal.clear()
         elif kind == "replay_started":
-            check_checkpoint_event(event, copies[event["node"]])
+            node = event["node"]
+            reset_to_persisted_commit(
+                event, copies.setdefault(node, CopyState()), persisted_commits.get(node)
+            )
         elif kind == "replay_entry":
             if event["outcome"] == "skip_committed":
                 check_checkpoint_event(event, copies[event["node"]])
@@ -445,7 +603,11 @@ def check_trace(events: list[dict[str, Any]]) -> None:
                         event,
                         f"copy_state for {event['node']} document {doc!r} is {actual}, expected {wanted}",
                     )
-            final_copy_states[event["node"]] = (event["step"], observed)
+            final_copy_states[event["node"]] = (
+                event["step"],
+                event["allocation"],
+                observed,
+            )
 
     authoritative = {primary, *in_sync}
     for node in sorted(authoritative):
@@ -457,7 +619,7 @@ def check_trace(events: list[dict[str, Any]]) -> None:
                 "trace_end",
                 f"available authoritative node {node} has no final copy_state",
             )
-        copy_step, _ = final_copy_states[node]
+        copy_step, _, _ = final_copy_states[node]
         if copy_step <= copies[node].last_effect_step:
             raise InvariantViolation(
                 events[-1]["step"],
@@ -481,7 +643,7 @@ def check_trace(events: list[dict[str, Any]]) -> None:
                 replica = final_copy_states.get(node)
                 if replica is None:
                     continue
-                if replica[1] != reference[1]:
+                if replica[2] != reference[2]:
                     raise InvariantViolation(
                         replica[0],
                         "copy_state",
@@ -496,7 +658,7 @@ def check_trace(events: list[dict[str, Any]]) -> None:
     for node in sorted(authoritative):
         if not alive.get(node, False) or node not in final_copy_states:
             continue
-        documents = final_copy_states[node][1]
+        documents = final_copy_states[node][2]
         for request_id in acknowledged:
             operation = request_operations[request_id]
             if operation.doc is None:
@@ -523,14 +685,37 @@ def check_trace(events: list[dict[str, Any]]) -> None:
                         "copy_state",
                         f"acknowledged request {request_id} has final identity {final}, expected {expected}",
                     )
+    if actual_copies is not None:
+        check_actual_state(events, copies, final_copy_states, actual_copies)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("trace", type=Path)
+    parser.add_argument("--actual", type=Path)
+    parser.add_argument("--completeness-only", action="store_true")
     args = parser.parse_args()
     try:
-        check_trace(load_trace(args.trace))
+        events = load_trace(args.trace)
+        actual_path = args.actual
+        if actual_path is None:
+            candidate = args.trace.with_suffix(".actual.json")
+            actual_path = candidate if candidate.is_file() else None
+        actual = (
+            load_actual(actual_path, events[0]["run_id"])
+            if actual_path is not None
+            else None
+        )
+        if args.completeness_only:
+            if actual is None:
+                raise InvariantViolation(
+                    events[-1]["step"],
+                    "actual_state",
+                    "completeness checking requires an actual-state sidecar",
+                )
+            check_completeness(events, actual)
+        else:
+            check_trace(events, actual)
     except InvariantViolation as error:
         print(
             f"Invariant violation at step {error.step} "

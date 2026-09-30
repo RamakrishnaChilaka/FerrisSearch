@@ -984,6 +984,17 @@ impl SearchEngine for CompositeEngine {
         self.text.protocol_trace_processed_sequences()
     }
 
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_copy_evidence(
+        &self,
+    ) -> Result<(
+        Vec<(String, serde_json::Value, u64, u64)>,
+        Vec<crate::protocol_trace::TraceActualDocument>,
+        Vec<crate::protocol_trace::TraceWalEntry>,
+    )> {
+        self.text.protocol_trace_copy_evidence()
+    }
+
     fn refresh(&self) -> Result<()> {
         let _vector_recovery = self
             .vector_recovery

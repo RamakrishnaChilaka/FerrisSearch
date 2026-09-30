@@ -3878,26 +3878,27 @@ impl ShardManager {
         let engine = self
             .get_shard(index, shard_id)
             .ok_or_else(|| anyhow::anyhow!("protocol trace shard engine is not open"))?;
-        let live = crate::protocol_trace::with_open_copy(copy.clone(), || {
-            engine.refresh()?;
-            let live = engine
-                .protocol_trace_documents()?
-                .into_iter()
-                .map(|(doc, source, seq_no, term)| {
-                    let content_hash = crate::protocol_trace::content_hash(
-                        &crate::engine::DocumentMutation::Index {
-                            doc_id: doc.clone(),
-                            source,
-                        },
-                    );
-                    (doc, seq_no, term, content_hash)
-                })
-                .collect::<Vec<_>>();
-            Ok::<Vec<(String, u64, u64, String)>, anyhow::Error>(live)
-        })?;
+        let (documents, actual_documents, wal_entries) =
+            crate::protocol_trace::with_open_copy(copy.clone(), || {
+                engine.refresh()?;
+                engine.protocol_trace_copy_evidence()
+            })?;
+        let live_documents = documents
+            .into_iter()
+            .map(|(doc, source, seq_no, term)| {
+                let content_hash =
+                    crate::protocol_trace::content_hash(&crate::engine::DocumentMutation::Index {
+                        doc_id: doc.clone(),
+                        source,
+                    });
+                (doc, seq_no, term, content_hash)
+            })
+            .collect::<Vec<_>>();
         Ok(crate::protocol_trace::TraceCopySnapshot {
             copy,
-            live_documents: live,
+            live_documents,
+            actual_documents,
+            wal_entries,
         })
     }
 

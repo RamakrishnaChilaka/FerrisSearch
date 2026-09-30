@@ -323,6 +323,27 @@ impl LiveVersionMap {
             .sum()
     }
 
+    #[cfg(feature = "protocol-trace")]
+    pub(crate) fn protocol_trace_versions(&self) -> Result<Vec<(String, VersionValue)>> {
+        let mut doc_ids = self
+            .current
+            .keys()
+            .chain(self.old.keys())
+            .chain(self.tombstones.keys())
+            .map(|doc_id| doc_id.to_string())
+            .collect::<Vec<_>>();
+        doc_ids.sort();
+        doc_ids.dedup();
+        doc_ids
+            .into_iter()
+            .map(|doc_id| {
+                self.lookup(&doc_id)?
+                    .map(|version| (doc_id.clone(), version))
+                    .ok_or_else(|| anyhow::anyhow!("version map lost document [{doc_id}]"))
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     pub(crate) fn set_max_bytes_for_test(&mut self, max_bytes: usize) {
         self.max_bytes = max_bytes;
