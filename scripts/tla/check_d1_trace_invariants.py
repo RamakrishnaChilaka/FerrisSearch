@@ -490,6 +490,11 @@ def check_trace(
                 and event["term"] < copy.fence_term
             ):
                 fail(event, "operation was processed below the durable fence")
+            if (
+                event["origin"] in {"primary", "live_replication", "promotion"}
+                and event["term"] > copy.fence_term
+            ):
+                fail(event, "operation was processed above the durable fence")
             pending_sequences = {
                 message["identity"].seq_no
                 for message in messages.values()
@@ -637,6 +642,14 @@ def check_trace(
                         event,
                         f"request acknowledged before replica acknowledgements: {sorted(missing)}",
                     )
+                acked = request_operations[request_id]
+                for replica_node in sorted(in_sync - {primary}):
+                    replica_copy = copies.setdefault(replica_node, CopyState())
+                    if replica_copy.identities.get(acked.seq_no) != acked:
+                        fail(
+                            event,
+                            f"request acknowledged before in-sync copy {replica_node} processed seq_no {acked.seq_no}",
+                        )
                 request_status[request_id] = "acknowledged"
             else:
                 request_status[request_id] = "failed"
@@ -807,6 +820,9 @@ def check_trace(
             in_sync = set(event["in_sync"])
         elif kind == "in_sync_removed":
             in_sync = set(event["in_sync"])
+        elif kind == "recovery_membership":
+            if event["outcome"] == "admitted":
+                in_sync.add(event["target_node"])
         elif kind == "copy_state":
             observed = normalized_documents(event["documents"])
             expected = {

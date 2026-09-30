@@ -32,7 +32,10 @@ does not prove unlogged Rust executions correct.
 The current Rust fault harness covers runs with periodic refresh and automatic
 flush disabled (`refresh_interval_ms = 600000` and
 `flush_threshold_bytes = u64::MAX`). Explicit commits performed by replay,
-activation, recovery, and final copy-state capture are traced, but background
+activation, peer-recovery target installation, and final copy-state capture
+are traced. The source-side commit that prepares a peer-recovery snapshot is
+not traced yet: it runs outside a traced copy scope, so traces under-report the
+source's durable boundary, which is conservative. Background
 refresh, maintenance/API flush, force merge, and their WAL truncation are not
 yet in the supported trace envelope because those tasks do not carry a stable
 copy identity into the engine/WAL callbacks. Enabling those maintenance paths
@@ -122,8 +125,9 @@ agreement with the sidecar. Missing and invented events both fail. Fixtures do
 not require a sidecar; every Rust fault-harness run does.
 
 The independent checker is an invariant oracle, not a complete
-protocol-conformance oracle. It checks acknowledged-write retention,
-authoritative-copy convergence, durable-fence acceptance, checkpoint
+protocol-conformance oracle. It checks acknowledged-write retention on every
+in-sync copy, including copies admitted by peer recovery, authoritative-copy
+convergence, durable-fence coverage of accepted terms, checkpoint
 consistency, transport acknowledgement prerequisites, and optional actual-state
 completeness. Protocol-order constraints such as activation sequencing,
 promotion NoOp fan-out completeness, replay lifecycle ordering, commit
