@@ -55,9 +55,12 @@ jobs:
       - name: Run tests
         run: cargo test
 
+      - name: Build D1 protocol trace harness
+        run: cargo test --features protocol-trace --test d1_protocol_trace --no-run
+
       - name: Validate seeded D1 protocol traces
         timeout-minutes: 5
-        run: ./scripts/tla/test_d1_protocol_trace.sh
+        run: ./scripts/tla/test_d1_protocol_trace_ci.sh
 
   tla-model-check:
     runs-on: ubuntu-latest

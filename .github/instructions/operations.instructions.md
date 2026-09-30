@@ -147,10 +147,13 @@ the same bounded job count and print their isolated logs in declaration order.
 overrides are available for diagnosis. Keep the bounded G1 empty-store and G2
 copy-failure/liveness checks, pending-marker restart regression, term-change
 liveness checks, and minimal two-shard isolation check in the fast matrix.
-The Rust `test` job also runs `scripts/tla/test_d1_protocol_trace.sh` after the
-ordinary test suite so it reuses Cargo artifacts. Keep that step capped at five
-minutes, its TLC runs at one worker and at most 2 GiB each, and its correct plus
-two mutation traces intact.
+The Rust `test` job builds the `protocol-trace` integration target without a
+tight timeout, then runs `scripts/tla/test_d1_protocol_trace_ci.sh` with a
+five-minute timeout. Keep compilation outside the timed validation step. The
+validation wrapper retains the scripted correct trace and two mutation traces,
+plus the fixed randomized seed set documented in `specs/tla/README.md`. Its TLC
+runs use one worker and at most 2 GiB each, with at most two trace validators in
+parallel.
 Keep corruption,
 open/fence/marker/apply persistent-I/O escalation, promote-only primary
 reporting, the apply-I/O no-escalation temporal regression, and the

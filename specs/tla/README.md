@@ -42,6 +42,7 @@ Validate one implementation trace or run the trace validator's self-tests:
 ./scripts/tla/validate_trace.sh path/to/d1-trace.jsonl
 ./scripts/tla/check_d1_trace_invariants.py path/to/d1-trace.jsonl
 ./scripts/tla/test_d1_protocol_trace.sh
+./scripts/tla/test_d1_protocol_trace_ci.sh
 ./scripts/tla/test_trace_validator.sh
 ./scripts/tla/check.sh trace-validator
 ./scripts/tla/check.sh trace-validator-round4
@@ -60,15 +61,52 @@ writes an isolated log, and the parent prints logs in declaration order after
 all children finish. The deliberate out-of-memory case keeps its 24 MiB heap.
 Set `TLA_TRACE_JOBS=1` to reproduce the sequential schedule.
 
-`test_d1_protocol_trace.sh` runs the seeded three-node in-process gRPC fault
+`test_d1_protocol_trace.sh` runs the scripted three-node in-process gRPC fault
 scenario behind the `protocol-trace` Cargo feature. It captures a correct
 schema-v4 trace plus the `arrival-order` and `seq-only-redelivery` mutations.
-The independent invariant checker and TLC must accept the correct trace and
-reject both mutations at the causal `operation_processed` event. Override
-`D1_TRACE_SEED` to reproduce another schedule. On September 29, 2026, seed
-`13754061` completed the full capture/checker/TLC matrix in 2m31.53s locally
-from an incrementally compiled worktree; a warm rerun completed in 59.17s.
-The correct 141-event trace took 4.27s in TLC.
+The independent invariant checker and TLC accept the 158-event correct trace
+and reject the mutations at `operation_processed` steps 27 and 117.
+
+`test_d1_protocol_trace_ci.sh` adds randomized correct-code seeds
+`16,44,102,149,160`. The fixed set spans 20 to 60 document operations, 277 to
+737 trace events, request delay and drop variation, replica restart with WAL
+replay, primary failover with NoOp gap fill, exact replica removal, and peer
+recovery. CI builds the integration target in a separate untimed step; only the
+capture and validation wrapper has the five-minute timeout. On September 30,
+2026, the separate build took 1m43.13s and the validation wrapper completed in
+1m25.85s with 695,160 KB peak RSS under `taskset -c 0-3` on the development
+host.
+
+Run the full deterministic sweep manually:
+
+```bash
+CARGO_TARGET_DIR=target/protocol-trace \
+python3 scripts/tla/sweep_d1_protocol_trace.py \
+  --mode correct \
+  --seeds 1..=200 \
+  --output-dir target/d1-trace-sweep/correct \
+  --jobs 2 \
+  --tla-timeout 300 \
+  --tla-heap 2g
+
+for mode in arrival-order seq-only-redelivery; do
+  CARGO_TARGET_DIR=target/protocol-trace \
+  python3 scripts/tla/sweep_d1_protocol_trace.py \
+    --mode "$mode" \
+    --seeds 1..=50 \
+    --output-dir "target/d1-trace-sweep/$mode" \
+    --jobs 2 \
+    --tla-timeout 300 \
+    --tla-heap 2g
+done
+```
+
+On September 30, 2026, all 200 correct-code seeds passed. The independent
+checker took 0.11s p50 and 0.36s maximum; TLC took 12.125s p50 and 26.08s
+maximum. Both checkers detected all 50 arrival-order and all 50
+sequence-only-redelivery mutations. These are development-host validation
+times from two concurrent one-worker TLC processes with 2 GiB heaps, not
+performance benchmarks.
 
 Use an existing verified jar or retain raw logs:
 
