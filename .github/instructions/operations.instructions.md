@@ -151,7 +151,8 @@ The Rust `test` job builds the `protocol-trace` integration target without a
 tight timeout, then runs `scripts/tla/test_d1_protocol_trace_ci.sh` with a
 five-minute timeout. Keep compilation outside the timed validation step. The
 validation wrapper retains the scripted correct trace and two mutation traces,
-plus the fixed randomized seed set documented in `specs/tla/README.md`. Its TLC
+the conditional/mixed-bulk trace with pre-WAL rejections, and the fixed
+randomized seed set documented in `specs/tla/README.md`. Its TLC
 runs use one worker and at most 2 GiB each, with at most two trace validators in
 parallel.
 Keep corruption,

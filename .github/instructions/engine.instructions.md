@@ -23,6 +23,7 @@ pub trait SearchEngine: Send + Sync {
     fn apply_replica_operation(&self, op: SequencedOperation) -> Result<ReplicaApplyReceipt>;
     fn apply_replica_batch(&self, ops: Vec<SequencedOperation>) -> Result<ReplicaBulkApplyReceipt>;
     fn get_document(&self, doc_id: &str) -> Result<Option<Value>>;
+    fn get_document_with_metadata(&self, doc_id: &str, realtime: bool) -> Result<Option<DocumentRead>>;
 
     // Engine lifecycle
     fn refresh(&self) -> Result<()>;
@@ -70,6 +71,17 @@ pub trait SearchEngine: Send + Sync {
   frame no larger than `MAX_WAL_FRAME_BYTES` (32 MiB including the frame
   header). Reject larger operations as validation errors before WAL or engine
   mutation; validate every item before writing any bulk bytes.
+- Conditional primary methods compare live/committed document versions under
+  the translog mutex, before sequence assignment or append. Conflicts return
+  `VersionConflictError` with no WAL or sequence effect. Create checks presence;
+  delete receipts distinguish absent documents but still assign a sequence.
+  `IndexWriteReceipt.created` and bulk `created` flags come from this same
+  critical section, in request order.
+- Keep `get_document()` searcher-only for existing internal consumers.
+  REST/OCC uses `get_document_with_metadata()`: realtime checks the live map,
+  resolves full source at its physical WAL cursor, and returns real identity.
+  Tombstones return missing. Reader fallback must cover the live version.
+  Hold the translog mutex so flush cannot prune between lookup and read.
 
 ## CompositeEngine (src/engine/composite.rs)
 ```rust
@@ -245,6 +257,12 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
 - A persisted committed checkpoint and any WAL truncation must be derived from
   a successful Tantivy commit boundary. Never advance or prune past operations
   that the corresponding commit did not make durable.
+- Live index versions carry WAL cursors for primary, replica, recovery, and
+  replay applies. Append batches obtain positions from frame headers; replay
+  carries each cursor from `for_each_from_at()`, including physical gaps
+  caused by committed-entry skips. Do not locate replay positions by repeated
+  sequence scans. Flush reloads the reader under the translog mutex before
+  pruning; refresh clears old map entries only after reader publication.
 - Snapshot hashes run after lock release. Unlocked byte-copy fallback is
   forbidden when hard links are unavailable.
 - `StartPeerRecovery` snapshot preparation runs in a detached, cancellation-safe

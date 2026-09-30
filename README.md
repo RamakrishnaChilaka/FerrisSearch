@@ -269,6 +269,8 @@ coordinator-side merge semantics are required.
 - Generation-based binary translog with request or asynchronous durability
 - Primary write receipts propagated to REST `_seq_no` responses, including bulk
   ranges and `_primary_term`, with replica WAL operation identity preservation
+- Realtime document GET, primary-side conditional index/delete and create,
+  and conflict-checked partial updates
 - Gap-aware processed and persisted checkpoints, with explicit `None` distinct
   from sequence zero and persisted-prefix global checkpoint calculation
 - Bounded file-based peer recovery for initial, later-added, and rejoining replicas:
@@ -450,11 +452,15 @@ production ready**. The most important limits are:
 - At the `8f17172` main baseline, startup replay resurrected acknowledged
   deletes and one transient Tantivy commit failure could lose later
   acknowledged writes. Both defects are fixed on this branch.
-- `_seq_no` and `_primary_term` report the primary-assigned operation identity,
-  while `_version` remains a placeholder. Internal replica redelivery is
-  sequence/term aware, but client retry tokens, `if_seq_no` /
-  `if_primary_term`, and complete optimistic concurrency control are still
-  missing.
+- For `local_shards`, GET by ID is realtime by default; `realtime=false`
+  reads the last refreshed searcher. `_update` reads the primary's latest
+  source and uses a conditional write, so concurrent changes either apply
+  or return 409. `retry_on_conflict` defaults to 0; `detect_noop` defaults
+  to true. Upsert is create-only, and scripts are rejected.
+- Index/delete support paired `if_seq_no`/`if_primary_term`; create is
+  available through `op_type=create` and `PUT`/`POST /{index}/_create/{id}`.
+  Single and bulk writes return real sequence/term identities and omit
+  `_version`. Client retry tokens and external versioning remain missing.
 - Replica bootstrap uses file snapshot plus physical-order WAL streaming, but
   source sessions and retention pins remain process-local and general D10
   rollback/resync is not implemented.
@@ -479,7 +485,7 @@ FerrisSearch intentionally exposes an OpenSearch-style REST API **subset**.
 | Area | Representative endpoints |
 |---|---|
 | Index | `PUT /{index}`, `DELETE /{index}`, `GET/PUT /{index}/_settings` |
-| Documents | `POST/PUT /{index}/_doc`, `GET/DELETE /{index}/_doc/{id}`, `POST /{index}/_update/{id}` |
+| Documents | `POST /{index}/_doc`, `POST/PUT /{index}/_doc/{id}`, `GET/DELETE /{index}/_doc/{id}`, `POST /{index}/_update/{id}`, `POST/PUT /{index}/_create/{id}` |
 | Bulk | `POST /_bulk`, `POST /{index}/_bulk` |
 | Search | `GET/POST /{index}/_search`, `GET/POST /{index}/_count` |
 | SQL | `POST /{index}/_sql`, `/_sql`, `/{index}/_sql/stream`, `/_sql/stream`, `/{index}/_sql/explain` |

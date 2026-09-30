@@ -191,6 +191,7 @@ values return `400 illegal_argument_exception` without enqueueing work.
 | GET | `/{index}/_doc/{id}` | `get_document()` |
 | DELETE | `/{index}/_doc/{id}` | `delete_document()` |
 | POST | `/{index}/_update/{id}` | `update_document()` — partial merge |
+| PUT/POST | `/{index}/_create/{id}` | `create_document()` — create-only write |
 | POST | `/_bulk` | `bulk_index_global()` |
 | POST | `/{index}/_bulk` | `bulk_index()` |
 
@@ -213,11 +214,23 @@ Only `RESOURCE_EXHAUSTED` statuses carrying the stable version-map-capacity
 marker map to HTTP 429 `version_map_capacity_exceeded`; unrelated resource
 exhaustion remains a 500 forwarding failure.
 
-This does not implement full OpenSearch write concurrency semantics.
-`_seq_no` and `_primary_term` are real primary-assigned operation receipts.
-`_version` remains a placeholder, and `if_seq_no` / `if_primary_term`, client
-retry identity, and complete optimistic concurrency control are not yet
-implemented.
+GET is realtime by default; `realtime=false` reads the refreshed reader.
+Found responses carry the document's `_seq_no` and `_primary_term`.
+Index/delete accept paired `if_seq_no`/`if_primary_term`; specifying only one
+is a 400. `op_type=create` and the `_create` route are create-only.
+Primary `ALREADY_EXISTS` maps to 409 `version_conflict_engine_exception`
+without hiding its OpenSearch-style reason. No conflict allocates a sequence
+or appends a WAL entry.
+
+`execute_update()` is shared by single and bulk update. It reads realtime
+from the primary and conditionally indexes a recursive merge. Retry only
+version conflicts, up to `retry_on_conflict` (default 0). Missing documents
+use a create-only upsert or return `document_missing_exception`.
+`detect_noop` defaults to true and consumes no sequence. Accept only `doc`,
+`upsert`, `doc_as_upsert`, and `detect_noop` body keys; unknown keys are
+400 `illegal_argument_exception`, not document-source mapper errors.
+Write responses omit `_version`. Client retry identity, external versions,
+and D13 rejection of other ignored query parameters remain unimplemented.
 
 Declared keyword fields accept nested arrays of string/number/boolean scalars,
 flatten and coerce them to text for indexing, ignore nulls, and deduplicate a
@@ -329,16 +342,29 @@ Both `refresh_index()` and `flush_index()` fan out to ALL nodes via `fan_out_mai
 pub struct RefreshParam { pub refresh: Option<String> }
 // ?refresh=true or ?refresh (empty) → forces refresh after write
 ```
-Used by: index, update, delete, bulk endpoints.
+`WriteParams` owns single-write conditions and refresh; `UpdateParams` adds
+retry count; `GetParams` owns realtime selection. `RefreshParam` is used by
+bulk and maintenance paths. All-copy refresh and `refresh=wait_for` remain
+proposed; do not claim them from coordinator-local refresh dispatch.
 Post-write refresh waits use Tokio's blocking pool; the document and replica
 write itself remains on the dedicated write pool.
 
 ## Bulk Index Parsing
-`parse_bulk_ndjson(text)` supports:
-- **OpenSearch format**: action line `{"index": {"_index": "idx", "_id": "1"}}` + document line
-- **Missing IDs**: UUID auto-generated
-- Document bodies are stored as supplied. Do not infer IDs from `_id` /
-  `_doc_id` source fields or unwrap a source-level `_source` object.
+`parse_bulk_ndjson(text)` returns a result and validates the entire action
+structure before any write. Each action line has exactly one supported key
+(`index`, `create`, `update`, `delete`) with object metadata. Malformed
+actions or missing sources reject the request with a line-numbered
+400 `illegal_argument_exception`. Delete consumes no source; other actions
+consume one. Invalid JSON sources are per-item mapper errors, never dropped.
+Only index/create auto-generate missing IDs.
+
+Preserve request order per shard, including duplicate IDs and update barriers.
+Updates use `execute_update`; other consecutive actions use the typed shard
+bulk RPC. Finalize results by position, not ID. Key each item by its action;
+`errors` depends only on `error` objects, not delete's 404 status. Honor and
+authorize action `_index` overrides on both bulk routes. Keep empty requests
+as no-write successes without auto-creating an index. Parsing is still
+materialized, not FS-014 streaming.
 
 ## Auto-Create Index (Coordinator Pattern)
 Document and bulk handlers auto-create missing indices via `auto_create_index()`. This helper:

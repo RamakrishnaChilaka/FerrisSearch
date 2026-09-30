@@ -231,6 +231,22 @@ cargo test -- test_name                         # Single test by name
   not cite it as a two-shard WAL, replication, or recovery proof.
 
 ## Unit Test Conventions
+- Write regressions must prove realtime/non-realtime visibility, delete
+  tombstones, WAL-truncated reader fallback, and replayed identities.
+  Check exact-one-winner CAS and unchanged WAL size/allocator on conflicts.
+  Concurrent updates must correlate each acknowledgement with a unique field
+  present in the final source; 409 losers must have no write effect.
+  Mixed bulk coverage needs action boundaries, duplicate-ID order,
+  create/conditional conflicts, no-op/upsert, malformed-action whole-request
+  rejection, source-error item retention, and delete 404 without `errors=true`.
+  Transport coverage must compare primary/replica sources, sequences, and WAL
+  histories after conditional and mixed CRUD.
+- D1 conditional traces emit `failure_stage: "version_conflict"` only before
+  primary WAL/sequence assignment. The owning `PrimaryVersionConflict` action
+  preserves document, WAL, checkpoint, and allocator state. The converter
+  rejects that stage after a primary WAL event. Capture all final copy
+  snapshots before emitting their observations so later commits cannot
+  invalidate earlier final-state evidence.
 - Tests live in `#[cfg(test)] mod tests` at the bottom of each source file
 - Use `#[tokio::test]` for async tests
 - Use `tempfile::TempDir` for isolated data directories

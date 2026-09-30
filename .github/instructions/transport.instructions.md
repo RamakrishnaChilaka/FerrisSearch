@@ -75,8 +75,10 @@ RaftSnapshot(RaftRequest) → RaftReply
 `ShardBulkResponse.start_seq_no` are optional on the wire so sequence zero is
 distinct from missing metadata. A successful single/delete response must carry
 `seq_no` and `primary_term`; a successful non-empty bulk response must carry
-`start_seq_no` and `primary_term`, while
-an empty bulk must omit it. New clients fail closed on missing or inconsistent
+`start_seq_no` and `primary_term` for an index-only engine batch. Mixed bulk
+responses instead carry per-item receipts; conflicts have no receipt.
+Every successful item, including delete's `not_found`, carries sequence and
+term. An empty bulk omits its start. New clients fail closed on missing or inconsistent
 receipt metadata. FerrisSearch is pre-1.0: successful responses require these
 receipts, and metadata-free success responses from older peers fail. Do not add
 compatibility fallbacks or rollout machinery for this protocol change.
@@ -136,6 +138,20 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   cache; `create_transport_service_for_test()` supplies isolated defaults.
 
 ### Key Handler Patterns
+- Primary `ShardDocRequest`/`ShardDeleteRequest` carry optional paired
+  conditions; index also carries create-only intent. Evaluate inside the
+  engine's translog critical section before assignment/append.
+  `VersionConflictError` is `ALREADY_EXISTS`, not a copy-I/O failure.
+  Replication requests never carry or evaluate these conditions.
+- `ShardGetRequest.realtime` defaults to true; found responses require sequence
+  and term. Use `get_document_with_metadata`, not the searcher-only convenience
+  getter. A malformed found receipt fails decoding.
+- `ShardBulkRequest.operations` is either empty for an unconditional index
+  batch or matches `documents_json` one-for-one. Reject invalid kinds/counts
+  before mutation. Preserve item order. Index-only runs keep engine batching;
+  mixed/conditional runs await single-write handlers sequentially and return
+  per-item status/result/error/receipt. Never infer mixed-item sequences from
+  a common range.
 - **join_cluster**: If leader → serialize concurrent joins, validate `node_id` / `raft_node_id`, register the transport address with `add_learner()` for non-voters, apply `AddNode`, then recompute the latest full voter set before `change_membership()`. If promotion fails, roll back the `AddNode`. If follower → **forwards to leader** via gRPC. NEVER mutate cluster state locally on a follower.
 - **publish_state**: Returns `UNIMPLEMENTED`. Cluster state is exclusively managed via Raft consensus; the legacy gossip-based state broadcast path has been removed.
 - **ping**: Returns `NOT_FOUND` when `source_node_id` is absent from cluster state. A successful ping means the target still recognizes the caller as a registered cluster node and has refreshed `last_seen`; a rejected ping is the follower's signal to re-run `JoinCluster`.
@@ -239,7 +255,12 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - **join_cluster MUST forward on followers**: A follower receiving a JoinCluster RPC must forward it to the Raft leader. It must NEVER fall through to `cluster_manager.add_node()` when Raft is active, as this would add the node to local state without Raft membership.
 - **ping MUST reject unknown nodes**: `Ping` is not just a transport liveness check. If `source_node_id` is absent from cluster state, return `NOT_FOUND` instead of silently succeeding, or removed/stale nodes will keep serving an old cluster view forever and never trigger `JoinCluster` recovery.
 - **Join identity MUST be unique and stable**: `raft_node_id` cannot be reused by a different logical node, and an existing `node_id` cannot silently switch to a different `raft_node_id`. Reject the join instead of mutating membership.
-- **Shard writes MUST fail on replication failure**: The `index_doc`, `bulk_index`, and `delete_doc` handlers must return `success: false` when `replicate_write()` / `replicate_bulk()` returns `Err`. Logging the error and returning `success: true` violates the synchronous replication contract.
+- **Shard writes MUST fail on replication failure**: single writes and
+  index-only bulk batches return `success: false` on replication failure.
+  Mixed bulk RPCs return a per-item 5xx error for each failed mutation; an RPC
+  envelope may succeed only with those failures preserved in its results.
+  Never acknowledge a failed item or ignore its error because the envelope
+  succeeded.
 - **Replica apply MUST preserve primary seq_nos**: `replicate_doc` and
   `replicate_bulk` must call the explicit-seq engine methods. Do not route
   replicated writes through local seq allocation APIs.
@@ -302,9 +323,10 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   single/delete responses without `seq_no`. A single index response must match
   a non-empty requested document ID exactly; an empty requested ID permits a
   server-generated ID, but a successful response ID must never be empty.
-  Clients must also reject non-empty bulk responses without a contiguous
-  `start_seq_no`, empty bulks with a start, and bulk responses whose document
-  IDs differ in length or order from the request.
+  Index-only receipt clients reject non-empty batches without a contiguous
+  start, empty batches with a start, and mismatched document IDs. Mixed-bulk
+  clients require one ordered result per input and real item-local receipts;
+  they do not require a common starting sequence.
 - **Write-side shard reopen MUST validate metadata**: `get_or_open_shard()` must return `NOT_FOUND` when the index or shard is absent from cluster state. It must NEVER create a shard with empty mappings/default settings on write or replication paths.
 - **Shard reopen on gRPC paths MUST be async-safe**: `get_or_open_shard()` / `get_or_open_search_shard()` are async helpers and must use `open_shard_with_settings_blocking()` so shard recovery/open does not block tonic's async tasks. Likewise, leader-side delete cleanup must use `close_index_shards_blocking_with_reason()`.
 - **Read-side shard reopen MUST fail closed on UUID mismatch**: `get_or_open_search_shard()` must reject empty UUIDs and missing expected UUID directories instead of creating a fresh shard on a read path.
@@ -368,6 +390,8 @@ Successful forwarding returns the primary-assigned write identity:
 `_primary_term`, and
 `forward_bulk_to_shard()` returns a typed `BulkWriteReceipt`. Do not reconstruct
 these values from a later checkpoint.
+`forward_bulk_operations_to_shard()` validates per-item identities, operation
+results, and receipts. Delete's 404 has no error and is not a shard failure.
 
 ### Critical Invariant: Remote Search Decode Must Not Drop Data
 - `forward_search_to_shard()` and `forward_search_dsl_to_shard()` must fail if a remote hit payload cannot be decoded.
