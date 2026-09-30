@@ -1652,9 +1652,13 @@ impl HotEngine {
         };
         let appended = wal_disposition == WalDisposition::Append && !wal_entries.is_empty();
         let start_cursor = match wal_disposition {
-            WalDisposition::Append if appended => {
-                Some(translog.recovery_read_snapshot()?.end_cursor())
-            }
+            WalDisposition::Append if appended => match translog.recovery_read_snapshot() {
+                Ok(snapshot) => Some(snapshot.end_cursor()),
+                Err(error) => {
+                    state.restore_planning_snapshot(planning_snapshot);
+                    return Err(error);
+                }
+            },
             WalDisposition::AlreadyInLocalWal { start_cursor, .. } => start_cursor,
             _ => None,
         };
@@ -2347,6 +2351,14 @@ impl HotEngine {
         context: &str,
     ) -> Result<u64> {
         let committed = self.load_committed_boundary()?;
+        // Publish the committed state to the reader before clearing the live
+        // version map. Otherwise a realtime GET or primary condition that
+        // misses the map falls back to an older reader. Some paths commit
+        // without reloading, such as the peer-recovery snapshot, and rely on
+        // the delayed commit watcher.
+        self.reader
+            .reload()
+            .with_context(|| format!("reader reload failed before {context} replay"))?;
         self.reset_apply_state_to_commit(committed.clone())?;
         #[cfg(feature = "protocol-trace")]
         let trace_copy = crate::protocol_trace::current_open_copy();

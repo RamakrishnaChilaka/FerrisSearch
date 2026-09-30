@@ -429,3 +429,72 @@ fn writes_regression_wal_positions_cross_buffer_boundaries() {
         }
     }
 }
+
+#[test]
+fn writes_regression_reactivation_after_unpublished_commit_keeps_realtime_occ() {
+    // The unpublished commit races Tantivy's commit watcher, which can reload
+    // the reader first. Repeat the schedule so the stale-reader window is hit
+    // on every run of the unfixed code.
+    for attempt in 0..10 {
+        reactivation_after_unpublished_commit_keeps_realtime_occ(attempt);
+    }
+}
+
+fn reactivation_after_unpublished_commit_keeps_realtime_occ(attempt: usize) {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(&directory.path().join("shard"));
+    let first = engine
+        .add_document_with_receipt("doc", json!({"v": 1}))
+        .unwrap();
+    engine.refresh().unwrap();
+    let second = engine
+        .add_document_with_receipt("doc", json!({"v": 2}))
+        .unwrap();
+    engine
+        .add_document_with_receipt("fresh", json!({"n": 1}))
+        .unwrap();
+    // A peer-recovery source snapshot commits both writes without publishing a reader.
+    drop(
+        engine
+            .prepare_peer_recovery_snapshot(&directory.path().join("snapshot"))
+            .unwrap(),
+    );
+    // A settlement term bump re-activates this engine; the rebuild resets the live map.
+    let term = second.primary_term + 1;
+    assert!(engine.prepare_primary_activation(term).unwrap().is_empty());
+
+    let current = engine
+        .get_document_with_metadata("doc", true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.source, json!({"v": 2}), "attempt {attempt}");
+    assert_eq!(
+        (current.seq_no, current.primary_term),
+        (second.seq_no, second.primary_term)
+    );
+    assert!(
+        engine
+            .get_document_with_metadata("fresh", true)
+            .unwrap()
+            .is_some()
+    );
+    let stale_cas = engine
+        .add_document_with_condition_at_term(
+            "doc",
+            json!({"v": 1, "lost_v2": true}),
+            term,
+            WriteCondition::IfMatch {
+                seq_no: first.seq_no,
+                primary_term: first.primary_term,
+            },
+        )
+        .unwrap_err();
+    assert!(stale_cas.is::<VersionConflictError>(), "{stale_cas:#}");
+    let duplicate_create = engine
+        .add_document_with_condition_at_term("fresh", json!({"n": 0}), term, WriteCondition::Create)
+        .unwrap_err();
+    assert!(
+        duplicate_create.is::<VersionConflictError>(),
+        "{duplicate_create:#}"
+    );
+}
