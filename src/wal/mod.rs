@@ -138,18 +138,40 @@ pub struct SequencedWalEntry {
     pub payload: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum WalDocumentOperation<'a> {
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(untagged)]
+pub enum WalDocumentOperation<'a> {
     Index {
+        #[serde(rename = "_doc_id")]
         doc_id: &'a str,
+        #[serde(rename = "_source")]
         source: &'a serde_json::Value,
     },
     Delete {
+        #[serde(rename = "_doc_id")]
         doc_id: &'a str,
     },
     NoOp {
+        #[serde(rename = "_reason")]
         reason: &'a str,
     },
+}
+
+impl WalDocumentOperation<'_> {
+    fn op(self) -> WalOperation {
+        match self {
+            Self::Index { .. } => WalOperation::Index,
+            Self::Delete { .. } => WalOperation::Delete,
+            Self::NoOp { .. } => WalOperation::NoOp,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BorrowedSequencedWalEntry<'a> {
+    pub seq_no: u64,
+    pub primary_term: u64,
+    pub operation: WalDocumentOperation<'a>,
 }
 
 pub(crate) fn document_operation(entry: &TranslogEntry) -> Result<WalDocumentOperation<'_>> {
@@ -315,6 +337,15 @@ struct WireEntryV2 {
     payload_json: String,
 }
 
+#[derive(Serialize)]
+struct WireEntryRef<'a> {
+    format_version: u32,
+    seq_no: u64,
+    primary_term: u64,
+    op: &'static str,
+    payload_json: &'a str,
+}
+
 impl WireEntryV2 {
     #[cfg(test)]
     fn from_translog(entry: &TranslogEntry) -> Result<Self> {
@@ -368,21 +399,31 @@ fn validate_entry_identity(
     op: WalOperation,
     payload: &serde_json::Value,
 ) -> Result<()> {
-    if primary_term == 0 {
-        anyhow::bail!("WAL primary term must be greater than zero");
-    }
+    validate_primary_term(primary_term)?;
     if op == WalOperation::NoOp {
         let reason = payload
             .get("_reason")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("WAL no-op requires a _reason string"))?;
-        if reason.len() > MAX_NOOP_REASON_BYTES {
-            anyhow::bail!(
-                "WAL no-op reason is {} bytes, exceeding maximum {}",
-                reason.len(),
-                MAX_NOOP_REASON_BYTES
-            );
-        }
+        validate_noop_reason(reason)?;
+    }
+    Ok(())
+}
+
+fn validate_primary_term(primary_term: u64) -> Result<()> {
+    if primary_term == 0 {
+        anyhow::bail!("WAL primary term must be greater than zero");
+    }
+    Ok(())
+}
+
+fn validate_noop_reason(reason: &str) -> Result<()> {
+    if reason.len() > MAX_NOOP_REASON_BYTES {
+        anyhow::bail!(
+            "WAL no-op reason is {} bytes, exceeding maximum {}",
+            reason.len(),
+            MAX_NOOP_REASON_BYTES
+        );
     }
     Ok(())
 }
@@ -443,6 +484,26 @@ pub trait WriteAheadLog: Send + Sync {
 
     /// Append arbitrary caller-assigned operations in physical input order.
     fn append_batch_with_seq(&self, entries: &[SequencedWalEntry]) -> Result<Vec<TranslogEntry>>;
+
+    /// Append a borrowed document envelope and return only its assigned sequence.
+    fn write_document_with_receipt(
+        &self,
+        primary_term: u64,
+        operation: WalDocumentOperation<'_>,
+    ) -> Result<u64>;
+
+    /// Append borrowed document envelopes with one fsync and a contiguous receipt.
+    fn write_document_bulk_with_receipt(
+        &self,
+        primary_term: u64,
+        operations: &[WalDocumentOperation<'_>],
+    ) -> Result<Option<u64>>;
+
+    /// Append borrowed explicit-sequence envelopes without constructing return entries.
+    fn write_document_batch_with_seq(
+        &self,
+        entries: &[BorrowedSequencedWalEntry<'_>],
+    ) -> Result<()>;
 
     /// Read all pending entries (used for replay on startup).
     fn read_all(&self) -> Result<Vec<TranslogEntry>>;
@@ -528,17 +589,40 @@ fn encode_entry_borrowed(
     payload: &serde_json::Value,
 ) -> Result<Vec<u8>> {
     validate_entry_identity(primary_term, op, payload)?;
-    let wire = WireEntryV2 {
+    let payload_json = serde_json::to_string(payload)?;
+    encode_payload_json(seq_no, primary_term, op, &payload_json)
+}
+
+fn encode_document_entry(
+    seq_no: u64,
+    primary_term: u64,
+    operation: WalDocumentOperation<'_>,
+) -> Result<Vec<u8>> {
+    validate_primary_term(primary_term)?;
+    if let WalDocumentOperation::NoOp { reason } = operation {
+        validate_noop_reason(reason)?;
+    }
+    let payload_json = serde_json::to_string(&operation)?;
+    encode_payload_json(seq_no, primary_term, operation.op(), &payload_json)
+}
+
+fn encode_payload_json(
+    seq_no: u64,
+    primary_term: u64,
+    op: WalOperation,
+    payload_json: &str,
+) -> Result<Vec<u8>> {
+    let wire = WireEntryRef {
         format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
         seq_no,
         primary_term,
-        op: op.as_str().to_string(),
-        payload_json: serde_json::to_string(payload)?,
+        op: op.as_str(),
+        payload_json,
     };
     encode_wire_entry(&wire)
 }
 
-fn encode_wire_entry(wire: &WireEntryV2) -> Result<Vec<u8>> {
+fn encode_wire_entry(wire: &impl Serialize) -> Result<Vec<u8>> {
     let encoded = bincode_next::serde::encode_to_vec(wire, BINCODE_CONFIG)?;
     let frame_bytes = checked_frame_bytes(encoded.len(), MAX_WAL_FRAME_BYTES)?;
     let len = u32::try_from(encoded.len())
@@ -1398,6 +1482,97 @@ impl HotTranslog {
         Err(std::io::Error::from_raw_os_error(*raw_os_error).into())
     }
 
+    fn write_primary_single_by(
+        &self,
+        encode_frame: impl FnOnce(u64) -> Result<Vec<u8>>,
+    ) -> Result<u64> {
+        #[cfg(test)]
+        self.maybe_fail_write_for_test()?;
+        let mut state = recover_lock(&self.state, "state");
+        let generation_index = state.active_generation_index()?;
+        let seq_no = state.next_seq_no;
+        let next_seq_no = seq_no
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("WAL sequence space exhausted"))?;
+        let frame = encode_frame(seq_no)?;
+        #[cfg(test)]
+        if let Some(barrier) =
+            recover_lock(self.append_frame_barrier.as_ref(), "append frame barrier").take()
+        {
+            let split = frame.len().min(20);
+            state.active_file.write_all(&frame[..split])?;
+            state.active_file.flush()?;
+            barrier.wait();
+            barrier.wait();
+            state.active_file.write_all(&frame[split..])?;
+        } else {
+            state.active_file.write_all(&frame)?;
+        }
+        #[cfg(not(test))]
+        state.active_file.write_all(&frame)?;
+        if matches!(self.durability, TranslogDurability::Request) {
+            state.active_file.sync_data()?;
+        }
+        let generation = &mut state.generations[generation_index];
+        generation.observe_seq(seq_no);
+        generation.size_bytes += frame.len() as u64;
+        state.next_seq_no = next_seq_no;
+        Ok(seq_no)
+    }
+
+    fn write_primary_bulk_by(
+        &self,
+        count: usize,
+        mut encode_frame: impl FnMut(u64, usize) -> Result<Vec<u8>>,
+    ) -> Result<Option<u64>> {
+        if count == 0 {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        self.maybe_fail_write_for_test()?;
+        let mut state = recover_lock(&self.state, "state");
+        let generation_index = state.active_generation_index()?;
+        let start_seq_no = state.next_seq_no;
+        let next_seq_no = start_seq_no
+            .checked_add(count as u64)
+            .ok_or_else(|| anyhow::anyhow!("WAL sequence space exhausted"))?;
+        let mut buf = Vec::with_capacity(count * 200);
+        for offset in 0..count {
+            buf.extend_from_slice(&encode_frame(start_seq_no + offset as u64, offset)?);
+        }
+        state.active_file.write_all(&buf)?;
+        if matches!(self.durability, TranslogDurability::Request) {
+            state.active_file.sync_data()?;
+        }
+        let generation = &mut state.generations[generation_index];
+        generation.observe_seq(start_seq_no);
+        generation.observe_seq(next_seq_no - 1);
+        generation.size_bytes += buf.len() as u64;
+        state.next_seq_no = next_seq_no;
+        Ok(Some(start_seq_no))
+    }
+
+    fn write_encoded_batch_with_seq(
+        &self,
+        encoded: &[u8],
+        seq_nos: impl IntoIterator<Item = u64>,
+        max_next_seq_no: u64,
+    ) -> Result<()> {
+        let mut state = recover_lock(&self.state, "state");
+        let generation_index = state.active_generation_index()?;
+        state.active_file.write_all(encoded)?;
+        if matches!(self.durability, TranslogDurability::Request) {
+            state.active_file.sync_data()?;
+        }
+        let generation = &mut state.generations[generation_index];
+        for seq_no in seq_nos {
+            generation.observe_seq(seq_no);
+        }
+        generation.size_bytes += encoded.len() as u64;
+        state.next_seq_no = state.next_seq_no.max(max_next_seq_no);
+        Ok(())
+    }
+
     /// Get the current (next) sequence number without incrementing.
     pub fn current_seq_no(&self) -> u64 {
         recover_lock(&self.state, "state").next_seq_no
@@ -1902,39 +2077,9 @@ impl WriteAheadLog for HotTranslog {
         op: WalOperation,
         payload: serde_json::Value,
     ) -> Result<TranslogEntry> {
-        #[cfg(test)]
-        self.maybe_fail_write_for_test()?;
-        let mut state = recover_lock(&self.state, "state");
-        let generation_index = state.active_generation_index()?;
-        let seq_no = state.next_seq_no;
-        let next_seq_no = seq_no
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("WAL sequence space exhausted"))?;
-        let frame = encode_entry_borrowed(seq_no, primary_term, op, &payload)?;
-        #[cfg(test)]
-        if let Some(barrier) =
-            recover_lock(self.append_frame_barrier.as_ref(), "append frame barrier").take()
-        {
-            let split = frame.len().min(20);
-            state.active_file.write_all(&frame[..split])?;
-            state.active_file.flush()?;
-            barrier.wait();
-            barrier.wait();
-            state.active_file.write_all(&frame[split..])?;
-        } else {
-            state.active_file.write_all(&frame)?;
-        }
-
-        #[cfg(not(test))]
-        state.active_file.write_all(&frame)?;
-        if matches!(self.durability, TranslogDurability::Request) {
-            state.active_file.sync_data()?;
-        }
-        let generation = &mut state.generations[generation_index];
-        generation.observe_seq(seq_no);
-        generation.size_bytes += frame.len() as u64;
-        state.next_seq_no = next_seq_no;
-
+        let seq_no = self.write_primary_single_by(|seq_no| {
+            encode_entry_borrowed(seq_no, primary_term, op, &payload)
+        })?;
         let entry = TranslogEntry {
             seq_no,
             primary_term,
@@ -2032,39 +2177,10 @@ impl WriteAheadLog for HotTranslog {
         primary_term: u64,
         ops: &[(WalOperation, serde_json::Value)],
     ) -> Result<Option<u64>> {
-        if ops.is_empty() {
-            return Ok(None);
-        }
-        #[cfg(test)]
-        self.maybe_fail_write_for_test()?;
-        let mut state = recover_lock(&self.state, "state");
-        let generation_index = state.active_generation_index()?;
-        let start_seq_no = state.next_seq_no;
-        let next_seq_no = start_seq_no
-            .checked_add(ops.len() as u64)
-            .ok_or_else(|| anyhow::anyhow!("WAL sequence space exhausted"))?;
-        let mut buf = Vec::with_capacity(ops.len() * 200);
-        let mut last_seq_no = None;
-
-        for (offset, (op, payload)) in ops.iter().enumerate() {
-            let seq_no = start_seq_no + offset as u64;
-            buf.extend_from_slice(&encode_entry_borrowed(seq_no, primary_term, *op, payload)?);
-            last_seq_no = Some(seq_no);
-        }
-
-        state.active_file.write_all(&buf)?;
-        if matches!(self.durability, TranslogDurability::Request) {
-            state.active_file.sync_data()?;
-        }
-        if let Some(last_seq_no) = last_seq_no {
-            let generation = &mut state.generations[generation_index];
-            generation.observe_seq(start_seq_no);
-            generation.observe_seq(last_seq_no);
-            generation.size_bytes += buf.len() as u64;
-            state.next_seq_no = next_seq_no;
-        }
-
-        Ok(Some(start_seq_no))
+        self.write_primary_bulk_by(ops.len(), |seq_no, offset| {
+            let (op, payload) = &ops[offset];
+            encode_entry_borrowed(seq_no, primary_term, *op, payload)
+        })
     }
 
     fn write_bulk_with_start_seq(
@@ -2127,18 +2243,11 @@ impl WriteAheadLog for HotTranslog {
             )?);
         }
 
-        let mut state = recover_lock(&self.state, "state");
-        let generation_index = state.active_generation_index()?;
-        state.active_file.write_all(&encoded)?;
-        if matches!(self.durability, TranslogDurability::Request) {
-            state.active_file.sync_data()?;
-        }
-        let generation = &mut state.generations[generation_index];
-        for entry in entries {
-            generation.observe_seq(entry.seq_no);
-        }
-        generation.size_bytes += encoded.len() as u64;
-        state.next_seq_no = state.next_seq_no.max(max_next_seq_no);
+        self.write_encoded_batch_with_seq(
+            &encoded,
+            entries.iter().map(|entry| entry.seq_no),
+            max_next_seq_no,
+        )?;
 
         Ok(entries
             .iter()
@@ -2149,6 +2258,56 @@ impl WriteAheadLog for HotTranslog {
                 payload: entry.payload.clone(),
             })
             .collect())
+    }
+
+    fn write_document_with_receipt(
+        &self,
+        primary_term: u64,
+        operation: WalDocumentOperation<'_>,
+    ) -> Result<u64> {
+        self.write_primary_single_by(|seq_no| {
+            encode_document_entry(seq_no, primary_term, operation)
+        })
+    }
+
+    fn write_document_bulk_with_receipt(
+        &self,
+        primary_term: u64,
+        operations: &[WalDocumentOperation<'_>],
+    ) -> Result<Option<u64>> {
+        self.write_primary_bulk_by(operations.len(), |seq_no, offset| {
+            encode_document_entry(seq_no, primary_term, operations[offset])
+        })
+    }
+
+    fn write_document_batch_with_seq(
+        &self,
+        entries: &[BorrowedSequencedWalEntry<'_>],
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        self.maybe_fail_write_for_test()?;
+        let mut encoded = Vec::with_capacity(entries.len() * 200);
+        let mut max_next_seq_no = 0u64;
+        for entry in entries {
+            let next_seq_no = entry
+                .seq_no
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("WAL sequence space exhausted"))?;
+            max_next_seq_no = max_next_seq_no.max(next_seq_no);
+            encoded.extend_from_slice(&encode_document_entry(
+                entry.seq_no,
+                entry.primary_term,
+                entry.operation,
+            )?);
+        }
+        self.write_encoded_batch_with_seq(
+            &encoded,
+            entries.iter().map(|entry| entry.seq_no),
+            max_next_seq_no,
+        )
     }
 
     fn read_all(&self) -> Result<Vec<TranslogEntry>> {
@@ -2451,6 +2610,187 @@ mod tests {
         4 + bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG)
             .unwrap()
             .len()
+    }
+
+    fn document_source_for_frame_len(seq_no: u64, target: usize) -> serde_json::Value {
+        let mut string_len = target.saturating_sub(128);
+        for _ in 0..8 {
+            let source = json!({"blob": "x".repeat(string_len)});
+            let payload_json = serde_json::to_string(&WalDocumentOperation::Index {
+                doc_id: "doc",
+                source: &source,
+            })
+            .unwrap();
+            let wire = WireEntryRef {
+                format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
+                seq_no,
+                primary_term: 1,
+                op: "index",
+                payload_json: &payload_json,
+            };
+            let actual = 4 + bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG)
+                .unwrap()
+                .len();
+            if actual == target {
+                return source;
+            }
+            if actual < target {
+                string_len += target - actual;
+            } else {
+                string_len -= actual - target;
+            }
+        }
+        panic!("could not construct a document WAL frame with exact length {target}");
+    }
+
+    #[test]
+    fn borrowed_document_encoder_matches_owned_frames_byte_for_byte() {
+        for source in [
+            json!({"nested": {"labels": ["a", "b"], "null": null}, "integer": u64::MAX}),
+            json!(null),
+            json!(["quoted \"", "slash \\", "newline \n"]),
+            json!(9_007_199_254_740_993u64),
+        ] {
+            let doc_id = "quoted\"id\\\n";
+            let operation = WalDocumentOperation::Index {
+                doc_id,
+                source: &source,
+            };
+            let owned = TranslogEntry {
+                seq_no: 258,
+                primary_term: 800,
+                op: WalOperation::Index,
+                payload: json!({"_doc_id": doc_id, "_source": source}),
+            };
+            assert_eq!(
+                encode_document_entry(258, 800, operation).unwrap(),
+                encode_entry(&owned).unwrap()
+            );
+        }
+        for (operation, op, payload) in [
+            (
+                WalDocumentOperation::Delete {
+                    doc_id: "quoted\"id",
+                },
+                WalOperation::Delete,
+                json!({"_doc_id": "quoted\"id"}),
+            ),
+            (
+                WalDocumentOperation::NoOp {
+                    reason: "gap \"fill\"",
+                },
+                WalOperation::NoOp,
+                json!({"_reason": "gap \"fill\""}),
+            ),
+        ] {
+            assert_eq!(
+                encode_document_entry(258, 800, operation).unwrap(),
+                encode_entry(&TranslogEntry {
+                    seq_no: 258,
+                    primary_term: 800,
+                    op,
+                    payload,
+                })
+                .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn borrowed_document_writes_preserve_identity_validation_and_overflow() {
+        let (_directory, wal) = open_translog();
+        let operation = WalDocumentOperation::Delete { doc_id: "doc" };
+        assert_eq!(wal.write_document_bulk_with_receipt(0, &[]).unwrap(), None);
+        wal.write_document_batch_with_seq(&[]).unwrap();
+        assert_eq!(
+            wal.write_document_with_receipt(0, operation)
+                .unwrap_err()
+                .to_string(),
+            "WAL primary term must be greater than zero"
+        );
+        let reason = "x".repeat(MAX_NOOP_REASON_BYTES + 1);
+        assert!(
+            wal.write_document_bulk_with_receipt(
+                1,
+                &[operation, WalDocumentOperation::NoOp { reason: &reason }],
+            )
+            .is_err()
+        );
+        assert_eq!(wal.next_seq_no(), 0);
+        assert_eq!(wal.size_bytes().unwrap(), 0);
+
+        recover_lock(&wal.state, "test").next_seq_no = u64::MAX;
+        assert!(wal.write_document_with_receipt(1, operation).is_err());
+        assert!(
+            wal.write_document_bulk_with_receipt(1, &[operation])
+                .is_err()
+        );
+        assert!(
+            wal.write_document_batch_with_seq(&[BorrowedSequencedWalEntry {
+                seq_no: u64::MAX,
+                primary_term: 1,
+                operation,
+            }])
+            .is_err()
+        );
+        assert_eq!(wal.size_bytes().unwrap(), 0);
+    }
+
+    #[test]
+    fn borrowed_document_frame_limit_is_exact_and_bulk_validation_is_atomic() {
+        let _guard = WAL_FRAME_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (_directory, wal) = open_translog();
+        let allowed = document_source_for_frame_len(0, TEST_MAX_WAL_FRAME_BYTES);
+        assert_eq!(
+            wal.write_document_with_receipt(
+                1,
+                WalDocumentOperation::Index {
+                    doc_id: "doc",
+                    source: &allowed,
+                },
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(wal.size_bytes().unwrap(), TEST_MAX_WAL_FRAME_BYTES as u64);
+        drop(allowed);
+        let oversized = document_source_for_frame_len(1, TEST_MAX_WAL_FRAME_BYTES + 1);
+        let operation = WalDocumentOperation::Index {
+            doc_id: "doc",
+            source: &oversized,
+        };
+        let error = wal.write_document_with_receipt(1, operation).unwrap_err();
+        assert!(error.is::<WalFrameTooLargeError>());
+        assert_eq!(wal.next_seq_no(), 1);
+        assert_eq!(wal.size_bytes().unwrap(), TEST_MAX_WAL_FRAME_BYTES as u64);
+
+        let (_directory, wal) = open_translog();
+        let valid = WalDocumentOperation::Delete { doc_id: "valid" };
+        assert!(
+            wal.write_document_bulk_with_receipt(1, &[valid, operation])
+                .unwrap_err()
+                .is::<WalFrameTooLargeError>()
+        );
+        assert!(
+            wal.write_document_batch_with_seq(&[
+                BorrowedSequencedWalEntry {
+                    seq_no: 0,
+                    primary_term: 1,
+                    operation: valid,
+                },
+                BorrowedSequencedWalEntry {
+                    seq_no: 1,
+                    primary_term: 1,
+                    operation,
+                },
+            ])
+            .unwrap_err()
+            .is::<WalFrameTooLargeError>()
+        );
+        assert_eq!(wal.next_seq_no(), 0);
+        assert_eq!(wal.size_bytes().unwrap(), 0);
     }
 
     fn payload_for_frame_len(seq_no: u64, op: WalOperation, target: usize) -> serde_json::Value {

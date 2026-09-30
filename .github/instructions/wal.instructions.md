@@ -33,6 +33,9 @@ pub trait WriteAheadLog: Send + Sync {
     fn write_bulk_with_receipt(&self, primary_term: u64, ops: &[(WalOperation, Value)]) -> Result<Option<u64>>;
     fn write_bulk_with_start_seq(&self, start_seq_no: u64, primary_term: u64, ops: &[(WalOperation, Value)]) -> Result<()>;
     fn append_batch_with_seq(&self, entries: &[SequencedWalEntry]) -> Result<Vec<TranslogEntry>>;
+    fn write_document_with_receipt(&self, primary_term: u64, operation: WalDocumentOperation<'_>) -> Result<u64>;
+    fn write_document_bulk_with_receipt(&self, primary_term: u64, operations: &[WalDocumentOperation<'_>]) -> Result<Option<u64>>;
+    fn write_document_batch_with_seq(&self, entries: &[BorrowedSequencedWalEntry<'_>]) -> Result<()>;
     fn read_all(&self) -> Result<Vec<TranslogEntry>>;
     fn find_entry(&self, seq_no: u64) -> Result<Option<TranslogEntry>>;
     fn read_from(&self, after_seq_no: u64) -> Result<Vec<TranslogEntry>>;  // replica recovery
@@ -85,6 +88,13 @@ pub trait WriteAheadLog: Send + Sync {
   advances the local allocator past it.
 - `append_batch_with_seq()` preserves arbitrary physical input order for live
   replica apply and peer recovery; do not sort it by sequence.
+- Receipt-only document writes serialize borrowed `WalDocumentOperation`
+  envelopes without constructing a deep JSON copy or unused return entries.
+  They share the existing append mutation logic, frame limits, sequence
+  overflow checks, fsync behavior, and test hooks. Borrowed and owned encoders
+  must produce byte-identical frames, including document-envelope key order.
+- `write_document_batch_with_seq()` preserves arbitrary physical input order
+  and explicit primary term/sequence identity, like `append_batch_with_seq()`.
 - `write_bulk_with_start_seq()` is only the contiguous explicit-sequence helper.
 - `read_from(seq_no)` is a test-only sequence filter, not a peer-recovery
   pagination cursor.
