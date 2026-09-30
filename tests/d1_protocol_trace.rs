@@ -1740,6 +1740,7 @@ async fn conditional_and_mixed_bulk_write_protocol_trace() -> Result<()> {
             if_seq_no: Some(0),
             if_primary_term: Some(1),
             create_only: false,
+            index_uuid: None,
         };
         let updated = client
             .index_doc(tonic::Request::new(conditional.clone()))

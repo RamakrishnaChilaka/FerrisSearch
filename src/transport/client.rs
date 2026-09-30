@@ -293,6 +293,7 @@ impl TransportClient {
             if_seq_no,
             if_primary_term,
             create_only: condition == crate::engine::WriteCondition::Create,
+            index_uuid: None,
         });
         let response = client.index_doc(request).await?.into_inner();
         decode_shard_doc_response(index_name, shard_id, doc_id, response)

@@ -112,6 +112,7 @@ message ShardDocRequest {
     optional uint64 if_seq_no = 5;
     optional uint64 if_primary_term = 6;
     bool create_only = 7;
+    optional string index_uuid = 8; // pins a read/CAS operation to one index incarnation
 }
 
 message ShardDocResponse {

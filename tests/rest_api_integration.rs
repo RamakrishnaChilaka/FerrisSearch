@@ -1486,6 +1486,74 @@ async fn writes_regression_update_preserves_unrefreshed_put() -> Result<()> {
 }
 
 #[tokio::test]
+async fn writes_regression_cas_rejects_recreated_index_with_matching_document_token() -> Result<()> {
+    use ferrissearch::transport::proto::ShardDocRequest;
+
+    let harness = RestTestHarness::start().await?;
+    let index = "index-incarnation";
+    create_write_contract_index(&harness, index).await?;
+    let (status, _) = harness
+        .put_json(
+            "/index-incarnation/_doc/same",
+            json!({"body": "old incarnation"}),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, old_document) = harness.get_json("/index-incarnation/_doc/same").await?;
+    assert_eq!(status, StatusCode::OK);
+    let old_uuid = harness.app_state.cluster_manager.get_state().indices[index]
+        .uuid
+        .to_string();
+    let (status, _) = harness.delete_json("/index-incarnation").await?;
+    assert_eq!(status, StatusCode::OK);
+    create_write_contract_index(&harness, index).await?;
+    let current_source = json!({"body": "new incarnation"});
+    let (status, _) = harness
+        .put_json("/index-incarnation/_doc/same", current_source.clone())
+        .await?;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, current_document) = harness.get_json("/index-incarnation/_doc/same").await?;
+    assert_eq!(status, StatusCode::OK);
+    let new_uuid = harness.app_state.cluster_manager.get_state().indices[index]
+        .uuid
+        .to_string();
+    assert_ne!(old_uuid, new_uuid);
+    assert_eq!(old_document["_seq_no"], current_document["_seq_no"]);
+    assert_eq!(old_document["_primary_term"], current_document["_primary_term"]);
+
+    let engine = harness.app_state.shard_manager.get_shard(index, 0).unwrap();
+    let sequence_before = engine.sequence_stats();
+    let wal_before = engine.retained_recovery_ops(0, 100, 1024 * 1024)?;
+    let mut client = InternalTransportClient::connect(format!("http://{}", harness.transport_addr))
+        .await?;
+    let result = client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: index.into(),
+            shard_id: 0,
+            doc_id: "same".into(),
+            payload_json: serde_json::to_vec(&json!({"body": "stale update"}))?,
+            if_seq_no: old_document["_seq_no"].as_u64(),
+            if_primary_term: old_document["_primary_term"].as_u64(),
+            index_uuid: Some(old_uuid.clone()),
+            ..Default::default()
+        }))
+        .await;
+    assert!(
+        matches!(&result, Err(error) if error.code() == tonic::Code::NotFound),
+        "stale incarnation CAS must return NOT_FOUND, not mutate the new index: {result:?}"
+    );
+    assert_eq!(engine.sequence_stats(), sequence_before);
+    let wal_after = engine.retained_recovery_ops(0, 100, 1024 * 1024)?;
+    assert_eq!(wal_after.operations.len(), wal_before.operations.len());
+    let (status, after) = harness.get_json("/index-incarnation/_doc/same").await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(after["_source"], current_source);
+    assert_eq!(after["_seq_no"], current_document["_seq_no"]);
+    assert_eq!(after["_primary_term"], current_document["_primary_term"]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn writes_regression_bulk_delete_and_update_preserve_action_boundaries() -> Result<()> {
     let harness = RestTestHarness::start().await?;
     create_write_contract_index(&harness, "bulk-repro").await?;

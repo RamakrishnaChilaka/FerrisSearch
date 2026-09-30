@@ -127,6 +127,7 @@ pub(super) async fn execute_ordered_bulk(
                     if_seq_no: operation.if_seq_no,
                     if_primary_term: operation.if_primary_term,
                     create_only: kind == ShardBulkOpKind::Create,
+                    index_uuid: None,
                 }))
                 .await
             {
