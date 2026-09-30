@@ -718,14 +718,16 @@ fn operation_for_apply(
 ) -> Result<OperationState> {
     let key = operation_key(copy, operation);
     let (doc, op, content_hash) = operation_parts(operation);
-    if origin != ApplyOrigin::Primary
-        && let Some(existing) = state.operations.get(&key)
-    {
-        let mut observed = existing.clone();
-        observed.doc = doc;
-        observed.op = op.to_string();
-        observed.content_hash = content_hash;
-        return Ok(observed);
+    if let Some(existing) = state.operations.get(&key) {
+        let same_identity =
+            existing.doc == doc && existing.op == op && existing.content_hash == content_hash;
+        if origin != ApplyOrigin::Primary || same_identity {
+            let mut observed = existing.clone();
+            observed.doc = doc;
+            observed.op = op.to_string();
+            observed.content_hash = content_hash;
+            return Ok(observed);
+        }
     }
     let request_id = if origin == ApplyOrigin::Primary {
         let request_id = take_request_token()
@@ -2532,6 +2534,62 @@ mod tests {
                 content_hash(&replica_operation.mutation)
             );
         }
+    }
+
+    #[test]
+    fn repeated_primary_effects_keep_the_same_concurrent_request() {
+        let _guard = test_trace_guard();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("concurrent-identical-primary.jsonl");
+        let session = start(config(&path)).unwrap();
+        let copy = TraceCopy {
+            node: "p".into(),
+            index_uuid: "idx".into(),
+            shard: 0,
+            allocation: 1,
+        };
+        let operation = SequencedOperation {
+            seq_no: 0,
+            primary_term: 1,
+            mutation: DocumentMutation::Delete { doc_id: "d".into() },
+        };
+        let older = route_client_write("p", "idx", 0, "p", "d", &operation.mutation).unwrap();
+        let current = route_client_write("p", "idx", 0, "p", "d", &operation.mutation).unwrap();
+        with_request_tokens(vec![current], || {
+            with_apply_scope(ApplyOrigin::Primary, vec![operation.clone()], || {
+                record_wal_appended(&copy, &operation, true).unwrap();
+                record_operation_processed(
+                    &copy,
+                    &operation,
+                    ApplyOutcome::Applied,
+                    SequenceStats {
+                        processed_checkpoint: Some(0),
+                        persisted_checkpoint: Some(0),
+                        max_seq_no: Some(0),
+                    },
+                )
+                .unwrap();
+            })
+        });
+        record_client_result(&older, "p", "idx", 0, "failed", Some("test"));
+        session.finish(false).unwrap();
+
+        let records = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let effect_requests = records
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record["event"].as_str(),
+                    Some("wal_appended" | "operation_processed")
+                )
+            })
+            .map(|record| record["request_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(effect_requests, ["req-1", "req-1"]);
     }
 
     #[test]
