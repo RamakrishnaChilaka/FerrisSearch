@@ -233,6 +233,10 @@ cargo test -- test_name                         # Single test by name
 - The current multi-node REST harness uses isolated in-memory Raft instances, so any `remote_store` regression that depends on leaf-side index metadata lookups needs a direct transport-level test in addition to any REST harness fan-out assertion.
 - For WAL generation/manifest changes, add regressions for manifest creation on new shards, manifest-required reopen, active-generation-only reopen, and ignored non-generation side files in the WAL directory.
 - For WAL corruption hardening, add regressions that an unknown operation tag in the active generation returns `Err` on reopen instead of panicking, and that an internal active-generation mismatch fails before append writes bytes.
+- For persistent Raft format errors, independently corrupt vote, committed-log,
+  and last-purged metadata through their public storage reads. Each error must
+  be `InvalidData`, name the component, use the exact wipe-node-data/recreate-
+  cluster remedy, and never use recreate-index guidance.
 - For primary sequence ownership changes, cover sequence zero versus missing
   optional wire fields, empty/non-empty bulk receipt consistency, document-ID
   order, concurrent single/bulk/delete identities across primary and replica

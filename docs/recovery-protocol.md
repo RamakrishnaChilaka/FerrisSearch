@@ -935,10 +935,11 @@ There is no conversion/export path in the current pre-1.0 implementation.
 Earlier on-disk schemas, WAL entries/manifests, committed boundaries, copy
 identities, vector sidecars, Raft logs/snapshots, and cluster-state wire
 snapshots are unsupported. Shard and index data fails with recreate-the-index
-guidance. An unsupported or unreadable Raft log or snapshot tells the operator
-to "wipe the node data directories and recreate the cluster". Incompatible wire
-formats fail the join. No role-specific migration, term-zero default, rolling
-mixed-protocol support, or compatibility shim is provided.
+guidance. Unsupported or unreadable Raft log entries, vote/commit/purge
+metadata, and snapshots tell the operator to "wipe the node data directories
+and recreate the cluster". Incompatible wire formats fail the join. No
+role-specific migration, term-zero default, rolling mixed-protocol support, or
+compatibility shim is provided.
 
 Ordinary process restart and same-version recovery remain required. File
 deletion and old-generation cleanup must wait until atomic-install and retention
