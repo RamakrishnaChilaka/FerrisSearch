@@ -3250,6 +3250,210 @@ async fn failed_promotion_noop_fanout_is_retried_end_to_end() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn promotion_noop_retry_on_one_shard_does_not_block_other_shards() {
+    let unavailable = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let replica_port = unavailable.local_addr().unwrap().port();
+    drop(unavailable);
+
+    let blackhole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let blackhole_port = blackhole.local_addr().unwrap().port();
+    let (blackhole_connected_tx, blackhole_connected_rx) = tokio::sync::oneshot::channel();
+    let blackhole_task = tokio::spawn(async move {
+        let (socket, _) = blackhole.accept().await.unwrap();
+        let _ = blackhole_connected_tx.send(());
+        let _socket = socket;
+        std::future::pending::<()>().await;
+    });
+
+    let mut state = gap_test_state(replica_port);
+    state.add_node(DomainNodeInfo {
+        id: "replica2".into(),
+        name: "replica2".into(),
+        host: "127.0.0.1".into(),
+        transport_port: blackhole_port,
+        http_port: 0,
+        roles: vec![NodeRole::Data],
+        raft_node_id: 0,
+    });
+    state.add_index(DomainIndexMetadata {
+        name: "idx2".into(),
+        uuid: crate::cluster::state::IndexUuid::new("uuid-2"),
+        number_of_shards: 1,
+        number_of_replicas: 1,
+        shard_routing: HashMap::from([(
+            0,
+            ShardRoutingEntry {
+                primary: "source".into(),
+                primary_term: 2,
+                replicas: vec!["replica2".into()],
+                in_sync_replicas: vec!["replica2".into()],
+                unassigned_replicas: 0,
+            },
+        )]),
+        mappings: HashMap::new(),
+        dynamic: Default::default(),
+        settings: crate::cluster::state::IndexSettings::default(),
+    });
+
+    let seed_gap = |engine: &Arc<dyn SearchEngine>| {
+        for seq_no in [0, 2] {
+            engine
+                .apply_replica_operation(crate::engine::SequencedOperation {
+                    seq_no,
+                    primary_term: 1,
+                    mutation: crate::engine::DocumentMutation::Index {
+                        doc_id: format!("doc-{seq_no}"),
+                        source: json!({"seq": seq_no}),
+                    },
+                })
+                .unwrap();
+        }
+    };
+
+    let source_dir = tempfile::tempdir().unwrap();
+    let source_shards = Arc::new(ShardManager::new(
+        source_dir.path(),
+        Duration::from_secs(60),
+    ));
+    for (index, index_uuid) in [("idx", "uuid-1"), ("idx2", "uuid-2")] {
+        let engine = source_shards
+            .open_assigned_shard_with_settings(
+                index,
+                0,
+                &HashMap::new(),
+                &crate::cluster::state::IndexSettings::default(),
+                index_uuid,
+                crate::shard::AssignedShardOpen {
+                    allocation_id: state.shard_allocation_id(index, 0, "source").unwrap(),
+                    primary_term: 1,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+        seed_gap(&engine);
+    }
+    let source_manager = Arc::new(ClusterManager::new(state.cluster_name.clone()));
+    source_manager.update_state(state.clone());
+    let source_service = Arc::new(TransportService {
+        cluster_manager: source_manager,
+        shard_manager: source_shards,
+        transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(source_dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
+        raft: None,
+        local_node_id: "source".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: new_primary_activation_state(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
+        join_lock: new_join_lock(),
+    });
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        source_service.activate_primary_for_lifecycle("idx", 0),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let replica_dir = tempfile::tempdir().unwrap();
+    let replica_shards = Arc::new(ShardManager::new(
+        replica_dir.path(),
+        Duration::from_secs(60),
+    ));
+    let replica_allocation = state.shard_allocation_id("idx", 0, "replica").unwrap();
+    let replica_engine = replica_shards
+        .open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &crate::cluster::state::IndexSettings::default(),
+            "uuid-1",
+            crate::shard::AssignedShardOpen {
+                allocation_id: replica_allocation,
+                primary_term: 1,
+                allow_empty_creation: true,
+            },
+        )
+        .unwrap();
+    seed_gap(&replica_engine);
+    replica_shards
+        .raise_copy_fence_blocking("idx".into(), 0, "uuid-1".into(), replica_allocation, 2)
+        .await
+        .unwrap();
+    let replica_manager = Arc::new(ClusterManager::new(state.cluster_name.clone()));
+    replica_manager.update_state(state);
+    let replica_activation_state = new_primary_activation_state();
+    let replica_service = TransportService {
+        cluster_manager: replica_manager,
+        shard_manager: replica_shards,
+        transport_client: crate::transport::TransportClient::new(),
+        storage_manager: test_storage_manager(replica_dir.path()),
+        remote_store_reader_cache: test_remote_store_reader_cache(),
+        raft: None,
+        local_node_id: "replica".into(),
+        worker_pools: crate::worker::WorkerPools::new(2, 2),
+        task_manager: Arc::new(crate::tasks::TaskManager::new()),
+        primary_activation_state: replica_activation_state.clone(),
+        peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
+        join_lock: new_join_lock(),
+    };
+    let replica_listener = tokio::net::TcpListener::bind(("127.0.0.1", replica_port))
+        .await
+        .unwrap();
+    let replica_server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(InternalTransportServer::new(replica_service))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+                replica_listener,
+            ))
+            .await
+            .unwrap();
+    });
+
+    let blocked_service = source_service.clone();
+    let blocked_activation = tokio::spawn(async move {
+        blocked_service
+            .activate_primary_for_lifecycle("idx2", 0)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), blackhole_connected_rx)
+        .await
+        .expect("idx2 NoOp retry never reached the black-hole replica")
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        source_service.index_doc(Request::new(ShardDocRequest {
+            index_name: "idx".into(),
+            shard_id: 0,
+            payload_json: serde_json::to_vec(&json!({"value": 1})).unwrap(),
+            doc_id: "healthy-write".into(),
+        })),
+    )
+    .await
+    .expect("a NoOp retry on idx2 blocked a write to idx")
+    .unwrap()
+    .into_inner();
+    let elapsed = started.elapsed();
+
+    blocked_activation.abort();
+    blackhole_task.abort();
+    replica_server.abort();
+
+    assert!(response.success, "{}", response.error);
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    assert_eq!(
+        replica_activation_state
+            .promotion_noop_bulk_requests_received
+            .load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn promoted_primary_replays_multiple_batches_and_reopens_cleanly() {
     const DOCUMENT_COUNT: u64 = 1_001;
 

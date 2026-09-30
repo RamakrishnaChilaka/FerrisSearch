@@ -167,7 +167,9 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   The next lifecycle or request activation retries it even when the local
   UUID/shard/allocation/term cache already says the primary is active. Remove
   pending state only after successful redelivery or when that primary copy is
-  invalidated.
+  invalidated. Activation and pending-NoOp retry mutexes are keyed by exact
+  index UUID, shard, and allocation. Never hold a node-wide or index-wide lock
+  across activation forwarding or replica fan-out.
 - Successful replica responses carry optional processed and persisted
   checkpoints and must prove the exact single operation or every bulk item was
   processed. A behind contiguous checkpoint is a gap observation, not failure

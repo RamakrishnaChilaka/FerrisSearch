@@ -75,7 +75,9 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > Promotion persists its fence, fills local gaps with NoOps, and replicates
 > those NoOps in bounded batches. Failed batches remain best-effort for local
 > activation but are retried by later lifecycle or request activation at the
-> same UUID, allocation, and term. A term/sequence collision durably marks the
+> same UUID, allocation, and term. Activation and retry locks are scoped to the
+> exact UUID, shard, and allocation, so a slow fan-out cannot serialize
+> unrelated shards. A term/sequence collision durably marks the
 > exact allocation as quarantined before closing it; the copy cannot reopen or
 > accept replication until Raft removes it and fresh peer recovery installs a
 > new allocation identity. The marker is checked before open-I/O backoff, so

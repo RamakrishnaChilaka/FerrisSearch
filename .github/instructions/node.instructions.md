@@ -189,6 +189,9 @@ NoOps, and only then enables writes. Best-effort NoOp replication may leave a
 bounded replica gap for normal probe/removal handling; it must not weaken local
 activation. Lifecycle ticks retry failed promotion NoOp batches for the same
 active UUID/allocation/term until fan-out succeeds or the copy is invalidated.
+Activation and retry serialization is allocation-local; a slow or unreachable
+replica for one shard must not delay activation or client writes on another
+shard.
 These promotion NoOps fill gaps on the promoted copy only; they do not repair
 replicas that missed a real post-WAL primary operation. Such copies follow the
 gap deadline and peer-recovery path until D10 exists.

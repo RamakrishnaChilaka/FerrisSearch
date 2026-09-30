@@ -357,7 +357,8 @@ cargo test -- test_name                         # Single test by name
 - Promotion NoOp coverage must include a real source activation, an initial
   failed gRPC fan-out, a later lifecycle activation, and value-level proof that
   the replica durably received the original term/sequence NoOp and closed its
-  checkpoint gap.
+  checkpoint gap. Also hold one shard's retry RPC open on a black-hole replica
+  and prove a write to another shard completes within a small bound.
 - Keep result-level round-6 coverage that a post-snapshot source apply failure
   stalls catch-up at the physical cursor and is served during finalize, and
   that 1,030 non-contiguous promotion NoOps reach a live replica in exactly two

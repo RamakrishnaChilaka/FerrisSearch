@@ -58,17 +58,33 @@ struct PendingPromotionNoOps {
 }
 
 #[derive(Default)]
+struct PrimaryCopyActivationLocks {
+    activation: Mutex<()>,
+    noop_replication: Mutex<()>,
+}
+
+#[derive(Default)]
 struct PrimaryActivationState {
     activated_terms: RwLock<HashMap<PrimaryActivationKey, u64>>,
     pending_noops: RwLock<HashMap<PrimaryActivationKey, PendingPromotionNoOps>>,
-    activation_lock: Mutex<()>,
-    noop_replication_lock: Mutex<()>,
+    copy_locks: std::sync::Mutex<HashMap<PrimaryActivationKey, Arc<PrimaryCopyActivationLocks>>>,
     failed_copy_reports: Mutex<HashMap<(String, u32, u64), std::time::Instant>>,
     available_primary_reports: Mutex<HashMap<(String, u32, u64, u64), std::time::Instant>>,
     #[cfg(test)]
     available_report_tasks_spawned: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     promotion_noop_bulk_requests_received: std::sync::atomic::AtomicUsize,
+}
+
+impl PrimaryActivationState {
+    fn copy_locks(&self, key: &PrimaryActivationKey) -> Arc<PrimaryCopyActivationLocks> {
+        self.copy_locks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry(key.clone())
+            .or_default()
+            .clone()
+    }
 }
 
 fn new_primary_activation_state() -> Arc<PrimaryActivationState> {
@@ -4393,7 +4409,7 @@ impl TransportService {
             return Ok(activated);
         }
 
-        let key = initial_key;
+        let key = initial_key.clone();
         if self
             .primary_activation_state
             .activated_terms
@@ -4412,8 +4428,15 @@ impl TransportService {
             return Ok(activated);
         }
 
-        let _activation_guard = self.primary_activation_state.activation_lock.lock().await;
+        let activation_locks = self.primary_activation_state.copy_locks(&initial_key);
+        let _activation_guard = activation_locks.activation.lock().await;
         let current = self.primary_routing(index_name, shard_id)?;
+        let current_key = (current.index_uuid.clone(), shard_id, current.allocation_id);
+        if current_key != initial_key {
+            return Err(format!(
+                "primary allocation changed for shard [{index_name}][{shard_id}] while activation was waiting; retry the write"
+            ));
+        }
         if let Err(error) = self
             .shard_manager
             .open_primary_assigned_shard_with_settings_blocking(
@@ -4690,11 +4713,8 @@ impl TransportService {
             return Ok(());
         }
 
-        let _replication_guard = self
-            .primary_activation_state
-            .noop_replication_lock
-            .lock()
-            .await;
+        let activation_locks = self.primary_activation_state.copy_locks(&activation_key);
+        let _replication_guard = activation_locks.noop_replication.lock().await;
         let operations = self
             .primary_activation_state
             .pending_noops
