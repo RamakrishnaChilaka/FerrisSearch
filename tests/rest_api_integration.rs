@@ -1486,7 +1486,8 @@ async fn writes_regression_update_preserves_unrefreshed_put() -> Result<()> {
 }
 
 #[tokio::test]
-async fn writes_regression_cas_rejects_recreated_index_with_matching_document_token() -> Result<()> {
+async fn writes_regression_cas_rejects_recreated_index_with_matching_document_token() -> Result<()>
+{
     use ferrissearch::transport::proto::ShardDocRequest;
 
     let harness = RestTestHarness::start().await?;
@@ -1519,13 +1520,16 @@ async fn writes_regression_cas_rejects_recreated_index_with_matching_document_to
         .to_string();
     assert_ne!(old_uuid, new_uuid);
     assert_eq!(old_document["_seq_no"], current_document["_seq_no"]);
-    assert_eq!(old_document["_primary_term"], current_document["_primary_term"]);
+    assert_eq!(
+        old_document["_primary_term"],
+        current_document["_primary_term"]
+    );
 
     let engine = harness.app_state.shard_manager.get_shard(index, 0).unwrap();
     let sequence_before = engine.sequence_stats();
     let wal_before = engine.retained_recovery_ops(0, 100, 1024 * 1024)?;
-    let mut client = InternalTransportClient::connect(format!("http://{}", harness.transport_addr))
-        .await?;
+    let mut client =
+        InternalTransportClient::connect(format!("http://{}", harness.transport_addr)).await?;
     let result = client
         .index_doc(tonic::Request::new(ShardDocRequest {
             index_name: index.into(),
@@ -1542,6 +1546,26 @@ async fn writes_regression_cas_rejects_recreated_index_with_matching_document_to
         matches!(&result, Err(error) if error.code() == tonic::Code::NotFound),
         "stale incarnation CAS must return NOT_FOUND, not mutate the new index: {result:?}"
     );
+    assert_eq!(old_document["_index_uuid"], old_uuid);
+    assert_eq!(current_document["_index_uuid"], new_uuid);
+    let (status, missing) = harness.get_json("/index-incarnation/_doc/missing").await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(missing["_index_uuid"], new_uuid);
+    let missing_upsert = client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: index.into(),
+            shard_id: 0,
+            doc_id: "missing".into(),
+            payload_json: serde_json::to_vec(&json!({"body": "stale upsert"}))?,
+            create_only: true,
+            index_uuid: Some(old_uuid),
+            ..Default::default()
+        }))
+        .await;
+    assert!(
+        matches!(&missing_upsert, Err(error) if error.code() == tonic::Code::NotFound),
+        "{missing_upsert:?}"
+    );
     assert_eq!(engine.sequence_stats(), sequence_before);
     let wal_after = engine.retained_recovery_ops(0, 100, 1024 * 1024)?;
     assert_eq!(wal_after.operations.len(), wal_before.operations.len());
@@ -1550,6 +1574,44 @@ async fn writes_regression_cas_rejects_recreated_index_with_matching_document_to
     assert_eq!(after["_source"], current_source);
     assert_eq!(after["_seq_no"], current_document["_seq_no"]);
     assert_eq!(after["_primary_term"], current_document["_primary_term"]);
+    let valid = client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: index.into(),
+            shard_id: 0,
+            doc_id: "same".into(),
+            payload_json: serde_json::to_vec(&current_source)?,
+            if_seq_no: current_document["_seq_no"].as_u64(),
+            if_primary_term: current_document["_primary_term"].as_u64(),
+            index_uuid: Some(new_uuid.clone()),
+            ..Default::default()
+        }))
+        .await?
+        .into_inner();
+    assert!(valid.success, "{valid:?}");
+    assert_eq!(
+        valid.seq_no,
+        current_document["_seq_no"]
+            .as_u64()
+            .map(|sequence| sequence + 1)
+    );
+    let (status, _) = harness.delete_json("/index-incarnation").await?;
+    assert_eq!(status, StatusCode::OK);
+    let disappeared = client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: index.into(),
+            shard_id: 0,
+            doc_id: "same".into(),
+            payload_json: serde_json::to_vec(&current_source)?,
+            if_seq_no: valid.seq_no,
+            if_primary_term: valid.primary_term,
+            index_uuid: Some(new_uuid),
+            ..Default::default()
+        }))
+        .await;
+    assert!(
+        matches!(&disappeared, Err(error) if error.code() == tonic::Code::NotFound),
+        "{disappeared:?}"
+    );
     Ok(())
 }
 

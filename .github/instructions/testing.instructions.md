@@ -241,6 +241,10 @@ cargo test -- test_name                         # Single test by name
   rejection, source-error item retention, and delete 404 without `errors=true`.
   Transport coverage must compare primary/replica sources, sequences, and WAL
   histories after conditional and mixed CRUD.
+  Incarnation coverage must recreate an index with the same document
+  sequence/term, reject the old UUID CAS and create-only upsert, preserve WAL
+  and allocator state, and accept the new UUID. Also cover a CAS delayed
+  inside the recovery write barrier. Missing GET documents retain their UUID.
 - D1 conditional traces emit `failure_stage: "version_conflict"` only before
   primary WAL/sequence assignment. The owning `PrimaryVersionConflict` action
   preserves document, WAL, checkpoint, and allocator state. The converter

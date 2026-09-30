@@ -30,6 +30,7 @@ fn forwarded_write_error_classification(error: &anyhow::Error) -> (StatusCode, &
         Some(tonic::Code::AlreadyExists) => {
             (StatusCode::CONFLICT, "version_conflict_engine_exception")
         }
+        Some(tonic::Code::NotFound) => (StatusCode::NOT_FOUND, "index_not_found_exception"),
         Some(tonic::Code::ResourceExhausted)
             if status.is_some_and(|status| {
                 status
@@ -55,7 +56,7 @@ fn document_write_error_response(
     error: anyhow::Error,
 ) -> (StatusCode, Json<Value>) {
     let (status, error_type) = forwarded_write_error_classification(&error);
-    if status == StatusCode::CONFLICT
+    if matches!(status, StatusCode::CONFLICT | StatusCode::NOT_FOUND)
         && let Some(error) = error.downcast_ref::<tonic::Status>()
     {
         return crate::api::error_response(status, error_type, error.message());
@@ -1264,7 +1265,7 @@ pub async fn get_document(
 
     match state
         .transport_client
-        .forward_get_to_shard(
+        .forward_get_with_index_uuid_to_shard(
             &target_node,
             &index_name,
             shard_id,
@@ -1273,19 +1274,31 @@ pub async fn get_document(
         )
         .await
     {
-        Ok(Some(document)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "_index": index_name, "_id": doc_id, "_shard": shard_id, "found": true,
-                "_source": document.source, "_seq_no": document.seq_no, "_primary_term": document.primary_term
-            })),
-        ),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "_index": index_name, "_id": doc_id, "found": false
-            })),
-        ),
+        Ok(read) => match read.document {
+            Some(document) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "_index": index_name, "_index_uuid": read.index_uuid,
+                    "_id": doc_id, "_shard": shard_id, "found": true,
+                    "_source": document.source, "_seq_no": document.seq_no,
+                    "_primary_term": document.primary_term
+                })),
+            ),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "_index": index_name, "_index_uuid": read.index_uuid,
+                    "_id": doc_id, "found": false
+                })),
+            ),
+        },
+        Err(error)
+            if error
+                .downcast_ref::<tonic::Status>()
+                .is_some_and(|status| status.code() == tonic::Code::NotFound) =>
+        {
+            document_write_error_response("Get", error)
+        }
         Err(e) => crate::api::error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "search_exception",
@@ -1431,17 +1444,25 @@ async fn execute_update(
         Err(error) => return illegal_argument(error),
     };
     let mut retries = params.retry_on_conflict;
+    let mut index_uuid: Option<String> = None;
     loop {
         let (_, shard_id, target_node) = match resolve_document_primary(state, index_name, doc_id) {
             Ok(target) => target,
             Err(response) => return response,
         };
-        let existing = match state
+        let read = match state
             .transport_client
-            .forward_get_to_shard(&target_node, index_name, shard_id, doc_id, true)
+            .forward_get_with_index_uuid_to_shard(&target_node, index_name, shard_id, doc_id, true)
             .await
         {
             Ok(document) => document,
+            Err(error)
+                if error
+                    .downcast_ref::<tonic::Status>()
+                    .is_some_and(|status| status.code() == tonic::Code::NotFound) =>
+            {
+                return document_write_error_response("Get", error);
+            }
             Err(error) => {
                 return crate::api::error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1450,6 +1471,21 @@ async fn execute_update(
                 );
             }
         };
+        if index_uuid
+            .as_ref()
+            .is_some_and(|expected| expected != &read.index_uuid)
+        {
+            return crate::api::error_response(
+                StatusCode::NOT_FOUND,
+                "index_not_found_exception",
+                format!(
+                    "no such index [{index_name}] for UUID [{}]",
+                    index_uuid.as_deref().expect("checked pinned UUID")
+                ),
+            );
+        }
+        let index_uuid = index_uuid.get_or_insert(read.index_uuid);
+        let existing = read.document;
         if let Err(error) = requested.check(
             doc_id,
             existing
@@ -1521,16 +1557,29 @@ async fn execute_update(
         if let Err(response) = validate_document_source_for_api(&source) {
             return response;
         }
+        let (if_seq_no, if_primary_term) = condition.expected_version();
+        let request = crate::transport::proto::ShardDocRequest {
+            index_name: index_name.to_owned(),
+            shard_id,
+            doc_id: doc_id.to_owned(),
+            payload_json: match serde_json::to_vec(&source) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return crate::api::error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "serialization_exception",
+                        error,
+                    );
+                }
+            },
+            if_seq_no,
+            if_primary_term,
+            create_only: condition == crate::engine::WriteCondition::Create,
+            index_uuid: Some(index_uuid.clone()),
+        };
         match state
             .transport_client
-            .forward_index_with_condition_to_shard(
-                &target_node,
-                index_name,
-                shard_id,
-                doc_id,
-                &source,
-                condition,
-            )
+            .forward_index_request_to_shard(&target_node, request)
             .await
         {
             Ok(response) => {

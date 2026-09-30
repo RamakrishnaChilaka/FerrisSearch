@@ -21,6 +21,11 @@ pub struct ReplicaApplyResponse {
     pub operation_persisted: bool,
 }
 
+pub struct ShardDocumentRead {
+    pub index_uuid: String,
+    pub document: Option<crate::engine::DocumentRead>,
+}
+
 #[derive(Clone)]
 pub struct TransportClient {
     timeout: Duration,
@@ -283,9 +288,8 @@ impl TransportClient {
         payload: &serde_json::Value,
         condition: crate::engine::WriteCondition,
     ) -> Result<serde_json::Value, anyhow::Error> {
-        let mut client = self.connect(&node.host, node.transport_port).await?;
         let (if_seq_no, if_primary_term) = condition.expected_version();
-        let request = tonic::Request::new(ShardDocRequest {
+        let request = ShardDocRequest {
             index_name: index_name.to_string(),
             shard_id,
             payload_json: serde_json::to_vec(payload)?,
@@ -294,9 +298,24 @@ impl TransportClient {
             if_primary_term,
             create_only: condition == crate::engine::WriteCondition::Create,
             index_uuid: None,
-        });
-        let response = client.index_doc(request).await?.into_inner();
-        decode_shard_doc_response(index_name, shard_id, doc_id, response)
+        };
+        self.forward_index_request_to_shard(node, request).await
+    }
+
+    pub async fn forward_index_request_to_shard(
+        &self,
+        node: &NodeInfo,
+        request: ShardDocRequest,
+    ) -> Result<serde_json::Value, anyhow::Error> {
+        let mut client = self.connect(&node.host, node.transport_port).await?;
+        let index_name = request.index_name.clone();
+        let shard_id = request.shard_id;
+        let doc_id = request.doc_id.clone();
+        let response = client
+            .index_doc(tonic::Request::new(request))
+            .await?
+            .into_inner();
+        decode_shard_doc_response(&index_name, shard_id, &doc_id, response)
     }
 
     /// Forward a bulk batch to a specific shard on a node
@@ -370,6 +389,20 @@ impl TransportClient {
         doc_id: &str,
         realtime: bool,
     ) -> Result<Option<crate::engine::DocumentRead>, anyhow::Error> {
+        Ok(self
+            .forward_get_with_index_uuid_to_shard(node, index_name, shard_id, doc_id, realtime)
+            .await?
+            .document)
+    }
+
+    pub async fn forward_get_with_index_uuid_to_shard(
+        &self,
+        node: &NodeInfo,
+        index_name: &str,
+        shard_id: u32,
+        doc_id: &str,
+        realtime: bool,
+    ) -> Result<ShardDocumentRead, anyhow::Error> {
         let mut client = self.connect(&node.host, node.transport_port).await?;
         let request = tonic::Request::new(ShardGetRequest {
             index_name: index_name.to_string(),
@@ -381,7 +414,10 @@ impl TransportClient {
         if !response.error.is_empty() {
             anyhow::bail!("Get failed: {}", response.error);
         }
-        if response.found {
+        if response.index_uuid.is_empty() {
+            anyhow::bail!("shard GET response is missing its index UUID");
+        }
+        let document = if response.found {
             let source: serde_json::Value = serde_json::from_slice(&response.source_json)?;
             let seq_no = response.seq_no.ok_or_else(|| {
                 anyhow::anyhow!("found shard GET response is missing its sequence")
@@ -392,14 +428,18 @@ impl TransportClient {
                 .ok_or_else(|| {
                     anyhow::anyhow!("found shard GET response is missing its primary term")
                 })?;
-            Ok(Some(crate::engine::DocumentRead {
+            Some(crate::engine::DocumentRead {
                 source,
                 seq_no,
                 primary_term,
-            }))
+            })
         } else {
-            Ok(None)
-        }
+            None
+        };
+        Ok(ShardDocumentRead {
+            index_uuid: response.index_uuid,
+            document,
+        })
     }
 
     pub async fn forward_bulk_operations_to_shard(

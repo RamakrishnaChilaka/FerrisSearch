@@ -1732,6 +1732,20 @@ async fn conditional_and_mixed_bulk_write_protocol_trace() -> Result<()> {
             created.success && created.created && created.seq_no == Some(0),
             "{created:?}"
         );
+        let wrong_incarnation = client
+            .index_doc(tonic::Request::new(ShardDocRequest {
+                index_name: INDEX.to_string(),
+                shard_id: SHARD,
+                doc_id: "a".to_string(),
+                payload_json: serde_json::to_vec(&serde_json::json!({"value": -1}))?,
+                if_seq_no: created.seq_no,
+                if_primary_term: created.primary_term,
+                index_uuid: Some(format!("{INDEX_UUID}-obsolete")),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        anyhow::ensure!(wrong_incarnation.code() == tonic::Code::NotFound);
         let conditional = ShardDocRequest {
             index_name: INDEX.to_string(),
             shard_id: SHARD,
@@ -1740,7 +1754,7 @@ async fn conditional_and_mixed_bulk_write_protocol_trace() -> Result<()> {
             if_seq_no: Some(0),
             if_primary_term: Some(1),
             create_only: false,
-            index_uuid: None,
+            index_uuid: Some(INDEX_UUID.to_string()),
         };
         let updated = client
             .index_doc(tonic::Request::new(conditional.clone()))
@@ -1767,6 +1781,7 @@ async fn conditional_and_mixed_bulk_write_protocol_trace() -> Result<()> {
         anyhow::ensure!(
             document.found && document.seq_no == Some(1) && document.primary_term == Some(1)
         );
+        anyhow::ensure!(document.index_uuid == INDEX_UUID);
         anyhow::ensure!(
             serde_json::from_slice::<serde_json::Value>(&document.source_json)?["value"] == 2
         );

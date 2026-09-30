@@ -220,6 +220,7 @@ exhaustion remains a 500 forwarding failure.
 
 GET is realtime by default; `realtime=false` reads the refreshed reader.
 Found responses carry the document's `_seq_no` and `_primary_term`.
+Found and missing-document responses also carry the serving `_index_uuid`.
 Index/delete accept paired `if_seq_no`/`if_primary_term`; specifying only one
 is a 400. `op_type=create` and the `_create` route are create-only.
 Primary `ALREADY_EXISTS` maps to 409 `version_conflict_engine_exception`
@@ -230,6 +231,11 @@ or appends a WAL entry.
 from the primary and conditionally indexes a recursive merge. Retry only
 version conflicts, up to `retry_on_conflict` (default 0). Missing documents
 use a create-only upsert or return `document_missing_exception`.
+Pin the primary GET's UUID across the CAS and every retry, including
+create-only upsert from a missing document. Primary `NOT_FOUND` maps to
+404 `index_not_found_exception`; never retry against a new incarnation.
+Move the existing/merged source and track no-op changes without copying it.
+Retain only the original patch/upsert input when another retry is possible.
 `detect_noop` defaults to true and consumes no sequence. Accept only `doc`,
 `upsert`, `doc_as_upsert`, and `detect_noop` body keys; unknown keys are
 400 `illegal_argument_exception`, not document-source mapper errors.

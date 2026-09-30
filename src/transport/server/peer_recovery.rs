@@ -2908,6 +2908,73 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queued_cas_rejects_index_uuid_change_before_sequence_assignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, shard_manager, cluster) = review_service(dir.path());
+        let engine = shard_manager
+            .open_shard_with_settings(
+                "idx",
+                0,
+                &HashMap::new(),
+                &IndexSettings::default(),
+                "uuid-1",
+            )
+            .unwrap();
+        service.ensure_primary_activated("idx", 0).await.unwrap();
+        let receipt = engine
+            .add_document_with_receipt("doc", serde_json::json!({"value": 1}))
+            .unwrap();
+        let sequence_before = engine.sequence_stats();
+        let barrier = service
+            .peer_recovery_state
+            .barrier(("uuid-1".to_string(), 0))
+            .await;
+        let guard = barrier.write_owned().await;
+        let (waiting_tx, waiting_rx) = oneshot::channel();
+        *service
+            .peer_recovery_state
+            .write_guard_waiting_sender
+            .lock()
+            .await = Some(waiting_tx);
+        let writer = service.clone();
+        let write = tokio::spawn(async move {
+            writer
+                .index_doc(tonic::Request::new(ShardDocRequest {
+                    index_name: "idx".into(),
+                    shard_id: 0,
+                    doc_id: "doc".into(),
+                    payload_json: serde_json::to_vec(&serde_json::json!({"value": 2})).unwrap(),
+                    if_seq_no: Some(receipt.seq_no),
+                    if_primary_term: Some(receipt.primary_term),
+                    index_uuid: Some("uuid-1".into()),
+                    ..Default::default()
+                }))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), waiting_rx)
+            .await
+            .expect("CAS never reached the recovery barrier")
+            .unwrap();
+        let mut replaced = cluster.get_state();
+        replaced.indices.get_mut("idx").unwrap().uuid =
+            crate::cluster::state::IndexUuid::new("uuid-2");
+        cluster.update_state(replaced);
+        drop(guard);
+        let error = write.await.unwrap().unwrap_err();
+        assert_eq!(error.code(), tonic::Code::NotFound);
+        assert_eq!(engine.sequence_stats(), sequence_before);
+        assert_eq!(engine.wal_max_seq_no(), Some(receipt.seq_no));
+        assert_eq!(
+            engine
+                .get_document_with_metadata("doc", true)
+                .unwrap()
+                .unwrap()
+                .source,
+            serde_json::json!({"value": 1})
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn queued_writes_reject_primary_change_inside_barrier() {
         let dir = tempfile::tempdir().unwrap();
         let (service, shard_manager, cluster) = review_service(dir.path());

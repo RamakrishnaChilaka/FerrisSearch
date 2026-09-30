@@ -300,6 +300,12 @@ A behind or missing fallback fails explicitly, rather than returning stale
 data. Replay carries cursors from the streaming decoder without rescanning
 the WAL per document.
 
+**Index-incarnation status (2026-09-30):** GET also returns `_index_uuid`,
+including when the document is missing. Coordinator update pins the serving
+primary's UUID across its GET/CAS cycle and every conflict retry. The primary
+rejects a missing or replaced incarnation before sequence assignment or WAL
+append, including requests delayed by the recovery barrier or write pool.
+
 Remaining: expose the existing internal version-map memory bound as an
 operator setting and add `_mget`. Neither is part of this implementation.
 
@@ -319,7 +325,7 @@ operator setting and add `_mget`. Neither is part of this implementation.
   refreshed reader.
 - **`_update`:** the coordinating node performs a realtime GET from the
   primary, recursively merges `doc`, and sends a primary conditional index
-  write using the `seq_no` and term it read. The primary compares and appends
+  write using the index UUID, `seq_no`, and term it read. The primary compares and appends
   atomically. A version conflict repeats the GET/merge/write cycle up to
   `retry_on_conflict` times (default 0); other errors are not retried.
   Missing documents use a create-only write from `upsert` or, with
@@ -328,6 +334,16 @@ operator setting and add `_mget`. Neither is part of this implementation.
   merged content returns `noop` without allocating a sequence or appending.
   Only `doc`, `upsert`, `doc_as_upsert`, and `detect_noop` are accepted body
   keys. Other keys return `400 illegal_argument_exception` naming the key.
+- **Index disappearance:** a pinned UUID that no longer names the index
+  returns `404 index_not_found_exception`, not a version conflict against the
+  replacement. OpenSearch's
+  [IndexNotFoundException](https://github.com/opensearch-project/OpenSearch/blob/3.3.0/server/src/main/java/org/opensearch/index/IndexNotFoundException.java)
+  extends
+  [ResourceNotFoundException](https://github.com/opensearch-project/OpenSearch/blob/3.3.0/server/src/main/java/org/opensearch/ResourceNotFoundException.java),
+  which returns HTTP 404. FerrisSearch uses gRPC `NOT_FOUND` internally and
+  preserves that error at the HTTP boundary. A UUID rejection has no write
+  receipt and is not a copy-I/O failure. The optional UUID is an internal
+  primary-write precondition; no new REST query parameter is introduced.
 - **Replicas:** they need the same per-document `seq_no` information, from the
   map or a stored `_seq_no`, to apply D1.
 
@@ -360,6 +376,7 @@ preconditions. A conflict consumes no sequence and appends no WAL entry.
 The primary checks under the same translog mutex as assignment, using the live
 map or the reader's `_seq_no`/`_primary_term` fast fields. Replicas apply only
 the resulting sequenced mutation, never the condition.
+Coordinator update also carries D9's index-incarnation precondition.
 
 Remaining: loud rejection of `version`/`version_type` is D13; external
 versioning and client operation IDs remain unimplemented.

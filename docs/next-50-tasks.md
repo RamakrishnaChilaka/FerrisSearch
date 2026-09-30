@@ -233,7 +233,12 @@ and replicated REST/bulk coverage in `tests/replication_integration.rs`.
 Restart/flush preserves the stored concurrency identity. This does not close
 the task's failover criteria or implement client retry tokens/external versions.
 
-**Evidence:** `_update` is read-merge-write and concurrent writers can silently
+**Integration note (2026-09-30):** Update pins the primary GET's index UUID
+across CAS and retries. A deleted/recreated incarnation returns
+`404 index_not_found_exception` before mutation, even if sequence/term tokens
+match. REST recreation and queued transport regressions cover both boundaries.
+
+**Historical evidence:** `_update` is read-merge-write and concurrent writers can silently
 overwrite each other.
 
 **Outcome:** Index, update, and delete accept and enforce expected sequence/
@@ -350,6 +355,11 @@ results and conditions. Index-scoped `_index` overrides are honored and
 authorized. Evidence: `writes_regression_*` REST tests and replicated mixed
 bulk coverage. Streaming, bounded memory, admission/backpressure, and
 cancellation remain open; this is not completion of FS-014.
+
+**Integration note (2026-09-30):** Shard action runs now move their document
+sources and serialize borrowed envelopes. Bulk update retains the same
+incarnation-pinned CAS logic as single update. Parsing/grouping remain
+materialized; these ownership changes do not implement bounded streaming.
 
 **Historical evidence (2026-09-27):** `parse_bulk_ndjson`
 (`src/api/index/bulk.rs`) treats every action as `index` and consumes lines in

@@ -143,6 +143,36 @@ struct ActivatedPrimary {
     primary_term: u64,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("no such index [{index_name}] for UUID [{index_uuid}]")]
+struct IndexIncarnationMismatchError {
+    index_name: String,
+    index_uuid: String,
+}
+
+fn require_index_uuid(
+    cluster_manager: &ClusterManager,
+    index_name: &str,
+    expected_uuid: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(expected_uuid) = expected_uuid else {
+        return Ok(());
+    };
+    if cluster_manager
+        .get_state()
+        .indices
+        .get(index_name)
+        .is_some_and(|metadata| metadata.uuid.as_str() == expected_uuid)
+    {
+        return Ok(());
+    }
+    Err(IndexIncarnationMismatchError {
+        index_name: index_name.to_owned(),
+        index_uuid: expected_uuid.to_owned(),
+    }
+    .into())
+}
+
 #[derive(Clone)]
 struct AssignedLocalShard {
     index_uuid: String,
@@ -632,6 +662,12 @@ impl InternalTransport for TransportService {
         let req = request.into_inner();
         let condition =
             primary_write_condition(req.if_seq_no, req.if_primary_term, req.create_only)?;
+        require_index_uuid(
+            &self.cluster_manager,
+            &req.index_name,
+            req.index_uuid.as_deref(),
+        )
+        .map_err(|error| Status::not_found(error.to_string()))?;
 
         let activated_primary = match self
             .ensure_primary_activated(&req.index_name, req.shard_id)
@@ -639,6 +675,12 @@ impl InternalTransport for TransportService {
         {
             Ok(term) => term,
             Err(error) => {
+                require_index_uuid(
+                    &self.cluster_manager,
+                    &req.index_name,
+                    req.index_uuid.as_deref(),
+                )
+                .map_err(|error| Status::not_found(error.to_string()))?;
                 return Ok(Response::new(ShardDocResponse {
                     success: false,
                     doc_id: req.doc_id,
@@ -649,12 +691,24 @@ impl InternalTransport for TransportService {
                 }));
             }
         };
+        require_index_uuid(
+            &self.cluster_manager,
+            &req.index_name,
+            req.index_uuid.as_deref(),
+        )
+        .map_err(|error| Status::not_found(error.to_string()))?;
         let _write_guard = match self
             .peer_recovery_write_guard(&req.index_name, req.shard_id)
             .await
         {
             Ok(guard) => guard,
             Err(error) => {
+                require_index_uuid(
+                    &self.cluster_manager,
+                    &req.index_name,
+                    req.index_uuid.as_deref(),
+                )
+                .map_err(|error| Status::not_found(error.to_string()))?;
                 return Ok(Response::new(ShardDocResponse {
                     success: false,
                     doc_id: req.doc_id,
@@ -665,6 +719,12 @@ impl InternalTransport for TransportService {
                 }));
             }
         };
+        require_index_uuid(
+            &self.cluster_manager,
+            &req.index_name,
+            req.index_uuid.as_deref(),
+        )
+        .map_err(|error| Status::not_found(error.to_string()))?;
         let _pre_mapping_write_state = match self.validated_primary_write_state(
             &req.index_name,
             req.shard_id,
@@ -699,6 +759,12 @@ impl InternalTransport for TransportService {
         let dynamic_override = self
             .ensure_dynamic_mappings(&req.index_name, req.shard_id, &payload)
             .await?;
+        require_index_uuid(
+            &self.cluster_manager,
+            &req.index_name,
+            req.index_uuid.as_deref(),
+        )
+        .map_err(|error| Status::not_found(error.to_string()))?;
         let write_state = match self.validated_primary_write_state(
             &req.index_name,
             req.shard_id,
@@ -719,6 +785,12 @@ impl InternalTransport for TransportService {
         let engine = self
             .get_or_open_shard_with_override(&req.index_name, req.shard_id, dynamic_override)
             .await?;
+        require_index_uuid(
+            &self.cluster_manager,
+            &req.index_name,
+            req.index_uuid.as_deref(),
+        )
+        .map_err(|error| Status::not_found(error.to_string()))?;
         #[cfg(feature = "protocol-trace")]
         let trace_copy = crate::protocol_trace::TraceCopy {
             node: self.local_node_id.clone(),
@@ -754,12 +826,20 @@ impl InternalTransport for TransportService {
                 let doc_id = doc_id.clone();
                 let payload = payload.clone();
                 let primary_term = activated_primary.primary_term;
+                let cluster_manager = self.cluster_manager.clone();
+                let index_name = req.index_name.clone();
+                let expected_uuid = req.index_uuid.clone();
                 #[cfg(feature = "protocol-trace")]
                 let trace_copy = trace_copy.clone();
                 #[cfg(feature = "protocol-trace")]
                 let trace_request = trace_request.clone();
                 self.worker_pools
                     .spawn_write(move || {
+                        require_index_uuid(
+                            &cluster_manager,
+                            &index_name,
+                            expected_uuid.as_deref(),
+                        )?;
                         #[cfg(feature = "protocol-trace")]
                         {
                             crate::protocol_trace::with_open_copy(trace_copy, || {
@@ -795,6 +875,22 @@ impl InternalTransport for TransportService {
             }
             Err(error) => Err(error),
         };
+        if let Err(error) = &write_result
+            && error.is::<IndexIncarnationMismatchError>()
+        {
+            #[cfg(feature = "protocol-trace")]
+            if let Some(trace_request) = trace_request.as_ref() {
+                crate::protocol_trace::record_client_result(
+                    trace_request,
+                    &self.local_node_id,
+                    &activated_primary.index_uuid,
+                    req.shard_id,
+                    "failed",
+                    Some("index_not_found"),
+                );
+            }
+            return Err(Status::not_found(error.to_string()));
+        }
         let write_result = self.shard_manager.record_local_apply_result(
             &activated_primary.index_uuid,
             req.shard_id,
@@ -1663,6 +1759,13 @@ impl InternalTransport for TransportService {
         request: Request<ShardGetRequest>,
     ) -> Result<Response<ShardGetResponse>, Status> {
         let req = request.into_inner();
+        let index_uuid = self
+            .cluster_manager
+            .get_state()
+            .indices
+            .get(&req.index_name)
+            .map(|metadata| metadata.uuid.to_string())
+            .ok_or_else(|| Status::not_found(format!("no such index [{}]", req.index_name)))?;
         let engine = match self
             .get_or_open_search_shard(&req.index_name, req.shard_id)
             .await
@@ -1687,6 +1790,8 @@ impl InternalTransport for TransportService {
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?
         };
+        require_index_uuid(&self.cluster_manager, &req.index_name, Some(&index_uuid))
+            .map_err(|error| Status::not_found(error.to_string()))?;
 
         match doc_result {
             Ok(Some(document)) => {
@@ -1698,12 +1803,14 @@ impl InternalTransport for TransportService {
                     error: String::new(),
                     seq_no: Some(document.seq_no),
                     primary_term: Some(document.primary_term),
+                    index_uuid,
                 }))
             }
             Ok(None) => Ok(Response::new(ShardGetResponse {
                 found: false,
                 source_json: vec![],
                 error: String::new(),
+                index_uuid,
                 ..Default::default()
             })),
             Err(e) => Ok(Response::new(ShardGetResponse {
@@ -5303,8 +5410,12 @@ impl TransportService {
             .ok_or_else(|| {
                 format!("primary shard [{index_name}][{shard_id}] is not open during activation")
             })?;
+        self.validated_primary_write_state(index_name, shard_id, activated_primary)?;
         let activation_engine = engine.clone();
         let primary_term = activated_primary.primary_term;
+        let cluster_manager = self.cluster_manager.clone();
+        let index_name_for_write = index_name.to_owned();
+        let index_uuid = activated_primary.index_uuid.clone();
         #[cfg(feature = "protocol-trace")]
         let trace_copy = crate::protocol_trace::TraceCopy {
             node: self.local_node_id.clone(),
@@ -5317,6 +5428,7 @@ impl TransportService {
         let noops = self
             .worker_pools
             .spawn_write(move || {
+                require_index_uuid(&cluster_manager, &index_name_for_write, Some(&index_uuid))?;
                 #[cfg(feature = "protocol-trace")]
                 {
                     crate::protocol_trace::with_open_copy(activation_trace_copy, || {

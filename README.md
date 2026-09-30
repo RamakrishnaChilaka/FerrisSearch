@@ -455,7 +455,9 @@ production ready**. The most important limits are:
 - For `local_shards`, GET by ID is realtime by default; `realtime=false`
   reads the last refreshed searcher. `_update` reads the primary's latest
   source and uses a conditional write, so concurrent changes either apply
-  or return 409. `retry_on_conflict` defaults to 0; `detect_noop` defaults
+  or return 409. GET returns `_index_uuid`; update pins it across retries and
+  returns `404 index_not_found_exception` if the index is deleted or replaced.
+  `retry_on_conflict` defaults to 0; `detect_noop` defaults
   to true. Upsert is create-only, and scripts are rejected.
 - Index/delete support paired `if_seq_no`/`if_primary_term`; create is
   available through `op_type=create` and `PUT`/`POST /{index}/_create/{id}`.

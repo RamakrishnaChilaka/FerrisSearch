@@ -143,9 +143,18 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   engine's translog critical section before assignment/append.
   `VersionConflictError` is `ALREADY_EXISTS`, not a copy-I/O failure.
   Replication requests never carry or evaluate these conditions.
+- `ShardDocRequest.index_uuid` optionally pins an internal update/CAS to the
+  GET incarnation. Check it before primary admission, after asynchronous
+  lifecycle/mapping/barrier work, and inside the queued write closure before
+  assignment. Missing/replaced UUIDs return `NOT_FOUND` with no receipt,
+  sequence, or WAL effect; do not classify them as copy-I/O failures.
+  Primary activation must validate its captured identity before local gap
+  fill, including after a worker-queue delay.
 - `ShardGetRequest.realtime` defaults to true; found responses require sequence
   and term. Use `get_document_with_metadata`, not the searcher-only convenience
-  getter. A malformed found receipt fails decoding.
+  getter. Both found and missing-document responses require the serving index
+  UUID. Verify the incarnation again after the read and fail decoding on a
+  missing UUID or malformed found receipt.
 - `ShardBulkRequest.operations` is either empty for an unconditional index
   batch or matches `documents_json` one-for-one. Reject invalid kinds/counts
   before mutation. Preserve item order. Index-only runs keep engine batching;
