@@ -166,6 +166,15 @@ pub(crate) struct PeerRecoveryTransportState {
     setup_hash_started_sender: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     #[cfg(test)]
     setup_hash_release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    // Inject one legal retry-to-catch-up response followed by one source stall.
+    #[cfg(test)]
+    force_retry_catch_up_once: AtomicBool,
+    #[cfg(test)]
+    force_stalled_retry_fetch_once: AtomicBool,
+    #[cfg(test)]
+    retry_catch_up_responses: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    stalled_retry_fetch_responses: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     pub(super) dynamic_mapping_committed_sender: Mutex<Option<oneshot::Sender<()>>>,
     #[cfg(test)]
@@ -191,6 +200,14 @@ impl PeerRecoveryTransportState {
             setup_hash_started_sender: Mutex::new(None),
             #[cfg(test)]
             setup_hash_release: Mutex::new(None),
+            #[cfg(test)]
+            force_retry_catch_up_once: AtomicBool::new(false),
+            #[cfg(test)]
+            force_stalled_retry_fetch_once: AtomicBool::new(false),
+            #[cfg(test)]
+            retry_catch_up_responses: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            stalled_retry_fetch_responses: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             dynamic_mapping_committed_sender: Mutex::new(None),
             #[cfg(test)]
@@ -627,6 +644,28 @@ enum MembershipObservation {
 }
 
 impl TransportService {
+    #[cfg(test)]
+    pub(crate) fn inject_retry_catch_up_stall_once(&self) {
+        self.peer_recovery_state
+            .force_retry_catch_up_once
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retry_catch_up_stall_counts(&self) -> (usize, usize, usize) {
+        (
+            self.peer_recovery_state
+                .setup_attempts
+                .load(Ordering::Acquire),
+            self.peer_recovery_state
+                .retry_catch_up_responses
+                .load(Ordering::Acquire),
+            self.peer_recovery_state
+                .stalled_retry_fetch_responses
+                .load(Ordering::Acquire),
+        )
+    }
+
     fn target_still_needs_recovery(
         &self,
         key: &ShardIdentity,
@@ -1481,6 +1520,24 @@ impl TransportService {
                 Status::unavailable("peer recovery source engine is not currently open")
             })?;
 
+        #[cfg(test)]
+        if self
+            .peer_recovery_state
+            .force_stalled_retry_fetch_once
+            .swap(false, Ordering::AcqRel)
+        {
+            self.peer_recovery_state
+                .stalled_retry_fetch_responses
+                .fetch_add(1, Ordering::AcqRel);
+            return Ok(FetchRecoveryOpsResponse {
+                operations: Vec::new(),
+                next_cursor: Some(proto_cursor(cursor)),
+                source_max_seq_no: engine.sequence_stats().max_seq_no,
+                complete: false,
+                error: String::new(),
+            });
+        }
+
         let batch = tokio::task::spawn_blocking(move || {
             engine.peer_recovery_ops(cursor, None, max_ops, MAX_RECOVERY_OP_BYTES)
         })
@@ -1592,6 +1649,30 @@ impl TransportService {
                 )));
             }
         };
+        #[cfg(test)]
+        if self
+            .peer_recovery_state
+            .force_retry_catch_up_once
+            .swap(false, Ordering::AcqRel)
+        {
+            drop(guard);
+            self.peer_recovery_state
+                .force_stalled_retry_fetch_once
+                .store(true, Ordering::Release);
+            self.peer_recovery_state
+                .retry_catch_up_responses
+                .fetch_add(1, Ordering::AcqRel);
+            return Ok(PrepareFinalizeRecoveryResponse {
+                operations: Vec::new(),
+                next_cursor: Some(proto_cursor(batch.next_cursor)),
+                barrier_wal_end: Some(proto_cursor(barrier.wal_end)),
+                barrier_processed_checkpoint: barrier.sequence.processed_checkpoint,
+                retry_catch_up: true,
+                complete: false,
+                error: String::new(),
+                barrier_max_seq_no: barrier.sequence.max_seq_no,
+            });
+        }
         if !batch.complete {
             drop(guard);
             return Ok(PrepareFinalizeRecoveryResponse {

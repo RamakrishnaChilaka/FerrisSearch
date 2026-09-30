@@ -1028,7 +1028,8 @@ mod tests {
         FetchRecoveryOpsRequest, ReplicateDocRequest, ShardDeleteRequest, ShardDocRequest,
     };
     use crate::transport::server::{
-        create_transport_service_for_test, create_transport_service_with_raft,
+        RemoteStoreTransportResources, create_transport_service_for_test,
+        create_transport_service_with_raft, create_transport_service_with_raft_and_storage_handle,
     };
     use std::collections::HashMap;
 
@@ -1203,6 +1204,180 @@ mod tests {
 
         assert_eq!(next_cursor, cursor);
         assert_eq!(applied, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn retry_catch_up_stall_returns_to_finalize_in_real_session() {
+        let (raft, state_handle) =
+            consensus::create_raft_instance_mem(1, "retry-catch-up-it".into())
+                .await
+                .unwrap();
+        consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:0".into())
+            .await
+            .unwrap();
+        wait_for_leader(&raft).await;
+
+        let source_dir = tempfile::tempdir().unwrap();
+        let source_shards = Arc::new(ShardManager::new(
+            source_dir.path(),
+            Duration::from_secs(60),
+        ));
+        let source_manager = Arc::new(ClusterManager::with_shared_state(state_handle.clone()));
+        let resources = RemoteStoreTransportResources {
+            storage_manager: Arc::new(
+                crate::storage::StorageManager::new_in_path(source_dir.path()).unwrap(),
+            ),
+            remote_store_reader_cache: Arc::new(
+                crate::engine::remote_store::RemoteSplitReaderCache::default(),
+            ),
+        };
+        let (source_service, source_handle) = create_transport_service_with_raft_and_storage_handle(
+            source_manager.clone(),
+            source_shards.clone(),
+            TransportClient::new(),
+            raft.clone(),
+            Arc::new(TaskManager::new()),
+            resources,
+            "primary-node".into(),
+        );
+        let (source_address, source_server) = serve(source_service).await;
+
+        for node in [
+            NodeInfo {
+                id: "primary-node".into(),
+                name: "primary-node".into(),
+                host: "127.0.0.1".into(),
+                transport_port: source_address.port(),
+                http_port: 0,
+                roles: vec![NodeRole::Master, NodeRole::Data],
+                raft_node_id: 1,
+            },
+            NodeInfo {
+                id: "replica-node".into(),
+                name: "replica-node".into(),
+                host: "127.0.0.1".into(),
+                transport_port: 1,
+                http_port: 0,
+                roles: vec![NodeRole::Data],
+                raft_node_id: 0,
+            },
+        ] {
+            assert_eq!(
+                raft.client_write(ClusterCommand::AddNode { node })
+                    .await
+                    .unwrap()
+                    .data,
+                ClusterResponse::Ok
+            );
+        }
+        assert_eq!(
+            raft.client_write(ClusterCommand::SetMaster {
+                node_id: "primary-node".into(),
+            })
+            .await
+            .unwrap()
+            .data,
+            ClusterResponse::Ok
+        );
+        assert_eq!(
+            raft.client_write(ClusterCommand::CreateIndex {
+                metadata: IndexMetadata {
+                    name: "docs".into(),
+                    uuid: IndexUuid::new("docs-uuid"),
+                    number_of_shards: 1,
+                    number_of_replicas: 1,
+                    shard_routing: HashMap::from([(
+                        0,
+                        ShardRoutingEntry {
+                            primary: "primary-node".into(),
+                            primary_term: 1,
+                            replicas: vec!["replica-node".into()],
+                            in_sync_replicas: Vec::new(),
+                            unassigned_replicas: 0,
+                        },
+                    )]),
+                    mappings: HashMap::new(),
+                    dynamic: Default::default(),
+                    settings: IndexSettings::default(),
+                },
+            })
+            .await
+            .unwrap()
+            .data,
+            ClusterResponse::Ok
+        );
+
+        let mut source_client = connect(source_address).await;
+        let write = source_client
+            .index_doc(tonic::Request::new(ShardDocRequest {
+                index_name: "docs".into(),
+                shard_id: 0,
+                doc_id: "snapshot-doc".into(),
+                payload_json: serde_json::to_vec(&serde_json::json!({"value": 1})).unwrap(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(write.success, "{}", write.error);
+        let source_engine = source_shards.get_shard("docs", 0).unwrap();
+        source_engine.flush().unwrap();
+
+        source_handle.inject_retry_catch_up_stall_once();
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_shards = Arc::new(ShardManager::new(
+            target_dir.path(),
+            Duration::from_secs(60),
+        ));
+        let candidate = RecoveryCandidate {
+            index_name: "docs".into(),
+            metadata: state_handle.read().unwrap().indices["docs"].clone(),
+            shard_id: 0,
+            allocation_id: state_handle
+                .read()
+                .unwrap()
+                .shard_allocation_id("docs", 0, "replica-node")
+                .unwrap(),
+            primary: state_handle.read().unwrap().nodes["primary-node"].clone(),
+        };
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            run_peer_recovery(
+                &candidate,
+                "replica-node",
+                source_manager,
+                target_shards.clone(),
+                TransportClient::new(),
+                Arc::new(AtomicBool::new(false)),
+            ),
+        )
+        .await
+        .expect("peer recovery did not return to finalize")
+        .unwrap();
+        let stats = match outcome {
+            RecoveryRunOutcome::Admitted(stats) => stats,
+            RecoveryRunOutcome::AwaitingMembership(_) => {
+                panic!("the real recovery session did not observe committed admission")
+            }
+        };
+
+        assert!(!stats.session_id.is_empty());
+        assert_eq!(stats.operations, 0);
+        assert_eq!(source_handle.retry_catch_up_stall_counts(), (1, 1, 1));
+        let target_engine = target_shards.get_shard("docs", 0).unwrap();
+        target_engine.refresh().unwrap();
+        assert_eq!(
+            target_engine.get_document("snapshot-doc").unwrap().unwrap()["value"],
+            serde_json::json!(1)
+        );
+        assert!(
+            state_handle.read().unwrap().indices["docs"].shard_routing[&0]
+                .in_sync_replicas
+                .contains(&"replica-node".to_string())
+        );
+        assert!(!target_shards.is_peer_recovery_target("docs", 0));
+
+        source_server.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

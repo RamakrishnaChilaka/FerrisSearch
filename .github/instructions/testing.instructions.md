@@ -365,7 +365,10 @@ cargo test -- test_name                         # Single test by name
   bounded bulk RPCs.
 - Retry-catch-up coverage must preserve an empty incomplete response at the
   unchanged physical cursor as a return-to-finalize signal, not a
-  no-progress failure.
+  no-progress failure. Drive that shape through `run_peer_recovery` with a real
+  source session, gRPC transport, target install, finalize, and admission;
+  assert the same session uses one setup and reaches finalize rather than only
+  testing the cursor helper.
 - Zero-replica bulk replication coverage must prove target resolution happens
   before sequence-range construction or JSON serialization. Performance
   changes require equivalent release-mode before/after measurements.
