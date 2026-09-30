@@ -976,7 +976,7 @@ impl SearchEngine for CompositeEngine {
 
     #[cfg(feature = "protocol-trace")]
     fn protocol_trace_documents(&self) -> Result<Vec<(String, serde_json::Value, u64, u64)>> {
-        self.text.vector_rebuild_documents()
+        self.text.protocol_trace_documents_snapshot()
     }
 
     #[cfg(feature = "protocol-trace")]

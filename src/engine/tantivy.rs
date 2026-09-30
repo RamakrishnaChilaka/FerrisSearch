@@ -3845,8 +3845,20 @@ impl HotEngine {
     }
 
     #[cfg(feature = "protocol-trace")]
+    pub(crate) fn protocol_trace_documents_snapshot(
+        &self,
+    ) -> Result<Vec<(String, serde_json::Value, u64, u64)>> {
+        let mut documents = Vec::new();
+        self.for_each_vector_rebuild_batch(|batch| {
+            documents.extend(batch);
+            Ok(())
+        })?;
+        Ok(documents)
+    }
+
+    #[cfg(feature = "protocol-trace")]
     pub(crate) fn protocol_trace_copy_evidence(&self) -> Result<super::ProtocolTraceCopyEvidence> {
-        let live_documents = self.vector_rebuild_documents()?;
+        let live_documents = self.protocol_trace_documents_snapshot()?;
         let versions = self
             .apply_state
             .lock()
@@ -7582,7 +7594,7 @@ impl super::SearchEngine for HotEngine {
 
     #[cfg(feature = "protocol-trace")]
     fn protocol_trace_documents(&self) -> Result<Vec<(String, serde_json::Value, u64, u64)>> {
-        self.vector_rebuild_documents()
+        self.protocol_trace_documents_snapshot()
     }
 
     #[cfg(feature = "protocol-trace")]
@@ -8006,7 +8018,7 @@ impl super::SearchEngine for HotEngine {
                 {
                     self.reader.reload()?;
                     let processed_seqs = self.protocol_trace_processed_sequences()?;
-                    let documents = self.vector_rebuild_documents()?;
+                    let documents = self.protocol_trace_documents_snapshot()?;
                     Ok((file_names, processed_seqs, documents))
                 }
                 #[cfg(not(feature = "protocol-trace"))]
