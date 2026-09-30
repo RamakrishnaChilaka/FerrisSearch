@@ -443,7 +443,7 @@ fn classify_index_action(method: &Method, action: &str) -> SecurityAction {
             Method::POST | Method::PUT | Method::DELETE => SecurityAction::IndexWrite,
             _ => SecurityAction::IndexWrite,
         },
-        "_update" | "_bulk" => SecurityAction::IndexWrite,
+        "_update" | "_create" | "_bulk" => SecurityAction::IndexWrite,
         "_search" | "_count" | "_sql" => SecurityAction::IndexRead,
         "_settings" => match *method {
             Method::GET => SecurityAction::IndexRead,
@@ -689,6 +689,15 @@ mod tests {
                 index: Some("metrics".into()),
             }
         ));
+    }
+
+    #[test]
+    fn create_document_routes_require_index_write_not_admin() {
+        for method in [Method::PUT, Method::POST] {
+            let request = classify_request(&method, "/logs-2026/_create/doc");
+            assert_eq!(request.action, SecurityAction::IndexWrite);
+            assert_eq!(request.index.as_deref(), Some("logs-2026"));
+        }
     }
 
     #[test]

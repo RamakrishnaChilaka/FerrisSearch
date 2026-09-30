@@ -50,6 +50,8 @@ pub struct ShardManager {
   partial install without manufacturing a failed-copy report
 
 ### Durable Copy Identity
+- OCC/create conflicts are normal pre-WAL rejections, not storage failures.
+  They must not consume Apply retry budget or quarantine the copy.
 - Every served assigned copy has `<data_dir>/<uuid>/shard_<id>/SHARD_COPY_IDENTITY.json`.
 - The versioned JSON contains index UUID, allocation ID, and durable replica
   fence plus an allocation-bound collision-quarantine flag. Updates use temp

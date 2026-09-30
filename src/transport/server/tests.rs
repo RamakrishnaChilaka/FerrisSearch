@@ -949,6 +949,7 @@ async fn version_map_capacity_rejection_is_resource_exhausted_before_wal_append(
             shard_id: 0,
             doc_id: "doc".into(),
             payload_json: serde_json::to_vec(&json!({})).unwrap(),
+            ..Default::default()
         }))
         .await
         .unwrap_err();
@@ -1101,6 +1102,7 @@ async fn get_doc_reopens_persisted_shard_via_metadata() {
             index_name: "restart-idx".into(),
             shard_id: 0,
             doc_id: "d1".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -3455,6 +3457,7 @@ async fn promotion_noop_retry_on_one_shard_does_not_block_other_shards() {
             shard_id: 0,
             payload_json: serde_json::to_vec(&json!({"value": 1})).unwrap(),
             doc_id: "healthy-write".into(),
+            ..Default::default()
         })),
     )
     .await
@@ -3574,6 +3577,7 @@ async fn promoted_primary_replays_multiple_batches_and_reopens_cleanly() {
                 shard_id: 0,
                 doc_id: "after-promotion".into(),
                 payload_json: serde_json::to_vec(&json!({"value": DOCUMENT_COUNT})).unwrap(),
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -3731,6 +3735,7 @@ async fn write_only_primary_fault_stays_unavailable_without_term_flapping_and_cl
                 shard_id: 0,
                 doc_id: "doc".into(),
                 payload_json: serde_json::to_vec(&json!({"value": 1})).unwrap(),
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -3772,6 +3777,7 @@ async fn write_only_primary_fault_stays_unavailable_without_term_flapping_and_cl
                     shard_id: 0,
                     doc_id: format!("still-failing-{interval}-{attempt}"),
                     payload_json: serde_json::to_vec(&json!({"value": 2})).unwrap(),
+                    ..Default::default()
                 }))
                 .await
                 .unwrap()
@@ -3805,6 +3811,7 @@ async fn write_only_primary_fault_stays_unavailable_without_term_flapping_and_cl
             shard_id: 0,
             doc_id: "repaired".into(),
             payload_json: serde_json::to_vec(&json!({"value": 3})).unwrap(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -3913,6 +3920,7 @@ async fn successful_write_does_not_wait_for_primary_available_report() {
             shard_id: 0,
             doc_id: "fast-response".into(),
             payload_json: serde_json::to_vec(&json!({"value": 1})).unwrap(),
+            ..Default::default()
         })),
     )
     .await
@@ -3995,6 +4003,7 @@ async fn ordinary_write_does_not_spawn_primary_available_report() {
             shard_id: 0,
             doc_id: "ordinary".into(),
             payload_json: serde_json::to_vec(&json!({"value": 1})).unwrap(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -4211,6 +4220,7 @@ async fn primary_apply_escalation_keeps_reads_open_without_immediate_wal_replay(
                 shard_id: 0,
                 doc_id: format!("failed-after-wal-{attempt}"),
                 payload_json: serde_json::to_vec(&json!({"value": attempt})).unwrap(),
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -4459,6 +4469,7 @@ async fn replica_commit_failure_recovers_writes_and_deletes_before_promotion() {
             shard_id: 0,
             doc_id: "after-promotion".into(),
             payload_json: serde_json::to_vec(&json!({"value": 7})).unwrap(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -4719,6 +4730,7 @@ async fn persistent_primary_apply_io_promotes_live_in_sync_replica() {
                 shard_id: 0,
                 doc_id: "doc".into(),
                 payload_json: serde_json::to_vec(&json!({"value": 1})).unwrap(),
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -5604,6 +5616,7 @@ async fn collision_marker_persist_failure_keeps_transport_quarantined() {
             index_name: "idx".into(),
             shard_id: 0,
             doc_id: "doc-5".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()

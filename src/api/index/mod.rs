@@ -27,6 +27,10 @@ fn forwarded_write_error_classification(error: &anyhow::Error) -> (StatusCode, &
     }
     let status = error.downcast_ref::<tonic::Status>();
     match status.map(tonic::Status::code) {
+        Some(tonic::Code::AlreadyExists) => {
+            (StatusCode::CONFLICT, "version_conflict_engine_exception")
+        }
+        Some(tonic::Code::NotFound) => (StatusCode::NOT_FOUND, "index_not_found_exception"),
         Some(tonic::Code::ResourceExhausted)
             if status.is_some_and(|status| {
                 status
@@ -52,6 +56,11 @@ fn document_write_error_response(
     error: anyhow::Error,
 ) -> (StatusCode, Json<Value>) {
     let (status, error_type) = forwarded_write_error_classification(&error);
+    if matches!(status, StatusCode::CONFLICT | StatusCode::NOT_FOUND)
+        && let Some(error) = error.downcast_ref::<tonic::Status>()
+    {
+        return crate::api::error_response(status, error_type, error.message());
+    }
     crate::api::error_response(status, error_type, format!("{operation} failed: {error}"))
 }
 
@@ -393,6 +402,56 @@ impl RefreshParam {
     }
 }
 
+#[derive(Default, serde::Deserialize)]
+pub struct WriteParams {
+    pub refresh: Option<String>,
+    pub if_seq_no: Option<u64>,
+    pub if_primary_term: Option<u64>,
+    pub op_type: Option<String>,
+}
+
+fn illegal_argument(error: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+    crate::api::error_response(StatusCode::BAD_REQUEST, "illegal_argument_exception", error)
+}
+
+impl WriteParams {
+    fn condition(&self) -> Result<crate::engine::WriteCondition, (StatusCode, Json<Value>)> {
+        let condition = crate::engine::WriteCondition::from_optional_values(
+            self.if_seq_no,
+            self.if_primary_term,
+        )
+        .map_err(illegal_argument)?;
+        match self.op_type.as_deref() {
+            None | Some("index") => Ok(condition),
+            Some("create") if condition == crate::engine::WriteCondition::Unconditional => {
+                Ok(crate::engine::WriteCondition::Create)
+            }
+            Some("create") => Err(illegal_argument(
+                "create operations cannot use if_seq_no or if_primary_term",
+            )),
+            Some(value) => Err(illegal_argument(format!("invalid op_type [{value}]"))),
+        }
+    }
+
+    fn should_refresh(&self) -> bool {
+        matches!(self.refresh.as_deref(), Some("true") | Some(""))
+    }
+}
+
+#[derive(Default, serde::Deserialize)]
+pub struct GetParams {
+    pub realtime: Option<bool>,
+}
+
+#[derive(Default, serde::Deserialize)]
+pub struct UpdateParams {
+    pub refresh: Option<String>,
+    pub if_seq_no: Option<u64>,
+    pub if_primary_term: Option<u64>,
+    #[serde(default)]
+    pub retry_on_conflict: u32,
+}
+
 async fn refresh_engine_after_write(
     engine: Arc<dyn crate::engine::SearchEngine>,
 ) -> crate::common::Result<()> {
@@ -606,10 +665,14 @@ pub async fn create_index(
 pub async fn index_document(
     State(state): State<AppState>,
     Path(index_name): Path<crate::common::IndexName>,
-    Query(refresh_param): Query<RefreshParam>,
+    Query(refresh_param): Query<WriteParams>,
     Json(payload): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     let _timer = crate::metrics::INDEX_LATENCY_SECONDS.start_timer();
+    let condition = match refresh_param.condition() {
+        Ok(condition) => condition,
+        Err(response) => return response,
+    };
 
     // IndexName is validated at extraction time
 
@@ -661,7 +724,14 @@ pub async fn index_document(
 
     match state
         .transport_client
-        .forward_index_to_shard(&target_node, &index_name, shard_id, &doc_id, &payload)
+        .forward_index_with_condition_to_shard(
+            &target_node,
+            &index_name,
+            shard_id,
+            &doc_id,
+            &payload,
+            condition,
+        )
         .await
     {
         Ok(res) => {
@@ -676,7 +746,14 @@ pub async fn index_document(
                     error
                 );
             }
-            (StatusCode::CREATED, Json(res))
+            (
+                if res["result"] == "created" {
+                    StatusCode::CREATED
+                } else {
+                    StatusCode::OK
+                },
+                Json(res),
+            )
         }
         Err(e) => document_write_error_response("Forward", e),
     }
@@ -686,10 +763,14 @@ pub async fn index_document(
 pub async fn index_document_with_id(
     State(state): State<AppState>,
     Path((index_name, doc_id)): Path<(crate::common::IndexName, String)>,
-    Query(refresh_param): Query<RefreshParam>,
+    Query(refresh_param): Query<WriteParams>,
     Json(payload): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     let _timer = crate::metrics::INDEX_LATENCY_SECONDS.start_timer();
+    let condition = match refresh_param.condition() {
+        Ok(condition) => condition,
+        Err(response) => return response,
+    };
 
     // IndexName is validated at extraction time
 
@@ -740,7 +821,14 @@ pub async fn index_document_with_id(
 
     match state
         .transport_client
-        .forward_index_to_shard(&target_node, &index_name, shard_id, &doc_id, &payload)
+        .forward_index_with_condition_to_shard(
+            &target_node,
+            &index_name,
+            shard_id,
+            &doc_id,
+            &payload,
+            condition,
+        )
         .await
     {
         Ok(res) => {
@@ -755,10 +843,27 @@ pub async fn index_document_with_id(
                     error
                 );
             }
-            (StatusCode::CREATED, Json(res))
+            (
+                if res["result"] == "created" {
+                    StatusCode::CREATED
+                } else {
+                    StatusCode::OK
+                },
+                Json(res),
+            )
         }
         Err(e) => document_write_error_response("Forward", e),
     }
+}
+
+pub async fn create_document(
+    state: State<AppState>,
+    path: Path<(crate::common::IndexName, String)>,
+    Query(mut params): Query<WriteParams>,
+    body: Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    params.op_type = Some("create".to_string());
+    index_document_with_id(state, path, Query(params), body).await
 }
 
 pub(crate) async fn execute_distributed_dsl_search(
@@ -1119,6 +1224,7 @@ pub async fn search_documents_dsl(
 pub async fn get_document(
     State(state): State<AppState>,
     Path((index_name, doc_id)): Path<(crate::common::IndexName, String)>,
+    Query(params): Query<GetParams>,
 ) -> (StatusCode, Json<Value>) {
     // IndexName is validated at extraction time
 
@@ -1159,21 +1265,40 @@ pub async fn get_document(
 
     match state
         .transport_client
-        .forward_get_to_shard(&target_node, &index_name, shard_id, &doc_id)
+        .forward_get_with_index_uuid_to_shard(
+            &target_node,
+            &index_name,
+            shard_id,
+            &doc_id,
+            params.realtime.unwrap_or(true),
+        )
         .await
     {
-        Ok(Some(source)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "_index": index_name, "_id": doc_id, "_shard": shard_id, "found": true, "_source": source
-            })),
-        ),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "_index": index_name, "_id": doc_id, "found": false
-            })),
-        ),
+        Ok(read) => match read.document {
+            Some(document) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "_index": index_name, "_index_uuid": read.index_uuid,
+                    "_id": doc_id, "_shard": shard_id, "found": true,
+                    "_source": document.source, "_seq_no": document.seq_no,
+                    "_primary_term": document.primary_term
+                })),
+            ),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "_index": index_name, "_index_uuid": read.index_uuid,
+                    "_id": doc_id, "found": false
+                })),
+            ),
+        },
+        Err(error)
+            if error
+                .downcast_ref::<tonic::Status>()
+                .is_some_and(|status| status.code() == tonic::Code::NotFound) =>
+        {
+            document_write_error_response("Get", error)
+        }
         Err(e) => crate::api::error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "search_exception",
@@ -1188,120 +1313,303 @@ pub async fn get_document(
 pub async fn update_document(
     State(state): State<AppState>,
     Path((index_name, doc_id)): Path<(crate::common::IndexName, String)>,
+    Query(params): Query<UpdateParams>,
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
-    // IndexName is validated at extraction time
+    execute_update(&state, &index_name, &doc_id, body, &params).await
+}
 
-    if let Some(doc) = body.get("doc")
-        && let Err(response) = validate_document_source_for_api(doc)
-    {
-        return response;
-    }
-    if let Some(upsert) = body.get("upsert")
-        && let Err(response) = validate_document_source_for_api(upsert)
-    {
-        return response;
-    }
-
-    let partial = match body.get("doc") {
-        Some(d) if d.is_object() => d.clone(),
-        _ => {
-            return crate::api::error_response(
-                StatusCode::BAD_REQUEST,
-                "action_request_validation_exception",
-                "update requires a 'doc' object",
-            );
-        }
+fn validate_update_body(body: &Value) -> Result<(), (StatusCode, Json<Value>)> {
+    let Some(object) = body.as_object() else {
+        return Err(illegal_argument("update body must be an object"));
     };
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "doc" | "upsert" | "doc_as_upsert" | "detect_noop"
+        ) {
+            return Err(illegal_argument(format!(
+                "unsupported update field [{key}]"
+            )));
+        }
+    }
+    for key in ["doc", "upsert"] {
+        if let Some(source) = body.get(key) {
+            if !source.is_object() {
+                return Err(illegal_argument(format!(
+                    "update [{key}] must be an object"
+                )));
+            }
+            validate_document_source_for_api(source)?;
+        }
+    }
+    for key in ["doc_as_upsert", "detect_noop"] {
+        if body.get(key).is_some_and(|value| !value.is_boolean()) {
+            return Err(illegal_argument(format!(
+                "update [{key}] must be a boolean"
+            )));
+        }
+    }
+    if body.get("doc").is_none() && (body.get("upsert").is_none() || body["doc_as_upsert"] == true)
+    {
+        return Err(illegal_argument("update requires a 'doc' object"));
+    }
+    Ok(())
+}
 
+fn merge_update_source(target: &mut Value, partial: Value) -> bool {
+    match partial {
+        Value::Object(partial) if target.is_object() => {
+            let target = target.as_object_mut().expect("checked object");
+            let mut changed = false;
+            for (key, value) in partial {
+                if let Some(existing) = target.get_mut(&key) {
+                    changed |= merge_update_source(existing, value);
+                } else {
+                    target.insert(key, value);
+                    changed = true;
+                }
+            }
+            changed
+        }
+        partial if *target != partial => {
+            *target = partial;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn resolve_document_primary(
+    state: &AppState,
+    index_name: &str,
+    doc_id: &str,
+) -> Result<(IndexMetadata, u32, crate::cluster::state::NodeInfo), (StatusCode, Json<Value>)> {
     let cluster_state = state.cluster_manager.get_state();
-    let metadata = match cluster_state.indices.get(index_name.as_str()) {
+    let metadata = match cluster_state.indices.get(index_name) {
         Some(m) => m.clone(),
         None => {
-            return crate::api::error_response(
+            return Err(crate::api::error_response(
                 StatusCode::NOT_FOUND,
                 "index_not_found_exception",
                 format!("no such index [{index_name}]"),
-            );
+            ));
         }
     };
 
     if let Some(resp) = crate::api::reject_write_if_engine_read_only(&metadata) {
-        return resp;
+        return Err(resp);
     }
 
-    let shard_id = crate::engine::routing::calculate_shard(&doc_id, metadata.number_of_shards);
+    let shard_id = crate::engine::routing::calculate_shard(doc_id, metadata.number_of_shards);
     let target_node_id = match metadata.primary_node(shard_id) {
         Some(id) => id.clone(),
         None => {
-            return crate::api::error_response(
+            return Err(crate::api::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "shard_not_available_exception",
                 "Shard has no assigned node",
-            );
+            ));
         }
     };
     let target_node = match cluster_state.nodes.get(&target_node_id) {
         Some(n) => n.clone(),
         None => {
-            return crate::api::error_response(
+            return Err(crate::api::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "node_not_found_exception",
                 "Target node not in cluster state",
-            );
+            ));
         }
     };
 
-    // 1. Fetch the existing document
-    let existing = match state
-        .transport_client
-        .forward_get_to_shard(&target_node, &index_name, shard_id, &doc_id)
-        .await
-    {
-        Ok(Some(source)) => source,
-        Ok(None) => {
-            return crate::api::error_response(
-                StatusCode::NOT_FOUND,
-                "document_missing_exception",
-                format!("[{doc_id}]: document missing"),
-            );
-        }
-        Err(e) => {
-            return crate::api::error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "get_exception",
-                format!("{e}"),
-            );
-        }
-    };
+    Ok((metadata, shard_id, target_node))
+}
 
-    // 2. Merge: overlay partial fields onto existing _source
-    let merged = if let (Some(existing_obj), Some(partial_obj)) =
-        (existing.as_object(), partial.as_object())
-    {
-        let mut merged_obj = existing_obj.clone();
-        for (key, value) in partial_obj {
-            merged_obj.insert(key.clone(), value.clone());
-        }
-        serde_json::Value::Object(merged_obj)
-    } else {
-        partial
-    };
-    if let Err(response) = validate_document_source_for_api(&merged) {
+async fn execute_update(
+    state: &AppState,
+    index_name: &str,
+    doc_id: &str,
+    mut body: Value,
+    params: &UpdateParams,
+) -> (StatusCode, Json<Value>) {
+    if let Err(response) = validate_update_body(&body) {
         return response;
     }
-
-    // 3. Re-index the merged document
-    match state
-        .transport_client
-        .forward_index_to_shard(&target_node, &index_name, shard_id, &doc_id, &merged)
-        .await
-    {
-        Ok(mut response) => {
-            response["result"] = serde_json::json!("updated");
-            (StatusCode::OK, Json(response))
+    let requested = match crate::engine::WriteCondition::from_optional_values(
+        params.if_seq_no,
+        params.if_primary_term,
+    ) {
+        Ok(condition) => condition,
+        Err(error) => return illegal_argument(error),
+    };
+    let mut retries = params.retry_on_conflict;
+    let mut index_uuid: Option<String> = None;
+    loop {
+        let (_, shard_id, target_node) = match resolve_document_primary(state, index_name, doc_id) {
+            Ok(target) => target,
+            Err(response) => return response,
+        };
+        let read = match state
+            .transport_client
+            .forward_get_with_index_uuid_to_shard(&target_node, index_name, shard_id, doc_id, true)
+            .await
+        {
+            Ok(document) => document,
+            Err(error)
+                if error
+                    .downcast_ref::<tonic::Status>()
+                    .is_some_and(|status| status.code() == tonic::Code::NotFound) =>
+            {
+                return document_write_error_response("Get", error);
+            }
+            Err(error) => {
+                return crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "get_exception",
+                    error,
+                );
+            }
+        };
+        if index_uuid
+            .as_ref()
+            .is_some_and(|expected| expected != &read.index_uuid)
+        {
+            return crate::api::error_response(
+                StatusCode::NOT_FOUND,
+                "index_not_found_exception",
+                format!(
+                    "no such index [{index_name}] for UUID [{}]",
+                    index_uuid.as_deref().expect("checked pinned UUID")
+                ),
+            );
         }
-        Err(e) => document_write_error_response("Update", e),
+        let index_uuid = index_uuid.get_or_insert(read.index_uuid);
+        let existing = read.document;
+        if let Err(error) = requested.check(
+            doc_id,
+            existing
+                .as_ref()
+                .map(|document| (document.seq_no, document.primary_term)),
+        ) {
+            return crate::api::error_response(
+                StatusCode::CONFLICT,
+                "version_conflict_engine_exception",
+                error,
+            );
+        }
+        let (source, condition) = if let Some(existing) = existing {
+            let mut merged = existing.source;
+            let changed = body.get_mut("doc").is_some_and(|partial| {
+                let partial = if retries > 0 {
+                    partial.clone()
+                } else {
+                    partial.take()
+                };
+                merge_update_source(&mut merged, partial)
+            });
+            if body
+                .get("detect_noop")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+                && !changed
+            {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "_index": index_name, "_id": doc_id,
+                        "_seq_no": existing.seq_no, "_primary_term": existing.primary_term,
+                        "result": "noop",
+                        "_shards": {"total": 0, "successful": 0, "failed": 0}
+                    })),
+                );
+            }
+            (
+                merged,
+                crate::engine::WriteCondition::IfMatch {
+                    seq_no: existing.seq_no,
+                    primary_term: existing.primary_term,
+                },
+            )
+        } else {
+            let key = if body["doc_as_upsert"] == true {
+                "doc"
+            } else {
+                "upsert"
+            };
+            let source = body.get_mut(key);
+            let Some(source) = source else {
+                return crate::api::error_response(
+                    StatusCode::NOT_FOUND,
+                    "document_missing_exception",
+                    format!("[{doc_id}]: document missing"),
+                );
+            };
+            (
+                if retries > 0 {
+                    source.clone()
+                } else {
+                    source.take()
+                },
+                crate::engine::WriteCondition::Create,
+            )
+        };
+        if let Err(response) = validate_document_source_for_api(&source) {
+            return response;
+        }
+        let (if_seq_no, if_primary_term) = condition.expected_version();
+        let request = crate::transport::proto::ShardDocRequest {
+            index_name: index_name.to_owned(),
+            shard_id,
+            doc_id: doc_id.to_owned(),
+            payload_json: match serde_json::to_vec(&source) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return crate::api::error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "serialization_exception",
+                        error,
+                    );
+                }
+            },
+            if_seq_no,
+            if_primary_term,
+            create_only: condition == crate::engine::WriteCondition::Create,
+            index_uuid: Some(index_uuid.clone()),
+        };
+        match state
+            .transport_client
+            .forward_index_request_to_shard(&target_node, request)
+            .await
+        {
+            Ok(response) => {
+                if matches!(params.refresh.as_deref(), Some("true") | Some(""))
+                    && let Some(engine) = state.shard_manager.get_shard(index_name, shard_id)
+                    && let Err(error) = refresh_engine_after_write(engine).await
+                {
+                    tracing::error!(
+                        "Post-update refresh failed for {index_name}/{shard_id}: {error}"
+                    );
+                }
+                return (
+                    if response["result"] == "created" {
+                        StatusCode::CREATED
+                    } else {
+                        StatusCode::OK
+                    },
+                    Json(response),
+                );
+            }
+            Err(error)
+                if retries > 0
+                    && error
+                        .downcast_ref::<tonic::Status>()
+                        .is_some_and(|status| status.code() == tonic::Code::AlreadyExists) =>
+            {
+                retries -= 1;
+            }
+            Err(error) => return document_write_error_response("Update", error),
+        }
     }
 }
 
@@ -1309,7 +1617,15 @@ pub async fn update_document(
 pub async fn delete_document(
     State(state): State<AppState>,
     Path((index_name, doc_id)): Path<(crate::common::IndexName, String)>,
+    Query(params): Query<WriteParams>,
 ) -> (StatusCode, Json<Value>) {
+    let condition = match params.condition() {
+        Ok(crate::engine::WriteCondition::Create) => {
+            return illegal_argument("delete does not support op_type=create");
+        }
+        Ok(condition) => condition,
+        Err(response) => return response,
+    };
     // IndexName is validated at extraction time
 
     let cluster_state = state.cluster_manager.get_state();
@@ -1353,10 +1669,23 @@ pub async fn delete_document(
 
     match state
         .transport_client
-        .forward_delete_to_shard(&target_node, &index_name, shard_id, &doc_id)
+        .forward_delete_with_condition_to_shard(
+            &target_node,
+            &index_name,
+            shard_id,
+            &doc_id,
+            condition,
+        )
         .await
     {
-        Ok(res) => (StatusCode::OK, Json(res)),
+        Ok(res) => (
+            if res["result"] == "not_found" {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::OK
+            },
+            Json(res),
+        ),
         Err(e) => document_write_error_response("Delete", e),
     }
 }

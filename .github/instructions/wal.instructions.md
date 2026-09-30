@@ -33,8 +33,14 @@ pub trait WriteAheadLog: Send + Sync {
     fn write_bulk_with_receipt(&self, primary_term: u64, ops: &[(WalOperation, Value)]) -> Result<Option<u64>>;
     fn write_bulk_with_start_seq(&self, start_seq_no: u64, primary_term: u64, ops: &[(WalOperation, Value)]) -> Result<()>;
     fn append_batch_with_seq(&self, entries: &[SequencedWalEntry]) -> Result<Vec<TranslogEntry>>;
+    fn write_document_with_receipt(&self, primary_term: u64, operation: WalDocumentOperation<'_>) -> Result<u64>;
+    fn write_document_bulk_with_receipt(&self, primary_term: u64, operations: &[WalDocumentOperation<'_>]) -> Result<Option<u64>>;
+    fn write_document_batch_with_seq(&self, entries: &[BorrowedSequencedWalEntry<'_>]) -> Result<()>;
     fn read_all(&self) -> Result<Vec<TranslogEntry>>;
     fn find_entry(&self, seq_no: u64) -> Result<Option<TranslogEntry>>;
+    fn find_entry_position(&self, seq_no: u64, primary_term: u64) -> Result<Option<WalCursor>>;
+    fn entry_positions(&self, start: WalCursor, count: usize) -> Result<Vec<WalCursor>>;
+    fn read_entry_at(&self, position: WalCursor) -> Result<Option<TranslogEntry>>;
     fn read_from(&self, after_seq_no: u64) -> Result<Vec<TranslogEntry>>;  // replica recovery
     fn truncate(&self) -> Result<()>;
     fn truncate_below(&self, global_checkpoint: u64) -> Result<()>;  // retain above for recovery
@@ -42,6 +48,7 @@ pub trait WriteAheadLog: Send + Sync {
     fn next_seq_no(&self) -> u64;
     fn size_bytes(&self) -> Result<u64>;  // auto-flush threshold check
     fn for_each_from(&self, min_seq_no: u64, callback: &mut dyn FnMut(TranslogEntry) -> Result<()>) -> Result<u64>;  // streaming replay
+    fn for_each_from_at(&self, min_seq_no: u64, callback: &mut dyn FnMut(WalCursor, TranslogEntry) -> Result<()>) -> Result<u64>;
     fn register_retention_pin(&self, min_seq_no: u64) -> Result<u64>;
     fn recovery_read_snapshot(&self) -> Result<TranslogReadSnapshot>;
     fn release_retention_pin(&self, pin_id: u64) -> Result<()>;
@@ -85,10 +92,27 @@ pub trait WriteAheadLog: Send + Sync {
   advances the local allocator past it.
 - `append_batch_with_seq()` preserves arbitrary physical input order for live
   replica apply and peer recovery; do not sort it by sequence.
+- Receipt-only document writes serialize borrowed `WalDocumentOperation`
+  envelopes without constructing a deep JSON copy or unused return entries.
+  They share the existing append mutation logic, frame limits, sequence
+  overflow checks, fsync behavior, and test hooks. Borrowed and owned encoders
+  must produce byte-identical frames, including document-envelope key order.
+- `write_document_batch_with_seq()` preserves arbitrary physical input order
+  and explicit primary term/sequence identity, like `append_batch_with_seq()`.
 - `write_bulk_with_start_seq()` is only the contiguous explicit-sequence helper.
 - `read_from(seq_no)` is a test-only sequence filter, not a peer-recovery
   pagination cursor.
 - `for_each_from(seq_no, callback)` streams entries with seq_no >= the given value without loading the whole WAL into memory (used by startup replay)
+- `for_each_from_at()` also returns the exact generation/byte offset before
+  each decoded frame. Filtering never changes those physical positions.
+  Realtime GET seeks directly with `read_entry_at()`; an unretained generation
+  returns `None`, while I/O or malformed frames fail explicitly.
+  Engine callers hold the translog mutex through lookup/read and publish a
+  covering reader before truncation. `entry_positions()` scans only frame
+  headers after a contiguous append. Do not serialize sources again to
+  calculate offsets or rescan the WAL per replayed document.
+  Track the checked byte offset locally and use buffered relative skips;
+  do not discard the read buffer or query the file position per frame.
 - `size_bytes()` returns the summed size of all retained generations so the engine can trigger checkpoint-aware auto-flush
 - `truncate_below(global_checkpoint)` rolls to a new empty generation and deletes only generations whose max seq_no is ≤ the checkpoint; it does NOT rewrite mixed generations in place
 - `truncate()` rolls to a new empty generation and deletes all older generations

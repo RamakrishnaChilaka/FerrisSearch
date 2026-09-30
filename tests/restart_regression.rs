@@ -1012,6 +1012,7 @@ async fn get_local_document(node: &NodeConfig, doc_id: &str) -> Result<Option<Va
             index_name: INDEX_NAME.into(),
             shard_id: 0,
             doc_id: doc_id.into(),
+            ..Default::default()
         }))
         .await?
         .into_inner();

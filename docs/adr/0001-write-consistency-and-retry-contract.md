@@ -1,6 +1,7 @@
 # ADR 0001: Write Consistency And Retry Contract
 
-- **Status:** Proposed. D1 is accepted and implemented; see its status line.
+- **Status:** Partially implemented. D1 and the marked parts of D8, D9, D11,
+  and D12 are implemented; the remaining decisions are proposed.
 - **Date:** 2026-09-27
 - **Backlog:** [FS-001](../next-50-tasks.md#fs-001--decide-the-write-consistency-and-retry-contract)
 - **Roadmap:** Gate 0 deliverable "accepted write acknowledgement, retry, OCC,
@@ -10,9 +11,8 @@
   bulk), and the reads writes depend on (GET by ID and refresh). Remote-store
   publication is FS-002.
 
-D1 is accepted and implemented. The other decisions are proposed: they define
-the intended contract and describe future behavior until their implementing
-tasks land. Section 1.1 describes the code at 6dbf9dc, before D1.
+Status lines distinguish implemented behavior from the proposed contract.
+Section 1.1 describes the historical code at 6dbf9dc, before these fixes.
 
 ## 1. Context
 
@@ -272,6 +272,12 @@ resends too.
 
 ### D8. Visibility
 
+**Status (2026-09-30):** Implemented for `local_shards`: search remains
+near-real-time, GET by ID is realtime by default, and `realtime=false` uses
+the search-visible reader. Remaining: all-copy `refresh=true`,
+`refresh=wait_for`, and acknowledgement-preserving refresh-failure reporting.
+Current post-write refresh dispatch remains coordinator-local.
+
 - **Search:** an acknowledgement does not imply search visibility. Search sees
   a write after the next refresh.
 - **`refresh=true`:** refreshes the primary and every in-sync copy before the
@@ -284,6 +290,24 @@ resends too.
   search-visible reader.
 
 ### D9. Realtime reads and update
+
+**Status (2026-09-30):** Implemented for `local_shards`. Primary, replica,
+replay, and recovery index applies retain physical WAL cursors in the existing
+live version map. Realtime GET holds the translog mutex while resolving the
+source. Flush publishes its reader before truncating under that mutex; a
+missing cursor can therefore fall back to a reader covering the live version.
+A behind or missing fallback fails explicitly, rather than returning stale
+data. Replay carries cursors from the streaming decoder without rescanning
+the WAL per document.
+
+**Index-incarnation status (2026-09-30):** GET also returns `_index_uuid`,
+including when the document is missing. Coordinator update pins the serving
+primary's UUID across its GET/CAS cycle and every conflict retry. The primary
+rejects a missing or replaced incarnation before sequence assignment or WAL
+append, including requests delayed by the recovery barrier or write pool.
+
+Remaining: expose the existing internal version-map memory bound as an
+operator setting and add `_mget`. Neither is part of this implementation.
 
 - **Live version map:** each shard keeps a map from `doc_id` to
   `(seq_no, term, deleted, WAL position)` for every operation since the last
@@ -299,10 +323,27 @@ resends too.
   changed document is read from its WAL entry, which stores the full `_source`.
   If that WAL position has been truncated, or the entry is absent, GET reads the
   refreshed reader.
-- **`_update`:** runs on the primary. It reads the latest state through the map,
-  merges the partial document, and writes conditioned on the `seq_no` and term
-  it read. A conflict repeats the cycle up to `retry_on_conflict` times
-  (default 0).
+- **`_update`:** the coordinating node performs a realtime GET from the
+  primary, recursively merges `doc`, and sends a primary conditional index
+  write using the index UUID, `seq_no`, and term it read. The primary compares and appends
+  atomically. A version conflict repeats the GET/merge/write cycle up to
+  `retry_on_conflict` times (default 0); other errors are not retried.
+  Missing documents use a create-only write from `upsert` or, with
+  `doc_as_upsert: true`, from `doc`. Without either, the result is
+  `404 document_missing_exception`. `detect_noop` defaults to true; equal
+  merged content returns `noop` without allocating a sequence or appending.
+  Only `doc`, `upsert`, `doc_as_upsert`, and `detect_noop` are accepted body
+  keys. Other keys return `400 illegal_argument_exception` naming the key.
+- **Index disappearance:** a pinned UUID that no longer names the index
+  returns `404 index_not_found_exception`, not a version conflict against the
+  replacement. OpenSearch's
+  [IndexNotFoundException](https://github.com/opensearch-project/OpenSearch/blob/3.3.0/server/src/main/java/org/opensearch/index/IndexNotFoundException.java)
+  extends
+  [ResourceNotFoundException](https://github.com/opensearch-project/OpenSearch/blob/3.3.0/server/src/main/java/org/opensearch/ResourceNotFoundException.java),
+  which returns HTTP 404. FerrisSearch uses gRPC `NOT_FOUND` internally and
+  preserves that error at the HTTP boundary. A UUID rejection has no write
+  receipt and is not a copy-I/O failure. The optional UUID is an internal
+  primary-write precondition; no new REST query parameter is introduced.
 - **Replicas:** they need the same per-document `seq_no` information, from the
   map or a stored `_seq_no`, to apply D1.
 
@@ -328,6 +369,18 @@ In-sync copies must not keep divergent operations after a failover:
 
 ### D11. Concurrency control
 
+**Status (2026-09-30):** Implemented for `local_shards`: paired
+`if_seq_no`/`if_primary_term` on index, delete, and update; create-only index
+with `op_type=create` or `PUT`/`POST /{index}/_create/{id}`; and bulk
+preconditions. A conflict consumes no sequence and appends no WAL entry.
+The primary checks under the same translog mutex as assignment, using the live
+map or the reader's `_seq_no`/`_primary_term` fast fields. Replicas apply only
+the resulting sequenced mutation, never the condition.
+Coordinator update also carries D9's index-incarnation precondition.
+
+Remaining: loud rejection of `version`/`version_type` is D13; external
+versioning and client operation IDs remain unimplemented.
+
 - **Conditional writes:** `if_seq_no` and `if_primary_term` are checked only on
   the primary, against the live version map or the committed index. A mismatch
   returns 409 `version_conflict_engine_exception`, and in bulk it is a per-item
@@ -338,15 +391,29 @@ In-sync copies must not keep divergent operations after a failover:
 
 ### D12. Bulk semantics
 
-- **Results:** items return in request order, and `errors` is true when any item
-  failed.
+**Status (2026-09-30):** Implemented: strict action/metadata parsing, source
+line boundaries, all four actions, ordered per-shard execution, and per-item
+outcomes. `_index` overrides on index-scoped bulk requests are honored and
+authorized. Updates use D9; consecutive other actions use one shard RPC.
+Unconditional index-only runs retain the existing engine batch path; mixed
+or conditional runs execute sequential single-write handlers.
+
+Remaining: FS-014's bounded streaming parser, backpressure, cancellation,
+and resource accounting. Request parsing and shard grouping still materialize
+the body. D2/D4 acknowledgement and indeterminate-failure refinements remain
+proposed.
+
+- **Results:** items return in request order. `errors` is true only when an
+  item has an `error` object; delete's `404 not_found` does not set it.
 - **Malformed action lines:** a malformed or unknown action or metadata line
   rejects the whole request with 400, as in OpenSearch, because item boundaries
   are lost after it.
 - **Source lines:** each action consumes the number of source lines its type
   defines. A malformed source line is a per-item error.
-- **Unimplemented actions:** `create`, `delete`, and `update` either follow the
-  single-document rules or are rejected per item with 400 until implemented.
+- **Actions:** `index`, `create`, `delete`, and `update` follow the
+  single-document rules. An action line has exactly one supported action with
+  object metadata. Delete consumes no source line; other actions require one.
+  A missing source line rejects the whole request with a line-numbered 400.
 - **Shard-group failures:** every item in the group receives that group's
   outcome class.
 - **Metadata keys in sources:** a top-level source key that names a metadata

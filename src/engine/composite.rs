@@ -15,7 +15,7 @@ use std::time::Duration;
 use super::SearchEngine;
 use super::tantivy::HotEngine;
 use super::vector::VectorIndex;
-use crate::wal::TranslogDurability;
+use crate::wal::{TranslogDurability, WalOperation};
 
 const VECTOR_INDEX_FILE: &str = "vectors.usearch";
 const VECTOR_DOC_IDS_FILE: &str = "vectors.docids.bin";
@@ -41,7 +41,6 @@ pub struct CompositeEngine {
     column_cache: Arc<super::column_cache::ColumnCache>,
 }
 
-#[derive(Clone)]
 enum PreparedVectorMutation {
     None,
     SkipShapeMismatch {
@@ -518,23 +517,31 @@ impl CompositeEngine {
         Ok(prepared)
     }
 
+    fn vector_operation_kind(mutation: &super::DocumentMutation) -> WalOperation {
+        match mutation {
+            super::DocumentMutation::Index { .. } => WalOperation::Index,
+            super::DocumentMutation::Delete { .. } => WalOperation::Delete,
+            super::DocumentMutation::NoOp { .. } => WalOperation::NoOp,
+        }
+    }
+
     fn apply_prepared_vector_mutation_to_index(
         index: Option<&VectorIndex>,
-        operation: &super::SequencedOperation,
+        kind: WalOperation,
+        doc_id: Option<&str>,
+        seq_no: u64,
+        primary_term: u64,
         prepared: &PreparedVectorMutation,
     ) -> Result<()> {
-        match (prepared, &operation.mutation) {
-            (
-                PreparedVectorMutation::Index { vector },
-                super::DocumentMutation::Index { doc_id, .. },
-            ) => {
+        match (prepared, kind, doc_id) {
+            (PreparedVectorMutation::Index { vector }, WalOperation::Index, Some(doc_id)) => {
                 let index =
                     index.ok_or_else(|| anyhow::anyhow!("prepared vector index disappeared"))?;
-                index.apply_index(doc_id, vector, operation.seq_no, operation.primary_term)?;
+                index.apply_index(doc_id, vector, seq_no, primary_term)?;
             }
-            (PreparedVectorMutation::Delete, super::DocumentMutation::Delete { doc_id }) => {
+            (PreparedVectorMutation::Delete, WalOperation::Delete, Some(doc_id)) => {
                 if let Some(index) = index {
-                    index.apply_delete(doc_id, operation.seq_no, operation.primary_term)?;
+                    index.apply_delete(doc_id, seq_no, primary_term)?;
                 }
             }
             (
@@ -543,7 +550,8 @@ impl CompositeEngine {
                     expected,
                     actual,
                 },
-                super::DocumentMutation::Index { doc_id, .. },
+                WalOperation::Index,
+                Some(doc_id),
             ) => {
                 tracing::warn!(
                     document_id = doc_id,
@@ -553,10 +561,7 @@ impl CompositeEngine {
                     "Skipping vector mutation because the numeric array dimension does not match"
                 );
             }
-            (PreparedVectorMutation::None, _)
-            | (PreparedVectorMutation::Delete, _)
-            | (PreparedVectorMutation::Index { .. }, _)
-            | (PreparedVectorMutation::SkipShapeMismatch { .. }, _) => {}
+            _ => {}
         }
         Ok(())
     }
@@ -566,6 +571,23 @@ impl CompositeEngine {
         operation: &super::SequencedOperation,
         prepared: &PreparedVectorMutation,
     ) -> Result<()> {
+        self.apply_prepared_vector_mutation_at_identity(
+            Self::vector_operation_kind(&operation.mutation),
+            operation.mutation.doc_id(),
+            operation.seq_no,
+            operation.primary_term,
+            prepared,
+        )
+    }
+
+    fn apply_prepared_vector_mutation_at_identity(
+        &self,
+        kind: WalOperation,
+        doc_id: Option<&str>,
+        seq_no: u64,
+        primary_term: u64,
+        prepared: &PreparedVectorMutation,
+    ) -> Result<()> {
         if let PreparedVectorMutation::Index { vector } = prepared {
             self.ensure_vector_index(vector.len())?;
         }
@@ -573,15 +595,31 @@ impl CompositeEngine {
             .vector
             .read()
             .unwrap_or_else(|error| error.into_inner());
-        Self::apply_prepared_vector_mutation_to_index(guard.as_ref(), operation, prepared)
+        Self::apply_prepared_vector_mutation_to_index(
+            guard.as_ref(),
+            kind,
+            doc_id,
+            seq_no,
+            primary_term,
+            prepared,
+        )
     }
 
     fn apply_vector_mutation_after_rebuild(
         &self,
-        operation: &super::SequencedOperation,
+        kind: WalOperation,
+        doc_id: Option<&str>,
+        seq_no: u64,
+        primary_term: u64,
         prepared: &PreparedVectorMutation,
     ) -> Result<()> {
-        match self.apply_prepared_vector_mutation(operation, prepared) {
+        match self.apply_prepared_vector_mutation_at_identity(
+            kind,
+            doc_id,
+            seq_no,
+            primary_term,
+            prepared,
+        ) {
             Ok(()) => Ok(()),
             Err(error) => match self.mark_vectors_stale() {
                 Ok(()) => Err(error),
@@ -653,14 +691,12 @@ impl CompositeEngine {
                         usearch::ffi::MetricKind::Cos,
                     )?);
                 }
-                let operation = super::SequencedOperation {
-                    seq_no,
-                    primary_term,
-                    mutation: super::DocumentMutation::Index { doc_id, source },
-                };
                 Self::apply_prepared_vector_mutation_to_index(
                     rebuilt.as_ref(),
-                    &operation,
+                    WalOperation::Index,
+                    Some(&doc_id),
+                    seq_no,
+                    primary_term,
                     &prepared,
                 )?;
             }
@@ -726,18 +762,33 @@ impl SearchEngine for CompositeEngine {
         payload: serde_json::Value,
         primary_term: u64,
     ) -> Result<super::IndexWriteReceipt> {
+        self.add_document_with_condition_at_term(
+            doc_id,
+            payload,
+            primary_term,
+            super::WriteCondition::Unconditional,
+        )
+    }
+
+    fn add_document_with_condition_at_term(
+        &self,
+        doc_id: &str,
+        payload: serde_json::Value,
+        primary_term: u64,
+        condition: super::WriteCondition,
+    ) -> Result<super::IndexWriteReceipt> {
         crate::common::validate_document_source(&payload)?;
         let _vector_recovery = self
             .vector_recovery
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let prepared = self.prepare_vector_mutation(&payload)?;
-        let source_for_rebuild = payload.clone();
         let rebuild_vectors = self.prepare_vector_rebuild(false)?;
-        let receipt = match self.text.add_primary_index_with_side_effect(
+        let receipt = match self.text.add_primary_index_with_condition_and_side_effect(
             doc_id,
             payload,
             primary_term,
+            condition,
             |operation| self.apply_prepared_vector_mutation(operation, &prepared),
         ) {
             Ok(receipt) => receipt,
@@ -751,14 +802,10 @@ impl SearchEngine for CompositeEngine {
         if rebuild_vectors {
             self.rebuild_vectors_locked()?;
             self.apply_vector_mutation_after_rebuild(
-                &super::SequencedOperation {
-                    seq_no: receipt.seq_no,
-                    primary_term: receipt.primary_term,
-                    mutation: super::DocumentMutation::Index {
-                        doc_id: receipt.doc_id.clone(),
-                        source: source_for_rebuild,
-                    },
-                },
+                WalOperation::Index,
+                Some(&receipt.doc_id),
+                receipt.seq_no,
+                receipt.primary_term,
                 &prepared,
             )?;
         }
@@ -782,19 +829,17 @@ impl SearchEngine for CompositeEngine {
             .iter()
             .map(|(_, payload)| self.prepare_vector_mutation(payload))
             .collect::<Result<Vec<_>>>()?;
-        let docs_for_rebuild = docs.clone();
-        let prepared_for_rebuild = prepared.clone();
         let rebuild_vectors = self.prepare_vector_rebuild(false)?;
 
-        let mut prepared = prepared.into_iter();
+        let mut apply_prepared = prepared.iter();
         let receipt =
             match self
                 .text
                 .add_primary_bulk_with_side_effect(docs, primary_term, |operation| {
-                    let prepared = prepared
+                    let prepared = apply_prepared
                         .next()
                         .expect("primary bulk vector preparation matches operation order");
-                    self.apply_prepared_vector_mutation(operation, &prepared)
+                    self.apply_prepared_vector_mutation(operation, prepared)
                 }) {
                 Ok(receipt) => receipt,
                 Err(error) => {
@@ -807,17 +852,14 @@ impl SearchEngine for CompositeEngine {
         if rebuild_vectors {
             self.rebuild_vectors_locked()?;
             if let Some(start_seq_no) = receipt.start_seq_no {
-                for (offset, ((doc_id, source), prepared)) in docs_for_rebuild
-                    .into_iter()
-                    .zip(prepared_for_rebuild.iter())
-                    .enumerate()
+                for (offset, (doc_id, prepared)) in
+                    receipt.doc_ids.iter().zip(&prepared).enumerate()
                 {
                     self.apply_vector_mutation_after_rebuild(
-                        &super::SequencedOperation {
-                            seq_no: start_seq_no + offset as u64,
-                            primary_term: receipt.primary_term,
-                            mutation: super::DocumentMutation::Index { doc_id, source },
-                        },
+                        WalOperation::Index,
+                        Some(doc_id),
+                        start_seq_no + offset as u64,
+                        receipt.primary_term,
                         prepared,
                     )?;
                 }
@@ -834,35 +876,47 @@ impl SearchEngine for CompositeEngine {
         doc_id: &str,
         primary_term: u64,
     ) -> Result<super::DeleteWriteReceipt> {
+        self.delete_document_with_condition_at_term(
+            doc_id,
+            primary_term,
+            super::WriteCondition::Unconditional,
+        )
+    }
+
+    fn delete_document_with_condition_at_term(
+        &self,
+        doc_id: &str,
+        primary_term: u64,
+        condition: super::WriteCondition,
+    ) -> Result<super::DeleteWriteReceipt> {
         let _vector_recovery = self
             .vector_recovery
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let rebuild_vectors = self.prepare_vector_rebuild(false)?;
-        let receipt =
-            match self
-                .text
-                .delete_primary_with_side_effect(doc_id, primary_term, |operation| {
-                    self.apply_prepared_vector_mutation(operation, &PreparedVectorMutation::Delete)
-                }) {
-                Ok(receipt) => receipt,
-                Err(error) => {
-                    return Err(self.record_vector_staleness_after_text_failure(
-                        "primary document deletion",
-                        error,
-                    ));
-                }
-            };
+        let receipt = match self.text.delete_primary_with_condition_and_side_effect(
+            doc_id,
+            primary_term,
+            condition,
+            |operation| {
+                self.apply_prepared_vector_mutation(operation, &PreparedVectorMutation::Delete)
+            },
+        ) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                return Err(self.record_vector_staleness_after_text_failure(
+                    "primary document deletion",
+                    error,
+                ));
+            }
+        };
         if rebuild_vectors {
             self.rebuild_vectors_locked()?;
             self.apply_vector_mutation_after_rebuild(
-                &super::SequencedOperation {
-                    seq_no: receipt.seq_no,
-                    primary_term: receipt.primary_term,
-                    mutation: super::DocumentMutation::Delete {
-                        doc_id: doc_id.to_string(),
-                    },
-                },
+                WalOperation::Delete,
+                Some(doc_id),
+                receipt.seq_no,
+                receipt.primary_term,
                 &PreparedVectorMutation::Delete,
             )?;
         }
@@ -889,10 +943,9 @@ impl SearchEngine for CompositeEngine {
             super::DocumentMutation::NoOp { .. } => PreparedVectorMutation::None,
         };
         let rebuild_vectors = self.prepare_vector_rebuild(false)?;
-        let operation_for_rebuild = operation.clone();
         let receipt = match self
             .text
-            .apply_sequenced_operation_with_side_effect(operation, |operation| {
+            .apply_sequenced_operation_with_side_effect(&operation, |operation| {
                 self.apply_prepared_vector_mutation(operation, &prepared)
             }) {
             Ok(receipt) => receipt,
@@ -904,7 +957,13 @@ impl SearchEngine for CompositeEngine {
         if rebuild_vectors {
             self.rebuild_vectors_locked()?;
             if receipt.outcome == super::ApplyOutcome::Applied {
-                self.apply_vector_mutation_after_rebuild(&operation_for_rebuild, &prepared)?;
+                self.apply_vector_mutation_after_rebuild(
+                    Self::vector_operation_kind(&operation.mutation),
+                    operation.mutation.doc_id(),
+                    operation.seq_no,
+                    operation.primary_term,
+                    &prepared,
+                )?;
             }
         }
         self.record_replica_persisted_checkpoint(receipt.sequence.persisted_checkpoint);
@@ -924,30 +983,31 @@ impl SearchEngine for CompositeEngine {
             .vector_recovery
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let prepared_by_identity = operations
+        let prepared = operations
             .iter()
-            .map(|operation| {
-                let prepared = match &operation.mutation {
-                    super::DocumentMutation::Index { source, .. } => {
-                        self.prepare_vector_mutation(source)?
-                    }
-                    super::DocumentMutation::Delete { .. } => PreparedVectorMutation::Delete,
-                    super::DocumentMutation::NoOp { .. } => PreparedVectorMutation::None,
-                };
-                Ok(((operation.primary_term, operation.seq_no), prepared))
+            .map(|operation| match &operation.mutation {
+                super::DocumentMutation::Index { source, .. } => {
+                    self.prepare_vector_mutation(source)
+                }
+                super::DocumentMutation::Delete { .. } => Ok(PreparedVectorMutation::Delete),
+                super::DocumentMutation::NoOp { .. } => Ok(PreparedVectorMutation::None),
             })
-            .collect::<Result<std::collections::HashMap<_, _>>>()?;
-        let mut apply_prepared = prepared_by_identity.clone();
-        let operations_for_rebuild = operations.clone();
+            .collect::<Result<Vec<_>>>()?;
+        let mut apply_prepared = operations
+            .iter()
+            .zip(&prepared)
+            .map(|(operation, prepared)| ((operation.primary_term, operation.seq_no), prepared))
+            .collect::<std::collections::HashMap<_, _>>();
         let rebuild_vectors = self.prepare_vector_rebuild(false)?;
+        let prepared_for_rebuild = rebuild_vectors.then(|| apply_prepared.clone());
         let receipt =
             match self
                 .text
-                .apply_sequenced_batch_with_side_effect(operations, true, |operation| {
+                .apply_sequenced_batch_with_side_effect(&operations, true, |operation| {
                     let prepared = apply_prepared
                         .remove(&(operation.primary_term, operation.seq_no))
                         .expect("prepared vector mutation must match the operation");
-                    self.apply_prepared_vector_mutation(operation, &prepared)
+                    self.apply_prepared_vector_mutation(operation, prepared)
                 }) {
                 Ok(receipt) => receipt,
                 Err(error) => {
@@ -957,12 +1017,21 @@ impl SearchEngine for CompositeEngine {
             };
         if rebuild_vectors {
             self.rebuild_vectors_locked()?;
-            for (operation, outcome) in operations_for_rebuild.iter().zip(&receipt.outcomes) {
+            for (operation, outcome) in operations.iter().zip(&receipt.outcomes) {
                 if *outcome == super::ApplyOutcome::Applied {
-                    let prepared = prepared_by_identity
+                    let prepared = prepared_for_rebuild
+                        .as_ref()
+                        .expect("vector rebuild preparation is retained when needed")
                         .get(&(operation.primary_term, operation.seq_no))
+                        .copied()
                         .expect("prepared vector mutation must match the operation");
-                    self.apply_vector_mutation_after_rebuild(operation, prepared)?;
+                    self.apply_vector_mutation_after_rebuild(
+                        Self::vector_operation_kind(&operation.mutation),
+                        operation.mutation.doc_id(),
+                        operation.seq_no,
+                        operation.primary_term,
+                        prepared,
+                    )?;
                 }
             }
         }
@@ -972,6 +1041,14 @@ impl SearchEngine for CompositeEngine {
 
     fn get_document(&self, doc_id: &str) -> Result<Option<serde_json::Value>> {
         self.text.get_document(doc_id)
+    }
+
+    fn get_document_with_metadata(
+        &self,
+        doc_id: &str,
+        realtime: bool,
+    ) -> Result<Option<super::DocumentRead>> {
+        self.text.get_document_with_metadata(doc_id, realtime)
     }
 
     #[cfg(feature = "protocol-trace")]

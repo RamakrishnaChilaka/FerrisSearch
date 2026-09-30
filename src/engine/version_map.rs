@@ -24,6 +24,7 @@ impl MonotonicClock for SystemMonotonicClock {
 pub(crate) struct IndexVersionValue {
     pub seq_no: u64,
     pub primary_term: u64,
+    pub wal_position: Option<crate::wal::WalCursor>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,7 +111,28 @@ impl LiveVersionMap {
         Ok(winner)
     }
 
-    pub(crate) fn apply_index(&mut self, doc_id: &str, seq_no: u64, primary_term: u64) {
+    pub(crate) fn apply_index_at(
+        &mut self,
+        doc_id: &str,
+        seq_no: u64,
+        primary_term: u64,
+        wal_position: crate::wal::WalCursor,
+    ) {
+        self.insert_index(doc_id, seq_no, primary_term, Some(wal_position));
+    }
+
+    #[cfg(test)]
+    fn apply_index(&mut self, doc_id: &str, seq_no: u64, primary_term: u64) {
+        self.insert_index(doc_id, seq_no, primary_term, None);
+    }
+
+    fn insert_index(
+        &mut self,
+        doc_id: &str,
+        seq_no: u64,
+        primary_term: u64,
+        wal_position: Option<crate::wal::WalCursor>,
+    ) {
         if self
             .current
             .insert(
@@ -118,6 +140,7 @@ impl LiveVersionMap {
                 IndexVersionValue {
                     seq_no,
                     primary_term,
+                    wal_position,
                 },
             )
             .is_none()
@@ -461,6 +484,7 @@ mod tests {
             Some(VersionValue::Index(IndexVersionValue {
                 seq_no: 4,
                 primary_term: 1,
+                wal_position: None,
             }))
         );
     }

@@ -1,12 +1,18 @@
-//! Bulk document indexing: NDJSON parsing, routing, forwarding, and response assembly.
+//! Strict NDJSON action parsing and ordered per-shard bulk execution.
 
 use super::*;
+use crate::engine::WriteCondition;
+use crate::transport::proto::{ShardBulkItemResponse, ShardBulkOpKind, ShardBulkOperation};
 
+#[derive(Debug)]
 pub(super) struct BulkDoc {
     pub action: String,
     pub doc_id: String,
     pub index: Option<String>,
     pub payload: Value,
+    pub condition: WriteCondition,
+    pub retry_on_conflict: u32,
+    pub source_error: Option<String>,
 }
 
 #[derive(Debug)]
@@ -17,14 +23,17 @@ pub(super) struct RoutedBulkDoc {
     pub payload: Value,
     pub shard_id: u32,
     pub node_id: String,
+    pub action: String,
+    pub condition: WriteCondition,
+    pub retry_on_conflict: u32,
 }
 
 pub(super) type BulkTargetKey = (String, String, u32);
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct BulkTargetFailure {
     pub status: StatusCode,
-    pub error_type: &'static str,
+    pub error_type: String,
     pub reason: String,
 }
 
@@ -32,7 +41,7 @@ impl BulkTargetFailure {
     pub(super) fn internal(reason: String) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            error_type: "shard_failure",
+            error_type: "shard_failure".into(),
             reason,
         }
     }
@@ -41,69 +50,179 @@ impl BulkTargetFailure {
         let (status, error_type) = forwarded_write_error_classification(&error);
         Self {
             status,
-            error_type,
+            error_type: error_type.into(),
             reason: error.to_string(),
+        }
+    }
+
+    fn from_api_response((status, Json(body)): (StatusCode, Json<Value>)) -> Self {
+        Self {
+            status,
+            error_type: body["error"]["type"]
+                .as_str()
+                .unwrap_or("bulk_item_exception")
+                .to_string(),
+            reason: body["error"]["reason"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| body.to_string()),
         }
     }
 }
 
-type BulkTargetResults =
-    HashMap<BulkTargetKey, Result<crate::engine::BulkWriteReceipt, BulkTargetFailure>>;
-
-fn bulk_success_item(index_name: &str, doc_id: &str, seq_no: u64, primary_term: u64) -> Value {
-    serde_json::json!({
-        "index": {
-            "_index": index_name,
-            "_id": doc_id,
-            "_version": 1,
-            "result": "created",
-            "status": 201,
-            "_shards": { "total": 1, "successful": 1, "failed": 0 },
-            "_seq_no": seq_no,
-            "_primary_term": primary_term
-        }
-    })
-}
+type BulkTargetResults = HashMap<BulkTargetKey, Result<Vec<Value>, BulkTargetFailure>>;
 
 fn bulk_error_item(
+    action: &str,
     index_name: Option<&str>,
     doc_id: &str,
     status: StatusCode,
     error_type: &str,
     reason: impl std::fmt::Display,
 ) -> Value {
-    let mut item = serde_json::json!({
-        "index": {
-            "_id": doc_id,
-            "status": status.as_u16(),
-            "error": {
-                "type": error_type,
-                "reason": reason.to_string(),
-            }
-        }
+    let mut result = serde_json::json!({
+        "_id": doc_id, "status": status.as_u16(),
+        "error": {"type": error_type, "reason": reason.to_string()}
     });
-
     if let Some(index_name) = index_name {
-        item["index"]["_index"] = serde_json::json!(index_name);
+        result["_index"] = serde_json::json!(index_name);
     }
-
-    item
+    serde_json::json!({(action): result})
 }
 
-fn validate_bulk_document(
-    document: &BulkDoc,
-) -> Result<(), crate::common::ReservedDocumentFieldError> {
-    crate::common::validate_document_source(&document.payload)?;
-
-    if document.action == "update" {
-        if let Some(doc) = document.payload.get("doc") {
-            crate::common::validate_document_source(doc)?;
-        }
-        if let Some(upsert) = document.payload.get("upsert") {
-            crate::common::validate_document_source(upsert)?;
-        }
+fn wire_item_json(index: &str, item: ShardBulkItemResponse) -> Value {
+    let mut result =
+        serde_json::json!({"_index": index, "_id": item.doc_id, "status": item.status});
+    if item.error.is_empty() {
+        result["result"] = serde_json::json!(item.result);
+        result["_shards"] = serde_json::json!({"total": 1, "successful": 1, "failed": 0});
+    } else {
+        result["error"] = serde_json::json!({"type": item.error_type, "reason": item.error});
     }
-    Ok(())
+    if let Some(seq_no) = item.seq_no {
+        result["_seq_no"] = serde_json::json!(seq_no);
+    }
+    if let Some(term) = item.primary_term {
+        result["_primary_term"] = serde_json::json!(term);
+    }
+    result
+}
+
+pub(super) fn parse_bulk_ndjson(text: &str) -> Result<Vec<BulkDoc>, String> {
+    let mut documents = Vec::new();
+    let mut lines = text
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty());
+    while let Some((line, action_line)) = lines.next() {
+        let line = line + 1;
+        let malformed =
+            |reason: String| format!("Malformed action/metadata line [{line}]: {reason}");
+        let value: Value =
+            serde_json::from_str(action_line).map_err(|error| malformed(error.to_string()))?;
+        let object = value
+            .as_object()
+            .filter(|object| object.len() == 1)
+            .ok_or_else(|| {
+                malformed("expected exactly one action [index, create, update, delete]".into())
+            })?;
+        let (action, metadata) = object.iter().next().expect("one action");
+        if !matches!(action.as_str(), "index" | "create" | "update" | "delete") {
+            return Err(malformed(format!("unknown action [{action}]")));
+        }
+        let metadata = metadata
+            .as_object()
+            .ok_or_else(|| malformed(format!("action [{action}] must contain an object")))?;
+        let string = |key: &str| -> Result<Option<String>, String> {
+            metadata
+                .get(key)
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| malformed(format!("[{key}] must be a string")))
+                })
+                .transpose()
+        };
+        let number = |key: &str| -> Result<Option<u64>, String> {
+            metadata
+                .get(key)
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .ok_or_else(|| malformed(format!("[{key}] must be a non-negative integer")))
+                })
+                .transpose()
+        };
+        let condition =
+            WriteCondition::from_optional_values(number("if_seq_no")?, number("if_primary_term")?)
+                .map_err(|error| malformed(error.to_string()))?;
+        if action == "create" && condition != WriteCondition::Unconditional {
+            return Err(malformed(
+                "create operations cannot use if_seq_no or if_primary_term".into(),
+            ));
+        }
+        let retries = number("retry_on_conflict")?.unwrap_or(0);
+        if retries > 0 && action != "update" {
+            return Err(malformed(
+                "retry_on_conflict is only supported for update".into(),
+            ));
+        }
+        let retry_on_conflict = u32::try_from(retries)
+            .map_err(|_| malformed("retry_on_conflict exceeds the supported range".into()))?;
+        let doc_id = string("_id")?.unwrap_or_else(|| {
+            if matches!(action.as_str(), "index" | "create") {
+                uuid::Uuid::new_v4().to_string()
+            } else {
+                String::new()
+            }
+        });
+        let index = string("_index")?;
+        let (payload, source_error) = if action == "delete" {
+            (Value::Null, None)
+        } else {
+            let (source_line, source) = lines
+                .next()
+                .ok_or_else(|| malformed(format!("action [{action}] requires a source line")))?;
+            match serde_json::from_str(source) {
+                Ok(payload) => (payload, None),
+                Err(error) => (
+                    Value::Null,
+                    Some(format!(
+                        "Malformed source line [{}]: {error}",
+                        source_line + 1
+                    )),
+                ),
+            }
+        };
+        documents.push(BulkDoc {
+            action: action.clone(),
+            doc_id,
+            index,
+            payload,
+            condition,
+            retry_on_conflict,
+            source_error,
+        });
+    }
+    Ok(documents)
+}
+
+fn validate_bulk_document(document: &BulkDoc) -> Result<(), (StatusCode, Json<Value>)> {
+    if let Some(error) = &document.source_error {
+        return Err(mapper_parsing_error_response(error));
+    }
+    if document.doc_id.is_empty() {
+        return Err(illegal_argument(format!(
+            "bulk [{}] requires an _id",
+            document.action
+        )));
+    }
+    match document.action.as_str() {
+        "delete" => Ok(()),
+        "update" => validate_update_body(&document.payload),
+        _ => validate_document_source_for_api(&document.payload),
+    }
 }
 
 pub(super) fn route_bulk_doc(
@@ -115,21 +234,22 @@ pub(super) fn route_bulk_doc(
     cluster_state: &crate::cluster::state::ClusterState,
 ) -> Result<RoutedBulkDoc, Value> {
     let shard_id = crate::engine::routing::calculate_shard(&doc_id, metadata.number_of_shards);
-    let node_id = match metadata.primary_node(shard_id) {
-        Some(node_id) => node_id.clone(),
-        None => {
-            return Err(bulk_error_item(
+    let node_id = metadata
+        .primary_node(shard_id)
+        .ok_or_else(|| {
+            bulk_error_item(
+                "index",
                 Some(&index_name),
                 &doc_id,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "shard_not_available_exception",
                 "Shard has no assigned primary",
-            ));
-        }
-    };
-
+            )
+        })?
+        .clone();
     if !cluster_state.nodes.contains_key(&node_id) {
         return Err(bulk_error_item(
+            "index",
             Some(&index_name),
             &doc_id,
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -137,7 +257,6 @@ pub(super) fn route_bulk_doc(
             format!("Primary node [{node_id}] not found in cluster state"),
         ));
     }
-
     Ok(RoutedBulkDoc {
         position,
         index_name,
@@ -145,137 +264,175 @@ pub(super) fn route_bulk_doc(
         payload,
         shard_id,
         node_id,
+        action: "index".into(),
+        condition: WriteCondition::Unconditional,
+        retry_on_conflict: 0,
     })
 }
 
 async fn forward_bulk_batches(
     state: &AppState,
     cluster_state: &crate::cluster::state::ClusterState,
-    routed_docs: &[RoutedBulkDoc],
+    routed_docs: &mut [RoutedBulkDoc],
 ) -> BulkTargetResults {
-    let mut shard_batches: HashMap<BulkTargetKey, Vec<(String, Value)>> = HashMap::new();
-    for doc in routed_docs {
-        shard_batches
+    let mut batches: HashMap<BulkTargetKey, Vec<&mut RoutedBulkDoc>> = HashMap::new();
+    for document in routed_docs {
+        batches
             .entry((
-                doc.index_name.to_string(),
-                doc.node_id.clone(),
-                doc.shard_id,
+                document.index_name.clone(),
+                document.node_id.clone(),
+                document.shard_id,
             ))
             .or_default()
-            .push((doc.doc_id.clone(), doc.payload.clone()));
+            .push(document);
     }
-
-    let mut futures = Vec::new();
-    let mut shard_keys = Vec::new();
-    let mut outcomes = HashMap::new();
-
-    for ((index_name, node_id, shard_id), batch) in shard_batches {
-        if let Some(node_info) = cluster_state.nodes.get(&node_id) {
-            let client = state.transport_client.clone();
-            let node_info = node_info.clone();
-            let batch_index = index_name.to_string();
-            futures.push(tokio::spawn(async move {
-                let receipt = client
-                    .forward_bulk_to_shard(&node_info, &batch_index, shard_id, &batch)
-                    .await?;
-                receipt.start_seq_no.ok_or_else(|| {
-                    anyhow::anyhow!("non-empty bulk batch has no assigned starting sequence")
-                })?;
-                Ok::<_, anyhow::Error>(receipt)
-            }));
-            shard_keys.push((index_name, node_id, shard_id));
-        } else {
-            outcomes.insert(
-                (index_name, node_id, shard_id),
+    join_all(batches.into_iter().map(|(key, mut batch)| async move {
+        let Some(node) = cluster_state.nodes.get(&key.1) else {
+            return (
+                key,
                 Err(BulkTargetFailure::internal(
-                    "Primary node missing from cluster state".to_string(),
+                    "Primary node missing from cluster state".into(),
                 )),
             );
+        };
+        let mut results = Vec::with_capacity(batch.len());
+        let mut cursor = 0;
+        while cursor < batch.len() {
+            let document = &mut *batch[cursor];
+            if document.action == "update" {
+                let (if_seq_no, if_primary_term) = document.condition.expected_version();
+                let (status, Json(mut response)) = execute_update(
+                    state,
+                    &document.index_name,
+                    &document.doc_id,
+                    document.payload.take(),
+                    &UpdateParams {
+                        if_seq_no,
+                        if_primary_term,
+                        retry_on_conflict: document.retry_on_conflict,
+                        refresh: None,
+                    },
+                )
+                .await;
+                response["status"] = serde_json::json!(status.as_u16());
+                response["_index"] = serde_json::json!(document.index_name);
+                response["_id"] = serde_json::json!(document.doc_id);
+                results.push(response);
+                cursor += 1;
+                continue;
+            }
+            let start = cursor;
+            while cursor < batch.len() && batch[cursor].action != "update" {
+                cursor += 1;
+            }
+            let run = &mut batch[start..cursor];
+            let operations = run
+                .iter_mut()
+                .map(|document| {
+                    let kind = match document.action.as_str() {
+                        "index" => ShardBulkOpKind::Index,
+                        "create" => ShardBulkOpKind::Create,
+                        "delete" => ShardBulkOpKind::Delete,
+                        _ => unreachable!("parser validated the action"),
+                    };
+                    let (if_seq_no, if_primary_term) = document.condition.expected_version();
+                    (
+                        document.doc_id.clone(),
+                        document.payload.take(),
+                        ShardBulkOperation {
+                            kind: kind as i32,
+                            if_seq_no,
+                            if_primary_term,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            match state
+                .transport_client
+                .forward_bulk_operations_to_shard(node, &key.0, key.2, &operations)
+                .await
+            {
+                Ok(items) => {
+                    results.extend(items.into_iter().map(|item| wire_item_json(&key.0, item)))
+                }
+                Err(error) => {
+                    let failure = BulkTargetFailure::from_forward_error(error);
+                    for document in run {
+                        let item = bulk_error_item(
+                            &document.action,
+                            Some(&document.index_name),
+                            &document.doc_id,
+                            failure.status,
+                            &failure.error_type,
+                            &failure.reason,
+                        );
+                        results.push(item[&document.action].clone());
+                    }
+                }
+            }
         }
-    }
-
-    let results = join_all(futures).await;
-    for (key, result) in shard_keys.into_iter().zip(results) {
-        match result {
-            Ok(Ok(receipt)) => {
-                outcomes.insert(key, Ok(receipt));
-            }
-            Ok(Err(e)) => {
-                outcomes.insert(key, Err(BulkTargetFailure::from_forward_error(e)));
-            }
-            Err(join_err) => {
-                outcomes.insert(
-                    key,
-                    Err(BulkTargetFailure::internal(format!(
-                        "bulk forwarding task failed: {join_err}"
-                    ))),
-                );
-            }
-        }
-    }
-
-    outcomes
+        (key, Ok(results))
+    }))
+    .await
+    .into_iter()
+    .collect()
 }
 
 pub(super) fn finalize_bulk_items(
-    mut item_results: Vec<Option<Value>>,
+    mut items: Vec<Option<Value>>,
     routed_docs: Vec<RoutedBulkDoc>,
     outcomes: &BulkTargetResults,
 ) -> Vec<Value> {
-    let mut offsets: HashMap<BulkTargetKey, u64> = HashMap::new();
-    for doc in routed_docs {
-        let target = (
-            doc.index_name.to_string(),
-            doc.node_id.clone(),
-            doc.shard_id,
+    let mut offsets: HashMap<BulkTargetKey, usize> = HashMap::new();
+    for document in routed_docs {
+        let key = (
+            document.index_name.clone(),
+            document.node_id.clone(),
+            document.shard_id,
         );
-        let item = match outcomes.get(&target) {
-            Some(Err(failure)) => bulk_error_item(
-                Some(&doc.index_name),
-                &doc.doc_id,
-                failure.status,
-                failure.error_type,
-                &failure.reason,
-            ),
-            Some(Ok(receipt)) => {
-                let offset = offsets.entry(target).or_default();
-                let seq_no = receipt
-                    .start_seq_no
-                    .and_then(|start_seq_no| start_seq_no.checked_add(*offset));
-                *offset += 1;
-                match seq_no {
-                    Some(seq_no) => bulk_success_item(
-                        &doc.index_name,
-                        &doc.doc_id,
-                        seq_no,
-                        receipt.primary_term,
-                    ),
-                    None => bulk_error_item(
-                        Some(&doc.index_name),
-                        &doc.doc_id,
+        let offset = offsets.entry(key.clone()).or_default();
+        let result = match outcomes.get(&key) {
+            Some(Ok(results)) => results
+                .get(*offset)
+                .cloned()
+                .map(|result| serde_json::json!({(document.action.clone()): result}))
+                .unwrap_or_else(|| {
+                    bulk_error_item(
+                        &document.action,
+                        Some(&document.index_name),
+                        &document.doc_id,
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "shard_failure",
-                        "primary bulk sequence range overflows",
-                    ),
-                }
-            }
+                        "missing primary bulk item result",
+                    )
+                }),
+            Some(Err(failure)) => bulk_error_item(
+                &document.action,
+                Some(&document.index_name),
+                &document.doc_id,
+                failure.status,
+                &failure.error_type,
+                &failure.reason,
+            ),
             None => bulk_error_item(
-                Some(&doc.index_name),
-                &doc.doc_id,
+                &document.action,
+                Some(&document.index_name),
+                &document.doc_id,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "shard_failure",
                 "missing primary bulk write receipt",
             ),
         };
-        item_results[doc.position] = Some(item);
+        *offset += 1;
+        items[document.position] = Some(result);
     }
-
-    item_results
+    items
         .into_iter()
         .enumerate()
         .map(|(position, item)| {
             item.unwrap_or_else(|| {
                 bulk_error_item(
+                    "index",
                     None,
                     "",
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -287,390 +444,213 @@ pub(super) fn finalize_bulk_items(
         .collect()
 }
 
-/// Parse NDJSON bulk body into a list of documents.
-/// Supports standard OpenSearch format:
-///   {"index": {"_index": "idx", "_id": "1"}}
-///   {"field": "value"}
-pub(super) fn parse_bulk_ndjson(text: &str) -> Vec<BulkDoc> {
-    let mut docs = Vec::new();
-    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
-    while let Some(action_line) = lines.next() {
-        if let Some(doc_line) = lines.next()
-            && let Ok(doc) = serde_json::from_str::<Value>(doc_line)
-        {
-            // Parse action metadata
-            let parsed_action = serde_json::from_str::<Value>(action_line).ok();
-            let action_name = parsed_action
-                .as_ref()
-                .and_then(Value::as_object)
-                .and_then(|object| object.keys().next())
-                .cloned()
-                .unwrap_or_else(|| "index".to_string());
-            let action_meta = parsed_action.and_then(|action| {
-                action
-                    .as_object()
-                    .and_then(|obj| obj.values().next().cloned())
-            });
-
-            let action_id = action_meta
-                .as_ref()
-                .and_then(|m| m.get("_id").and_then(|v| v.as_str().map(String::from)));
-
-            let action_index = action_meta
-                .as_ref()
-                .and_then(|m| m.get("_index").and_then(|v| v.as_str().map(String::from)));
-
-            let doc_id = action_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            docs.push(BulkDoc {
-                action: action_name,
-                doc_id,
-                index: action_index,
-                payload: doc,
-            });
-        }
+async fn bulk_metadata(
+    state: &AppState,
+    cluster_state: &crate::cluster::state::ClusterState,
+    principal: Option<&crate::security::Principal>,
+    index: &str,
+) -> Result<IndexMetadata, BulkTargetFailure> {
+    if crate::security::is_protected_system_index(index) {
+        return Err(BulkTargetFailure {
+            status: StatusCode::FORBIDDEN,
+            error_type: "security_exception".into(),
+            reason: format!(
+                "index [{index}] is a protected system index and cannot be accessed through ordinary index APIs"
+            ),
+        });
     }
-    docs
+    crate::common::IndexName::new(index.to_string()).map_err(|reason| BulkTargetFailure {
+        status: StatusCode::BAD_REQUEST,
+        error_type: "invalid_index_name_exception".into(),
+        reason: reason.to_string(),
+    })?;
+    state
+        .security_manager
+        .authorize_or_error(
+            principal,
+            &crate::security::ClassifiedRequest {
+                action: crate::security::SecurityAction::IndexWrite,
+                index: Some(index.to_string()),
+            },
+        )
+        .map_err(|error| BulkTargetFailure {
+            status: error.status,
+            error_type: error.error_type.into(),
+            reason: error.reason.to_string(),
+        })?;
+    let metadata = match cluster_state.indices.get(index) {
+        Some(metadata) => metadata.clone(),
+        None => auto_create_index(state, index, cluster_state)
+            .await
+            .map_err(BulkTargetFailure::from_api_response)?,
+    };
+    if let Some(response) = crate::api::reject_write_if_engine_read_only(&metadata) {
+        return Err(BulkTargetFailure::from_api_response(response));
+    }
+    Ok(metadata)
 }
 
-/// POST /_bulk — Global bulk endpoint (index name comes from action metadata).
-pub async fn bulk_index_global(
-    State(state): State<AppState>,
-    principal: Option<axum::extract::Extension<crate::security::Principal>>,
-    Query(refresh_param): Query<RefreshParam>,
-    body: axum::body::Bytes,
+async fn execute_bulk(
+    state: &AppState,
+    principal: Option<&crate::security::Principal>,
+    default_index: Option<&str>,
+    refresh: &RefreshParam,
+    body: &[u8],
 ) -> (StatusCode, Json<Value>) {
-    let _timer = crate::metrics::INDEX_LATENCY_SECONDS.start_timer();
-    crate::metrics::BULK_REQUESTS_TOTAL.inc();
-
-    let text = match std::str::from_utf8(&body) {
-        Ok(t) => t,
-        Err(_) => {
-            return crate::api::error_response(
-                StatusCode::BAD_REQUEST,
-                "parse_exception",
-                "Invalid UTF-8 body",
-            );
-        }
+    let text = match std::str::from_utf8(body) {
+        Ok(text) => text,
+        Err(error) => return illegal_argument(format!("Invalid UTF-8 bulk body: {error}")),
     };
-
-    let docs = parse_bulk_ndjson(text);
-
-    if docs.is_empty() {
+    let documents = match parse_bulk_ndjson(text) {
+        Ok(documents) => documents,
+        Err(error) => return illegal_argument(error),
+    };
+    if documents.is_empty() {
         return (
             StatusCode::OK,
-            Json(serde_json::json!({ "took": 0, "errors": false, "items": [] })),
+            Json(serde_json::json!({"took": 0, "errors": false, "items": []})),
         );
     }
-
     let cluster_state = state.cluster_manager.get_state();
-    let mut item_results: Vec<Option<Value>> = vec![None; docs.len()];
-    let mut has_errors = false;
-    let mut by_index: HashMap<String, Vec<(usize, String, Value)>> = HashMap::new();
-
-    for (position, doc) in docs.into_iter().enumerate() {
-        if let Err(error) = validate_bulk_document(&doc) {
-            has_errors = true;
-            item_results[position] = Some(bulk_error_item(
-                doc.index.as_deref(),
-                &doc.doc_id,
-                StatusCode::BAD_REQUEST,
-                "mapper_parsing_exception",
-                error,
+    if let Some(index) = default_index
+        && let Some(metadata) = cluster_state.indices.get(index)
+        && documents
+            .iter()
+            .all(|document| document.index.as_deref().unwrap_or(index) == index)
+        && let Some(response) = crate::api::reject_write_if_engine_read_only(metadata)
+    {
+        return response;
+    }
+    let mut items = vec![None; documents.len()];
+    let mut metadata: HashMap<String, Result<IndexMetadata, BulkTargetFailure>> = HashMap::new();
+    let mut routed = Vec::new();
+    for (position, document) in documents.into_iter().enumerate() {
+        let index = document
+            .index
+            .as_deref()
+            .map(str::to_owned)
+            .or_else(|| default_index.map(str::to_string));
+        if let Err(response) = validate_bulk_document(&document) {
+            let failure = BulkTargetFailure::from_api_response(response);
+            items[position] = Some(bulk_error_item(
+                &document.action,
+                index.as_deref(),
+                &document.doc_id,
+                failure.status,
+                &failure.error_type,
+                &failure.reason,
             ));
             continue;
         }
-        if let Some(index_name) = doc.index {
-            by_index
-                .entry(index_name)
-                .or_default()
-                .push((position, doc.doc_id, doc.payload));
-        } else {
-            has_errors = true;
-            item_results[position] = Some(bulk_error_item(
+        let Some(index) = index else {
+            items[position] = Some(bulk_error_item(
+                &document.action,
                 None,
-                &doc.doc_id,
+                &document.doc_id,
                 StatusCode::BAD_REQUEST,
                 "action_request_validation_exception",
                 "bulk action metadata must include _index",
             ));
-        }
-    }
-
-    let mut routed_docs = Vec::new();
-    let principal = principal.as_ref().map(|axum::extract::Extension(p)| p);
-    for (index_name, batch) in by_index {
-        if crate::security::is_protected_system_index(&index_name) {
-            has_errors = true;
-            for (position, doc_id, _) in batch {
-                item_results[position] = Some(bulk_error_item(
-                    Some(&index_name),
-                    &doc_id,
-                    StatusCode::FORBIDDEN,
-                    "security_exception",
-                    format!(
-                        "index [{index_name}] is a protected system index and cannot be accessed through ordinary index APIs"
-                    ),
-                ));
-            }
             continue;
+        };
+        if !metadata.contains_key(&index) {
+            metadata.insert(
+                index.clone(),
+                bulk_metadata(state, &cluster_state, principal, &index).await,
+            );
         }
-
-        if let Err(reason) = crate::common::IndexName::new(index_name.clone()) {
-            has_errors = true;
-            for (position, doc_id, _) in batch {
-                item_results[position] = Some(bulk_error_item(
-                    Some(&index_name),
-                    &doc_id,
-                    StatusCode::BAD_REQUEST,
-                    "invalid_index_name_exception",
-                    reason,
+        let index_metadata = match &metadata[&index] {
+            Ok(metadata) => metadata,
+            Err(failure) => {
+                items[position] = Some(bulk_error_item(
+                    &document.action,
+                    Some(&index),
+                    &document.doc_id,
+                    failure.status,
+                    &failure.error_type,
+                    &failure.reason,
                 ));
-            }
-            continue;
-        }
-
-        if let Err(error) = state.security_manager.authorize_or_error(
-            principal,
-            &crate::security::ClassifiedRequest {
-                action: crate::security::SecurityAction::IndexWrite,
-                index: Some(index_name.clone()),
-            },
-        ) {
-            has_errors = true;
-            for (position, doc_id, _) in batch {
-                item_results[position] = Some(bulk_error_item(
-                    Some(&index_name),
-                    &doc_id,
-                    error.status,
-                    error.error_type,
-                    error.reason,
-                ));
-            }
-            continue;
-        }
-
-        let metadata = if let Some(m) = cluster_state.indices.get(index_name.as_str()) {
-            m.clone()
-        } else {
-            match auto_create_index(&state, &index_name, &cluster_state).await {
-                Ok(m) => m,
-                Err(_) => {
-                    has_errors = true;
-                    for (position, doc_id, _) in batch {
-                        item_results[position] = Some(bulk_error_item(
-                            Some(&index_name),
-                            &doc_id,
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "auto_create_exception",
-                            "Failed to auto-create index",
-                        ));
-                    }
-                    continue;
-                }
+                continue;
             }
         };
-
-        if !metadata.settings.engine.supports_writes() {
-            has_errors = true;
-            let engine = metadata.settings.engine.to_string();
-            for (position, doc_id, _) in batch {
-                item_results[position] = Some(bulk_error_item(
-                    Some(&index_name),
-                    &doc_id,
-                    StatusCode::NOT_IMPLEMENTED,
-                    "illegal_argument_exception",
-                    format!(
-                        "index [{index_name}] uses engine [{engine}] which does not accept writes yet"
-                    ),
-                ));
+        match route_bulk_doc(
+            position,
+            index,
+            document.doc_id,
+            document.payload,
+            index_metadata,
+            &cluster_state,
+        ) {
+            Ok(mut target) => {
+                target.action = document.action;
+                target.condition = document.condition;
+                target.retry_on_conflict = document.retry_on_conflict;
+                routed.push(target);
             }
-            continue;
-        }
-
-        for (position, doc_id, payload) in batch {
-            match route_bulk_doc(
-                position,
-                index_name.to_string(),
-                doc_id,
-                payload,
-                &metadata,
-                &cluster_state,
-            ) {
-                Ok(doc) => routed_docs.push(doc),
-                Err(item) => {
-                    has_errors = true;
-                    item_results[position] = Some(item);
-                }
+            Err(item) => {
+                let result = item["index"].clone();
+                items[position] = Some(serde_json::json!({(document.action): result}));
             }
         }
     }
-
-    let outcomes = forward_bulk_batches(&state, &cluster_state, &routed_docs).await;
-    if outcomes.values().any(Result::is_err) {
-        has_errors = true;
-    }
-
-    // ?refresh=true: commit + reload all affected shards so docs are immediately searchable
-    if refresh_param.should_refresh() {
-        let affected_indices: std::collections::HashSet<String> = routed_docs
+    let outcomes = forward_bulk_batches(state, &cluster_state, &mut routed).await;
+    if refresh.should_refresh() {
+        let indices = routed
             .iter()
-            .map(|doc| doc.index_name.to_string())
-            .collect();
-        for index_name in affected_indices {
-            for (shard_id, engine) in state.shard_manager.get_index_shards(&index_name) {
+            .map(|document| &document.index_name)
+            .collect::<std::collections::HashSet<_>>();
+        for index in indices {
+            for (shard_id, engine) in state.shard_manager.get_index_shards(index) {
                 if let Err(error) = refresh_engine_after_write(engine).await {
-                    tracing::error!(
-                        "Post-write refresh failed for {}/{}: {}",
-                        index_name,
-                        shard_id,
-                        error
-                    );
+                    tracing::error!("Post-bulk refresh failed for {index}/{shard_id}: {error}");
                 }
             }
         }
     }
-
-    let all_items = finalize_bulk_items(item_results, routed_docs, &outcomes);
-    has_errors |= all_items
-        .iter()
-        .any(|item| item["index"].get("error").is_some());
-
+    let items = finalize_bulk_items(items, routed, &outcomes);
+    let errors = items.iter().any(|item| {
+        item.as_object()
+            .is_some_and(|object| object.values().any(|result| result.get("error").is_some()))
+    });
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "took": 0,
-            "errors": has_errors,
-            "items": all_items
-        })),
+        Json(serde_json::json!({"took": 0, "errors": errors, "items": items})),
     )
 }
 
-/// POST /{index}/_bulk — Parse NDJSON, route each doc to the correct shard node.
-pub async fn bulk_index(
+pub async fn bulk_index_global(
     State(state): State<AppState>,
-    Path(index_name): Path<crate::common::IndexName>,
-    Query(refresh_param): Query<RefreshParam>,
+    principal: Option<axum::extract::Extension<crate::security::Principal>>,
+    Query(refresh): Query<RefreshParam>,
     body: axum::body::Bytes,
 ) -> (StatusCode, Json<Value>) {
     let _timer = crate::metrics::INDEX_LATENCY_SECONDS.start_timer();
     crate::metrics::BULK_REQUESTS_TOTAL.inc();
-
-    // IndexName is validated at extraction time
-
-    let text = match std::str::from_utf8(&body) {
-        Ok(t) => t,
-        Err(_) => {
-            return crate::api::error_response(
-                StatusCode::BAD_REQUEST,
-                "parse_exception",
-                "Invalid UTF-8 body",
-            );
-        }
-    };
-
-    // Parse NDJSON body
-    let docs = parse_bulk_ndjson(text);
-
-    if docs.is_empty() {
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({ "took": 0, "errors": false, "items": [] })),
-        );
-    }
-
-    let mut item_results: Vec<Option<Value>> = vec![None; docs.len()];
-    let mut has_errors = false;
-    let mut valid_documents = Vec::new();
-    for (position, document) in docs.into_iter().enumerate() {
-        if let Err(error) = validate_bulk_document(&document) {
-            has_errors = true;
-            item_results[position] = Some(bulk_error_item(
-                Some(&index_name),
-                &document.doc_id,
-                StatusCode::BAD_REQUEST,
-                "mapper_parsing_exception",
-                error,
-            ));
-        } else {
-            valid_documents.push((position, document));
-        }
-    }
-    if valid_documents.is_empty() {
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "took": 0,
-                "errors": has_errors,
-                "items": item_results.into_iter().flatten().collect::<Vec<_>>()
-            })),
-        );
-    }
-
-    let cluster_state = state.cluster_manager.get_state();
-
-    // Auto-create index if it doesn't exist
-    let metadata = if let Some(m) = cluster_state.indices.get(index_name.as_str()) {
-        m.clone()
-    } else {
-        match auto_create_index(&state, &index_name, &cluster_state).await {
-            Ok(m) => m,
-            Err(err_resp) => return err_resp,
-        }
-    };
-
-    if let Some(resp) = crate::api::reject_write_if_engine_read_only(&metadata) {
-        return resp;
-    }
-
-    let mut routed_docs = Vec::new();
-
-    for (position, document) in valid_documents {
-        match route_bulk_doc(
-            position,
-            index_name.to_string(),
-            document.doc_id,
-            document.payload,
-            &metadata,
-            &cluster_state,
-        ) {
-            Ok(doc) => routed_docs.push(doc),
-            Err(item) => {
-                has_errors = true;
-                item_results[position] = Some(item);
-            }
-        }
-    }
-
-    let outcomes = forward_bulk_batches(&state, &cluster_state, &routed_docs).await;
-    if outcomes.values().any(Result::is_err) {
-        has_errors = true;
-    }
-
-    // ?refresh=true: commit + reload all affected shards so docs are immediately searchable
-    if refresh_param.should_refresh() {
-        for (shard_id, engine) in state.shard_manager.get_index_shards(&index_name) {
-            if let Err(error) = refresh_engine_after_write(engine).await {
-                tracing::error!(
-                    "Post-write refresh failed for {}/{}: {}",
-                    index_name,
-                    shard_id,
-                    error
-                );
-            }
-        }
-    }
-
-    let items = finalize_bulk_items(item_results, routed_docs, &outcomes);
-    has_errors |= items
-        .iter()
-        .any(|item| item["index"].get("error").is_some());
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "took": 0,
-            "errors": has_errors,
-            "items": items
-        })),
+    execute_bulk(
+        &state,
+        principal.as_ref().map(|principal| &principal.0),
+        None,
+        &refresh,
+        &body,
     )
+    .await
+}
+
+pub async fn bulk_index(
+    State(state): State<AppState>,
+    Path(index): Path<crate::common::IndexName>,
+    principal: Option<axum::extract::Extension<crate::security::Principal>>,
+    Query(refresh): Query<RefreshParam>,
+    body: axum::body::Bytes,
+) -> (StatusCode, Json<Value>) {
+    let _timer = crate::metrics::INDEX_LATENCY_SECONDS.start_timer();
+    crate::metrics::BULK_REQUESTS_TOTAL.inc();
+    execute_bulk(
+        &state,
+        principal.as_ref().map(|principal| &principal.0),
+        Some(&index),
+        &refresh,
+        &body,
+    )
+    .await
 }

@@ -405,10 +405,12 @@ ClientResultEvent(event) ==
     /\ CASE event.outcome = "acknowledged" ->
               D1PrimaryAck(event.writeId)
        [] event.outcome = "failed" ->
-              \/ StableReplication(PrimaryFail(event.writeId))
-              \/ StableReplication(PrimaryReject(event.writeId))
-                 \/ /\ writeStatus[event.writeId] = "Failed"
-                    /\ UNCHANGED d1vars
+              IF event.preWalVersionConflict
+              THEN StableReplication(PrimaryVersionConflict(event.writeId))
+              ELSE \/ StableReplication(PrimaryFail(event.writeId))
+                   \/ StableReplication(PrimaryReject(event.writeId))
+                   \/ /\ writeStatus[event.writeId] = "Failed"
+                      /\ UNCHANGED d1vars
        [] OTHER -> FALSE
     /\ UNCHANGED AuxVars
 

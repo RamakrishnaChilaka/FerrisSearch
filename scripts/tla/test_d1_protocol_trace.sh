@@ -108,6 +108,7 @@ correct="$RUN_DIR/correct.jsonl"
 arrival="$RUN_DIR/arrival-order.jsonl"
 seq_only="$RUN_DIR/seq-only-redelivery.jsonl"
 retry="$RUN_DIR/promotion-noop-retry.jsonl"
+writes="$RUN_DIR/conditional-bulk.jsonl"
 
 capture none "$correct"
 arrival_order_step "$correct" stale >/dev/null
@@ -131,5 +132,14 @@ D1_TRACE_RETRY_OUTPUT="$retry" cargo test \
     -- --exact --nocapture
 python3 "$CHECKER" "$retry"
 TLA_TRACE_EXPECTED=accepted "$VALIDATOR" "$retry"
+
+D1_WRITES_TRACE_OUTPUT="$writes" cargo test \
+    --manifest-path "$ROOT_DIR/Cargo.toml" \
+    --test d1_protocol_trace \
+    --features protocol-trace \
+    conditional_and_mixed_bulk_write_protocol_trace \
+    -- --exact --nocapture
+python3 "$CHECKER" "$writes"
+TLA_TRACE_EXPECTED=accepted "$VALIDATOR" "$writes"
 
 echo "D1 Rust trace validation passed (seed=$SEED)."

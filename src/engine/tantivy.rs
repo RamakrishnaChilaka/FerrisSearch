@@ -20,7 +20,6 @@ use super::sequence::{
     CommittedBoundaryRecord, LocalCheckpointTracker, PrimaryTermSequenceState, SequenceStats,
     initialize_term_sequence_state,
 };
-#[cfg(feature = "protocol-trace")]
 use super::version_map::VersionValue;
 use super::version_map::{DEFAULT_VERSION_MAP_MAX_BYTES, LiveVersionMap, PrunedTombstone};
 use crate::wal::{
@@ -151,15 +150,20 @@ impl ApplyState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WalDisposition {
+enum WalDisposition<'a> {
     Append,
     AlreadyInLocalWal {
         persisted: bool,
         validate_redelivery: bool,
+        start_cursor: Option<crate::wal::WalCursor>,
+        replay_positions: Option<&'a WalPositions>,
+        initial_versions: Option<&'a HashMap<&'a str, Option<CurrentVersion>>>,
     },
 }
 
-impl WalDisposition {
+type WalPositions = HashMap<(u64, u64), crate::wal::WalCursor>;
+
+impl WalDisposition<'_> {
     fn is_already_in_local_wal(self) -> bool {
         matches!(self, Self::AlreadyInLocalWal { .. })
     }
@@ -191,8 +195,8 @@ enum CurrentVersion {
     Native(super::version_map::VersionValue),
 }
 
-struct PlannedOperation {
-    operation: super::SequencedOperation,
+struct PlannedOperation<'a> {
+    operation: &'a super::SequencedOperation,
     outcome: super::ApplyOutcome,
     complete: bool,
 }
@@ -718,27 +722,19 @@ fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
 
 fn sequenced_wal_entry(
     operation: &super::SequencedOperation,
-) -> Result<crate::wal::SequencedWalEntry> {
-    let (op, payload) = match &operation.mutation {
-        super::DocumentMutation::Index { doc_id, source } => (
-            crate::wal::WalOperation::Index,
-            serde_json::json!({ "_doc_id": doc_id, "_source": source }),
-        ),
-        super::DocumentMutation::Delete { doc_id } => (
-            crate::wal::WalOperation::Delete,
-            serde_json::json!({ "_doc_id": doc_id }),
-        ),
-        super::DocumentMutation::NoOp { reason } => (
-            crate::wal::WalOperation::NoOp,
-            serde_json::json!({ "_reason": reason }),
-        ),
+) -> crate::wal::BorrowedSequencedWalEntry<'_> {
+    let mutation = match &operation.mutation {
+        super::DocumentMutation::Index { doc_id, source } => {
+            WalDocumentOperation::Index { doc_id, source }
+        }
+        super::DocumentMutation::Delete { doc_id } => WalDocumentOperation::Delete { doc_id },
+        super::DocumentMutation::NoOp { reason } => WalDocumentOperation::NoOp { reason },
     };
-    Ok(crate::wal::SequencedWalEntry {
+    crate::wal::BorrowedSequencedWalEntry {
         seq_no: operation.seq_no,
         primary_term: operation.primary_term,
-        op,
-        payload,
-    })
+        operation: mutation,
+    }
 }
 
 fn wal_entry_matches_operation(
@@ -771,19 +767,29 @@ fn wal_entry_matches_operation(
 }
 
 fn sequenced_operation_from_entry(
-    entry: &crate::wal::TranslogEntry,
+    mut entry: crate::wal::TranslogEntry,
 ) -> Result<super::SequencedOperation> {
-    let mutation = match document_operation(entry)? {
-        WalDocumentOperation::Index { doc_id, source } => super::DocumentMutation::Index {
-            doc_id: doc_id.to_string(),
-            source: source.clone(),
-        },
-        WalDocumentOperation::Delete { doc_id } => super::DocumentMutation::Delete {
-            doc_id: doc_id.to_string(),
-        },
-        WalDocumentOperation::NoOp { reason } => super::DocumentMutation::NoOp {
-            reason: reason.to_string(),
-        },
+    document_operation(&entry)?;
+    let mutation = match entry.op {
+        crate::wal::WalOperation::Index | crate::wal::WalOperation::Delete => {
+            let serde_json::Value::String(doc_id) = entry.payload["_doc_id"].take() else {
+                unreachable!("validated WAL document ID is a string");
+            };
+            if entry.op == crate::wal::WalOperation::Index {
+                super::DocumentMutation::Index {
+                    doc_id,
+                    source: entry.payload["_source"].take(),
+                }
+            } else {
+                super::DocumentMutation::Delete { doc_id }
+            }
+        }
+        crate::wal::WalOperation::NoOp => {
+            let serde_json::Value::String(reason) = entry.payload["_reason"].take() else {
+                unreachable!("validated WAL no-op reason is a string");
+            };
+            super::DocumentMutation::NoOp { reason }
+        }
     };
     Ok(super::SequencedOperation {
         seq_no: entry.seq_no,
@@ -1245,6 +1251,21 @@ impl HotEngine {
             return Ok(Some(CurrentVersion::Native(version)));
         }
 
+        Ok(self
+            .find_refreshed_document(doc_id)?
+            .map(|(_, _, version)| CurrentVersion::Native(VersionValue::Index(version))))
+    }
+
+    fn find_refreshed_document(
+        &self,
+        doc_id: &str,
+    ) -> Result<
+        Option<(
+            tantivy::Searcher,
+            tantivy::DocAddress,
+            super::version_map::IndexVersionValue,
+        )>,
+    > {
         let registry = self
             .field_registry
             .read()
@@ -1307,12 +1328,57 @@ impl HotEngine {
             }
             .into());
         }
-        Ok(Some(CurrentVersion::Native(
-            super::version_map::VersionValue::Index(super::version_map::IndexVersionValue {
+        Ok(Some((
+            searcher,
+            address,
+            super::version_map::IndexVersionValue {
                 seq_no,
                 primary_term,
-            }),
+                wal_position: None,
+            },
         )))
+    }
+
+    fn check_primary_condition(
+        &self,
+        doc_id: &str,
+        condition: super::WriteCondition,
+    ) -> Result<bool> {
+        let state = self
+            .apply_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+        let current = match self.current_version(&state, doc_id)? {
+            Some(CurrentVersion::Native(VersionValue::Index(value))) => {
+                Some((value.seq_no, value.primary_term))
+            }
+            _ => None,
+        };
+        condition.check(doc_id, current)?;
+        Ok(current.is_some())
+    }
+
+    fn read_refreshed_document(&self, doc_id: &str) -> Result<Option<super::DocumentRead>> {
+        let Some((searcher, address, version)) = self.find_refreshed_document(doc_id)? else {
+            return Ok(None);
+        };
+        let registry = self
+            .field_registry
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let document = searcher.doc::<TantivyDocument>(address)?;
+        let text = document
+            .get_first(registry.source_field)
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| anyhow::anyhow!("document [{doc_id}] has no stored _source"))?;
+        let mut source = serde_json::from_str(text)
+            .with_context(|| format!("invalid stored _source for document [{doc_id}]"))?;
+        Self::normalize_result_source_with_registry(&registry, &mut source);
+        Ok(Some(super::DocumentRead {
+            source,
+            seq_no: version.seq_no,
+            primary_term: version.primary_term,
+        }))
     }
 
     fn validate_redelivery(
@@ -1339,8 +1405,8 @@ impl HotEngine {
     fn apply_sequenced_batch_locked<F>(
         &self,
         translog: &dyn WriteAheadLog,
-        operations: Vec<super::SequencedOperation>,
-        wal_disposition: WalDisposition,
+        operations: &[super::SequencedOperation],
+        wal_disposition: WalDisposition<'_>,
         mut writer_override: Option<&mut WriterState>,
         inject_apply_failure: bool,
         mut side_effect: F,
@@ -1386,7 +1452,7 @@ impl HotEngine {
         let seq_only_redelivery = false;
         let planning_snapshot = state.planning_snapshot();
         let mut planned = Vec::with_capacity(operations.len());
-        let mut shadow_versions = HashMap::<String, CurrentVersion>::new();
+        let mut shadow_versions = HashMap::<&str, CurrentVersion>::with_capacity(operations.len());
         #[cfg(feature = "protocol-trace")]
         let mut collision_operation = None;
 
@@ -1408,18 +1474,18 @@ impl HotEngine {
                 {
                     #[cfg(feature = "protocol-trace")]
                     {
-                        collision_operation = Some(operation.clone());
+                        collision_operation = Some(operation);
                     }
                     return Err(error);
                 }
                 if already_processed {
                     if wal_disposition.validates_redelivery()
                         && !seq_only_redelivery
-                        && let Err(error) = self.validate_redelivery(translog, &operation)
+                        && let Err(error) = self.validate_redelivery(translog, operation)
                     {
                         #[cfg(feature = "protocol-trace")]
                         {
-                            collision_operation = Some(operation.clone());
+                            collision_operation = Some(operation);
                         }
                         return Err(error);
                     }
@@ -1444,11 +1510,22 @@ impl HotEngine {
                     super::DocumentMutation::NoOp { .. } => super::ApplyOutcome::NoOp,
                     super::DocumentMutation::Index { doc_id, .. }
                     | super::DocumentMutation::Delete { doc_id } => {
-                        let current = if let Some(current) = shadow_versions.get(doc_id).copied() {
-                            Some(current)
-                        } else {
-                            self.current_version(&state, doc_id)?
-                        };
+                        let current =
+                            if let Some(current) = shadow_versions.get(doc_id.as_str()).copied() {
+                                Some(current)
+                            } else if let WalDisposition::AlreadyInLocalWal {
+                                initial_versions: Some(initial_versions),
+                                ..
+                            } = wal_disposition
+                            {
+                                initial_versions.get(doc_id.as_str()).copied().ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "primary bulk plan has no initial version for [{doc_id}]"
+                                    )
+                                })?
+                            } else {
+                                self.current_version(&state, doc_id)?
+                            };
                         let outcome = match current {
                             Some(CurrentVersion::Native(version))
                                 if version.seq_no() > operation.seq_no =>
@@ -1479,7 +1556,7 @@ impl HotEngine {
                                     } else {
                                         #[cfg(feature = "protocol-trace")]
                                         {
-                                            collision_operation = Some(operation.clone());
+                                            collision_operation = Some(operation);
                                         }
                                         return Err(SequenceOperationCollisionError {
                                             primary_term: operation.primary_term,
@@ -1491,11 +1568,11 @@ impl HotEngine {
                                     if wal_disposition.validates_redelivery()
                                         && !seq_only_redelivery
                                         && let Err(error) =
-                                            self.validate_redelivery(translog, &operation)
+                                            self.validate_redelivery(translog, operation)
                                     {
                                         #[cfg(feature = "protocol-trace")]
                                         {
-                                            collision_operation = Some(operation.clone());
+                                            collision_operation = Some(operation);
                                         }
                                         return Err(error);
                                     }
@@ -1511,6 +1588,7 @@ impl HotEngine {
                                         super::version_map::IndexVersionValue {
                                             seq_no: operation.seq_no,
                                             primary_term: operation.primary_term,
+                                            wal_position: None,
                                         },
                                     ))
                                 }
@@ -1525,7 +1603,7 @@ impl HotEngine {
                                 ),
                                 super::DocumentMutation::NoOp { .. } => unreachable!(),
                             };
-                            shadow_versions.insert(doc_id.clone(), version);
+                            shadow_versions.insert(doc_id.as_str(), version);
                         }
                         outcome
                     }
@@ -1563,29 +1641,28 @@ impl HotEngine {
             return Err(error);
         }
 
-        let wal_entries = match planned
-            .iter()
-            .filter(|planned| planned.outcome != super::ApplyOutcome::Redelivery)
-            .map(|planned| sequenced_wal_entry(&planned.operation))
-            .collect::<Result<Vec<_>>>()
-        {
-            Ok(entries) => entries,
-            Err(error) => {
-                state.restore_planning_snapshot(planning_snapshot);
-                if wal_disposition.is_already_in_local_wal() {
-                    if let Some(writer_state) = writer_override.as_deref_mut() {
-                        writer_state.fail(format!(
-                            "sequenced operation failed after WAL persistence: {error:#}"
-                        ));
-                    } else {
-                        self.fail_writer_after_wal(&error);
-                    }
-                }
-                return Err(error);
-            }
+        let wal_entries = if wal_disposition == WalDisposition::Append {
+            planned
+                .iter()
+                .filter(|planned| planned.outcome != super::ApplyOutcome::Redelivery)
+                .map(|planned| sequenced_wal_entry(planned.operation))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
         };
         let appended = wal_disposition == WalDisposition::Append && !wal_entries.is_empty();
-        if appended && let Err(error) = translog.append_batch_with_seq(&wal_entries) {
+        let start_cursor = match wal_disposition {
+            WalDisposition::Append if appended => match translog.recovery_read_snapshot() {
+                Ok(snapshot) => Some(snapshot.end_cursor()),
+                Err(error) => {
+                    state.restore_planning_snapshot(planning_snapshot);
+                    return Err(error);
+                }
+            },
+            WalDisposition::AlreadyInLocalWal { start_cursor, .. } => start_cursor,
+            _ => None,
+        };
+        if appended && let Err(error) = translog.write_document_batch_with_seq(&wal_entries) {
             state.restore_planning_snapshot(planning_snapshot);
             return Err(error);
         }
@@ -1598,7 +1675,7 @@ impl HotEngine {
             {
                 crate::protocol_trace::record_wal_appended(
                     copy,
-                    &planned_operation.operation,
+                    planned_operation.operation,
                     durable,
                 )?;
             }
@@ -1626,6 +1703,44 @@ impl HotEngine {
             None
         };
         let execution_result = (|| {
+            let positions = match wal_disposition {
+                WalDisposition::AlreadyInLocalWal {
+                    replay_positions: Some(positions),
+                    ..
+                } => positions.clone(),
+                _ => match start_cursor {
+                    Some(start) => {
+                        let count = if appended {
+                            wal_entries.len()
+                        } else {
+                            operations.len()
+                        };
+                        let cursors = if count == 1 {
+                            vec![start]
+                        } else {
+                            translog.entry_positions(start, count)?
+                        };
+                        if appended {
+                            wal_entries
+                                .iter()
+                                .zip(cursors)
+                                .map(|(entry, position)| {
+                                    ((entry.primary_term, entry.seq_no), position)
+                                })
+                                .collect::<HashMap<_, _>>()
+                        } else {
+                            operations
+                                .iter()
+                                .zip(cursors)
+                                .map(|(operation, position)| {
+                                    ((operation.primary_term, operation.seq_no), position)
+                                })
+                                .collect::<HashMap<_, _>>()
+                        }
+                    }
+                    None => HashMap::new(),
+                },
+            };
             #[cfg(test)]
             if inject_apply_failure {
                 self.maybe_fail_engine_apply_for_test()?;
@@ -1656,11 +1771,30 @@ impl HotEngine {
                             planned_operation.operation.primary_term,
                         )?;
                         writer.add_document(doc)?;
-                        side_effect(&planned_operation.operation)?;
-                        state.versions.apply_index(
+                        side_effect(planned_operation.operation)?;
+                        let wal_position = match positions.get(&(
+                            planned_operation.operation.primary_term,
+                            planned_operation.operation.seq_no,
+                        )) {
+                            Some(position) => *position,
+                            None => translog
+                                .find_entry_position(
+                                    planned_operation.operation.seq_no,
+                                    planned_operation.operation.primary_term,
+                                )?
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "applied index operation ({}, {}) has no WAL position",
+                                        planned_operation.operation.primary_term,
+                                        planned_operation.operation.seq_no
+                                    )
+                                })?,
+                        };
+                        state.versions.apply_index_at(
                             doc_id,
                             planned_operation.operation.seq_no,
                             planned_operation.operation.primary_term,
+                            wal_position,
                         );
                     }
                     (super::DocumentMutation::Delete { doc_id }, super::ApplyOutcome::Applied) => {
@@ -1674,7 +1808,7 @@ impl HotEngine {
                             .unwrap_or_else(|error| error.into_inner())
                             .id_field;
                         writer.delete_term(Term::from_field_text(id_field, doc_id));
-                        side_effect(&planned_operation.operation)?;
+                        side_effect(planned_operation.operation)?;
                         state.versions.apply_delete(
                             doc_id,
                             planned_operation.operation.seq_no,
@@ -1701,7 +1835,7 @@ impl HotEngine {
                 if let Some(copy) = trace_copy.as_ref() {
                     crate::protocol_trace::record_operation_processed(
                         copy,
-                        &planned_operation.operation,
+                        planned_operation.operation,
                         planned_operation.outcome,
                         state.checkpoints.stats(),
                     )?;
@@ -1742,21 +1876,24 @@ impl HotEngine {
 
     pub(crate) fn apply_sequenced_operation_with_side_effect<F>(
         &self,
-        operation: super::SequencedOperation,
+        operation: &super::SequencedOperation,
         side_effect: F,
     ) -> Result<super::ReplicaApplyReceipt>
     where
         F: FnOnce(&super::SequencedOperation) -> Result<()>,
     {
         let mut side_effect = Some(side_effect);
-        let bulk =
-            self.apply_sequenced_batch_with_side_effect(vec![operation], false, |operation| {
+        let bulk = self.apply_sequenced_batch_with_side_effect(
+            std::slice::from_ref(operation),
+            false,
+            |operation| {
                 side_effect
                     .take()
                     .expect("single operation side effect runs at most once")(
                     operation
                 )
-            })?;
+            },
+        )?;
         Ok(super::ReplicaApplyReceipt {
             outcome: bulk.outcomes[0],
             operation_processed: bulk.all_operations_processed,
@@ -1767,30 +1904,27 @@ impl HotEngine {
 
     pub(crate) fn apply_sequenced_batch_with_side_effect<F>(
         &self,
-        operations: Vec<super::SequencedOperation>,
+        operations: &[super::SequencedOperation],
         allow_oversized_bulk: bool,
-        mut side_effect: F,
+        side_effect: F,
     ) -> Result<super::ReplicaBulkApplyReceipt>
     where
         F: FnMut(&super::SequencedOperation) -> Result<()>,
     {
-        let doc_ids = operations
-            .iter()
-            .filter_map(|operation| operation.mutation.doc_id())
-            .map(str::to_string)
-            .collect::<Vec<_>>();
         self.with_version_map_capacity(
             "sequenced operation apply",
-            doc_ids.iter().map(String::as_str),
+            operations
+                .iter()
+                .filter_map(|operation| operation.mutation.doc_id()),
             allow_oversized_bulk,
             |translog| {
                 self.apply_sequenced_batch_locked(
                     translog,
-                    operations.clone(),
+                    operations,
                     WalDisposition::Append,
                     None,
                     true,
-                    &mut side_effect,
+                    side_effect,
                 )
             },
         )
@@ -1801,6 +1935,26 @@ impl HotEngine {
         doc_id: &str,
         payload: serde_json::Value,
         primary_term: u64,
+        side_effect: F,
+    ) -> Result<super::IndexWriteReceipt>
+    where
+        F: FnMut(&super::SequencedOperation) -> Result<()>,
+    {
+        self.add_primary_index_with_condition_and_side_effect(
+            doc_id,
+            payload,
+            primary_term,
+            super::WriteCondition::Unconditional,
+            side_effect,
+        )
+    }
+
+    pub(crate) fn add_primary_index_with_condition_and_side_effect<F>(
+        &self,
+        doc_id: &str,
+        payload: serde_json::Value,
+        primary_term: u64,
+        condition: super::WriteCondition,
         mut side_effect: F,
     ) -> Result<super::IndexWriteReceipt>
     where
@@ -1809,21 +1963,25 @@ impl HotEngine {
         self.validate_keyword_documents(std::iter::once(&payload))?;
         self.prepare_primary_term_before_wal(primary_term)?;
         let doc_id_owned = doc_id.to_string();
-        let seq_no =
+        let (seq_no, created) =
             self.with_version_map_capacity("document indexing", [doc_id], false, |translog| {
                 drop(self.writer_state_with_replay(translog, "document indexing")?);
                 self.prepare_primary_term_before_wal(primary_term)?;
-                let receipt = translog.append(
+                let existed = self.check_primary_condition(doc_id, condition)?;
+                let start_cursor = translog.recovery_read_snapshot()?.end_cursor();
+                let seq_no = translog.write_document_with_receipt(
                     primary_term,
-                    crate::wal::WalOperation::Index,
-                    serde_json::json!({ "_doc_id": doc_id, "_source": payload }),
+                    WalDocumentOperation::Index {
+                        doc_id,
+                        source: &payload,
+                    },
                 )?;
                 let operation = super::SequencedOperation {
-                    seq_no: receipt.seq_no,
+                    seq_no,
                     primary_term,
                     mutation: super::DocumentMutation::Index {
-                        doc_id: doc_id_owned.clone(),
-                        source: payload.clone(),
+                        doc_id: doc_id_owned,
+                        source: payload,
                     },
                 };
                 #[cfg(feature = "protocol-trace")]
@@ -1836,21 +1994,25 @@ impl HotEngine {
                 }
                 self.apply_sequenced_batch_locked(
                     translog,
-                    vec![operation],
+                    std::slice::from_ref(&operation),
                     WalDisposition::AlreadyInLocalWal {
                         persisted: matches!(self.durability, TranslogDurability::Request),
                         validate_redelivery: true,
+                        start_cursor: Some(start_cursor),
+                        replay_positions: None,
+                        initial_versions: None,
                     },
                     None,
                     true,
                     &mut side_effect,
                 )?;
-                Ok(receipt.seq_no)
+                Ok((seq_no, !existed))
             })?;
         Ok(super::IndexWriteReceipt {
             doc_id: doc_id.to_string(),
             seq_no,
             primary_term,
+            created,
         })
     }
 
@@ -1865,33 +2027,51 @@ impl HotEngine {
     {
         self.validate_keyword_documents(docs.iter().map(|(_, payload)| payload))?;
         self.prepare_primary_term_before_wal(primary_term)?;
-        let wal_ops = docs
-            .iter()
-            .map(|(doc_id, payload)| {
-                (
-                    crate::wal::WalOperation::Index,
-                    serde_json::json!({ "_doc_id": doc_id, "_source": payload }),
-                )
-            })
-            .collect::<Vec<_>>();
         let doc_ids = docs
             .iter()
             .map(|(doc_id, _)| doc_id.clone())
             .collect::<Vec<_>>();
-        let start_seq_no = self.with_version_map_capacity(
+        let (start_seq_no, created) = self.with_version_map_capacity(
             "bulk indexing",
             doc_ids.iter().map(String::as_str),
             true,
             |translog| {
                 drop(self.writer_state_with_replay(translog, "bulk indexing")?);
                 self.prepare_primary_term_before_wal(primary_term)?;
-                let Some(start_seq_no) =
-                    translog.write_bulk_with_receipt(primary_term, &wal_ops)?
-                else {
-                    return Ok(None);
+                let mut initial_versions = HashMap::with_capacity(docs.len());
+                let mut created = Vec::with_capacity(docs.len());
+                {
+                    let state = self
+                        .apply_state
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+                    for doc_id in &doc_ids {
+                        match initial_versions.entry(doc_id.as_str()) {
+                            std::collections::hash_map::Entry::Occupied(_) => created.push(false),
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                let current = self.current_version(&state, doc_id)?;
+                                created.push(!matches!(
+                                    current,
+                                    Some(CurrentVersion::Native(VersionValue::Index(_)))
+                                ));
+                                entry.insert(current);
+                            }
+                        }
+                    }
+                }
+                let start_cursor = translog.recovery_read_snapshot()?.end_cursor();
+                let start_seq_no = {
+                    let wal_ops = docs
+                        .iter()
+                        .map(|(doc_id, source)| WalDocumentOperation::Index { doc_id, source })
+                        .collect::<Vec<_>>();
+                    translog.write_document_bulk_with_receipt(primary_term, &wal_ops)?
+                };
+                let Some(start_seq_no) = start_seq_no else {
+                    return Ok((None, created));
                 };
                 let operations = docs
-                    .iter()
+                    .into_iter()
                     .enumerate()
                     .map(|(offset, (doc_id, payload))| {
                         Ok(super::SequencedOperation {
@@ -1900,8 +2080,8 @@ impl HotEngine {
                             })?,
                             primary_term,
                             mutation: super::DocumentMutation::Index {
-                                doc_id: doc_id.clone(),
-                                source: payload.clone(),
+                                doc_id,
+                                source: payload,
                             },
                         })
                     })
@@ -1918,22 +2098,26 @@ impl HotEngine {
                 }
                 self.apply_sequenced_batch_locked(
                     translog,
-                    operations,
+                    &operations,
                     WalDisposition::AlreadyInLocalWal {
                         persisted: matches!(self.durability, TranslogDurability::Request),
                         validate_redelivery: true,
+                        start_cursor: Some(start_cursor),
+                        replay_positions: None,
+                        initial_versions: Some(&initial_versions),
                     },
                     None,
                     true,
                     &mut side_effect,
                 )?;
-                Ok(Some(start_seq_no))
+                Ok((Some(start_seq_no), created))
             },
         )?;
         Ok(super::BulkWriteReceipt {
             doc_ids,
             start_seq_no,
             primary_term,
+            created,
         })
     }
 
@@ -1941,6 +2125,24 @@ impl HotEngine {
         &self,
         doc_id: &str,
         primary_term: u64,
+        side_effect: F,
+    ) -> Result<super::DeleteWriteReceipt>
+    where
+        F: FnMut(&super::SequencedOperation) -> Result<()>,
+    {
+        self.delete_primary_with_condition_and_side_effect(
+            doc_id,
+            primary_term,
+            super::WriteCondition::Unconditional,
+            side_effect,
+        )
+    }
+
+    pub(crate) fn delete_primary_with_condition_and_side_effect<F>(
+        &self,
+        doc_id: &str,
+        primary_term: u64,
+        condition: super::WriteCondition,
         mut side_effect: F,
     ) -> Result<super::DeleteWriteReceipt>
     where
@@ -1948,20 +2150,21 @@ impl HotEngine {
     {
         self.prepare_primary_term_before_wal(primary_term)?;
         let doc_id_owned = doc_id.to_string();
-        let seq_no =
+        let (seq_no, existed) =
             self.with_version_map_capacity("document delete", [doc_id], false, |translog| {
                 drop(self.writer_state_with_replay(translog, "document delete")?);
                 self.prepare_primary_term_before_wal(primary_term)?;
-                let receipt = translog.append(
+                let existed = self.check_primary_condition(doc_id, condition)?;
+                let start_cursor = translog.recovery_read_snapshot()?.end_cursor();
+                let seq_no = translog.write_document_with_receipt(
                     primary_term,
-                    crate::wal::WalOperation::Delete,
-                    serde_json::json!({ "_doc_id": doc_id }),
+                    WalDocumentOperation::Delete { doc_id },
                 )?;
                 let operation = super::SequencedOperation {
-                    seq_no: receipt.seq_no,
+                    seq_no,
                     primary_term,
                     mutation: super::DocumentMutation::Delete {
-                        doc_id: doc_id_owned.clone(),
+                        doc_id: doc_id_owned,
                     },
                 };
                 #[cfg(feature = "protocol-trace")]
@@ -1974,19 +2177,22 @@ impl HotEngine {
                 }
                 self.apply_sequenced_batch_locked(
                     translog,
-                    vec![operation],
+                    std::slice::from_ref(&operation),
                     WalDisposition::AlreadyInLocalWal {
                         persisted: matches!(self.durability, TranslogDurability::Request),
                         validate_redelivery: true,
+                        start_cursor: Some(start_cursor),
+                        replay_positions: None,
+                        initial_versions: None,
                     },
                     None,
                     true,
                     &mut side_effect,
                 )?;
-                Ok(receipt.seq_no)
+                Ok((seq_no, existed))
             })?;
         Ok(super::DeleteWriteReceipt {
-            deleted: 1,
+            deleted: u64::from(existed),
             seq_no,
             primary_term,
         })
@@ -2006,11 +2212,11 @@ impl HotEngine {
         context: &'static str,
         doc_ids: I,
         allow_oversized_bulk: bool,
-        mut operation: F,
+        operation: F,
     ) -> Result<T>
     where
         I: IntoIterator<Item = &'a str>,
-        F: FnMut(&dyn WriteAheadLog) -> Result<T>,
+        F: FnOnce(&dyn WriteAheadLog) -> Result<T>,
     {
         let reservation_bytes = LiveVersionMap::estimate_reservation(doc_ids);
         let mut refreshed = false;
@@ -2145,6 +2351,14 @@ impl HotEngine {
         context: &str,
     ) -> Result<u64> {
         let committed = self.load_committed_boundary()?;
+        // Publish the committed state to the reader before clearing the live
+        // version map. Otherwise a realtime GET or primary condition that
+        // misses the map falls back to an older reader. Some paths commit
+        // without reloading, such as the peer-recovery snapshot, and rely on
+        // the delayed commit watcher.
+        self.reader
+            .reload()
+            .with_context(|| format!("reader reload failed before {context} replay"))?;
         self.reset_apply_state_to_commit(committed.clone())?;
         #[cfg(feature = "protocol-trace")]
         let trace_copy = crate::protocol_trace::current_open_copy();
@@ -2176,70 +2390,86 @@ impl HotEngine {
         let mut replayed: u64 = 0;
         let mut last_committed_boundary = None;
         let mut batch = Vec::with_capacity(TRANSLOG_REPLAY_BATCH_SIZE as usize);
-        let mut flush_batch = |batch: &mut Vec<super::SequencedOperation>| -> Result<()> {
-            if batch.is_empty() {
-                return Ok(());
-            }
-            let operations = std::mem::take(batch);
-            #[cfg(feature = "protocol-trace")]
-            let result = if trace_replay {
-                crate::protocol_trace::with_apply_scope(
-                    crate::protocol_trace::ApplyOrigin::Replay,
-                    operations.clone(),
-                    || {
-                        self.apply_sequenced_batch_locked(
-                            translog,
-                            operations,
-                            WalDisposition::AlreadyInLocalWal {
-                                persisted: true,
-                                validate_redelivery: false,
-                            },
-                            Some(writer_state),
-                            false,
-                            |_| Ok(()),
-                        )
-                    },
-                )
-            } else {
-                self.apply_sequenced_batch_locked(
+        let mut flush_batch =
+            |batch: &mut Vec<(super::SequencedOperation, crate::wal::WalCursor)>| -> Result<()> {
+                if batch.is_empty() {
+                    return Ok(());
+                }
+                let (operations, cursors): (Vec<_>, Vec<_>) =
+                    std::mem::take(batch).into_iter().unzip();
+                let positions = operations
+                    .iter()
+                    .zip(cursors)
+                    .map(|(operation, cursor)| ((operation.primary_term, operation.seq_no), cursor))
+                    .collect::<WalPositions>();
+                #[cfg(feature = "protocol-trace")]
+                let result = if trace_replay {
+                    crate::protocol_trace::with_apply_scope(
+                        crate::protocol_trace::ApplyOrigin::Replay,
+                        operations.clone(),
+                        || {
+                            self.apply_sequenced_batch_locked(
+                                translog,
+                                &operations,
+                                WalDisposition::AlreadyInLocalWal {
+                                    persisted: true,
+                                    validate_redelivery: false,
+                                    start_cursor: None,
+                                    replay_positions: Some(&positions),
+                                    initial_versions: None,
+                                },
+                                Some(writer_state),
+                                false,
+                                |_| Ok(()),
+                            )
+                        },
+                    )
+                } else {
+                    self.apply_sequenced_batch_locked(
+                        translog,
+                        &operations,
+                        WalDisposition::AlreadyInLocalWal {
+                            persisted: true,
+                            validate_redelivery: false,
+                            start_cursor: None,
+                            replay_positions: Some(&positions),
+                            initial_versions: None,
+                        },
+                        Some(writer_state),
+                        false,
+                        |_| Ok(()),
+                    )
+                };
+                #[cfg(not(feature = "protocol-trace"))]
+                let result = self.apply_sequenced_batch_locked(
                     translog,
-                    operations,
+                    &operations,
                     WalDisposition::AlreadyInLocalWal {
                         persisted: true,
                         validate_redelivery: false,
+                        start_cursor: None,
+                        replay_positions: Some(&positions),
+                        initial_versions: None,
                     },
                     Some(writer_state),
                     false,
                     |_| Ok(()),
-                )
+                );
+                result?;
+                let boundary = self.current_committed_boundary()?;
+                let boundary = self.commit_writer_at_boundary(writer_state, context, boundary)?;
+                self.persist_committed_boundary(&boundary)?;
+                last_committed_boundary = Some(boundary);
+                Ok(())
             };
-            #[cfg(not(feature = "protocol-trace"))]
-            let result = self.apply_sequenced_batch_locked(
-                translog,
-                operations,
-                WalDisposition::AlreadyInLocalWal {
-                    persisted: true,
-                    validate_redelivery: false,
-                },
-                Some(writer_state),
-                false,
-                |_| Ok(()),
-            );
-            result?;
-            let boundary = self.current_committed_boundary()?;
-            let boundary = self.commit_writer_at_boundary(writer_state, context, boundary)?;
-            self.persist_committed_boundary(&boundary)?;
-            last_committed_boundary = Some(boundary);
-            Ok(())
-        };
-        let replay_result = translog.for_each_from(0, &mut |entry| {
+        let replay_result = translog.for_each_from_at(0, &mut |position, entry| {
             if committed
                 .processed_checkpoint
                 .is_some_and(|checkpoint| entry.seq_no <= checkpoint)
             {
                 #[cfg(feature = "protocol-trace")]
                 if trace_replay && let Some(copy) = trace_copy.as_ref() {
-                    let operation = sequenced_operation_from_entry(&entry)?;
+                    let operation = sequenced_operation_from_entry(entry)?;
                     crate::protocol_trace::record_replay_skip(
                         copy,
                         &operation,
@@ -2251,7 +2481,7 @@ impl HotEngine {
             if replayed == 0 {
                 tracing::warn!("Replaying translog entries during {context}...");
             }
-            batch.push(sequenced_operation_from_entry(&entry)?);
+            batch.push((sequenced_operation_from_entry(entry)?, position));
             replayed += 1;
             if batch.len() >= TRANSLOG_REPLAY_BATCH_SIZE as usize {
                 flush_batch(&mut batch)?;
@@ -3907,7 +4137,7 @@ impl HotEngine {
                 .read_all()?
                 .into_iter()
                 .map(|entry| {
-                    let operation = sequenced_operation_from_entry(&entry)?;
+                    let operation = sequenced_operation_from_entry(entry)?;
                     let (doc, op, content_hash) =
                         crate::protocol_trace::operation_parts(&operation);
                     Ok(crate::protocol_trace::TraceWalEntry {
@@ -7511,6 +7741,22 @@ impl super::SearchEngine for HotEngine {
         self.add_primary_index_with_side_effect(doc_id, payload, primary_term, |_| Ok(()))
     }
 
+    fn add_document_with_condition_at_term(
+        &self,
+        doc_id: &str,
+        payload: serde_json::Value,
+        primary_term: u64,
+        condition: super::WriteCondition,
+    ) -> Result<super::IndexWriteReceipt> {
+        self.add_primary_index_with_condition_and_side_effect(
+            doc_id,
+            payload,
+            primary_term,
+            condition,
+            |_| Ok(()),
+        )
+    }
+
     fn bulk_add_documents_with_receipt_at_term(
         &self,
         docs: Vec<(String, serde_json::Value)>,
@@ -7527,6 +7773,17 @@ impl super::SearchEngine for HotEngine {
         self.delete_primary_with_side_effect(doc_id, primary_term, |_| Ok(()))
     }
 
+    fn delete_document_with_condition_at_term(
+        &self,
+        doc_id: &str,
+        primary_term: u64,
+        condition: super::WriteCondition,
+    ) -> Result<super::DeleteWriteReceipt> {
+        self.delete_primary_with_condition_and_side_effect(doc_id, primary_term, condition, |_| {
+            Ok(())
+        })
+    }
+
     fn apply_replica_operation(
         &self,
         operation: super::SequencedOperation,
@@ -7534,7 +7791,7 @@ impl super::SearchEngine for HotEngine {
         if let super::DocumentMutation::Index { source, .. } = &operation.mutation {
             self.validate_keyword_documents(std::iter::once(source))?;
         }
-        self.apply_sequenced_operation_with_side_effect(operation, |_| Ok(()))
+        self.apply_sequenced_operation_with_side_effect(&operation, |_| Ok(()))
     }
 
     fn apply_replica_batch(
@@ -7548,7 +7805,7 @@ impl super::SearchEngine for HotEngine {
                 None
             }
         }))?;
-        self.apply_sequenced_batch_with_side_effect(operations, true, |_| Ok(()))
+        self.apply_sequenced_batch_with_side_effect(&operations, true, |_| Ok(()))
     }
 
     fn get_document(&self, doc_id: &str) -> Result<Option<serde_json::Value>> {
@@ -7572,6 +7829,54 @@ impl super::SearchEngine for HotEngine {
             }
         }
         Ok(None)
+    }
+
+    fn get_document_with_metadata(
+        &self,
+        doc_id: &str,
+        realtime: bool,
+    ) -> Result<Option<super::DocumentRead>> {
+        if !realtime {
+            return self.read_refreshed_document(doc_id);
+        }
+        self.with_translog("realtime GET", |translog| {
+            let version = self.apply_state.lock()
+                .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
+                .versions.lookup(doc_id)?;
+            let Some(VersionValue::Index(version)) = version else {
+                return if version.is_some() { Ok(None) } else { self.read_refreshed_document(doc_id) };
+            };
+            if let Some(position) = version.wal_position
+                && let Some(mut entry) = translog.read_entry_at(position)?
+            {
+                if entry.seq_no != version.seq_no || entry.primary_term != version.primary_term {
+                    anyhow::bail!("realtime WAL position has the wrong identity for document [{doc_id}]");
+                }
+                match document_operation(&entry)? {
+                    WalDocumentOperation::Index { doc_id: entry_id, .. } if entry_id == doc_id => {}
+                    _ => anyhow::bail!("realtime WAL position has the wrong operation for document [{doc_id}]"),
+                }
+                let mut source = entry.payload.get_mut("_source")
+                    .expect("validated index WAL entry has a source").take();
+                let registry = self.field_registry.read().unwrap_or_else(|error| error.into_inner());
+                Self::normalize_result_source_with_registry(&registry, &mut source);
+                return Ok(Some(super::DocumentRead {
+                    source, seq_no: version.seq_no, primary_term: version.primary_term,
+                }));
+            }
+            // Flush reloads the reader before pruning WAL, under this same mutex.
+            // Refresh drops old map entries only after reader publication.
+            let document = self.read_refreshed_document(doc_id)?;
+            if document.as_ref().is_some_and(|document| document.seq_no > version.seq_no
+                    || (document.seq_no == version.seq_no
+                        && document.primary_term == version.primary_term)) {
+                Ok(document)
+            } else {
+                anyhow::bail!(
+                    "realtime source for document [{doc_id}] is missing from both WAL and the visible reader"
+                )
+            }
+        })
     }
 
     #[cfg(feature = "protocol-trace")]
@@ -8211,7 +8516,7 @@ impl super::SearchEngine for HotEngine {
                 || {
                     self.apply_sequenced_batch_locked(
                         translog,
-                        operations.clone(),
+                        &operations,
                         WalDisposition::Append,
                         None,
                         false,
@@ -8222,7 +8527,7 @@ impl super::SearchEngine for HotEngine {
             #[cfg(not(feature = "protocol-trace"))]
             self.apply_sequenced_batch_locked(
                 translog,
-                operations.clone(),
+                &operations,
                 WalDisposition::Append,
                 None,
                 false,

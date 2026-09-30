@@ -74,6 +74,23 @@ schema-v4 trace plus the `arrival-order` and `seq-only-redelivery` mutations.
 The independent invariant checker and TLC accept the 158-event correct trace
 and reject the mutations at `operation_processed` steps 27 and 117.
 
+The wrapper also captures `conditional_and_mixed_bulk_write_protocol_trace`:
+three copies, conditional index, create conflicts, ordered delete/create, and
+delete-not-found. `version_conflict` results map to the owning
+`PrimaryVersionConflict` input action before WAL or assignment; the converter
+rejects that label after a primary WAL event. The action changes only request
+outcome and leaves allocator, documents, WAL, and checkpoints unchanged.
+Ordinary unconditional matrix workloads do not enable this external input in
+`Next`. This checks D1 protocol emission, not a formal proof of the HTTP
+condition predicate or update merge semantics; Rust result-level regressions
+cover those.
+
+The conditional fixture also sends the GET/CAS index UUID and checks that a
+wrong incarnation is rejected before primary admission without consuming a
+sequence. A queued rejection emits `index_not_found`, not `version_conflict`.
+The model contains one fixed-UUID shard; delete/recreate ABA is covered by the
+REST recreation and queued transport regressions, not by this bounded model.
+
 The Rust trace evidence currently scopes out periodic refresh, automatic or
 API-driven flush, force merge, and their WAL truncation. The harness sets a
 long refresh interval and disables automatic flush because those background

@@ -57,7 +57,7 @@ fn parse_opensearch_ndjson_format() {
 {"index":{"_index":"my-index","_id":"2"}}
 {"title":"World","year":2025}
 "#;
-    let docs = parse_bulk_ndjson(input);
+    let docs = parse_bulk_ndjson(input).unwrap();
     assert_eq!(docs.len(), 2);
     assert_eq!(docs[0].doc_id, "1");
     assert_eq!(docs[0].index.as_deref(), Some("my-index"));
@@ -71,7 +71,7 @@ fn parse_opensearch_create_action() {
     let input = r#"{"create":{"_index":"logs","_id":"abc"}}
 {"msg":"test log"}
 "#;
-    let docs = parse_bulk_ndjson(input);
+    let docs = parse_bulk_ndjson(input).unwrap();
     assert_eq!(docs.len(), 1);
     assert_eq!(docs[0].doc_id, "abc");
     assert_eq!(docs[0].index.as_deref(), Some("logs"));
@@ -83,7 +83,7 @@ fn parse_action_id_takes_precedence_over_body_id() {
     let input = r#"{"index":{"_id":"action-id"}}
 {"_id":"body-id","title":"test"}
 "#;
-    let docs = parse_bulk_ndjson(input);
+    let docs = parse_bulk_ndjson(input).unwrap();
     assert_eq!(docs.len(), 1);
     assert_eq!(docs[0].doc_id, "action-id");
 }
@@ -93,7 +93,7 @@ fn parse_auto_generates_id_when_missing() {
     let input = r#"{"index":{}}
 {"title":"no id"}
 "#;
-    let docs = parse_bulk_ndjson(input);
+    let docs = parse_bulk_ndjson(input).unwrap();
     assert_eq!(docs.len(), 1);
     assert!(!docs[0].doc_id.is_empty());
     assert_eq!(docs[0].payload["title"], "no id");
@@ -101,7 +101,7 @@ fn parse_auto_generates_id_when_missing() {
 
 #[test]
 fn parse_empty_body() {
-    let docs = parse_bulk_ndjson("");
+    let docs = parse_bulk_ndjson("").unwrap();
     assert!(docs.is_empty());
 }
 
@@ -115,7 +115,7 @@ fn parse_blank_lines_are_skipped() {
 
 {"title":"World"}
 "#;
-    let docs = parse_bulk_ndjson(input);
+    let docs = parse_bulk_ndjson(input).unwrap();
     assert_eq!(docs.len(), 2);
 }
 
@@ -128,7 +128,7 @@ fn parse_index_extracted_from_action() {
 {"index":{"_id":"3"}}
 {"f":"v3"}
 "#;
-    let docs = parse_bulk_ndjson(input);
+    let docs = parse_bulk_ndjson(input).unwrap();
     assert_eq!(docs.len(), 3);
     assert_eq!(docs[0].index.as_deref(), Some("idx-a"));
     assert_eq!(docs[1].index.as_deref(), Some("idx-b"));
@@ -136,14 +136,14 @@ fn parse_index_extracted_from_action() {
 }
 
 #[test]
-fn parse_odd_number_of_lines_ignores_trailing() {
+fn parse_trailing_action_rejects_missing_source() {
     let input = r#"{"index":{"_id":"1"}}
 {"title":"complete"}
 {"index":{"_id":"2"}}
 "#;
-    let docs = parse_bulk_ndjson(input);
-    assert_eq!(docs.len(), 1);
-    assert_eq!(docs[0].doc_id, "1");
+    let error = parse_bulk_ndjson(input).unwrap_err();
+    assert!(error.contains("line [3]"), "{error}");
+    assert!(error.contains("requires a source line"), "{error}");
 }
 
 fn make_test_node(id: &str) -> NodeInfo {
@@ -253,6 +253,23 @@ fn route_bulk_doc_reports_missing_primary() {
 }
 
 #[tokio::test]
+async fn empty_bulk_does_not_create_an_index() {
+    let (_temporary, state) = make_test_app_state(ClusterState::new("empty-bulk".into())).await;
+    let (status, Json(body)) = bulk_index(
+        State(state.clone()),
+        Path(crate::common::IndexName::new("empty").unwrap()),
+        None,
+        Query(RefreshParam { refresh: None }),
+        axum::body::Bytes::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["items"], serde_json::json!([]));
+    assert_eq!(body["errors"], false);
+    assert!(state.cluster_manager.get_state().indices.is_empty());
+}
+
+#[tokio::test]
 async fn bulk_index_reports_missing_primary_node_as_item_error() {
     let mut cluster_state = ClusterState::new("test-cluster".into());
     cluster_state.add_node(make_test_node("node-1"));
@@ -264,6 +281,7 @@ async fn bulk_index_reports_missing_primary_node_as_item_error() {
     let (status, Json(body)) = bulk_index(
         State(state),
         Path(crate::common::IndexName::new("idx").unwrap()),
+        None,
         Query(RefreshParam { refresh: None }),
         input,
     )
@@ -400,6 +418,43 @@ async fn bulk_index_global_enforces_principal_index_permissions() {
     );
 }
 
+#[tokio::test]
+async fn index_scoped_bulk_authorizes_the_action_index_override() {
+    let (_temporary, mut state) =
+        make_test_app_state(ClusterState::new("bulk-override".into())).await;
+    state.security_manager = Arc::new(
+        crate::security::SecurityManager::new(crate::security::SecurityConfig {
+            enabled: true,
+            auto_create_security_index: false,
+            bootstrap_api_keys: vec![],
+        })
+        .unwrap(),
+    );
+    let principal = crate::security::Principal {
+        name: "writer".into(),
+        key_id: "writer-key".into(),
+        roles: vec!["write".into()],
+        indices: vec!["logs-*".into()],
+    };
+    let (status, Json(body)) = bulk_index(
+        State(state.clone()),
+        Path(crate::common::IndexName::new("logs-2026").unwrap()),
+        Some(axum::extract::Extension(principal)),
+        Query(RefreshParam { refresh: None }),
+        axum::body::Bytes::from(
+            "{\"index\":{\"_index\":\"metrics\",\"_id\":\"1\"}}\n{\"value\":1}\n",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["items"][0]["index"]["status"], 403);
+    assert_eq!(
+        body["items"][0]["index"]["error"]["type"],
+        "security_exception"
+    );
+    assert!(state.cluster_manager.get_state().indices.is_empty());
+}
+
 #[test]
 fn finalize_bulk_items_preserves_shard_error_reason() {
     let routed_docs = vec![RoutedBulkDoc {
@@ -409,6 +464,9 @@ fn finalize_bulk_items_preserves_shard_error_reason() {
         payload: serde_json::json!({"title": "hello"}),
         shard_id: 0,
         node_id: "node-1".into(),
+        action: "index".into(),
+        condition: crate::engine::WriteCondition::Unconditional,
+        retry_on_conflict: 0,
     }];
     let failed_targets = HashMap::from([(
         ("idx".to_string(), "node-1".to_string(), 0),
@@ -454,6 +512,9 @@ fn bulk_aborted_failure_remains_attributable_and_retryable() {
         payload: serde_json::json!({"title": "hello"}),
         shard_id: 0,
         node_id: "node-1".into(),
+        action: "index".into(),
+        condition: crate::engine::WriteCondition::Unconditional,
+        retry_on_conflict: 0,
     }];
     let failure = bulk::BulkTargetFailure::from_forward_error(anyhow::Error::from(
         tonic::Status::aborted("stale shard reopen; retry the write"),
@@ -494,24 +555,24 @@ fn finalize_bulk_items_preserves_receipts_across_targets_and_duplicate_ids() {
             payload: serde_json::json!({}),
             shard_id,
             node_id: "node-1".into(),
+            action: "index".into(),
+            condition: crate::engine::WriteCondition::Unconditional,
+            retry_on_conflict: 0,
         })
         .collect();
     let outcomes = HashMap::from([
         (
             ("a".to_string(), "node-1".to_string(), 0),
-            Ok(crate::engine::BulkWriteReceipt {
-                doc_ids: vec!["same".into(), "same".into()],
-                start_seq_no: Some(10),
-                primary_term: 7,
-            }),
+            Ok(vec![
+                serde_json::json!({"_id": "same", "_seq_no": 10, "_primary_term": 7, "status": 201}),
+                serde_json::json!({"_id": "same", "_seq_no": 11, "_primary_term": 7, "status": 200}),
+            ]),
         ),
         (
             ("b".to_string(), "node-1".to_string(), 1),
-            Ok(crate::engine::BulkWriteReceipt {
-                doc_ids: vec!["other".into()],
-                start_seq_no: Some(20),
-                primary_term: 8,
-            }),
+            Ok(vec![
+                serde_json::json!({"_id": "other", "_seq_no": 20, "_primary_term": 8, "status": 201}),
+            ]),
         ),
     ]);
     let items = finalize_bulk_items(vec![None, None, None], routed, &outcomes);
@@ -524,7 +585,9 @@ fn finalize_bulk_items_preserves_receipts_across_targets_and_duplicate_ids() {
     );
     assert_eq!(items[0]["index"]["_primary_term"], 7);
     assert_eq!(items[1]["index"]["_primary_term"], 8);
-    assert!(items.iter().all(|item| item["index"]["status"] == 201));
+    assert_eq!(items[0]["index"]["status"], 201);
+    assert_eq!(items[1]["index"]["status"], 201);
+    assert_eq!(items[2]["index"]["status"], 200);
 }
 
 #[test]
@@ -536,6 +599,9 @@ fn finalize_bulk_items_fails_when_primary_receipt_is_missing() {
         payload: serde_json::json!({}),
         shard_id: 0,
         node_id: "node-1".into(),
+        action: "index".into(),
+        condition: crate::engine::WriteCondition::Unconditional,
+        retry_on_conflict: 0,
     }];
     let items = finalize_bulk_items(vec![None], routed, &HashMap::new());
     assert_eq!(items[0]["index"]["status"], 500);

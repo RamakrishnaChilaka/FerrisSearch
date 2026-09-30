@@ -43,8 +43,9 @@ This is the canonical example of the control-plane idiom — read `control-plane
 
 ## Authorization Surfaces
 - Path-routed endpoints are classified in `classify_request()` and enforced by `auth_middleware()`.
+- `PUT`/`POST /{index}/_create/{id}` is `IndexWrite`, not `IndexAdmin`.
 - Body-routed global endpoints need handler-level authorization after parsing resource names:
-  - `POST /_bulk`: validate raw action `_index`, reject `.ferris_security`, and authorize `IndexWrite` per item before metadata lookup or auto-create.
+  - Both bulk routes: validate raw action `_index`, reject `.ferris_security`, and authorize `IndexWrite` per item before metadata lookup or auto-create. An index-scoped path is only the default index, not authorization for an action override.
   - `POST /_sql` and `POST /_sql/stream`: authorize extracted table names for `DESCRIBE`, `SHOW CREATE TABLE`, and `SELECT ... FROM` before metadata lookup or execution.
   - `SHOW TABLES` / `SHOW INDICES`: filter rows by the principal's index allow-list and hide `.ferris_security`.
 

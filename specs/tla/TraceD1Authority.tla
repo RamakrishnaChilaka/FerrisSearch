@@ -132,8 +132,10 @@ ClientResultEvent(event) ==
     /\ CASE event.outcome = "acknowledged" ->
               StableReplication(PrimaryAck(event.writeId))
        [] event.outcome = "failed" ->
-              \/ StableReplication(PrimaryFail(event.writeId))
-              \/ StableReplication(PrimaryReject(event.writeId))
+              IF event.preWalVersionConflict
+              THEN StableReplication(PrimaryVersionConflict(event.writeId))
+              ELSE \/ StableReplication(PrimaryFail(event.writeId))
+                   \/ StableReplication(PrimaryReject(event.writeId))
        [] OTHER -> FALSE
     /\ UNCHANGED observedFenceTerms
 

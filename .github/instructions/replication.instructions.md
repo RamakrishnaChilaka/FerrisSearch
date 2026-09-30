@@ -95,6 +95,11 @@ pub async fn replicate_bulk(
 | `PrepareFinalizeRecovery` / `CompleteFinalizeRecovery` | Establish the final barrier and conditionally admit the target |
 
 ## Key Design Decisions
+- Conditions and create intent are primary-only. Replicas receive full index
+  replacements or deletes with the assigned sequence/term, including updates
+  coordinated through realtime GET plus CAS. Every applied index records its
+  local physical WAL cursor for realtime reads; never copy a primary cursor
+  into replica storage.
 - **Synchronous replication**: primary waits for every authoritative in-sync replica before ACK
 - **Concurrent fan-out**: replicas are contacted in parallel via `tokio::spawn` + `join_all` — write latency = max(replica RTTs), not sum
 - Bulk replication resolves the captured routing term and authoritative targets
@@ -102,6 +107,10 @@ pub async fn replicate_bulk(
   returns immediately. Non-empty fan-out serializes each payload once and
   shares the immutable operation slice across replica tasks; each gRPC request
   performs only its required owned protobuf copy.
+- Single-operation fan-out also serializes the borrowed source once, after a
+  valid target is found, and shares the encoded result across replica tasks.
+  Do not deep-clone the JSON source or serialize it separately for each target;
+  retain per-target serialization-error reporting and protocol-trace events.
 - Assigned replicas are in `ShardRoutingEntry.replicas`; required
   acknowledgement targets are in `ShardRoutingEntry.in_sync_replicas`
 - Primary write handlers hold the shard's shared write-barrier guard from
@@ -164,7 +173,9 @@ pub async fn replicate_bulk(
   authoritative candidates only when the reporting leader hosts the primary;
   otherwise candidate selection falls back to a live in-sync cluster member.
   Checkpoint observations cannot grant membership.
-- Primary shard handlers (`index_doc`, `bulk_index`, `delete_doc`) MUST return `success: false` when replication fails — never swallow replication errors
+- Single writes and index-only shard batches return `success: false` when
+  replication fails. Mixed bulk returns a failed item, never a successful
+  result for that mutation. The RPC envelope does not override item errors.
 - **Primary owns seq numbers**: replica WAL entries must preserve the seq_no assigned by the primary; never allocate replica-local seq_nos for replicated or recovered operations
 - Never derive an operation's sequence from `last_seq_no()` or a checkpoint after
   releasing the primary write lock. Concurrent writes can advance both before
