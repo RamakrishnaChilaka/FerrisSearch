@@ -152,7 +152,7 @@ def apply_observed_operation(
     if (
         event["outcome"] == "stale"
         and observed.doc is not None
-        and event.get("origin") != "replay"
+        and not replay
     ):
         current = copy.documents.get(observed.doc)
         if (
