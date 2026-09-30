@@ -1434,6 +1434,94 @@ async fn rest_can_index_get_update_delete_and_refresh_flush_documents() -> Resul
     Ok(())
 }
 
+async fn create_write_contract_index(harness: &RestTestHarness, index: &str) -> Result<()> {
+    let (status, body) = harness
+        .put_json(
+            &format!("/{index}"),
+            json!({
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0,
+                    "refresh_interval_ms": 60000,
+                    "flush_threshold_bytes": 0
+                },
+                "mappings": {"dynamic": false}
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn writes_regression_update_preserves_unrefreshed_put() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_write_contract_index(&harness, "update-repro").await?;
+    let (status, body) = harness
+        .put_json(
+            "/update-repro/_doc/42?refresh=true",
+            json!({"name": "a", "price": 10}),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = harness
+        .put_json("/update-repro/_doc/42", json!({"name": "b", "price": 20}))
+        .await?;
+    assert!(status.is_success(), "{body}");
+    let (status, body) = harness
+        .post_json("/update-repro/_update/42", json!({"doc": {"stock": 5}}))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    harness
+        .post_json("/update-repro/_refresh", json!({}))
+        .await?;
+    let (status, body) = harness.get_json("/update-repro/_doc/42").await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["_source"],
+        json!({"name": "b", "price": 20, "stock": 5}),
+        "an acknowledged PUT must survive the following update"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn writes_regression_bulk_delete_and_update_preserve_action_boundaries() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_write_contract_index(&harness, "bulk-repro").await?;
+    harness
+        .put_json("/bulk-repro/_doc/old?refresh=true", json!({"keep": 1}))
+        .await?;
+    let body = concat!(
+        "{\"delete\":{\"_id\":\"old\"}}\n",
+        "{\"index\":{\"_id\":\"new\"}}\n",
+        "{\"keep\":2}\n",
+        "{\"update\":{\"_id\":\"new\"}}\n",
+        "{\"doc\":{\"added\":3}}\n"
+    );
+    let (status, response) = harness
+        .post_ndjson("/bulk-repro/_bulk?refresh=true", body)
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["errors"], json!(false), "{response}");
+    assert_eq!(
+        response["items"].as_array().map(Vec::len),
+        Some(3),
+        "{response}"
+    );
+    assert_eq!(response["items"][0]["delete"]["result"], json!("deleted"));
+    assert_eq!(response["items"][1]["index"]["result"], json!("created"));
+    assert_eq!(response["items"][2]["update"]["result"], json!("updated"));
+    assert_eq!(
+        harness.get_json("/bulk-repro/_doc/old").await?.0,
+        StatusCode::NOT_FOUND
+    );
+    let (status, document) = harness.get_json("/bulk-repro/_doc/new").await?;
+    assert_eq!(status, StatusCode::OK, "{document}");
+    assert_eq!(document["_source"], json!({"keep": 2, "added": 3}));
+    Ok(())
+}
+
 #[tokio::test]
 async fn rest_forcemerge_returns_task_and_task_endpoint_reports_completion() -> Result<()> {
     let harness = RestTestHarness::start().await?;
