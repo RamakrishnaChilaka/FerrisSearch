@@ -109,6 +109,7 @@ struct ReplicaWireOperation {
 
 struct ReplicaBatchRoute {
     index_uuid: String,
+    #[cfg(feature = "protocol-trace")]
     primary_node: String,
     replica_node_ids: Vec<String>,
 }
@@ -144,6 +145,7 @@ fn resolve_replica_batch_route(
         .collect::<Vec<_>>();
     Ok(Some(ReplicaBatchRoute {
         index_uuid: metadata.uuid.to_string(),
+        #[cfg(feature = "protocol-trace")]
         primary_node: routing.primary.clone(),
         replica_node_ids,
     }))
