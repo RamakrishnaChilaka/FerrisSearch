@@ -83,13 +83,20 @@ pub trait SearchEngine: Send + Sync {
   across refresh, replica apply, or replay.
 - Keep `get_document()` searcher-only for existing internal consumers.
   REST/OCC uses `get_document_with_metadata()`: realtime checks map completeness
-  and the live version under one apply-state lock. A complete-map miss acquires
-  the searcher after the lookup and reads without the translog mutex; a
-  complete-map tombstone returns missing. Index hits still hold the translog
+  and the live version under one short version-map read lock, separate from
+  `ApplyState`. A complete-map miss acquires the searcher after releasing that
+  lock and reads without the apply-state or translog mutex; a complete-map
+  tombstone returns missing. Index hits release the map lock, then hold the translog
   mutex through re-lookup and WAL cursor reads, so flush cannot prune between
   lookup and read. Reader fallback must cover the live version. An incomplete
   map waits for the mutex and fails with the replay cause if it remains
   incomplete; never return stale source or a false 404 after failed replay.
+- Keep D1 planning, checkpoints, term tracking, and planning-snapshot restore
+  under the whole-batch apply-state mutex. Acquire apply state before the
+  version map whenever both are needed, never the reverse. Hold the map's
+  write lock only around map mutation, not WAL I/O, fsync, Tantivy apply, or
+  reader lookup. Publish map entries per applied operation; an in-flight
+  index hit still waits for the translog mutex before reading its WAL source.
 
 ## CompositeEngine (src/engine/composite.rs)
 ```rust
@@ -215,7 +222,8 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
   including an empty suffix. Intermediate commits and failed replay leave the
   map incomplete. Refresh clears old entries only after publishing a covering
   reader; the byte limit forces refresh or rejects writes instead of evicting.
-  Failed map rotation or rollback also invalidates completeness and the writer.
+  Failed map rotation, rollback, or post-WAL apply also invalidates completeness
+  and the writer. Map state and completeness share the same version-map lock.
 - The durable term-start maximum comes from the copy fence and may be ahead of
   `CommittedBoundaryRecord.max_seq_no` at an intermediate replay commit. This is
   valid because WAL-only operations have not reached that batch yet. Validation

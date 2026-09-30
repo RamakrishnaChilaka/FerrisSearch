@@ -214,7 +214,7 @@ Oversized single/delete writes return a validation error before mutation;
 oversized bulk documents remain attributable item failures.
 Retryable gRPC `ABORTED` document-operation failures map to HTTP 503
 `shard_not_available_exception` with the underlying cause preserved.
-Realtime GET returns this status when WAL replay leaves the live map
+Realtime GET returns this status when post-WAL apply or replay leaves the live map
 incomplete. Single `_update` propagates the GET failure; bulk `update` returns
 an item-level 503 and sets `errors: true`, rather than attempting a CAS or upsert.
 Only `RESOURCE_EXHAUSTED` statuses carrying the stable version-map-capacity

@@ -100,10 +100,12 @@ pub async fn replicate_bulk(
   coordinated through realtime GET plus CAS. Every applied index records its
   local physical WAL cursor for realtime reads; never copy a primary cursor
   into replica storage.
-  Complete-map misses and tombstones do not take the translog mutex. Index
+  Complete-map misses and tombstones take only the separate version-map read
+  lock, not the apply-state or translog mutex. Keep map write sections brief;
+  acquire apply state before the map whenever both are needed. Index
   hits still serialize cursor reads with WAL truncation. Replay marks the map
-  incomplete until it publishes the full suffix; failed replay makes realtime
-  reads fail rather than report stale state. Conditional writes still finish
+  incomplete until it publishes the full suffix; post-WAL apply and replay
+  failures make realtime reads fail rather than report stale state. Conditional writes still finish
   replay before evaluating presence or versions.
 - **Synchronous replication**: primary waits for every authoritative in-sync replica before ACK
 - **Concurrent fan-out**: replicas are contacted in parallel via `tokio::spawn` + `join_all` — write latency = max(replica RTTs), not sum

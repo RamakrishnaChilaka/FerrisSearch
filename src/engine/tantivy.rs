@@ -71,9 +71,21 @@ pub(crate) struct InternalSequenceFieldError {
 struct ApplyState {
     checkpoints: LocalCheckpointTracker,
     term_sequences: PrimaryTermSequenceState,
-    versions: LiveVersionMap,
-    version_map_complete: bool,
     max_seq_no_of_updates_or_deletes: Option<u64>,
+}
+
+struct VersionMapState {
+    map: LiveVersionMap,
+    complete: bool,
+}
+
+impl VersionMapState {
+    fn new() -> Self {
+        Self {
+            map: LiveVersionMap::new(DEFAULT_VERSION_MAP_MAX_BYTES),
+            complete: true,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -134,21 +146,23 @@ impl ApplyState {
         Ok(Self {
             checkpoints: LocalCheckpointTracker::new(committed.clone())?,
             term_sequences,
-            versions: LiveVersionMap::new(DEFAULT_VERSION_MAP_MAX_BYTES),
-            version_map_complete: true,
             max_seq_no_of_updates_or_deletes: committed.max_seq_no_of_updates_or_deletes,
         })
     }
 
-    fn reset_to_commit(&mut self, committed: CommittedBoundaryRecord) -> Result<()> {
+    fn reset_to_commit(
+        &mut self,
+        committed: CommittedBoundaryRecord,
+        versions: &mut VersionMapState,
+    ) -> Result<()> {
         self.checkpoints.reset_to_commit(committed.clone())?;
         self.term_sequences = initialize_term_sequence_state(
             committed.term_sequence_state.current_term,
             committed.term_sequence_state.max_seq_no_at_term_start,
             &committed,
         )?;
-        self.versions.reset();
-        self.version_map_complete = false;
+        versions.map.reset();
+        versions.complete = false;
         self.max_seq_no_of_updates_or_deletes = committed.max_seq_no_of_updates_or_deletes;
         Ok(())
     }
@@ -430,7 +444,9 @@ pub struct HotEngine {
     pub refresh_interval: Duration,
     /// Write-ahead log for crash durability
     translog: Arc<Mutex<dyn WriteAheadLog>>,
+    // Acquire apply state before versions when both locks are needed.
     apply_state: Mutex<ApplyState>,
+    versions: RwLock<VersionMapState>,
     identity_term_state: Mutex<Option<(u64, Option<u64>)>>,
     committed_boundary_path: PathBuf,
     durability: TranslogDurability,
@@ -1096,6 +1112,7 @@ impl HotEngine {
             refresh_interval,
             translog: Arc::new(Mutex::new(translog)),
             apply_state: Mutex::new(apply_state),
+            versions: RwLock::new(VersionMapState::new()),
             identity_term_state: Mutex::new(None),
             committed_boundary_path,
             durability,
@@ -1273,6 +1290,26 @@ impl HotEngine {
         Ok(boundary)
     }
 
+    fn version_map_read(&self) -> Result<std::sync::RwLockReadGuard<'_, VersionMapState>> {
+        self.versions
+            .read()
+            .map_err(|_| anyhow::anyhow!("version map lock poisoned"))
+    }
+
+    fn version_map_write(&self) -> Result<std::sync::RwLockWriteGuard<'_, VersionMapState>> {
+        self.versions
+            .write()
+            .map_err(|_| anyhow::anyhow!("version map lock poisoned"))
+    }
+
+    fn invalidate_version_map(&self) {
+        let mut versions = self.versions.write().unwrap_or_else(|poisoned| {
+            tracing::error!("version map lock poisoned while invalidating incomplete apply");
+            poisoned.into_inner()
+        });
+        versions.complete = false;
+    }
+
     fn reset_apply_state_to_commit(&self, committed: CommittedBoundaryRecord) -> Result<()> {
         let identity_term_state = *self
             .identity_term_state
@@ -1282,7 +1319,10 @@ impl HotEngine {
             .apply_state
             .lock()
             .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
-        state.reset_to_commit(committed.clone())?;
+        {
+            let mut versions = self.version_map_write()?;
+            state.reset_to_commit(committed.clone(), &mut versions)?;
+        }
         if let Some((identity_fence, identity_fence_max_seq_no)) = identity_term_state {
             state.term_sequences = initialize_term_sequence_state(
                 identity_fence,
@@ -1306,8 +1346,9 @@ impl HotEngine {
         Ok(())
     }
 
-    fn current_version(&self, state: &ApplyState, doc_id: &str) -> Result<Option<CurrentVersion>> {
-        if let Some(version) = state.versions.lookup(doc_id)? {
+    fn current_version(&self, _state: &ApplyState, doc_id: &str) -> Result<Option<CurrentVersion>> {
+        let version = self.version_map_read()?.map.lookup(doc_id)?;
+        if let Some(version) = version {
             return Ok(Some(CurrentVersion::Native(version)));
         }
 
@@ -1695,6 +1736,7 @@ impl HotEngine {
             trace_collision_result.context("record protocol trace operation collision")?;
             if wal_disposition.is_already_in_local_wal() {
                 if let Some(writer_state) = writer_override.as_deref_mut() {
+                    self.invalidate_version_map();
                     writer_state.fail(format!(
                         "sequenced operation failed after WAL persistence: {error:#}"
                     ));
@@ -1854,7 +1896,7 @@ impl HotEngine {
                                     )
                                 })?,
                         };
-                        state.versions.apply_index_at(
+                        self.version_map_write()?.map.apply_index_at(
                             doc_id,
                             planned_operation.operation.seq_no,
                             planned_operation.operation.primary_term,
@@ -1873,7 +1915,7 @@ impl HotEngine {
                             .id_field;
                         writer.delete_term(Term::from_field_text(id_field, doc_id));
                         side_effect(planned_operation.operation)?;
-                        state.versions.apply_delete(
+                        self.version_map_write()?.map.apply_delete(
                             doc_id,
                             planned_operation.operation.seq_no,
                             planned_operation.operation.primary_term,
@@ -1910,6 +1952,7 @@ impl HotEngine {
         if let Err(error) = execution_result {
             if appended || wal_disposition.is_already_in_local_wal() {
                 if let Some(writer_state) = writer_state.as_mut() {
+                    self.invalidate_version_map();
                     (*writer_state).fail(format!(
                         "sequenced operation failed after WAL persistence: {error:#}"
                     ));
@@ -2267,6 +2310,7 @@ impl HotEngine {
     }
 
     fn fail_writer_after_wal(&self, error: &anyhow::Error) {
+        self.invalidate_version_map();
         self.writer
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2294,15 +2338,12 @@ impl HotEngine {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("translog lock poisoned during {context}"))?;
             let (can_reserve, current_old_empty, estimated_bytes, max_bytes) = {
-                let state = self
-                    .apply_state
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+                let versions = self.version_map_read()?;
                 (
-                    state.versions.can_reserve(reservation_bytes),
-                    state.versions.current_and_old_are_empty(),
-                    state.versions.estimated_bytes(),
-                    state.versions.max_bytes(),
+                    versions.map.can_reserve(reservation_bytes),
+                    versions.map.current_and_old_are_empty(),
+                    versions.map.estimated_bytes(),
+                    versions.map.max_bytes(),
                 )
             };
             let oversized_bulk = reservation_bytes > max_bytes;
@@ -2339,10 +2380,9 @@ impl HotEngine {
 
     #[cfg(test)]
     pub(crate) fn set_version_map_max_bytes_for_test(&self, max_bytes: usize) {
-        self.apply_state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .versions
+        self.version_map_write()
+            .unwrap()
+            .map
             .set_max_bytes_for_test(max_bytes);
     }
 
@@ -2360,12 +2400,14 @@ impl HotEngine {
             }
             let mut writer_state = self.writer_state_with_replay(translog, "refresh")?;
             {
-                let mut state = self
+                let state = self
                     .apply_state
                     .lock()
                     .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
-                if let Err(error) = state.versions.rotate_current_into_old() {
-                    state.version_map_complete = false;
+                let mut versions = self.version_map_write()?;
+                if let Err(error) = versions.map.rotate_current_into_old() {
+                    versions.complete = false;
+                    drop(versions);
                     drop(state);
                     writer_state.fail(format!(
                         "version map rotation failed during refresh: {error:#}"
@@ -2377,12 +2419,14 @@ impl HotEngine {
             match self.commit_writer_at_boundary(&mut writer_state, "refresh", boundary) {
                 Ok(boundary) => Ok(boundary),
                 Err(error) => {
-                    let mut state = self
+                    let state = self
                         .apply_state
                         .lock()
                         .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
-                    if let Err(rollback_error) = state.versions.rollback_refresh() {
-                        state.version_map_complete = false;
+                    let mut versions = self.version_map_write()?;
+                    if let Err(rollback_error) = versions.map.rollback_refresh() {
+                        versions.complete = false;
+                        drop(versions);
                         drop(state);
                         let context = format!(
                             "version map rollback failed after refresh commit failure: {error:#}"
@@ -2415,15 +2459,10 @@ impl HotEngine {
         }
 
         self.reader.reload()?;
-        let pruned = self
-            .apply_state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
-            .versions
-            .complete_reader_reload(
-                committed_boundary.processed_checkpoint,
-                self.delete_tombstone_retention,
-            );
+        let pruned = self.version_map_write()?.map.complete_reader_reload(
+            committed_boundary.processed_checkpoint,
+            self.delete_tombstone_retention,
+        );
         Ok(pruned)
     }
 
@@ -2475,10 +2514,7 @@ impl HotEngine {
             if trace_replay && let Some(copy) = trace_copy.as_ref() {
                 crate::protocol_trace::record_replay_finished(copy, "completed")?;
             }
-            self.apply_state
-                .lock()
-                .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
-                .version_map_complete = true;
+            self.version_map_write()?.complete = true;
             return Ok(0);
         }
 
@@ -2610,10 +2646,7 @@ impl HotEngine {
             if trace_replay && let Some(copy) = trace_copy.as_ref() {
                 crate::protocol_trace::record_replay_finished(copy, "completed")?;
             }
-            self.apply_state
-                .lock()
-                .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
-                .version_map_complete = true;
+            self.version_map_write()?.complete = true;
             return Ok(0);
         }
         flush_batch(&mut batch)?;
@@ -2640,15 +2673,12 @@ impl HotEngine {
             });
         }
         {
-            let mut state = self
-                .apply_state
-                .lock()
-                .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
-            state.versions.complete_reader_reload(
+            let mut versions = self.version_map_write()?;
+            versions.map.complete_reader_reload(
                 committed_boundary.processed_checkpoint,
                 self.delete_tombstone_retention,
             );
-            state.version_map_complete = true;
+            versions.complete = true;
         }
         tracing::info!(
             "Translog replay during {} recovered {} operations.",
@@ -4205,12 +4235,13 @@ impl HotEngine {
     #[cfg(feature = "protocol-trace")]
     pub(crate) fn protocol_trace_copy_evidence(&self) -> Result<super::ProtocolTraceCopyEvidence> {
         let live_documents = self.protocol_trace_documents_snapshot()?;
-        let versions = self
-            .apply_state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
-            .versions
-            .protocol_trace_versions()?;
+        let versions = {
+            let _state = self
+                .apply_state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+            self.version_map_read()?.map.protocol_trace_versions()?
+        };
         let mut actual = BTreeMap::new();
         for (doc, source, seq_no, term) in &live_documents {
             actual.insert(
@@ -7979,14 +8010,11 @@ impl super::SearchEngine for HotEngine {
             return self.read_refreshed_document(doc_id);
         }
         let (complete, version) = {
-            let state = self
-                .apply_state
-                .lock()
-                .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+            let versions = self.version_map_read()?;
             (
-                state.version_map_complete,
-                if state.version_map_complete {
-                    state.versions.lookup(doc_id)?
+                versions.complete,
+                if versions.complete {
+                    versions.map.lookup(doc_id)?
                 } else {
                     None
                 },
@@ -8001,10 +8029,9 @@ impl super::SearchEngine for HotEngine {
         }
         self.with_translog("realtime GET", |translog| {
             let version = {
-                let state = self.apply_state.lock()
-                    .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
-                if !state.version_map_complete {
-                    drop(state);
+                let versions = self.version_map_read()?;
+                if !versions.complete {
+                    drop(versions);
                     let writer_state = self.writer.read()
                         .unwrap_or_else(|error| error.into_inner());
                     return Err(TantivyWriterUnavailableError {
@@ -8014,7 +8041,7 @@ impl super::SearchEngine for HotEngine {
                                 .unwrap_or("WAL replay has not completed")),
                     }.into());
                 }
-                state.versions.lookup(doc_id)?
+                versions.map.lookup(doc_id)?
             };
             let Some(VersionValue::Index(version)) = version else {
                 return if version.is_some() { Ok(None) } else { self.read_refreshed_document(doc_id) };
@@ -9887,6 +9914,7 @@ mod tests {
             refresh_interval: Duration::from_secs(60),
             translog: Arc::new(Mutex::new(translog)),
             apply_state: Mutex::new(ApplyState::new(committed_boundary).unwrap()),
+            versions: RwLock::new(VersionMapState::new()),
             identity_term_state: Mutex::new(None),
             committed_boundary_path,
             durability: TranslogDurability::Request,
@@ -11068,10 +11096,9 @@ mod tests {
         engine.refresh().unwrap();
         assert!(
             engine
-                .apply_state
-                .lock()
+                .version_map_read()
                 .unwrap()
-                .versions
+                .map
                 .lookup("old")
                 .unwrap()
                 .is_none()
@@ -11092,10 +11119,9 @@ mod tests {
         engine.delete_document("deleted").unwrap();
         assert!(matches!(
             engine
-                .apply_state
-                .lock()
+                .version_map_read()
                 .unwrap()
-                .versions
+                .map
                 .lookup("deleted")
                 .unwrap(),
             Some(VersionValue::Delete(_))
@@ -11173,22 +11199,21 @@ mod tests {
             .add_document("collision", json!({"value": 1}))
             .unwrap();
         engine
-            .apply_state
-            .lock()
+            .version_map_write()
             .unwrap()
-            .versions
+            .map
             .rotate_current_into_old()
             .unwrap();
         let receipt = engine
             .add_document_with_receipt("unrelated", json!({"value": 2}))
             .unwrap();
         {
-            let mut state = engine.apply_state.lock().unwrap();
-            let Some(VersionValue::Index(version)) = state.versions.lookup("collision").unwrap()
+            let mut versions = engine.version_map_write().unwrap();
+            let Some(VersionValue::Index(version)) = versions.map.lookup("collision").unwrap()
             else {
                 panic!("collision setup requires a live index version");
             };
-            state.versions.apply_index_at(
+            versions.map.apply_index_at(
                 "collision",
                 version.seq_no,
                 version.primary_term + 1,
@@ -11232,10 +11257,9 @@ mod tests {
         reset_rx.recv_timeout(TEST_SYNC_TIMEOUT).unwrap();
         assert!(
             engine
-                .apply_state
-                .lock()
+                .version_map_read()
                 .unwrap()
-                .versions
+                .map
                 .lookup("doc")
                 .unwrap()
                 .is_none()
@@ -11371,6 +11395,53 @@ mod tests {
         assert!(
             engine
                 .get_document_with_metadata("deleted", true)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn realtime_get_after_post_wal_apply_failure_fails_closed() {
+        let (_directory, engine) = create_engine();
+        engine.add_document("old", json!({"value": 1})).unwrap();
+        engine.refresh().unwrap();
+        engine.inject_engine_apply_failures_for_test(28, 1);
+        let error = engine
+            .add_document("pending", json!({"value": 2}))
+            .unwrap_err();
+        assert!(
+            error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.raw_os_error() == Some(28))
+            }),
+            "{error:#}"
+        );
+        for doc_id in ["old", "pending", "missing"] {
+            let error = engine.get_document_with_metadata(doc_id, true).unwrap_err();
+            assert!(error.is::<TantivyWriterUnavailableError>(), "{error:#}");
+            assert!(format!("{error:#}").contains("No space left"), "{error:#}");
+        }
+        assert_eq!(
+            engine
+                .get_document_with_metadata("old", false)
+                .unwrap()
+                .unwrap()
+                .source,
+            json!({"value": 1})
+        );
+        engine.refresh().unwrap();
+        assert_eq!(
+            engine
+                .get_document_with_metadata("pending", true)
+                .unwrap()
+                .unwrap()
+                .source,
+            json!({"value": 2})
+        );
+        assert!(
+            engine
+                .get_document_with_metadata("missing", true)
                 .unwrap()
                 .is_none()
         );
