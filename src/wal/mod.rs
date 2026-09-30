@@ -2416,8 +2416,8 @@ impl WriteAheadLog for HotTranslog {
         let mut reader = BufReader::new(File::open(&generation.path)?);
         reader.seek(SeekFrom::Start(start.byte_offset))?;
         let mut positions = Vec::with_capacity(count);
+        let mut byte_offset = start.byte_offset;
         for _ in 0..count {
-            let byte_offset = reader.stream_position()?;
             let mut len = [0u8; 4];
             reader.read_exact(&mut len)?;
             let payload_len = u32::from_le_bytes(len) as usize;
@@ -2434,7 +2434,8 @@ impl WriteAheadLog for HotTranslog {
                 generation_id: generation.id,
                 byte_offset,
             });
-            reader.seek(SeekFrom::Start(end))?;
+            reader.seek_relative(payload_len as i64)?;
+            byte_offset = end;
         }
         Ok(positions)
     }

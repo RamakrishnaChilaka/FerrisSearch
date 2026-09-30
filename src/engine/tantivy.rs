@@ -157,6 +157,7 @@ enum WalDisposition<'a> {
         validate_redelivery: bool,
         start_cursor: Option<crate::wal::WalCursor>,
         replay_positions: Option<&'a WalPositions>,
+        initial_versions: Option<&'a HashMap<&'a str, Option<CurrentVersion>>>,
     },
 }
 
@@ -1512,6 +1513,16 @@ impl HotEngine {
                         let current =
                             if let Some(current) = shadow_versions.get(doc_id.as_str()).copied() {
                                 Some(current)
+                            } else if let WalDisposition::AlreadyInLocalWal {
+                                initial_versions: Some(initial_versions),
+                                ..
+                            } = wal_disposition
+                            {
+                                initial_versions.get(doc_id.as_str()).copied().ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "primary bulk plan has no initial version for [{doc_id}]"
+                                    )
+                                })?
                             } else {
                                 self.current_version(&state, doc_id)?
                             };
@@ -1985,6 +1996,7 @@ impl HotEngine {
                         validate_redelivery: true,
                         start_cursor: Some(start_cursor),
                         replay_positions: None,
+                        initial_versions: None,
                     },
                     None,
                     true,
@@ -2022,15 +2034,26 @@ impl HotEngine {
             |translog| {
                 drop(self.writer_state_with_replay(translog, "bulk indexing")?);
                 self.prepare_primary_term_before_wal(primary_term)?;
-                let mut seen = std::collections::HashSet::new();
+                let mut initial_versions = HashMap::with_capacity(docs.len());
                 let mut created = Vec::with_capacity(docs.len());
-                for (doc_id, _) in &docs {
-                    let existed = !seen.insert(doc_id.as_str())
-                        || self.check_primary_condition(
-                            doc_id,
-                            super::WriteCondition::Unconditional,
-                        )?;
-                    created.push(!existed);
+                {
+                    let state = self
+                        .apply_state
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+                    for doc_id in &doc_ids {
+                        match initial_versions.entry(doc_id.as_str()) {
+                            std::collections::hash_map::Entry::Occupied(_) => created.push(false),
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                let current = self.current_version(&state, doc_id)?;
+                                created.push(!matches!(
+                                    current,
+                                    Some(CurrentVersion::Native(VersionValue::Index(_)))
+                                ));
+                                entry.insert(current);
+                            }
+                        }
+                    }
                 }
                 let start_cursor = translog.recovery_read_snapshot()?.end_cursor();
                 let start_seq_no = {
@@ -2077,6 +2100,7 @@ impl HotEngine {
                         validate_redelivery: true,
                         start_cursor: Some(start_cursor),
                         replay_positions: None,
+                        initial_versions: Some(&initial_versions),
                     },
                     None,
                     true,
@@ -2155,6 +2179,7 @@ impl HotEngine {
                         validate_redelivery: true,
                         start_cursor: Some(start_cursor),
                         replay_positions: None,
+                        initial_versions: None,
                     },
                     None,
                     true,
@@ -2379,6 +2404,7 @@ impl HotEngine {
                                     validate_redelivery: false,
                                     start_cursor: None,
                                     replay_positions: Some(&positions),
+                                    initial_versions: None,
                                 },
                                 Some(writer_state),
                                 false,
@@ -2395,6 +2421,7 @@ impl HotEngine {
                             validate_redelivery: false,
                             start_cursor: None,
                             replay_positions: Some(&positions),
+                            initial_versions: None,
                         },
                         Some(writer_state),
                         false,
@@ -2410,6 +2437,7 @@ impl HotEngine {
                         validate_redelivery: false,
                         start_cursor: None,
                         replay_positions: Some(&positions),
+                        initial_versions: None,
                     },
                     Some(writer_state),
                     false,

@@ -354,6 +354,7 @@ fn writes_regression_wal_positions_survive_batches_and_detect_truncation() {
             Some(position)
         );
     }
+
     wal.truncate_below(1).unwrap();
     assert!(wal.read_entry_at(start).unwrap().is_none());
     let next = wal.recovery_read_snapshot().unwrap().end_cursor();
@@ -369,4 +370,62 @@ fn writes_regression_wal_positions_survive_batches_and_detect_truncation() {
         wal.read_entry_at(next).unwrap().unwrap().payload["_source"],
         json!({"value": 3})
     );
+}
+
+#[test]
+fn writes_regression_bulk_reuses_initial_versions_without_changing_ordered_results() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    engine
+        .add_document("existing", json!({"value": 1}))
+        .unwrap();
+    engine.add_document("deleted", json!({"value": 1})).unwrap();
+    engine.refresh().unwrap();
+    engine.delete_document("deleted").unwrap();
+    let receipt = engine
+        .bulk_add_documents_with_receipt(vec![
+            ("existing".into(), json!({"value": 2})),
+            ("new".into(), json!({"value": 3})),
+            ("new".into(), json!({"value": 4})),
+            ("deleted".into(), json!({"value": 5})),
+            ("deleted".into(), json!({"value": 6})),
+        ])
+        .unwrap();
+    assert_eq!(receipt.created, vec![false, true, false, true, false]);
+    for (doc_id, value, offset) in [("existing", 2, 0), ("new", 4, 2), ("deleted", 6, 4)] {
+        let document = engine
+            .get_document_with_metadata(doc_id, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(document.source, json!({"value": value}));
+        assert_eq!(document.seq_no, receipt.start_seq_no.unwrap() + offset);
+    }
+}
+
+#[test]
+fn writes_regression_wal_positions_cross_buffer_boundaries() {
+    let directory = tempfile::tempdir().unwrap();
+    let wal = HotTranslog::open(directory.path()).unwrap();
+    let operations = [64, 16_384, 4_096, 20_000]
+        .into_iter()
+        .enumerate()
+        .map(|(id, size)| {
+            (
+                WalOperation::Index,
+                json!({"_doc_id": id.to_string(), "_source": {"body": "x".repeat(size)}}),
+            )
+        })
+        .collect::<Vec<_>>();
+    let start = wal.recovery_read_snapshot().unwrap().end_cursor();
+    wal.write_bulk_with_receipt(1, &operations).unwrap();
+    let positions = wal.entry_positions(start, operations.len()).unwrap();
+    assert_eq!(positions[0], start);
+    for (offset, position) in positions.iter().enumerate() {
+        let entry = wal.read_entry_at(*position).unwrap().unwrap();
+        assert_eq!(entry.seq_no, offset as u64);
+        assert_eq!(entry.payload, operations[offset].1);
+        if offset > 0 {
+            assert!(position.byte_offset > positions[offset - 1].byte_offset);
+        }
+    }
 }

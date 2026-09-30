@@ -77,6 +77,10 @@ pub trait SearchEngine: Send + Sync {
   delete receipts distinguish absent documents but still assign a sequence.
   `IndexWriteReceipt.created` and bulk `created` flags come from this same
   critical section, in request order.
+  Primary index-only bulk may reuse its initial live/committed versions in
+  the apply planner only within that same translog critical section. Keep
+  shadow versions authoritative for duplicate IDs; never reuse the cache
+  across refresh, replica apply, or replay.
 - Keep `get_document()` searcher-only for existing internal consumers.
   REST/OCC uses `get_document_with_metadata()`: realtime checks the live map,
   resolves full source at its physical WAL cursor, and returns real identity.

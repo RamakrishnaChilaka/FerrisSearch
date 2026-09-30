@@ -111,6 +111,8 @@ pub trait WriteAheadLog: Send + Sync {
   covering reader before truncation. `entry_positions()` scans only frame
   headers after a contiguous append. Do not serialize sources again to
   calculate offsets or rescan the WAL per replayed document.
+  Track the checked byte offset locally and use buffered relative skips;
+  do not discard the read buffer or query the file position per frame.
 - `size_bytes()` returns the summed size of all retained generations so the engine can trigger checkpoint-aware auto-flush
 - `truncate_below(global_checkpoint)` rolls to a new empty generation and deletes only generations whose max seq_no is ≤ the checkpoint; it does NOT rewrite mixed generations in place
 - `truncate()` rolls to a new empty generation and deletes all older generations
