@@ -1177,6 +1177,10 @@ impl HotEngine {
             .map_err(|_| anyhow::anyhow!("maintenance lock poisoned during {context}"))
     }
 
+    fn reload_reader(&self) -> Result<()> {
+        self.reader.reload().map_err(Into::into)
+    }
+
     fn open_replacement_writer(
         &self,
         context: &str,
@@ -2396,6 +2400,16 @@ impl HotEngine {
             .set_max_bytes_for_test(max_bytes);
     }
 
+    #[cfg(test)]
+    pub(crate) fn use_manual_reader_for_test(&mut self) -> Result<()> {
+        self.reader = self
+            .index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()?;
+        Ok(())
+    }
+
     pub(crate) fn refresh_with_pruned_tombstones(&self) -> Result<Vec<PrunedTombstone>> {
         let _maintenance = self.maintenance_guard("refresh")?;
         let committed_boundary = self.with_translog("refresh", |translog| {
@@ -2468,7 +2482,7 @@ impl HotEngine {
             }
         }
 
-        self.reader.reload()?;
+        self.reload_reader()?;
         #[cfg(test)]
         if let Some(pause) = self.refresh_before_map_clear.lock().unwrap().take() {
             pause.ready.send(()).unwrap();
@@ -2491,8 +2505,7 @@ impl HotEngine {
         let committed = self.load_committed_boundary()?;
         // Publish the commit before resetting the map, including empty replay.
         // Completeness remains false until the acknowledged suffix is restored.
-        self.reader
-            .reload()
+        self.reload_reader()
             .with_context(|| format!("reader reload failed before {context} replay"))?;
         self.reset_apply_state_to_commit(committed.clone())?;
         #[cfg(test)]
@@ -2666,7 +2679,7 @@ impl HotEngine {
             return Ok(0);
         }
         flush_batch(&mut batch)?;
-        if let Err(error) = self.reader.reload() {
+        if let Err(error) = self.reload_reader() {
             writer_state.fail(format!("reader reload failed after {context}: {error}"));
             #[cfg(feature = "protocol-trace")]
             if trace_replay && let Some(copy) = trace_copy.as_ref() {
@@ -4503,7 +4516,7 @@ impl HotEngine {
         let committed_boundary =
             self.commit_writer_at_boundary(&mut writer_state, "checkpoint-aware flush", boundary)?;
         drop(writer_state);
-        self.reader.reload()?;
+        self.reload_reader()?;
         self.persist_committed_boundary(&committed_boundary)?;
         self.validate_truncation_boundary(&*tl, &committed_boundary)?;
         if let Some(processed_checkpoint) = committed_boundary.processed_checkpoint {
@@ -4523,7 +4536,7 @@ impl HotEngine {
                 boundary,
             )?;
             drop(writer_state);
-            self.reader.reload()?;
+            self.reload_reader()?;
             self.persist_committed_boundary(&committed_boundary)?;
             self.validate_truncation_boundary(tl, &committed_boundary)?;
             if let Some(processed_checkpoint) = committed_boundary.processed_checkpoint {
@@ -4544,7 +4557,7 @@ impl HotEngine {
                 boundary,
             )?;
             drop(writer_state);
-            self.reader.reload()?;
+            self.reload_reader()?;
             self.persist_committed_boundary(&committed_boundary)?;
             self.validate_truncation_boundary(tl, &committed_boundary)
         })
@@ -8124,7 +8137,7 @@ impl super::SearchEngine for HotEngine {
             let committed_boundary =
                 self.commit_writer_at_boundary(&mut writer_state, "flush", boundary)?;
             drop(writer_state); // release lock before reader reload
-            self.reader.reload()?;
+            self.reload_reader()?;
             self.persist_committed_boundary(&committed_boundary)?;
             self.validate_truncation_boundary(tl, &committed_boundary)?;
             if let Some(processed_checkpoint) = committed_boundary.processed_checkpoint {
@@ -8160,7 +8173,7 @@ impl super::SearchEngine for HotEngine {
 
         let merge_result = (|| {
             self.persist_committed_boundary(&committed_boundary)?;
-            self.reader.reload()?;
+            self.reload_reader()?;
 
             loop {
                 let segment_ids = self.index.searchable_segment_ids()?;
@@ -8178,7 +8191,7 @@ impl super::SearchEngine for HotEngine {
                 let _: Option<tantivy::SegmentMeta> = future
                     .wait()
                     .context("Tantivy force-merge operation failed")?;
-                self.reader.reload()?;
+                self.reload_reader()?;
             }
 
             let final_segment_count = self.index.searchable_segment_ids()?.len();
@@ -8521,7 +8534,7 @@ impl super::SearchEngine for HotEngine {
                 std::fs::File::open(snapshot_dir)?.sync_all()?;
                 #[cfg(feature = "protocol-trace")]
                 {
-                    self.reader.reload()?;
+                    self.reload_reader()?;
                     let processed_seqs = self.protocol_trace_processed_sequences()?;
                     let documents = self.protocol_trace_documents_snapshot()?;
                     Ok((file_names, processed_seqs, documents))
@@ -9480,6 +9493,250 @@ mod tests {
         (dir, engine)
     }
 
+    fn commit_without_reader_reload(engine: &HotEngine) {
+        engine
+            .with_translog("reader publication test", |translog| {
+                let mut writer_state =
+                    engine.writer_state_with_replay(translog, "reader publication test")?;
+                let boundary = engine.current_committed_boundary()?;
+                let boundary = engine.commit_writer_at_boundary(
+                    &mut writer_state,
+                    "reader publication test",
+                    boundary,
+                )?;
+                engine.persist_committed_boundary(&boundary)
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn reader_publication_commit_does_not_reload_in_background() {
+        let (_directory, engine) = create_engine();
+        let generation = engine.reader.searcher().generation().generation_id();
+        engine.add_document("doc", json!({"value": 1})).unwrap();
+        commit_without_reader_reload(&engine);
+
+        std::thread::sleep(Duration::from_millis(1500));
+
+        assert_eq!(
+            engine.reader.searcher().generation().generation_id(),
+            generation,
+            "a commit without refresh must not publish a searcher"
+        );
+        assert!(engine.get_document("doc").unwrap().is_none());
+        engine.refresh().unwrap();
+        assert_eq!(
+            engine.get_document("doc").unwrap().unwrap(),
+            json!({"value": 1})
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "protocol-trace"))]
+    fn reader_publication_peer_snapshot_commit_waits_for_refresh() {
+        let (directory, engine) = create_engine();
+        let receipt = engine
+            .add_document_with_receipt("doc", json!({"value": 1}))
+            .unwrap();
+        drop(
+            engine
+                .prepare_peer_recovery_snapshot(&directory.path().join("snapshot"))
+                .unwrap(),
+        );
+
+        std::thread::sleep(Duration::from_millis(1500));
+
+        assert!(
+            engine.get_document("doc").unwrap().is_none(),
+            "a durable peer snapshot must not refresh the source reader"
+        );
+        let realtime = engine
+            .get_document_with_metadata("doc", true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(realtime.source, json!({"value": 1}));
+        assert_eq!(realtime.seq_no, receipt.seq_no);
+        engine.refresh().unwrap();
+        assert_eq!(
+            engine.get_document("doc").unwrap().unwrap(),
+            json!({"value": 1})
+        );
+    }
+
+    struct ReaderPublicationSchedule {
+        engine: Arc<HotEngine>,
+        _directory: tempfile::TempDir,
+        acknowledged: super::super::IndexWriteReceipt,
+        generations: Vec<u64>,
+        observer_generations: Vec<Vec<u64>>,
+        second_reload_waited: bool,
+    }
+
+    fn interleaved_reader_publication() -> ReaderPublicationSchedule {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let gate = Arc::new(ReaderReloadGate {
+            armed: AtomicBool::new(false),
+            entered_sender: entered_tx,
+            release_receiver: Mutex::new(release_rx),
+        });
+        let (directory, mut engine, _, _, _) = create_engine_with_io_gates(Some(gate.clone()));
+        engine.reader = engine
+            .index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
+            .unwrap();
+        engine.delete_tombstone_retention = Duration::ZERO;
+        engine.add_document("doc", json!({"value": 1})).unwrap();
+        engine.add_document("deleted", json!({"value": 1})).unwrap();
+        engine.refresh().unwrap();
+        let engine = Arc::new(engine);
+        let initial = engine.reader.searcher().generation().generation_id();
+        let stop = Arc::new(AtomicBool::new(false));
+        let observers = (0..2)
+            .map(|_| {
+                let engine = engine.clone();
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut generations = Vec::new();
+                    while !stop.load(Ordering::Acquire) {
+                        let generation = engine.reader.searcher().generation().generation_id();
+                        if generations.last() != Some(&generation) {
+                            generations.push(generation);
+                        }
+                        std::thread::yield_now();
+                    }
+                    generations
+                })
+            })
+            .collect::<Vec<_>>();
+        gate.armed.store(true, Ordering::Release);
+        let older_engine = engine.clone();
+        let older = std::thread::Builder::new()
+            .name("blocked-reader-reload".to_string())
+            .spawn(move || older_engine.reload_reader())
+            .unwrap();
+        entered_rx.recv_timeout(TEST_SYNC_TIMEOUT).unwrap();
+
+        let acknowledged = engine
+            .add_document_with_receipt("doc", json!({"value": 2}))
+            .unwrap();
+        let deletion = engine.delete_document_with_receipt("deleted").unwrap();
+        engine
+            .version_map_write()
+            .unwrap()
+            .map
+            .rotate_current_into_old()
+            .unwrap();
+        commit_without_reader_reload(&engine);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let newer_engine = engine.clone();
+        let newer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            newer_engine.reload_reader().unwrap();
+            let (_, retired) = newer_engine
+                .version_map_write()
+                .unwrap()
+                .map
+                .complete_reader_reload(Some(deletion.seq_no), Duration::ZERO);
+            drop(retired);
+            finished_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(TEST_SYNC_TIMEOUT).unwrap();
+        let second_reload_waited = match finished_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(()) => false,
+            Err(mpsc::RecvTimeoutError::Timeout) => true,
+            Err(error) => panic!("second reader reload failed: {error}"),
+        };
+        let before_release = engine.reader.searcher().generation().generation_id();
+        release_tx.send(()).unwrap();
+        older.join().unwrap().unwrap();
+        newer.join().unwrap();
+        let final_generation = engine.reader.searcher().generation().generation_id();
+        stop.store(true, Ordering::Release);
+        let observer_generations = observers
+            .into_iter()
+            .map(|observer| observer.join().unwrap())
+            .collect();
+        ReaderPublicationSchedule {
+            _directory: directory,
+            engine,
+            acknowledged,
+            generations: vec![initial, before_release, final_generation],
+            observer_generations,
+            second_reload_waited,
+        }
+    }
+
+    #[test]
+    fn reader_publication_concurrent_reloads_are_monotonic() {
+        let schedule = interleaved_reader_publication();
+        for generations in
+            std::iter::once(&schedule.generations).chain(schedule.observer_generations.iter())
+        {
+            assert!(
+                generations.windows(2).all(|pair| pair[0] <= pair[1]),
+                "reader generations regressed: {generations:?}"
+            );
+        }
+        assert!(
+            schedule.second_reload_waited,
+            "the second reload must wait while the first holds an older searcher"
+        );
+        assert_eq!(
+            schedule.engine.get_document("doc").unwrap().unwrap(),
+            json!({"value": 2})
+        );
+    }
+
+    #[test]
+    fn reader_publication_realtime_miss_after_old_map_clear_keeps_latest_version() {
+        let schedule = interleaved_reader_publication();
+        assert!(
+            schedule
+                .engine
+                .version_map_read()
+                .unwrap()
+                .map
+                .lookup("doc")
+                .unwrap()
+                .is_none()
+        );
+        let document = schedule
+            .engine
+            .get_document_with_metadata("doc", true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(document.source, json!({"value": 2}));
+        assert_eq!(document.seq_no, schedule.acknowledged.seq_no);
+        assert_eq!(document.primary_term, schedule.acknowledged.primary_term);
+    }
+
+    #[test]
+    fn reader_publication_realtime_miss_after_tombstone_pruning_stays_deleted() {
+        let schedule = interleaved_reader_publication();
+        assert!(
+            schedule
+                .engine
+                .version_map_read()
+                .unwrap()
+                .map
+                .lookup("deleted")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            schedule
+                .engine
+                .get_document_with_metadata("deleted", true)
+                .unwrap()
+                .is_none(),
+            "an older reader must not resurrect a checkpoint-covered delete"
+        );
+    }
+
     fn realtime_get_while_apply_state_is_held(
         engine: Arc<HotEngine>,
         doc_id: &'static str,
@@ -9799,10 +10056,63 @@ mod tests {
         }
     }
 
+    struct ReaderReloadGate {
+        armed: AtomicBool,
+        entered_sender: Sender<()>,
+        release_receiver: Mutex<Receiver<()>>,
+    }
+
+    struct BlockingReaderFileHandle {
+        inner: Arc<dyn FileHandle>,
+        gate: Arc<ReaderReloadGate>,
+        reads: AtomicUsize,
+    }
+
+    impl fmt::Debug for BlockingReaderFileHandle {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("BlockingReaderFileHandle")
+        }
+    }
+
+    impl tantivy::HasLen for BlockingReaderFileHandle {
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+    }
+
+    impl FileHandle for BlockingReaderFileHandle {
+        fn read_bytes(
+            &self,
+            range: std::ops::Range<usize>,
+        ) -> std::io::Result<tantivy::directory::OwnedBytes> {
+            let bytes = self.inner.read_bytes(range)?;
+            // ManagedDirectory reads its footer twice under META_LOCK. The
+            // third read opens StoreReader after the searcher generation is
+            // captured and META_LOCK is released, but before ArcSwap publication.
+            if self.reads.fetch_add(1, Ordering::Relaxed) == 2
+                && std::thread::current().name() == Some("blocked-reader-reload")
+                && self.gate.armed.swap(false, Ordering::AcqRel)
+            {
+                self.gate
+                    .entered_sender
+                    .send(())
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::BrokenPipe, error))?;
+                self.gate
+                    .release_receiver
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(TEST_SYNC_TIMEOUT)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::TimedOut, error))?;
+            }
+            Ok(bytes)
+        }
+    }
+
     #[derive(Clone)]
     struct BlockingMergeDirectory {
         inner: RamDirectory,
         gate: Arc<MergeWriteGate>,
+        reader_gate: Option<Arc<ReaderReloadGate>>,
     }
 
     impl fmt::Debug for BlockingMergeDirectory {
@@ -9816,7 +10126,19 @@ mod tests {
             &self,
             path: &Path,
         ) -> std::result::Result<Arc<dyn FileHandle>, OpenReadError> {
-            self.inner.get_file_handle(path)
+            let handle = self.inner.get_file_handle(path)?;
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "store")
+                && let Some(gate) = self.reader_gate.as_ref()
+            {
+                return Ok(Arc::new(BlockingReaderFileHandle {
+                    inner: handle,
+                    gate: gate.clone(),
+                    reads: AtomicUsize::new(0),
+                }));
+            }
+            Ok(handle)
         }
 
         fn delete(&self, path: &Path) -> std::result::Result<(), DeleteError> {
@@ -9858,6 +10180,18 @@ mod tests {
         Receiver<()>,
         Sender<()>,
     ) {
+        create_engine_with_io_gates(None)
+    }
+
+    fn create_engine_with_io_gates(
+        reader_gate: Option<Arc<ReaderReloadGate>>,
+    ) -> (
+        tempfile::TempDir,
+        HotEngine,
+        Arc<MergeWriteGate>,
+        Receiver<()>,
+        Sender<()>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let (entered_sender, entered_receiver) = mpsc::channel();
         let (release_sender, release_receiver) = mpsc::channel();
@@ -9869,6 +10203,7 @@ mod tests {
         let directory = BlockingMergeDirectory {
             inner: RamDirectory::create(),
             gate: gate.clone(),
+            reader_gate,
         };
 
         let mut schema_builder = Schema::builder();

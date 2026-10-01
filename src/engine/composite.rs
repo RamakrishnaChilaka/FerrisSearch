@@ -1774,6 +1774,71 @@ mod tests {
         .unwrap()
     }
 
+    fn snapshot_vector_rebuild_covers_committed_updates(prepare: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let mut engine = vector_engine(directory.path());
+        engine.text.use_manual_reader_for_test().unwrap();
+        engine
+            .add_document("doc", json!({"emb": [1.0, 0.0, 0.0]}))
+            .unwrap();
+        engine
+            .add_document("deleted", json!({"emb": [1.0, 0.0, 0.0]}))
+            .unwrap();
+        engine.refresh().unwrap();
+        let updated = engine
+            .add_document_with_receipt("doc", json!({"emb": [0.0, 1.0, 0.0]}))
+            .unwrap();
+        let fresh = engine
+            .add_document_with_receipt("fresh", json!({"emb": [0.0, 0.0, 1.0]}))
+            .unwrap();
+        engine.delete_document("deleted").unwrap();
+        engine.mark_vectors_stale().unwrap();
+        assert!(!engine.text.writer_requires_rebuild());
+
+        let snapshot_dir = directory.path().join("snapshot");
+        if prepare {
+            drop(
+                engine
+                    .prepare_peer_recovery_snapshot(&snapshot_dir)
+                    .unwrap(),
+            );
+        } else {
+            let snapshot = engine.create_peer_recovery_snapshot(&snapshot_dir).unwrap();
+            engine
+                .release_peer_recovery_pin(snapshot.retention_pin_id)
+                .unwrap();
+        }
+
+        let vectors = engine.vector.read().unwrap();
+        let vectors = vectors.as_ref().unwrap();
+        assert_eq!(
+            vectors.version_for_test("doc").unwrap().seq_no,
+            updated.seq_no,
+            "snapshot-time vector repair must read the newly committed version"
+        );
+        assert_eq!(
+            vectors.version_for_test("fresh").unwrap().seq_no,
+            fresh.seq_no
+        );
+        assert!(vectors.version_for_test("deleted").is_none());
+        assert_eq!(vectors.len(), 2);
+        assert!(!engine.vectors_are_stale().unwrap());
+        assert_eq!(
+            engine.get_document("doc").unwrap().unwrap()["emb"],
+            json!([0.0, 1.0, 0.0])
+        );
+    }
+
+    #[test]
+    fn reader_publication_prepared_snapshot_vector_rebuild_covers_commit() {
+        snapshot_vector_rebuild_covers_committed_updates(true);
+    }
+
+    #[test]
+    fn reader_publication_created_snapshot_vector_rebuild_covers_commit() {
+        snapshot_vector_rebuild_covers_committed_updates(false);
+    }
+
     fn vector_state_after_failed_write(
         between: impl FnOnce(&CompositeEngine),
     ) -> (Option<u64>, serde_json::Value) {
