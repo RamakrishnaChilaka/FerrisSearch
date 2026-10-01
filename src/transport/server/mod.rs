@@ -72,6 +72,9 @@ fn new_join_lock() -> Arc<Mutex<()>> {
 
 type PrimaryActivationKey = (String, u32, u64);
 
+#[cfg(test)]
+type CheckpointRecordingHook = Box<dyn FnOnce() + Send>;
+
 #[derive(Clone)]
 struct PendingPromotionNoOps {
     primary_term: u64,
@@ -95,6 +98,8 @@ struct PrimaryActivationState {
     available_report_tasks_spawned: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     promotion_noop_bulk_requests_received: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    checkpoint_recording_hook: std::sync::Mutex<Option<CheckpointRecordingHook>>,
 }
 
 impl PrimaryActivationState {
@@ -5907,6 +5912,18 @@ impl TransportService {
             })
             .cloned()
             .collect::<Vec<_>>();
+        #[cfg(test)]
+        {
+            let hook = self
+                .primary_activation_state
+                .checkpoint_recording_hook
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         // Request durability persists before fan-out, so a post-replication sample
         // covers the primary prefix completed by a last-gap or highest-sequence round.
         // Serialized tracker maxima then converge without holding the node-wide

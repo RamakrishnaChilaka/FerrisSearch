@@ -1105,6 +1105,225 @@ async fn gcp_removed_copy_stops_holding_progress_and_none_reports_never_regress(
     assert_eq!(primary.global_checkpoint(), Some(40));
 }
 
+#[tokio::test]
+async fn promotion_noop_retry_waits_for_exclusive_recovery_barrier() {
+    let (_dir, service, primary, activated) = gcp_test_primary(3);
+    let mut state = service.cluster_manager.get_state();
+    let routing = state
+        .indices
+        .get_mut("idx")
+        .unwrap()
+        .shard_routing
+        .get_mut(&0)
+        .unwrap();
+    routing.replicas.clear();
+    routing.in_sync_replicas.clear();
+    state
+        .shard_allocations
+        .get_mut("idx")
+        .unwrap()
+        .get_mut(&0)
+        .unwrap()
+        .replicas
+        .clear();
+    service.cluster_manager.update_state(state);
+    let noop = crate::engine::SequencedOperation {
+        seq_no: 4,
+        primary_term: 2,
+        mutation: crate::engine::DocumentMutation::NoOp {
+            reason: "promotion gap".into(),
+        },
+    };
+    primary.apply_replica_operation(noop.clone()).unwrap();
+    primary.prepare_primary_activation(2).unwrap();
+    service
+        .primary_activation_state
+        .pending_noops
+        .write()
+        .unwrap()
+        .insert(
+            ("uuid-1".into(), 0, 1),
+            PendingPromotionNoOps {
+                primary_term: 2,
+                operations: vec![noop],
+            },
+        );
+    assert_eq!(primary.global_checkpoint(), None);
+
+    let exclusive = service.peer_recovery_exclusive_guard("uuid-1", 0).await;
+    let mut retry = Box::pin(service.retry_pending_promotion_noops("idx", 0, &activated));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), retry.as_mut())
+            .await
+            .is_err(),
+        "NoOp retry advanced the global checkpoint to {:?} while finalization held the exclusive barrier",
+        primary.global_checkpoint(),
+    );
+    assert_eq!(primary.global_checkpoint(), None);
+    drop(exclusive);
+    tokio::time::timeout(Duration::from_secs(5), retry)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(primary.global_checkpoint(), Some(4));
+    assert!(
+        service
+            .primary_activation_state
+            .pending_noops
+            .read()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn promotion_noop_retry_keeps_admission_outside_checkpoint_snapshot() {
+    let (_dir, service, primary, activated) = gcp_test_primary(36);
+    primary
+        .apply_replica_batch(gcp_replica_operations(38..=40))
+        .unwrap();
+    let noops = primary.prepare_primary_activation(2).unwrap();
+    assert_eq!(
+        noops
+            .iter()
+            .map(|operation| operation.seq_no)
+            .collect::<Vec<_>>(),
+        vec![37]
+    );
+    service
+        .primary_activation_state
+        .pending_noops
+        .write()
+        .unwrap()
+        .insert(
+            ("uuid-1".into(), 0, 1),
+            PendingPromotionNoOps {
+                primary_term: 2,
+                operations: noops,
+            },
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut state = service.cluster_manager.get_state();
+    state.nodes.get_mut("replica").unwrap().transport_port = listener.local_addr().unwrap().port();
+    service.cluster_manager.update_state(state.clone());
+    let replica_dir = tempfile::tempdir().unwrap();
+    let replica_shards = Arc::new(ShardManager::new(
+        replica_dir.path(),
+        Duration::from_secs(60),
+    ));
+    let replica = replica_shards
+        .open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &crate::cluster::state::IndexSettings::default(),
+            "uuid-1",
+            crate::shard::AssignedShardOpen {
+                allocation_id: 1,
+                primary_term: 2,
+                allow_empty_creation: true,
+            },
+        )
+        .unwrap();
+    replica
+        .apply_replica_batch(gcp_replica_operations(0..=36))
+        .unwrap();
+    replica
+        .apply_replica_batch(gcp_replica_operations(38..=40))
+        .unwrap();
+    let replica_manager = Arc::new(ClusterManager::new("gcp-admission".into()));
+    replica_manager.update_state(state);
+    let replica_service = build_transport_service_for_test(
+        replica_manager,
+        replica_shards,
+        crate::transport::TransportClient::new(),
+        Arc::new(crate::tasks::TaskManager::new()),
+        "replica".into(),
+    );
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(InternalTransportServer::new(replica_service))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    let (_target_dir, target) = make_checkpoint_engine();
+    target
+        .apply_replica_batch(gcp_replica_operations(0..=36))
+        .unwrap();
+    target
+        .apply_replica_batch(gcp_replica_operations(38..=40))
+        .unwrap();
+    assert_eq!(target.sequence_stats().persisted_checkpoint, Some(36));
+    {
+        let _write_guard = service.peer_recovery_write_guard("idx", 0).await.unwrap();
+        service.record_replica_checkpoints(
+            &primary,
+            "idx",
+            0,
+            &activated,
+            primary.sequence_stats(),
+            &[replica_checkpoint("replica", Some(30), Some(30))],
+        );
+    }
+    assert_eq!(primary.global_checkpoint(), Some(30));
+
+    let barrier = service
+        .peer_recovery_state
+        .barrier_for_test(("uuid-1".into(), 0))
+        .await;
+    let admitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_admitted = admitted.clone();
+    let hook_service = service.clone();
+    let hook_primary = primary.clone();
+    let hook_activated = activated.clone();
+    *service
+        .primary_activation_state
+        .checkpoint_recording_hook
+        .lock()
+        .unwrap() = Some(Box::new(move || {
+        if let Ok(exclusive) = barrier.clone().try_write_owned() {
+            gcp_add_replica(&hook_service, "replica-2", 1);
+            hook_admitted.store(true, std::sync::atomic::Ordering::Release);
+            drop(exclusive);
+            let _write_guard = barrier.try_read_owned().unwrap();
+            hook_service.record_replica_checkpoints(
+                &hook_primary,
+                "idx",
+                0,
+                &hook_activated,
+                hook_primary.sequence_stats(),
+                &[
+                    replica_checkpoint("replica", Some(40), Some(40)),
+                    replica_checkpoint("replica-2", Some(36), Some(36)),
+                ],
+            );
+            assert_eq!(hook_primary.global_checkpoint(), Some(36));
+        }
+    }));
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        service.retry_pending_promotion_noops("idx", 0, &activated),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    server.abort();
+    assert_eq!(replica.sequence_stats().persisted_checkpoint, Some(40));
+    if admitted.load(std::sync::atomic::Ordering::Acquire) {
+        gcp_assert_persisted_bound(&primary, &[&replica, &target]);
+    } else {
+        gcp_assert_persisted_bound(&primary, &[&replica]);
+    }
+    assert!(
+        !admitted.load(std::sync::atomic::Ordering::Acquire),
+        "admission acquired the exclusive barrier inside the checkpoint snapshot window"
+    );
+    assert_eq!(primary.global_checkpoint(), Some(40));
+}
+
 #[test]
 fn advance_global_checkpoint_no_replicas_uses_primary() {
     let (_dir, engine) = make_checkpoint_engine();

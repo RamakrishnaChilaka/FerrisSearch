@@ -4053,6 +4053,260 @@ async fn gcp_transport_rejects_checkpoint_observations_from_previous_copy_author
     }
 }
 
+async fn two_replica_checkpoint_cluster(
+    index: &str,
+) -> (
+    Vec<tempfile::TempDir>,
+    Arc<ShardManager>,
+    Vec<Arc<ShardManager>>,
+    std::net::SocketAddr,
+    Vec<tokio::task::JoinHandle<()>>,
+) {
+    let mut dirs = Vec::new();
+    let mut replica_managers = Vec::new();
+    let mut replica_ports = Vec::new();
+    let mut servers = Vec::new();
+    for node in ["replica-node", "replica-node-2"] {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(ClusterManager::new("checkpoint-concurrency".into()));
+        let shards = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+        let (address, server) =
+            start_grpc_server_for_node_with_handle(manager.clone(), shards.clone(), node).await;
+        dirs.push(dir);
+        replica_managers.push((manager, shards));
+        replica_ports.push(address.port());
+        servers.push(server);
+    }
+    let primary_dir = tempfile::tempdir().unwrap();
+    let primary_manager = Arc::new(ClusterManager::new("checkpoint-concurrency".into()));
+    let primary_shards = Arc::new(ShardManager::new(
+        primary_dir.path(),
+        Duration::from_secs(60),
+    ));
+    dirs.push(primary_dir);
+    setup_two_node_cluster_state(
+        &primary_manager,
+        &replica_managers[0].0,
+        index,
+        replica_ports[0],
+    );
+    let mut state = primary_manager.get_state();
+    state.add_node(DomainNodeInfo {
+        id: "replica-node-2".into(),
+        name: "replica-2".into(),
+        host: "127.0.0.1".into(),
+        transport_port: replica_ports[1],
+        http_port: 0,
+        roles: vec![NodeRole::Data],
+        raft_node_id: 0,
+    });
+    {
+        let metadata = state.indices.get_mut(index).unwrap();
+        metadata.number_of_replicas = 2;
+        metadata.dynamic = ferrissearch::cluster::state::DynamicMapping::Strict;
+        metadata.mappings.insert(
+            "message".into(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        );
+        let routing = metadata.shard_routing.get_mut(&0).unwrap();
+        routing.replicas.push("replica-node-2".into());
+        routing.in_sync_replicas.push("replica-node-2".into());
+    }
+    state
+        .shard_allocations
+        .get_mut(index)
+        .unwrap()
+        .get_mut(&0)
+        .unwrap()
+        .replicas
+        .insert("replica-node-2".into(), 1);
+    for manager in [
+        &primary_manager,
+        &replica_managers[0].0,
+        &replica_managers[1].0,
+    ] {
+        manager.update_state(state.clone());
+    }
+    let metadata = &state.indices[index];
+    for (_, shards) in &replica_managers {
+        shards
+            .open_shard_with_settings(
+                index,
+                0,
+                &metadata.mappings,
+                &metadata.settings,
+                metadata.uuid.as_str(),
+            )
+            .unwrap();
+    }
+    let (address, server) = start_grpc_server_for_node_with_handle(
+        primary_manager,
+        primary_shards.clone(),
+        "primary-node",
+    )
+    .await;
+    servers.push(server);
+    (
+        dirs,
+        primary_shards,
+        replica_managers
+            .into_iter()
+            .map(|(_, shards)| shards)
+            .collect(),
+        address,
+        servers,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_replica_concurrent_writes_converge_and_preserve_live_checkpoint_safety() {
+    let index = "checkpoint-concurrency";
+    let (_dirs, primary_shards, replica_shards, address, servers) =
+        two_replica_checkpoint_cluster(index).await;
+    let mut client = connect_client(address).await;
+    let seed = client
+        .index_doc(tonic::Request::new(ShardDocRequest {
+            index_name: index.into(),
+            shard_id: 0,
+            doc_id: "seed".into(),
+            payload_json: serde_json::to_vec(&serde_json::json!({"message": "seed"})).unwrap(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(seed.success, "{}", seed.error);
+    assert_eq!(seed.seq_no, Some(0));
+    let primary = primary_shards.get_shard(index, 0).unwrap();
+    let replicas: Vec<_> = replica_shards
+        .iter()
+        .map(|shards| shards.get_shard(index, 0).unwrap())
+        .collect();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    struct StopSampler(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for StopSampler {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let stop_sampler = StopSampler(stop.clone());
+    let sampler = {
+        let stop = stop.clone();
+        let primary = primary.clone();
+        let replicas = replicas.clone();
+        std::thread::spawn(move || {
+            let mut samples = 0;
+            let mut violation = None;
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                // Read global first: later persisted samples can only increase.
+                let global = primary.global_checkpoint();
+                let mut persisted = vec![primary.sequence_stats().persisted_checkpoint];
+                persisted.extend(
+                    replicas
+                        .iter()
+                        .map(|replica| replica.sequence_stats().persisted_checkpoint),
+                );
+                if global.is_some()
+                    && persisted.iter().any(|checkpoint| global > *checkpoint)
+                    && violation.is_none()
+                {
+                    violation = Some((global, persisted));
+                }
+                samples += 1;
+                std::thread::yield_now();
+            }
+            (samples, violation)
+        })
+    };
+    let jobs = (0..60).map(|number| {
+        let mut client = client.clone();
+        async move {
+            match number % 3 {
+                0 => {
+                    let id = format!("single-{number}");
+                    let response = client
+                        .index_doc(tonic::Request::new(ShardDocRequest {
+                            index_name: index.into(),
+                            shard_id: 0,
+                            doc_id: id.clone(),
+                            payload_json: serde_json::to_vec(&serde_json::json!({"message": id}))
+                                .unwrap(),
+                            ..Default::default()
+                        }))
+                        .await
+                        .unwrap()
+                        .into_inner();
+                    assert!(response.success, "{}", response.error);
+                    vec![response.seq_no.unwrap()]
+                }
+                1 => {
+                    let ids: Vec<_> = (0..3).map(|item| format!("bulk-{number}-{item}")).collect();
+                    let response = client
+                        .bulk_index(tonic::Request::new(ShardBulkRequest {
+                            index_name: index.into(),
+                            shard_id: 0,
+                            documents_json: ids
+                                .iter()
+                                .map(|id| {
+                                    serde_json::to_vec(&serde_json::json!({
+                                        "_doc_id": id, "_source": {"message": id},
+                                    }))
+                                    .unwrap()
+                                })
+                                .collect(),
+                            ..Default::default()
+                        }))
+                        .await
+                        .unwrap()
+                        .into_inner();
+                    assert!(response.success, "{}", response.error);
+                    assert_eq!(response.doc_ids, ids);
+                    let start = response.start_seq_no.unwrap();
+                    (start..start + 3).collect()
+                }
+                _ => {
+                    let response = client
+                        .delete_doc(tonic::Request::new(ShardDeleteRequest {
+                            index_name: index.into(),
+                            shard_id: 0,
+                            doc_id: format!("single-{}", number - 2),
+                            ..Default::default()
+                        }))
+                        .await
+                        .unwrap()
+                        .into_inner();
+                    assert!(response.success, "{}", response.error);
+                    vec![response.seq_no.unwrap()]
+                }
+            }
+        }
+    });
+    let results =
+        tokio::time::timeout(Duration::from_secs(60), futures::future::join_all(jobs)).await;
+    drop(stop_sampler);
+    let (samples, violation) = sampler.join().unwrap();
+    for server in servers {
+        server.abort();
+    }
+    let mut sequences: Vec<u64> = results.unwrap().into_iter().flatten().collect();
+    sequences.push(0);
+    sequences.sort_unstable();
+    assert_eq!(sequences, (0..=100).collect::<Vec<_>>());
+    assert!(samples > 0, "live checkpoint sampler did not run");
+    assert!(
+        violation.is_none(),
+        "live persisted-prefix safety violation: {violation:?}"
+    );
+    assert_eq!(primary.sequence_stats().persisted_checkpoint, Some(100));
+    for replica in &replicas {
+        assert_eq!(replica.sequence_stats().persisted_checkpoint, Some(100));
+    }
+    assert_eq!(primary.global_checkpoint(), Some(100));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_primary_receipts_match_primary_and_replica_wal() {
     let replica_dir = tempfile::tempdir().unwrap();

@@ -215,6 +215,11 @@ impl PeerRecoveryTransportState {
         })
     }
 
+    #[cfg(test)]
+    pub(super) async fn barrier_for_test(&self, key: (String, u32)) -> Arc<RwLock<()>> {
+        self.barrier(key).await
+    }
+
     async fn barrier(&self, key: (String, u32)) -> Arc<RwLock<()>> {
         let mut barriers = self.write_barriers.lock().await;
         barriers
