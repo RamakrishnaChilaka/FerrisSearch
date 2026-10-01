@@ -2819,7 +2819,8 @@ async fn rest_qsearch_wildcards_distinguish_missing_null_and_empty_keyword_value
             vec![("q", "*:*")],
             vec!["empty", "missing", "null", "value"],
         ),
-        (vec![("q", "*")], vec!["value"]),
+        (vec![("q", "*")], vec!["empty", "missing", "null", "value"]),
+        (vec![("q", "*"), ("df", "body")], vec!["value"]),
         (vec![("q", "tag:*")], vec!["empty", "value"]),
         (vec![("q", "*"), ("df", "tag")], vec!["empty", "value"]),
         (vec![("q", "number:*")], vec!["value"]),
@@ -3205,7 +3206,7 @@ async fn rest_qsearch_remote_store_match_all_and_parse_errors() -> Result<()> {
     assert_eq!(status, StatusCode::OK, "{body}");
     for (query, expected_status, expected_count) in [
         ("*:*", StatusCode::OK, 2),
-        ("*", StatusCode::OK, 1),
+        ("*", StatusCode::OK, 2),
         ("body:(", StatusCode::BAD_REQUEST, 0),
     ] {
         let response = harness
@@ -3237,6 +3238,205 @@ async fn rest_qsearch_remote_store_match_all_and_parse_errors() -> Result<()> {
                     .as_str()
                     .unwrap()
                     .contains(query),
+                "{body}"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn qsearch_review_seed_semantics(harness: &RestTestHarness) -> Result<()> {
+    let (status, body) = harness
+        .put_json(
+            "/sem",
+            json!({
+                "settings": {"number_of_shards": 2, "number_of_replicas": 0},
+                "mappings": {"properties": {
+                    "title": {"type": "text"}, "tag": {"type": "keyword"}, "n": {"type": "integer"}
+                }}
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = harness.post_ndjson("/sem/_bulk?refresh=true", concat!(
+        "{\"index\":{\"_id\":\"d1\"}}\n{\"title\":\"hello world\",\"tag\":\"rust\",\"n\":1}\n",
+        "{\"index\":{\"_id\":\"d2\"}}\n{\"title\":\"hello there\",\"tag\":\"python\",\"n\":5}\n",
+        "{\"index\":{\"_id\":\"d3\"}}\n{\"title\":\"goodbye world\",\"tag\":\"Rust\",\"n\":10}\n",
+        "{\"index\":{\"_id\":\"d4\"}}\n{\"tag\":\"\"}\n",
+        "{\"index\":{\"_id\":\"d5\"}}\n{\"n\":0}\n",
+        "{\"index\":{\"_id\":\"d6\"}}\n{}\n",
+        "{\"index\":{\"_id\":\"d7\"}}\n{\"meta\":{\"k\":\"hello\"}}\n",
+        "{\"index\":{\"_id\":\"d8\"}}\n{\"title\":\"!!!\"}\n",
+        "{\"index\":{\"_id\":\"d9\"}}\n{\"title\":null,\"tag\":null}\n",
+        "{\"index\":{\"_id\":\"d10\"}}\n{\"words\":[\"hello\",\"array\"]}\n"
+    )).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["errors"], false, "{body}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_qsearch_review_bare_star_matches_all_without_an_explicit_field() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    qsearch_review_seed_semantics(&harness).await?;
+    let expected = ["d1", "d10", "d2", "d3", "d4", "d5", "d6", "d7", "d8", "d9"];
+    for query in ["*", " * ", "(*)", "*:*"] {
+        let response = harness
+            .client
+            .get(qsearch_url(
+                &harness.base_url,
+                "/sem/_search",
+                &[("q", query), ("size", "50")],
+            )?)
+            .send()
+            .await?;
+        let status = response.status();
+        let body: Value = response.json().await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["_shards"]["successful"], 2, "{body}");
+        assert_eq!(body["_shards"]["failed"], 0, "{body}");
+        assert_eq!(body["hits"]["total"]["value"], 10, "{body}");
+        let mut ids: Vec<_> = body["hits"]["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["_id"].as_str().unwrap())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, expected, "{query}: {body}");
+    }
+    for query in [json!({"query": "*"}), json!({"query": "*:*"})] {
+        let (status, body) = harness
+            .post_json(
+                "/sem/_search",
+                json!({
+                    "query": {"query_string": query}, "size": 50
+                }),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["hits"]["total"]["value"], 10, "{body}");
+        assert_eq!(
+            body["hits"]["hits"].as_array().map(Vec::len),
+            Some(10),
+            "{body}"
+        );
+        let (status, body) = harness
+            .post_json(
+                "/sem/_count",
+                json!({
+                    "query": {"query_string": query}
+                }),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["count"], 10, "{body}");
+    }
+    for (field, expected) in [("tag", 4), ("n", 4), ("title", 3), ("body", 4)] {
+        let response = harness
+            .client
+            .get(qsearch_url(
+                &harness.base_url,
+                "/sem/_search",
+                &[("q", "*"), ("df", field)],
+            )?)
+            .send()
+            .await?;
+        let status = response.status();
+        let body: Value = response.json().await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["hits"]["total"]["value"], expected, "{field}: {body}");
+        let (status, body) = harness
+            .post_json(
+                "/sem/_search",
+                json!({
+                    "query": {"query_string": {"query": "*", "default_field": field}}
+                }),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["hits"]["total"]["value"], expected, "{field}: {body}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_qsearch_review_huge_windows_preserve_node_liveness() -> Result<()> {
+    const CHILD: &str = "FERRIS_QSEARCH_HUGE_WINDOW_CHILD";
+    if std::env::var(CHILD).as_deref() != Ok("1") {
+        let output = tokio::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "rest_qsearch_review_huge_windows_preserve_node_liveness",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .await?;
+        assert!(
+            output.status.success(),
+            "isolated search node/test failed: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(());
+    }
+    let harness = RestTestHarness::start().await?;
+    qsearch_review_seed_semantics(&harness).await?;
+    for (from, size) in [
+        (0_u64, u64::MAX),
+        (1, u64::MAX),
+        (u64::MAX, 1),
+        (u64::MAX - 1, 1),
+        (u64::MAX - 1, 2),
+        (0, u64::MAX / 4 + 1),
+        (0, 10_000_000_000),
+    ] {
+        for dsl in [false, true] {
+            let (status, body) = if dsl {
+                harness
+                    .post_json(
+                        "/sem/_search",
+                        json!({
+                            "query": {"match_all": {}}, "from": from, "size": size
+                        }),
+                    )
+                    .await?
+            } else {
+                harness
+                    .get_json(&format!("/sem/_search?q=*:*&from={from}&size={size}"))
+                    .await?
+            };
+            if from.checked_add(size).is_none() {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+                assert_eq!(
+                    body["error"]["type"], "illegal_argument_exception",
+                    "{body}"
+                );
+                assert!(
+                    body["error"]["reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains("pagination"),
+                    "{body}"
+                );
+            } else {
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body["_shards"]["failed"], 0, "{body}");
+                assert_eq!(body["hits"]["total"]["value"], 10, "{body}");
+                assert_eq!(
+                    body["hits"]["hits"].as_array().map(Vec::len),
+                    Some(if from < 10 { 10 - from as usize } else { 0 }),
+                    "{body}"
+                );
+            }
+            let (status, body) = harness.get_json("/sem/_search?q=*:*&size=50").await?;
+            assert_eq!(status, StatusCode::OK, "follow-up failed: {body}");
+            assert_eq!(body["hits"]["total"]["value"], 10, "{body}");
+            assert_eq!(
+                body["hits"]["hits"].as_array().map(Vec::len),
+                Some(10),
                 "{body}"
             );
         }

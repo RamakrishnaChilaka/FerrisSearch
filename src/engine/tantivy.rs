@@ -11114,7 +11114,7 @@ mod tests {
     }
 
     #[test]
-    fn qsearch_parser_bare_wildcard_requires_default_field_terms() {
+    fn qsearch_parser_bare_wildcard_matches_every_document() {
         let (_dir, engine) = create_engine();
         engine
             .add_document("text", json!({"body": "rust"}))
@@ -11123,9 +11123,15 @@ mod tests {
         engine.add_document("null", json!({"body": null})).unwrap();
         engine.refresh().unwrap();
 
-        let hits = engine.search("*").unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0]["_id"], "text");
+        for query in ["*", " * ", "(*)", "*:*"] {
+            let hits = engine.search(query).unwrap();
+            let mut ids: Vec<_> = hits
+                .iter()
+                .map(|hit| hit["_id"].as_str().unwrap())
+                .collect();
+            ids.sort();
+            assert_eq!(ids, ["empty", "null", "text"], "query [{query}]");
+        }
     }
 
     #[test]
@@ -11165,17 +11171,23 @@ mod tests {
         for (query, default_field, expected) in [
             (
                 "*:*",
-                "body",
+                Some("body"),
                 vec!["empty-value", "missing", "null", "value"],
             ),
-            ("*", "tag", vec!["empty-value", "value"]),
-            ("tag:*", "body", vec!["empty-value", "value"]),
-            ("missing:*", "body", vec![]),
-            ("tag:rust", "body", vec!["value"]),
-            ("", "body", vec![]),
+            ("*", None, vec!["empty-value", "missing", "null", "value"]),
+            ("*", Some("body"), vec!["value"]),
+            ("*", Some("tag"), vec!["empty-value", "value"]),
+            ("tag:*", None, vec!["empty-value", "value"]),
+            ("missing:*", None, vec![]),
+            ("tag:rust", None, vec!["value"]),
+            ("", None, vec![]),
         ] {
+            let mut params = json!({"query": query});
+            if let Some(default_field) = default_field {
+                params["default_field"] = json!(default_field);
+            }
             let request: SearchRequest = serde_json::from_value(json!({
-                "query": {"query_string": {"query": query, "default_field": default_field}},
+                "query": {"query_string": params},
                 "size": 10
             }))
             .unwrap();
@@ -11188,6 +11200,61 @@ mod tests {
             assert_eq!(ids, expected, "query [{query}]");
             assert_eq!(total, expected.len(), "query [{query}]");
         }
+    }
+
+    #[test]
+    fn qsearch_review_huge_collector_windows_are_bounded_by_live_documents() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let (_dir, engine) = create_engine_with_mappings(HashMap::from([(
+            "number".to_string(),
+            FieldMapping {
+                field_type: FieldType::Integer,
+                dimension: None,
+            },
+        )]));
+        for number in 0..4 {
+            engine
+                .add_document(&number.to_string(), json!({"number": number}))
+                .unwrap();
+        }
+        engine.refresh().unwrap();
+        engine.delete_document("3").unwrap();
+        engine.refresh().unwrap();
+        assert_eq!(engine.doc_count(), 3);
+        for (from, size) in [
+            (0, usize::MAX),
+            (1, usize::MAX),
+            (usize::MAX, usize::MAX),
+            (usize::MAX - 1, 1),
+            (0, usize::MAX / 4 + 1),
+        ] {
+            for sort in [json!([]), json!([{"number": "asc"}])] {
+                let request: SearchRequest = serde_json::from_value(json!({
+                    "query": {"match_all": {}}, "from": from, "size": size, "sort": sort,
+                    "aggs": {"numbers": {"stats": {"field": "number"}}}
+                }))
+                .unwrap();
+                let outcome = catch_unwind(AssertUnwindSafe(|| engine.search_query(&request)));
+                assert!(
+                    outcome.is_ok(),
+                    "collector panicked for from={from}, size={size}"
+                );
+                let (hits, total, partials) = outcome.unwrap().unwrap();
+                assert_eq!(total, 3);
+                assert_eq!(hits.len(), 3);
+                assert!(!partials.is_empty());
+            }
+        }
+        let (_dir, empty) = create_engine();
+        let request: SearchRequest = serde_json::from_value(json!({
+            "query": {"match_all": {}}, "size": usize::MAX
+        }))
+        .unwrap();
+        let outcome = catch_unwind(AssertUnwindSafe(|| empty.search_query(&request)));
+        assert!(outcome.is_ok(), "empty shard collector panicked");
+        let (hits, total, _) = outcome.unwrap().unwrap();
+        assert!(hits.is_empty());
+        assert_eq!(total, 0);
     }
 
     #[test]
