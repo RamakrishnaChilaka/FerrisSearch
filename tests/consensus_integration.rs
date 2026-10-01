@@ -1105,21 +1105,25 @@ async fn start_raft_grpc_server(
     raft: Arc<consensus::types::RaftInstance>,
     state_handle: Arc<std::sync::RwLock<ferrissearch::cluster::state::ClusterState>>,
 ) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
     let cm = Arc::new(ClusterManager::with_shared_state(state_handle));
-    // Add a data node so create_index has nodes to assign shards to
-    {
-        let mut s = cm.get_state();
-        s.add_node(NodeInfo {
-            id: "data-1".into(),
-            name: "data-1".into(),
+    raft.client_write(ClusterCommand::AddNode {
+        node: NodeInfo {
+            id: "node-1".into(),
+            name: "node-1".into(),
             host: "127.0.0.1".into(),
-            transport_port: 9300,
-            http_port: 9200,
-            roles: vec![NodeRole::Data],
-            raft_node_id: 0,
-        });
-        cm.update_state(s);
-    }
+            transport_port: addr.port(),
+            http_port: 0,
+            roles: vec![NodeRole::Master, NodeRole::Data],
+            raft_node_id: 1,
+        },
+    })
+    .await
+    .unwrap()
+    .data
+    .into_result()
+    .unwrap();
     let dir = tempfile::tempdir().unwrap();
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
     let tc = TransportClient::new();
@@ -1127,8 +1131,6 @@ async fn start_raft_grpc_server(
     let service =
         create_transport_service_with_raft(cm, sm, tc, raft, task_manager, "node-1".into());
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
     tokio::spawn(async move {
