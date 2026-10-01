@@ -463,8 +463,8 @@ production ready**. The most important limits are:
   available through `op_type=create` and `PUT`/`POST /{index}/_create/{id}`.
   Single and bulk writes return real sequence/term identities and omit
   `_version`. Client retry tokens and external versioning remain missing.
-- Write APIs reject unsupported safety parameters with
-  `400 illegal_argument_exception`, including `routing`, `pipeline`,
+- Document writes, bulk, and index creation reject unsupported safety
+  parameters with `400 illegal_argument_exception`, including `routing`, `pipeline`,
   `version`, `version_type`, `require_alias`, and `dynamic_templates`.
   Bulk action metadata rejection fails the whole request before any writes.
   `wait_for_active_shards` accepts only absent or `1`, not `all`.

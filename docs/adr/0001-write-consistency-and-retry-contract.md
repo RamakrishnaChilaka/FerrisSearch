@@ -464,8 +464,9 @@ A write parameter that changes safety semantics and is not implemented returns
 400 `illegal_argument_exception` naming the parameter:
 
 - **Honored:** paired `if_seq_no`/`if_primary_term` on index, update, delete,
-  and bulk actions; `op_type=create` on index and the `_create` route; and
-  `retry_on_conflict` on `_update` and bulk `update` actions.
+  and bulk index, update, and delete actions; `op_type=create` on index and
+  the `_create` route; and `retry_on_conflict` on `_update` and bulk `update`
+  actions.
 - **Rejected:** `routing`, `_routing`, `pipeline`, `version`, `_version`,
   `version_type`, `_version_type`, `require_alias`, `require_data_stream`,
   and `dynamic_templates`. Reject conditions, `op_type`, and
