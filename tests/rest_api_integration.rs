@@ -1482,7 +1482,7 @@ async fn write_parameter_request(
             .post_ndjson(
                 &path,
                 &format!(
-                    "{{\"index\":{{\"_index\":\"{index}\",\"_id\":\"candidate\"}}}}\n{{\"value\":\"changed\"}}\n"
+                    "{{\"index\":{{\"_index\":\"{index}\",\"_id\":\"candidate\",\"wait_for_active_shards\":\"1\"}}}}\n{{\"value\":\"changed\"}}\n"
                 ),
             )
             .await;
@@ -1586,7 +1586,21 @@ async fn writes_regression_write_params_rejects_unsupported_query_keys_without_w
             assert_write_parameter_rejection(status, &error, parameter);
             assert_write_parameter_no_writes(&harness, index, &seed).await?;
         }
-        let additional = if endpoint.starts_with("_update/") {
+        let additional = if endpoint.starts_with("_create/") {
+            vec![
+                ("retry_on_conflict", "0"),
+                ("retry_on_conflict", "2"),
+                ("op_type", "index"),
+                ("op_type", "foo"),
+            ]
+        } else if method == "DELETE" {
+            vec![
+                ("retry_on_conflict", "0"),
+                ("retry_on_conflict", "2"),
+                ("op_type", "index"),
+                ("op_type", "create"),
+            ]
+        } else if endpoint.starts_with("_update/") {
             vec![("op_type", "create")]
         } else if matches!(endpoint, "_bulk" | "global_bulk") {
             vec![
@@ -1784,7 +1798,7 @@ async fn writes_regression_write_params_preserves_supported_and_benign_query_par
                     seed["_seq_no"],
                     seed["_primary_term"]
                 )
-            } else if endpoint == "_doc/candidate" {
+            } else if matches!(endpoint, "_doc" | "_doc/candidate" | "_create/candidate") {
                 format!(
                     "{}{}op_type=create",
                     query,
@@ -1844,7 +1858,7 @@ async fn writes_regression_write_params_preserves_supported_and_benign_query_par
         .put_json(&format!("/{index}/_doc/seed"), json!({"value": 1}))
         .await?;
     let request = format!(
-        "{{\"update\":{{\"_id\":\"seed\",\"retry_on_conflict\":2,\"if_seq_no\":{},\"if_primary_term\":{}}}}}\n{{\"doc\":{{\"value\":2}}}}\n",
+        "{{\"update\":{{\"_id\":\"seed\",\"retry_on_conflict\":2,\"if_seq_no\":{},\"if_primary_term\":{},\"wait_for_active_shards\":1}}}}\n{{\"doc\":{{\"value\":2}}}}\n",
         first["_seq_no"], first["_primary_term"]
     );
     let (status, body) = harness

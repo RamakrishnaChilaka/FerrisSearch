@@ -383,14 +383,74 @@ async fn auto_create_index(
     Ok(created_metadata)
 }
 
-/// Query parameter for `?refresh=true|false|wait_for`.
-/// Matches the OpenSearch refresh parameter on indexing endpoints.
+#[derive(serde::Deserialize, Default)]
+pub struct UnsupportedWriteParams {
+    pub wait_for_active_shards: Option<String>,
+    #[serde(flatten)]
+    pub additional: HashMap<String, String>,
+}
+
+fn validate_write_parameter(name: &str, value: Option<&str>) -> Result<(), String> {
+    if matches!(
+        name,
+        "routing"
+            | "_routing"
+            | "pipeline"
+            | "version"
+            | "_version"
+            | "version_type"
+            | "_version_type"
+            | "require_alias"
+            | "require_data_stream"
+            | "dynamic_templates"
+            | "if_seq_no"
+            | "if_primary_term"
+            | "op_type"
+            | "retry_on_conflict"
+            | "refresh"
+    ) || (name == "wait_for_active_shards" && value != Some("1"))
+    {
+        return Err(format!("request parameter [{name}] is not supported"));
+    }
+    Ok(())
+}
+
+impl UnsupportedWriteParams {
+    fn validate(&self) -> Result<(), (StatusCode, Json<Value>)> {
+        if let Some(value) = self.wait_for_active_shards.as_deref() {
+            validate_write_parameter("wait_for_active_shards", Some(value))
+                .map_err(illegal_argument)?;
+        }
+        for (name, value) in &self.additional {
+            validate_write_parameter(name, Some(value)).map_err(illegal_argument)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_refresh_parameter(refresh: Option<&str>) -> Result<(), (StatusCode, Json<Value>)> {
+    match refresh {
+        None | Some("true" | "false" | "") => Ok(()),
+        Some(value) => Err(illegal_argument(format!(
+            "request parameter [refresh] with value [{value}] is not supported"
+        ))),
+    }
+}
+
+/// Query parameters for bulk writes, including `?refresh=true|false`.
 #[derive(serde::Deserialize, Default)]
 pub struct RefreshParam {
     pub refresh: Option<String>,
+    #[serde(flatten)]
+    pub unsupported: UnsupportedWriteParams,
 }
 
 impl RefreshParam {
+    fn validate(&self) -> Result<(), (StatusCode, Json<Value>)> {
+        self.unsupported.validate()?;
+        validate_refresh_parameter(self.as_deref())
+    }
+
     /// Returns true when the caller explicitly requested an immediate refresh.
     /// OpenSearch treats `?refresh`, `?refresh=true`, and `?refresh=""` as "refresh now".
     fn should_refresh(&self) -> bool {
@@ -408,6 +468,8 @@ pub struct WriteParams {
     pub if_seq_no: Option<u64>,
     pub if_primary_term: Option<u64>,
     pub op_type: Option<String>,
+    #[serde(flatten)]
+    pub unsupported: UnsupportedWriteParams,
 }
 
 fn illegal_argument(error: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
@@ -416,6 +478,8 @@ fn illegal_argument(error: impl std::fmt::Display) -> (StatusCode, Json<Value>) 
 
 impl WriteParams {
     fn condition(&self) -> Result<crate::engine::WriteCondition, (StatusCode, Json<Value>)> {
+        self.unsupported.validate()?;
+        validate_refresh_parameter(self.refresh.as_deref())?;
         let condition = crate::engine::WriteCondition::from_optional_values(
             self.if_seq_no,
             self.if_primary_term,
@@ -450,6 +514,15 @@ pub struct UpdateParams {
     pub if_primary_term: Option<u64>,
     #[serde(default)]
     pub retry_on_conflict: u32,
+    #[serde(flatten)]
+    pub unsupported: UnsupportedWriteParams,
+}
+
+impl UpdateParams {
+    fn validate(&self) -> Result<(), (StatusCode, Json<Value>)> {
+        self.unsupported.validate()?;
+        validate_refresh_parameter(self.refresh.as_deref())
+    }
 }
 
 async fn refresh_engine_after_write(
@@ -535,8 +608,12 @@ fn forwarded_create_index_error_response(
 pub async fn create_index(
     State(state): State<AppState>,
     Path(index_name): Path<crate::common::IndexName>,
+    Query(params): Query<UnsupportedWriteParams>,
     body: axum::body::Bytes,
 ) -> (StatusCode, Json<Value>) {
+    if let Err(response) = params.validate() {
+        return response;
+    }
     // IndexName is validated at extraction time
 
     let settings: Value = serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
@@ -862,6 +939,13 @@ pub async fn create_document(
     Query(mut params): Query<WriteParams>,
     body: Json<Value>,
 ) -> (StatusCode, Json<Value>) {
+    if let Some(value) = params.op_type.as_deref()
+        && value != "create"
+    {
+        return illegal_argument(format!(
+            "request parameter [op_type] with value [{value}] is not supported for create operations"
+        ));
+    }
     params.op_type = Some("create".to_string());
     index_document_with_id(state, path, Query(params), body).await
 }
@@ -1433,6 +1517,9 @@ async fn execute_update(
     mut body: Value,
     params: &UpdateParams,
 ) -> (StatusCode, Json<Value>) {
+    if let Err(response) = params.validate() {
+        return response;
+    }
     if let Err(response) = validate_update_body(&body) {
         return response;
     }
@@ -1620,10 +1707,10 @@ pub async fn delete_document(
     Query(params): Query<WriteParams>,
 ) -> (StatusCode, Json<Value>) {
     let condition = match params.condition() {
-        Ok(crate::engine::WriteCondition::Create) => {
-            return illegal_argument("delete does not support op_type=create");
+        Ok(condition) if params.op_type.is_none() => condition,
+        Ok(_) => {
+            return illegal_argument("request parameter [op_type] is not supported for delete");
         }
-        Ok(condition) => condition,
         Err(response) => return response,
     };
     // IndexName is validated at extraction time
@@ -1678,14 +1765,27 @@ pub async fn delete_document(
         )
         .await
     {
-        Ok(res) => (
-            if res["result"] == "not_found" {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::OK
-            },
-            Json(res),
-        ),
+        Ok(res) => {
+            if params.should_refresh()
+                && let Some(engine) = state.shard_manager.get_shard(&index_name, shard_id)
+                && let Err(error) = refresh_engine_after_write(engine).await
+            {
+                tracing::error!(
+                    "Post-delete refresh failed for {}/{}: {}",
+                    index_name,
+                    shard_id,
+                    error
+                );
+            }
+            (
+                if res["result"] == "not_found" {
+                    StatusCode::NOT_FOUND
+                } else {
+                    StatusCode::OK
+                },
+                Json(res),
+            )
+        }
         Err(e) => document_write_error_response("Delete", e),
     }
 }

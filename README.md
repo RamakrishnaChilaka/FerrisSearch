@@ -463,6 +463,16 @@ production ready**. The most important limits are:
   available through `op_type=create` and `PUT`/`POST /{index}/_create/{id}`.
   Single and bulk writes return real sequence/term identities and omit
   `_version`. Client retry tokens and external versioning remain missing.
+- Write APIs reject unsupported safety parameters with
+  `400 illegal_argument_exception`, including `routing`, `pipeline`,
+  `version`, `version_type`, `require_alias`, and `dynamic_templates`.
+  Bulk action metadata rejection fails the whole request before any writes.
+  `wait_for_active_shards` accepts only absent or `1`, not `all`.
+  Document and bulk URLs accept `refresh=true`, an empty value, and
+  `refresh=false`; refresh affects only copies on the coordinating node.
+  `refresh=wait_for` and invalid refresh values are rejected. See
+  [ADR 0001, D13](docs/adr/0001-write-consistency-and-retry-contract.md#d13-unimplemented-parameters-fail-loudly)
+  for endpoint-specific conditions and unsupported aliases.
 - Replica bootstrap uses file snapshot plus physical-order WAL streaming, but
   source sessions and retention pins remain process-local and general D10
   rollback/resync is not implemented.

@@ -133,6 +133,19 @@ pub(super) fn parse_bulk_ndjson(text: &str) -> Result<Vec<BulkDoc>, String> {
         let metadata = metadata
             .as_object()
             .ok_or_else(|| malformed(format!("action [{action}] must contain an object")))?;
+        for (name, value) in metadata {
+            if matches!(name.as_str(), "if_seq_no" | "if_primary_term")
+                || (name == "retry_on_conflict" && action == "update")
+            {
+                continue;
+            }
+            let scalar = value
+                .as_str()
+                .or_else(|| (value.as_u64() == Some(1)).then_some("1"));
+            validate_write_parameter(name, scalar).map_err(|reason| {
+                malformed(format!("bulk item [{}]: {reason}", documents.len() + 1))
+            })?;
+        }
         let string = |key: &str| -> Result<Option<String>, String> {
             metadata
                 .get(key)
@@ -163,11 +176,6 @@ pub(super) fn parse_bulk_ndjson(text: &str) -> Result<Vec<BulkDoc>, String> {
             ));
         }
         let retries = number("retry_on_conflict")?.unwrap_or(0);
-        if retries > 0 && action != "update" {
-            return Err(malformed(
-                "retry_on_conflict is only supported for update".into(),
-            ));
-        }
         let retry_on_conflict = u32::try_from(retries)
             .map_err(|_| malformed("retry_on_conflict exceeds the supported range".into()))?;
         let doc_id = string("_id")?.unwrap_or_else(|| {
@@ -311,6 +319,7 @@ async fn forward_bulk_batches(
                         if_primary_term,
                         retry_on_conflict: document.retry_on_conflict,
                         refresh: None,
+                        ..UpdateParams::default()
                     },
                 )
                 .await;
@@ -497,6 +506,9 @@ async fn execute_bulk(
     refresh: &RefreshParam,
     body: &[u8],
 ) -> (StatusCode, Json<Value>) {
+    if let Err(response) = refresh.validate() {
+        return response;
+    }
     let text = match std::str::from_utf8(body) {
         Ok(text) => text,
         Err(error) => return illegal_argument(format!("Invalid UTF-8 bulk body: {error}")),
