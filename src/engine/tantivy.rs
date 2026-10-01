@@ -124,6 +124,12 @@ struct RefreshMapClearPause {
 }
 
 #[cfg(test)]
+struct VectorRebuildScanPause {
+    ready: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
 impl Drop for ApplyStateTimer<'_> {
     fn drop(&mut self) {
         let duration = self.started.elapsed();
@@ -438,6 +444,8 @@ pub struct HotEngine {
     refresh_after_commit_release_receiver: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     #[cfg(test)]
     refresh_before_map_clear: Mutex<Option<RefreshMapClearPause>>,
+    #[cfg(test)]
+    vector_rebuild_scan_pause: Mutex<Option<VectorRebuildScanPause>>,
     #[cfg(test)]
     replay_after_reset_sender: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     #[cfg(test)]
@@ -1150,6 +1158,8 @@ impl HotEngine {
             refresh_after_commit_release_receiver: Mutex::new(None),
             #[cfg(test)]
             refresh_before_map_clear: Mutex::new(None),
+            #[cfg(test)]
+            vector_rebuild_scan_pause: Mutex::new(None),
             #[cfg(test)]
             replay_after_reset_sender: Mutex::new(None),
             #[cfg(test)]
@@ -3930,6 +3940,16 @@ impl HotEngine {
     }
 
     #[cfg(test)]
+    pub(crate) fn pause_vector_rebuild_scan_for_test(
+        &self,
+        ready: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.vector_rebuild_scan_pause.lock().unwrap() =
+            Some(VectorRebuildScanPause { ready, release });
+    }
+
+    #[cfg(test)]
     fn pause_after_replay_reset_for_test(
         &self,
         sender: std::sync::mpsc::Sender<()>,
@@ -4483,6 +4503,20 @@ impl HotEngine {
         searcher: &tantivy::Searcher,
         mut consume: impl FnMut(Vec<(String, serde_json::Value, u64, u64)>) -> Result<()>,
     ) -> Result<()> {
+        #[cfg(test)]
+        {
+            let pause = self.vector_rebuild_scan_pause.lock().unwrap().take();
+            if let Some(pause) = pause {
+                pause
+                    .ready
+                    .send(())
+                    .context("vector scan ready receiver dropped")?;
+                pause
+                    .release
+                    .recv_timeout(Duration::from_secs(10))
+                    .context("vector scan release timed out")?;
+            }
+        }
         let registry = self
             .field_registry
             .read()
@@ -9965,6 +9999,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reader_publication_reload_panic_inside_refresh_keeps_outer_lock_failed_closed() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let gate = Arc::new(ReaderReloadGate {
+            armed: AtomicBool::new(false),
+            entered_sender: entered_tx,
+            release_receiver: Mutex::new(release_rx),
+            panic_before_publication: AtomicBool::new(true),
+        });
+        let (_directory, engine, _, _, _) = create_engine_with_io_gates(Some(gate.clone()));
+        engine.add_document("base", json!({"value": 1})).unwrap();
+        engine.refresh().unwrap();
+        engine.add_document("pending", json!({"value": 2})).unwrap();
+        let generation = engine.reader.searcher().generation().generation_id();
+        let engine = Arc::new(engine);
+        gate.armed.store(true, Ordering::Release);
+        let refreshing = engine.clone();
+        let refresh = std::thread::Builder::new()
+            .name("blocked-reader-reload".into())
+            .spawn(move || refreshing.refresh())
+            .unwrap();
+        entered_rx.recv_timeout(TEST_SYNC_TIMEOUT).unwrap();
+        release_tx.send(()).unwrap();
+        assert!(refresh.join().is_err());
+        assert!(engine.reader_reload_lock.is_poisoned());
+        assert!(engine.maintenance_lock.is_poisoned());
+        for _ in 0..3 {
+            let error = engine.refresh().unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("maintenance lock poisoned during refresh"),
+                "{error:#}"
+            );
+        }
+        let error = engine.flush().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("maintenance lock poisoned during flush"),
+            "{error:#}"
+        );
+        assert!(engine.reader_reload_lock.is_poisoned());
+        assert_eq!(
+            engine.reader.searcher().generation().generation_id(),
+            generation
+        );
+        assert!(engine.get_document("pending").unwrap().is_none());
+        assert_eq!(
+            engine.get_document("base").unwrap().unwrap(),
+            json!({"value": 1})
+        );
+    }
+
     fn realtime_get_while_apply_state_is_held(
         engine: Arc<HotEngine>,
         doc_id: &'static str,
@@ -10488,6 +10577,7 @@ mod tests {
             refresh_after_commit_sender: Mutex::new(None),
             refresh_after_commit_release_receiver: Mutex::new(None),
             refresh_before_map_clear: Mutex::new(None),
+            vector_rebuild_scan_pause: Mutex::new(None),
             replay_after_reset_sender: Mutex::new(None),
             replay_after_reset_release_receiver: Mutex::new(None),
             replay_commit_failure: Mutex::new(None),

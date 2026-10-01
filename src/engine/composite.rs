@@ -2071,7 +2071,7 @@ mod tests {
     }
 
     #[test]
-    fn vector_rebuild_gap_keeps_stale_marker_until_coverage_is_proven() {
+    fn vector_rebuild_gap_covers_applied_set_and_clears_stale_marker() {
         let directory = tempfile::tempdir().unwrap();
         let engine = vector_engine(directory.path());
         for (seq_no, doc_id) in [(0, "base"), (2, "above-gap")] {
@@ -2090,13 +2090,17 @@ mod tests {
         assert_eq!(engine.sequence_stats().processed_checkpoint, Some(0));
         assert_eq!(engine.sequence_stats().max_seq_no, Some(2));
 
-        let error = engine.rebuild_vectors().unwrap_err();
-        assert!(error.to_string().contains("gap-free"), "{error:#}");
-        assert!(engine.vectors_are_stale().unwrap());
+        engine.rebuild_vectors().unwrap();
+        assert!(!engine.vectors_are_stale().unwrap());
+        assert_eq!(engine.sequence_stats().processed_checkpoint, Some(0));
+        assert_eq!(
+            engine.text.missing_sequence_intervals_through(2),
+            vec![1..=1]
+        );
         assert_eq!(
             engine.vector.read().unwrap().as_ref().unwrap().len(),
             2,
-            "unproven coverage must not replace the existing vector index"
+            "a covering rebuild must keep vectors above the gap"
         );
         engine
             .apply_replica_operation(super::super::SequencedOperation {
@@ -2116,6 +2120,224 @@ mod tests {
             .map(|hit| hit["_id"].as_str().unwrap())
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(ids, std::collections::BTreeSet::from(["above-gap", "base"]));
+    }
+
+    fn gapped_vector_operation(seq_no: u64, doc_id: &str) -> super::super::SequencedOperation {
+        super::super::SequencedOperation {
+            seq_no,
+            primary_term: 1,
+            mutation: super::super::DocumentMutation::Index {
+                doc_id: doc_id.into(),
+                source: json!({"emb": [1.0, 0.0, 0.0], "value": seq_no}),
+            },
+        }
+    }
+
+    fn assert_applied_vector_ids(engine: &CompositeEngine, expected: &[&str]) {
+        let hits = engine.search_knn("emb", &[1.0, 0.0, 0.0], 10).unwrap();
+        let ids = hits
+            .iter()
+            .map(|hit| hit["_id"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(ids, expected.iter().copied().collect());
+    }
+
+    #[test]
+    fn vector_rebuild_gapped_replica_reopen_keeps_applied_vectors() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let directory = tempfile::tempdir().unwrap();
+        {
+            let engine = vector_engine(directory.path());
+            for (seq_no, doc_id) in [(0, "a"), (2, "c")] {
+                engine
+                    .apply_replica_operation(gapped_vector_operation(seq_no, doc_id))
+                    .unwrap();
+            }
+            assert!(!engine.vectors_are_stale().unwrap());
+        }
+        let mappings = std::collections::HashMap::from([(
+            "emb".into(),
+            FieldMapping {
+                field_type: FieldType::KnnVector,
+                dimension: Some(3),
+            },
+        )]);
+        let reopened = CompositeEngine::open_existing_with_mappings(
+            directory.path(),
+            Duration::from_secs(60),
+            &mappings,
+            TranslogDurability::Request,
+            Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
+        )
+        .unwrap();
+        assert_eq!(reopened.sequence_stats().processed_checkpoint, Some(0));
+        assert_eq!(reopened.sequence_stats().max_seq_no, Some(2));
+        reopened.rebuild_vectors().unwrap();
+        assert!(!reopened.vectors_are_stale().unwrap());
+        assert_applied_vector_ids(&reopened, &["a", "c"]);
+        let vectors = reopened.vector.read().unwrap();
+        assert_eq!(
+            vectors
+                .as_ref()
+                .unwrap()
+                .version_for_test("c")
+                .unwrap()
+                .seq_no,
+            2
+        );
+        drop(vectors);
+        reopened
+            .apply_replica_operation(gapped_vector_operation(1, "b"))
+            .unwrap();
+        reopened.refresh().unwrap();
+        assert_eq!(reopened.sequence_stats().processed_checkpoint, Some(2));
+        assert_applied_vector_ids(&reopened, &["a", "b", "c"]);
+    }
+
+    #[test]
+    fn vector_rebuild_gapped_replica_writer_failure_recovers_applied_vectors() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = vector_engine(directory.path());
+        for (seq_no, doc_id) in [(0, "a"), (2, "c")] {
+            engine
+                .apply_replica_operation(gapped_vector_operation(seq_no, doc_id))
+                .unwrap();
+        }
+        engine.inject_engine_apply_failures_for_test(5, 1);
+        assert!(
+            engine
+                .apply_replica_operation(gapped_vector_operation(3, "d"))
+                .is_err()
+        );
+        assert!(engine.vectors_are_stale().unwrap());
+        engine
+            .apply_replica_operation(gapped_vector_operation(4, "e"))
+            .unwrap();
+        assert!(!engine.vectors_are_stale().unwrap());
+        assert_eq!(engine.sequence_stats().processed_checkpoint, Some(0));
+        assert_eq!(engine.sequence_stats().max_seq_no, Some(4));
+        engine.refresh().unwrap();
+        assert_applied_vector_ids(&engine, &["a", "c", "d", "e"]);
+        let duplicate = engine
+            .apply_replica_operation(gapped_vector_operation(4, "e"))
+            .unwrap();
+        assert_eq!(duplicate.outcome, super::super::ApplyOutcome::Redelivery);
+        assert_applied_vector_ids(&engine, &["a", "c", "d", "e"]);
+    }
+
+    #[test]
+    fn vector_rebuild_scan_does_not_block_realtime_get() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = Arc::new(vector_engine(directory.path()));
+        engine
+            .add_document("base", json!({"emb": [1.0, 0.0, 0.0]}))
+            .unwrap();
+        engine.refresh().unwrap();
+        let hot = engine
+            .add_document_with_receipt("hot", json!({"emb": [0.0, 1.0, 0.0]}))
+            .unwrap();
+        engine.mark_vectors_stale().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        engine
+            .text
+            .pause_vector_rebuild_scan_for_test(ready_tx, release_rx);
+        let rebuilding = engine.clone();
+        let rebuild = std::thread::spawn(move || rebuilding.rebuild_vectors());
+        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (get_tx, get_rx) = std::sync::mpsc::channel();
+        let reading = engine.clone();
+        let get = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            get_tx
+                .send(reading.get_document_with_metadata("hot", true))
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let while_paused = get_rx.recv_timeout(Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        rebuild.join().unwrap().unwrap();
+        get.join().unwrap();
+        let document = while_paused
+            .expect("realtime GET must finish while the vector scan remains paused")
+            .unwrap()
+            .unwrap();
+        assert_eq!(document.seq_no, hot.seq_no);
+        assert_eq!(document.source["emb"], json!([0.0, 1.0, 0.0]));
+        assert!(!engine.vectors_are_stale().unwrap());
+    }
+
+    #[test]
+    fn vector_rebuild_changed_missing_intervals_keeps_stale_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = Arc::new(vector_engine(directory.path()));
+        for (seq_no, doc_id) in [(0, "a"), (3, "d")] {
+            engine
+                .apply_replica_operation(gapped_vector_operation(seq_no, doc_id))
+                .unwrap();
+        }
+        engine.mark_vectors_stale().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        engine
+            .text
+            .pause_vector_rebuild_scan_for_test(ready_tx, release_rx);
+        let rebuilding = engine.clone();
+        let rebuild = std::thread::spawn(move || rebuilding.rebuild_vectors());
+        if let Err(error) = ready_rx.recv_timeout(Duration::from_secs(2)) {
+            let result = rebuild.join().unwrap();
+            panic!("vector scan did not start: {error}; rebuild result: {result:?}");
+        }
+        assert_eq!(
+            engine.text.missing_sequence_intervals_through(3),
+            vec![1..=2]
+        );
+        // Bypass composite exclusion to prove the post-scan guard detects an
+        // applied-set change even when the prefix and maximum are unchanged.
+        let applying = engine.clone();
+        let (applied_tx, applied_rx) = std::sync::mpsc::channel();
+        let apply = std::thread::spawn(move || {
+            applied_tx
+                .send(
+                    applying
+                        .text
+                        .apply_replica_operation(super::super::SequencedOperation {
+                            seq_no: 2,
+                            primary_term: 1,
+                            mutation: super::super::DocumentMutation::NoOp {
+                                reason: "coverage changed during scan".into(),
+                            },
+                        }),
+                )
+                .unwrap();
+        });
+        let applied = applied_rx.recv_timeout(Duration::from_secs(2));
+        release_tx.send(()).unwrap();
+        let result = rebuild.join().unwrap();
+        apply.join().unwrap();
+        applied
+            .expect("translog must be released before the vector scan")
+            .unwrap();
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no longer covers applied history"),
+            "{error:#}"
+        );
+        assert_eq!(engine.sequence_stats().processed_checkpoint, Some(0));
+        assert_eq!(engine.sequence_stats().max_seq_no, Some(3));
+        assert_eq!(
+            engine.text.missing_sequence_intervals_through(3),
+            vec![1..=1]
+        );
+        assert!(engine.vectors_are_stale().unwrap());
+        assert_eq!(engine.vector.read().unwrap().as_ref().unwrap().len(), 2);
+        engine.rebuild_vectors().unwrap();
+        assert!(!engine.vectors_are_stale().unwrap());
+        engine.refresh().unwrap();
+        assert_applied_vector_ids(&engine, &["a", "d"]);
     }
 
     #[test]

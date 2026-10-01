@@ -78,6 +78,157 @@ fn gap_test_state(replica_port: u16) -> DomainClusterState {
     state
 }
 
+fn gapped_vector_replica_service(
+    directory: &std::path::Path,
+    open: bool,
+) -> (TransportService, u64) {
+    let mappings = HashMap::from([(
+        "emb".into(),
+        FieldMapping {
+            field_type: FieldType::KnnVector,
+            dimension: Some(3),
+        },
+    )]);
+    let mut state = gap_test_state(0);
+    state.indices.get_mut("idx").unwrap().mappings = mappings.clone();
+    state
+        .shard_allocations
+        .get_mut("idx")
+        .unwrap()
+        .get_mut(&0)
+        .unwrap()
+        .primary_initialized = true;
+    let allocation_id = state.shard_allocation_id("idx", 0, "replica").unwrap();
+    let cluster_manager = Arc::new(ClusterManager::new(state.cluster_name.clone()));
+    cluster_manager.update_state(state);
+    let shard_manager = Arc::new(ShardManager::new(directory, Duration::from_secs(60)));
+    if open {
+        shard_manager
+            .open_assigned_shard_with_settings(
+                "idx",
+                0,
+                &mappings,
+                &crate::cluster::state::IndexSettings::default(),
+                "uuid-1",
+                crate::shard::AssignedShardOpen {
+                    allocation_id,
+                    primary_term: 2,
+                    allow_empty_creation: true,
+                },
+            )
+            .unwrap();
+    }
+    (
+        TransportService {
+            cluster_manager,
+            shard_manager,
+            transport_client: crate::transport::TransportClient::new(),
+            storage_manager: test_storage_manager(directory),
+            remote_store_reader_cache: test_remote_store_reader_cache(),
+            raft: None,
+            local_node_id: "replica".into(),
+            worker_pools: crate::worker::WorkerPools::new(2, 2),
+            task_manager: Arc::new(crate::tasks::TaskManager::new()),
+            primary_activation_state: new_primary_activation_state(),
+            peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
+            join_lock: new_join_lock(),
+        },
+        allocation_id,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gapped_vector_replica_transport_restart_accepts_missing_operation() {
+    let directory = tempfile::tempdir().unwrap();
+    let request = |seq_no, doc_id: &str, allocation_id| ReplicateDocRequest {
+        index_name: "idx".into(),
+        shard_id: 0,
+        doc_id: doc_id.into(),
+        payload_json: serde_json::to_vec(&json!({"emb": [1.0, 0.0, 0.0], "value": seq_no}))
+            .unwrap(),
+        op: "index".into(),
+        seq_no,
+        index_uuid: "uuid-1".into(),
+        primary_term: Some(2),
+        target_allocation_id: Some(allocation_id),
+    };
+    {
+        let path = directory.path().to_path_buf();
+        let (service, allocation_id) =
+            tokio::task::spawn_blocking(move || gapped_vector_replica_service(&path, true))
+                .await
+                .unwrap();
+        for (seq_no, doc_id) in [(0, "a"), (2, "c")] {
+            let response = service
+                .replicate_doc(Request::new(request(seq_no, doc_id, allocation_id)))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(response.success, "{}", response.error);
+            assert!(response.operation_processed && response.operation_persisted);
+        }
+    }
+    let path = directory.path().to_path_buf();
+    let (service, allocation_id) =
+        tokio::task::spawn_blocking(move || gapped_vector_replica_service(&path, false))
+            .await
+            .unwrap();
+    let probe_request = || GetShardSequenceStateRequest {
+        index_name: "idx".into(),
+        index_uuid: "uuid-1".into(),
+        shard_id: 0,
+        allocation_id: Some(allocation_id),
+        expected_primary_term: 2,
+    };
+    for (seq_no, doc_id, checkpoint) in [(3, "d", 0), (1, "b", 3), (4, "e", 4)] {
+        let response = service
+            .replicate_doc(Request::new(request(seq_no, doc_id, allocation_id)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success, "seq {seq_no}: {}", response.error);
+        assert!(response.operation_processed && response.operation_persisted);
+        assert_eq!(response.processed_checkpoint, Some(checkpoint));
+        let probe = service
+            .get_shard_sequence_state(Request::new(probe_request()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(probe.processed_checkpoint, Some(checkpoint));
+        assert_eq!(probe.max_seq_no, Some(seq_no.max(3)));
+    }
+    let engine = service.shard_manager.get_shard("idx", 0).unwrap();
+    tokio::task::spawn_blocking(move || {
+        engine.refresh().unwrap();
+        let hits = engine.search_knn("emb", &[1.0, 0.0, 0.0], 10).unwrap();
+        let ids = hits
+            .iter()
+            .map(|hit| hit["_id"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            ids,
+            std::collections::BTreeSet::from(["a", "b", "c", "d", "e"])
+        );
+        for (seq_no, doc_id) in [(0, "a"), (1, "b"), (2, "c"), (3, "d"), (4, "e")] {
+            let document = engine
+                .get_document_with_metadata(doc_id, true)
+                .unwrap()
+                .unwrap();
+            assert_eq!(document.seq_no, seq_no);
+            assert_eq!(document.primary_term, 2);
+            assert_eq!(document.source["value"], seq_no);
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !directory
+            .path()
+            .join("uuid-1/shard_0/vectors.stale")
+            .exists()
+    );
+}
+
 fn make_full_cluster_state() -> DomainClusterState {
     let mut cs = DomainClusterState::new("roundtrip-cluster".into());
     cs.version = 42;
