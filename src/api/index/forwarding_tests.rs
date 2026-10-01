@@ -10,6 +10,9 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[path = "forwarding_review_tests.rs"]
+mod review;
+
 struct ForwardingNode {
     _data: tempfile::TempDir,
     state: AppState,

@@ -18,6 +18,10 @@ pub struct ClusterManager {
     state: Arc<RwLock<ClusterState>>,
     #[cfg(test)]
     pub(crate) forwarding_wait_millis: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    pub(crate) primary_open_wait_millis: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    pub(crate) primary_open_delay_millis: std::sync::atomic::AtomicU64,
     #[cfg(feature = "protocol-trace")]
     protocol_trace_node: RwLock<Option<String>>,
 }
@@ -28,6 +32,10 @@ impl ClusterManager {
             state: Arc::new(RwLock::new(ClusterState::new(cluster_name))),
             #[cfg(test)]
             forwarding_wait_millis: std::sync::atomic::AtomicU64::new(5_000),
+            #[cfg(test)]
+            primary_open_wait_millis: std::sync::atomic::AtomicU64::new(20_000),
+            #[cfg(test)]
+            primary_open_delay_millis: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "protocol-trace")]
             protocol_trace_node: RwLock::new(None),
         }
@@ -40,6 +48,10 @@ impl ClusterManager {
             state,
             #[cfg(test)]
             forwarding_wait_millis: std::sync::atomic::AtomicU64::new(5_000),
+            #[cfg(test)]
+            primary_open_wait_millis: std::sync::atomic::AtomicU64::new(20_000),
+            #[cfg(test)]
+            primary_open_delay_millis: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "protocol-trace")]
             protocol_trace_node: RwLock::new(None),
         }

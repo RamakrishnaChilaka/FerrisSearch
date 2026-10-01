@@ -4256,6 +4256,13 @@ impl TransportService {
     }
 
     async fn open_local_index_primaries(&self, index_name: &str) -> Result<(), Status> {
+        #[cfg(test)]
+        tokio::time::sleep(std::time::Duration::from_millis(
+            self.cluster_manager
+                .primary_open_delay_millis
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ))
+        .await;
         let state = self.cluster_manager.get_state();
         let metadata = state
             .indices
