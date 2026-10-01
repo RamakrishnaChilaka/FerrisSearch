@@ -5,6 +5,10 @@ pub mod client;
 pub mod server;
 
 /// Generated protobuf types and gRPC service definitions
+// Clippy lints don't apply to tonic-generated code. Rust 1.99 added
+// `clippy::double_must_use`, which fires on the generated `#[async_trait]`
+// server trait.
+#[allow(clippy::all)]
 pub mod proto {
     tonic::include_proto!("transport");
 }
