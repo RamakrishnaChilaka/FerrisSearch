@@ -196,14 +196,23 @@ curl -sS -X POST 'http://localhost:9200/movies/_search' \
 |---|---|
 | No `q` parameter, or standalone `*:*` | Match all documents, including documents with no indexed text. |
 | `rust` or `genre:documentary` | Parse terms with Tantivy's query parser. Unqualified terms use the built-in `body` field. |
-| Standalone `*` | Match documents with an indexed value in the default field. |
+| Standalone `*`, without `df` or `default_field` | Match all documents, including empty, null-only, nested-only, array-only, and analyzer-empty documents. |
+| Standalone `*`, with `df` or `default_field` | Match documents with an indexed value in the explicitly selected field. |
 | Standalone `genre:*` | Match documents with an indexed value in the named field. Unknown fields match no documents. |
 
-Set the default field with URI parameter `df` or DSL option `default_field`.
-The DSL accepts only `query` and `default_field`. Keyword fields include empty
+Select an explicit field with URI parameter `df` or DSL option `default_field`.
+Both options are optional. Unqualified terms still search the built-in `body`
+field when neither option is set. The DSL accepts only `query` and
+`default_field`. Keyword fields include empty
 strings; numeric fields include zero. Text presence means at least one indexed
 token, so empty or analyzer-empty text does not match `*`. This differs from
 OpenSearch's text-field existence semantics.
+
+Explicit text presence uses field norms when available, scanning document
+lengths rather than the term dictionary. Text fields without field norms fall
+back to an all-terms query; that cost grows with vocabulary and postings.
+Fast-field presence uses Tantivy's `ExistsQuery`. Bare `*` without an explicit
+field uses `AllQuery` and does not enumerate terms.
 
 These wildcard rewrites apply only to standalone expressions. Other expressions
 use Tantivy syntax, not the full Lucene query language. Unsupported syntax returns
@@ -221,6 +230,11 @@ unavailable shard set.
 Empty remote-store indices also validate query strings against the index mappings
 and return HTTP 400 with a parser cause instead of hiding invalid queries behind
 an empty result.
+
+Search clamps each shard's collector window to its live document count.
+Oversized `size` values cannot allocate more hit slots than the shard can return.
+If `from + size` overflows, URI and query-body search return HTTP 400 with a
+pagination reason before dispatching work.
 
 ### 5. Analyze the matched set
 

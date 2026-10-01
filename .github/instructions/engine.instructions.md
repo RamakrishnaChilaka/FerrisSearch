@@ -54,8 +54,12 @@ pub trait SearchEngine: Send + Sync {
 - `size=0` with no aggs: uses `(None::<AggCollector>, Count)` — skip TopDocs entirely
 - `size=0` with aggs: uses `(AggCollector, Count)` — aggs without hit materialization
 - `size>0` with fast-field sort: uses `TopDocs::order_by_fast_field()` for Tantivy-native sorting
-- `size>0` default: uses `(TopDocs::with_limit(from + size), AggCollector?, Count)`
-- TopDocs limit is always `from + size` (not `max(from+size, 100)`) — each shard collects exactly the requested count; the coordinator handles cross-shard merging
+- `size>0` default: uses `(TopDocs::with_limit(bounded_window), AggCollector?, Count)`
+- The shard-local TopDocs window is
+  `from.saturating_add(size).min(searcher.num_docs() as usize)`, with a minimum
+  collector capacity of 1 for an empty shard. Clamp before score, fast-field
+  sort, grouped aggregation, and cursor collectors. The coordinator applies
+  pagination; exact Count totals remain independent of the bounded hit window.
 
 ### Seq Ownership Rule
 - `add_document()` / `bulk_add_documents()` / `delete_document()` are for local primary-originated writes that allocate new WAL seq_nos

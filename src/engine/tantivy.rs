@@ -613,7 +613,7 @@ pub(crate) fn validate_query_strings_with_mappings(
                 crate::search::query_string::parse_query_string(
                     index,
                     &params.query,
-                    &params.default_field,
+                    params.default_field.as_deref(),
                 )?;
             }
             crate::search::QueryClause::Bool(query) => {
@@ -4139,7 +4139,7 @@ impl HotEngine {
             QueryClause::QueryString(params) => crate::search::query_string::parse_query_string(
                 &self.index,
                 &params.query,
-                &params.default_field,
+                params.default_field.as_deref(),
             ),
             QueryClause::Term(fields) => {
                 if let Some((field_name, value)) = fields.iter().next() {
@@ -8289,8 +8289,7 @@ impl super::SearchEngine for HotEngine {
 
     fn search(&self, query_str: &str) -> Result<Vec<serde_json::Value>> {
         let searcher = self.reader.searcher();
-        let query =
-            crate::search::query_string::parse_query_string(&self.index, query_str, "body")?;
+        let query = crate::search::query_string::parse_query_string(&self.index, query_str, None)?;
         self.execute_search(searcher, &*query, 100)
     }
 
@@ -8303,9 +8302,11 @@ impl super::SearchEngine for HotEngine {
         std::collections::HashMap<String, crate::search::PartialAggResult>,
     )> {
         let searcher = self.reader.searcher();
-        // Use the exact requested limit when from+size is explicit.
-        // The coordinator handles cross-shard merging at the API layer.
-        let limit = req.from + req.size;
+        // A shard cannot contribute more hits than its live document count.
+        let limit = req
+            .from
+            .saturating_add(req.size)
+            .min(searcher.num_docs() as usize);
         let user_query = self.build_query(&req.query)?;
         // search_after: build a separate hits_query that ANDs the cursor filter
         // onto the user query. The cursor filter must NOT bias total counts or

@@ -301,8 +301,8 @@ fn remote_count_targets(
 pub struct SearchParams {
     #[serde(default = "default_query")]
     q: String,
-    #[serde(default = "crate::search::query_string::default_field")]
-    df: String,
+    #[serde(default)]
+    df: Option<String>,
     #[serde(default = "default_size")]
     size: usize,
     #[serde(default)]

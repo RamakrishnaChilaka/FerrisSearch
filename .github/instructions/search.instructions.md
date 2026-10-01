@@ -41,11 +41,16 @@ pub struct SearchRequest {
   separate URI path that counted a capped hit list instead of all matches.
 - Omitted `q` defaults to `*:*`. Standalone `*:*` matches every live document,
   including documents with no indexed `body` terms.
-- URI `df` and DSL `default_field` select one literal default field; both
-  default to `body`. The DSL accepts only `query` and `default_field`.
-- Standalone `*` and `field:*` are presence queries. Fast fields use Tantivy's
-  `ExistsQuery`; indexed non-fast text uses an all-terms query. Missing fields
-  match no documents. Do not fall back to `body` for an unknown named field.
+- URI `df` and DSL `default_field` are optional literal field selectors.
+  Bare `*` without either selector matches all documents, including documents
+  with no indexed text. Ordinary unqualified terms still fall back to `body`.
+  The DSL accepts only `query` and `default_field`.
+- Presence applies only to standalone `field:*` or `*` with an explicit field.
+  Fast fields use Tantivy's `ExistsQuery`; indexed text with field norms checks
+  document lengths without enumerating terms. Text without field norms uses
+  an all-terms fallback whose cost grows with vocabulary and postings.
+  Missing fields match no documents. Do not fall back to `body` for an unknown
+  named field.
 - Keyword presence includes empty strings, and numeric presence includes zero.
   Text presence requires an indexed token; empty or analyzer-empty text does
   not match. This is an explicit difference from OpenSearch field existence.
@@ -56,6 +61,10 @@ pub struct SearchRequest {
   it into an untyped success-false envelope.
 - Keep parser and engine execution on the existing search worker pools.
   Existing `match` and SQL `text_match` success semantics stay unchanged.
+- Before constructing a Tantivy hit collector, bound the window by the shard's
+  live document count and saturate `from + size`. Never pass a user-controlled
+  huge capacity directly to TopDocs. Coordinator pagination overflow remains
+  HTTP 400, while valid huge windows preserve total counts and result values.
 
 ## Shard failure responses
 

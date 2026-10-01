@@ -1,19 +1,86 @@
 use serde::{Deserialize, Serialize};
-use tantivy::Index;
+use tantivy::fieldnorm::FieldNormReader;
 use tantivy::query::{
-    AllQuery, EmptyQuery, ExistsQuery, Query, QueryParser, QueryParserError, RegexQuery,
+    AllQuery, ConstScorer, EmptyQuery, EmptyScorer, EnableScoring, ExistsQuery, Explanation, Query,
+    QueryParser, QueryParserError, RegexQuery, Scorer, Weight,
 };
+use tantivy::schema::Field;
+use tantivy::{DocId, DocSet, Index, Score, SegmentReader, TERMINATED};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueryStringParams {
     pub query: String,
-    #[serde(default = "default_field")]
-    pub default_field: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_field: Option<String>,
 }
 
-pub(crate) fn default_field() -> String {
-    "body".to_string()
+#[derive(Clone, Debug)]
+struct FieldNormPresenceQuery(Field);
+
+impl Query for FieldNormPresenceQuery {
+    fn weight(&self, _: EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
+        Ok(Box::new(FieldNormPresenceWeight(self.0)))
+    }
+}
+
+struct FieldNormPresenceWeight(Field);
+
+impl Weight for FieldNormPresenceWeight {
+    fn scorer(&self, reader: &SegmentReader, boost: Score) -> tantivy::Result<Box<dyn Scorer>> {
+        let Some(fieldnorms) = reader.fieldnorms_readers().get_field(self.0)? else {
+            return Ok(Box::new(EmptyScorer));
+        };
+        let mut docs = FieldNormPresenceDocSet {
+            fieldnorms,
+            doc: 0,
+            max_doc: reader.max_doc(),
+        };
+        docs.seek(0);
+        Ok(Box::new(ConstScorer::new(docs, boost)))
+    }
+
+    fn explain(&self, reader: &SegmentReader, doc: DocId) -> tantivy::Result<Explanation> {
+        let mut scorer = self.scorer(reader, 1.0)?;
+        if doc == TERMINATED || scorer.seek(doc) != doc {
+            return Err(tantivy::TantivyError::InvalidArgument(format!(
+                "document [{doc}] has no indexed tokens in the presence field"
+            )));
+        }
+        Ok(Explanation::new("FieldNormPresenceQuery", 1.0))
+    }
+}
+
+struct FieldNormPresenceDocSet {
+    fieldnorms: FieldNormReader,
+    doc: DocId,
+    max_doc: DocId,
+}
+
+impl DocSet for FieldNormPresenceDocSet {
+    fn advance(&mut self) -> DocId {
+        self.seek(self.doc.saturating_add(1))
+    }
+
+    fn seek(&mut self, target: DocId) -> DocId {
+        self.doc = self.doc.max(target);
+        while self.doc < self.max_doc {
+            if self.fieldnorms.fieldnorm_id(self.doc) != 0 {
+                return self.doc;
+            }
+            self.doc += 1;
+        }
+        self.doc = TERMINATED;
+        TERMINATED
+    }
+
+    fn doc(&self) -> DocId {
+        self.doc
+    }
+
+    fn size_hint(&self) -> u32 {
+        self.max_doc
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -44,6 +111,9 @@ fn presence_query(index: &Index, field_name: &str) -> Result<Box<dyn Query>, Que
         return Ok(Box::new(ExistsQuery::new(field_name.to_string(), false)));
     }
     if entry.is_indexed() && entry.field_type().value_type() == tantivy::schema::Type::Str {
+        if entry.has_fieldnorms() {
+            return Ok(Box::new(FieldNormPresenceQuery(field)));
+        }
         return RegexQuery::from_pattern(".*", field)
             .map(|query| Box::new(query) as Box<dyn Query>)
             .map_err(|error| QueryParserError::UnsupportedQuery(error.to_string()));
@@ -54,7 +124,7 @@ fn presence_query(index: &Index, field_name: &str) -> Result<Box<dyn Query>, Que
 pub(crate) fn parse_query_string(
     index: &Index,
     query: &str,
-    default_field: &str,
+    default_field: Option<&str>,
 ) -> anyhow::Result<Box<dyn Query>> {
     let parse = || {
         let expression = query.trim();
@@ -62,8 +132,12 @@ pub(crate) fn parse_query_string(
             return Ok(Box::new(AllQuery) as Box<dyn Query>);
         }
         if expression == "*" {
-            return presence_query(index, default_field);
+            return match default_field {
+                Some(field) => presence_query(index, field),
+                None => Ok(Box::new(AllQuery) as Box<dyn Query>),
+            };
         }
+        let default_field = default_field.unwrap_or("body");
         if let Some((field, value)) = expression.split_once(':') {
             let field = field.trim();
             if value.trim() == "*"
@@ -193,7 +267,7 @@ mod tests {
             "*:* AND tag:rust",
             "-tag:*",
         ] {
-            let error = parse_query_string(&index, query, "body").unwrap_err();
+            let error = parse_query_string(&index, query, Some("body")).unwrap_err();
             assert!(error.to_string().contains(query), "{error:#}");
             assert!(error.is::<QueryParseError>(), "{error:#}");
             assert!(
@@ -211,13 +285,13 @@ mod tests {
             "tag:rust OR tag:python",
             "(tag:rust AND body:search)",
         ] {
-            parse_query_string(&index, query, "body").unwrap();
+            parse_query_string(&index, query, Some("body")).unwrap();
         }
     }
 
     #[test]
     fn qsearch_helper_rejects_unknown_default_field_for_term_queries() {
-        let error = parse_query_string(&index(), "rust", "missing").unwrap_err();
+        let error = parse_query_string(&index(), "rust", Some("missing")).unwrap_err();
         assert!(error.to_string().contains("missing"), "{error:#}");
         assert!(error.to_string().contains("rust"), "{error:#}");
     }
@@ -230,5 +304,68 @@ mod tests {
             let error = serde_json::from_value::<QueryStringParams>(value).unwrap_err();
             assert!(error.to_string().contains(option), "{error}");
         }
+    }
+
+    #[test]
+    fn qsearch_review_implicit_star_uses_all_query_not_term_enumeration() {
+        let index = index();
+        for query in ["*", " * ", "*:*"] {
+            let parsed = parse_query_string(&index, query, None).unwrap();
+            assert!(
+                parsed.as_ref().as_any().is::<AllQuery>(),
+                "query [{query}]: {parsed:?}"
+            );
+        }
+        let params: QueryStringParams = serde_json::from_value(json!({"query": "*"})).unwrap();
+        assert!(params.default_field.is_none());
+        assert_eq!(serde_json::to_value(params).unwrap(), json!({"query": "*"}));
+    }
+
+    #[test]
+    fn qsearch_review_text_presence_uses_fieldnorms_and_respects_deletes() {
+        use tantivy::collector::Count;
+        let index = index();
+        let body = index.schema().get_field("body").unwrap();
+        let number = index.schema().get_field("number").unwrap();
+        let mut writer = index
+            .writer_with_num_threads::<tantivy::TantivyDocument>(1, 15_000_000)
+            .unwrap();
+        for document in [
+            tantivy::doc!(body => "search", number => 1_i64),
+            tantivy::doc!(body => "!!!", number => 2_i64),
+            tantivy::doc!(body => "", number => 3_i64),
+            tantivy::doc!(number => 4_i64),
+            tantivy::doc!(body => "delete this", number => 5_i64),
+        ] {
+            writer.add_document(document).unwrap();
+        }
+        writer.commit().unwrap();
+        writer.delete_term(tantivy::Term::from_field_i64(number, 5));
+        writer.commit().unwrap();
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        for (query, field) in [("*", Some("body")), ("body:*", None)] {
+            let parsed = parse_query_string(&index, query, field).unwrap();
+            assert!(
+                parsed.as_ref().as_any().is::<FieldNormPresenceQuery>(),
+                "{parsed:?}"
+            );
+            assert_eq!(searcher.search(parsed.as_ref(), &Count).unwrap(), 1);
+            let weight = parsed
+                .weight(EnableScoring::disabled_from_schema(searcher.schema()))
+                .unwrap();
+            for segment in searcher.segment_readers() {
+                let mut scorer = weight.scorer(segment, 2.0).unwrap();
+                if scorer.doc() != TERMINATED {
+                    let doc = scorer.doc();
+                    assert_eq!(scorer.seek(doc), doc);
+                    assert_eq!(scorer.score(), 2.0);
+                }
+                assert_eq!(scorer.seek(TERMINATED), TERMINATED);
+                assert_eq!(scorer.advance(), TERMINATED);
+            }
+        }
+        let implicit = parse_query_string(&index, "*", None).unwrap();
+        assert_eq!(searcher.search(implicit.as_ref(), &Count).unwrap(), 4);
     }
 }
