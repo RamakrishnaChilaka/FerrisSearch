@@ -9587,7 +9587,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "protocol-trace"))]
     fn reader_publication_peer_snapshot_commit_waits_for_refresh() {
         let (directory, engine) = create_engine();
         let receipt = engine
@@ -9635,6 +9634,7 @@ mod tests {
             armed: AtomicBool::new(false),
             entered_sender: entered_tx,
             release_receiver: Mutex::new(release_rx),
+            panic_before_publication: AtomicBool::new(false),
         });
         let (directory, mut engine, _, _, _) = create_engine_with_io_gates(Some(gate.clone()));
         engine.reader = engine
@@ -9836,6 +9836,67 @@ mod tests {
             .unwrap();
         assert_eq!(document.source, json!({"value": 1}));
         assert_eq!(document.seq_no, acknowledged.seq_no);
+    }
+
+    #[test]
+    fn reader_publication_reload_panic_recovers_on_next_attempt() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let gate = Arc::new(ReaderReloadGate {
+            armed: AtomicBool::new(false),
+            entered_sender: entered_tx,
+            release_receiver: Mutex::new(release_rx),
+            panic_before_publication: AtomicBool::new(true),
+        });
+        let (_directory, engine, _, _, _) = create_engine_with_io_gates(Some(gate.clone()));
+        engine.add_document("base", json!({"value": 1})).unwrap();
+        engine.refresh().unwrap();
+        let acknowledged = engine
+            .add_document_with_receipt("pending", json!({"value": 2}))
+            .unwrap();
+        commit_without_reader_reload(&engine);
+        let generation = engine.reader.searcher().generation().generation_id();
+        let engine = Arc::new(engine);
+        gate.armed.store(true, Ordering::Release);
+        let panicking_engine = engine.clone();
+        let reload = std::thread::Builder::new()
+            .name("blocked-reader-reload".into())
+            .spawn(move || panicking_engine.reload_reader())
+            .unwrap();
+        entered_rx.recv_timeout(TEST_SYNC_TIMEOUT).unwrap();
+        release_tx.send(()).unwrap();
+        assert!(reload.join().is_err());
+        assert!(engine.reader_reload_lock.is_poisoned());
+        assert_eq!(
+            engine.reader.searcher().generation().generation_id(),
+            generation,
+            "panic while opening segments must not publish an incomplete reader"
+        );
+        assert!(engine.get_document("pending").unwrap().is_none());
+        let error = engine.reload_reader().unwrap_err();
+        assert!(
+            error.to_string().contains("reader reload lock poisoned"),
+            "{error:#}"
+        );
+        assert_eq!(
+            engine.reader.searcher().generation().generation_id(),
+            generation
+        );
+        assert_eq!(engine.translog.lock().unwrap().read_all().unwrap().len(), 2);
+
+        engine.refresh().unwrap();
+        assert!(!engine.reader_reload_lock.is_poisoned());
+        assert!(engine.reader.searcher().generation().generation_id() > generation);
+        let document = engine
+            .get_document_with_metadata("pending", false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(document.source, json!({"value": 2}));
+        assert_eq!(document.seq_no, acknowledged.seq_no);
+        assert_eq!(
+            engine.get_document("base").unwrap().unwrap(),
+            json!({"value": 1})
+        );
     }
 
     fn realtime_get_while_apply_state_is_held(
@@ -10161,6 +10222,7 @@ mod tests {
         armed: AtomicBool,
         entered_sender: Sender<()>,
         release_receiver: Mutex<Receiver<()>>,
+        panic_before_publication: AtomicBool,
     }
 
     struct BlockingReaderFileHandle {
@@ -10204,6 +10266,13 @@ mod tests {
                     .unwrap()
                     .recv_timeout(TEST_SYNC_TIMEOUT)
                     .map_err(|error| std::io::Error::new(std::io::ErrorKind::TimedOut, error))?;
+                if self
+                    .gate
+                    .panic_before_publication
+                    .swap(false, Ordering::AcqRel)
+                {
+                    panic!("injected reader reload panic before searcher publication");
+                }
             }
             Ok(bytes)
         }

@@ -1814,8 +1814,8 @@ mod tests {
                 .unwrap();
         }
 
-        let vectors = engine.vector.read().unwrap();
-        let vectors = vectors.as_ref().unwrap();
+        let vector_guard = engine.vector.read().unwrap();
+        let vectors = vector_guard.as_ref().unwrap();
         assert_eq!(
             vectors.version_for_test("doc").unwrap().seq_no,
             updated.seq_no,
@@ -1830,8 +1830,18 @@ mod tests {
         assert!(!engine.vectors_are_stale().unwrap());
         assert_eq!(
             engine.get_document("doc").unwrap().unwrap()["emb"],
+            json!([1.0, 0.0, 0.0]),
+            "vector repair must not publish the snapshot commit"
+        );
+        assert!(engine.get_document("fresh").unwrap().is_none());
+        assert!(engine.get_document("deleted").unwrap().is_some());
+        drop(vector_guard);
+        engine.refresh().unwrap();
+        assert_eq!(
+            engine.get_document("doc").unwrap().unwrap()["emb"],
             json!([0.0, 1.0, 0.0])
         );
+        assert!(engine.get_document("deleted").unwrap().is_none());
     }
 
     #[test]
@@ -1842,6 +1852,284 @@ mod tests {
     #[test]
     fn reader_publication_created_snapshot_vector_rebuild_covers_commit() {
         snapshot_vector_rebuild_covers_committed_updates(false);
+    }
+
+    fn stale_ready_vector_rebuild_covers_pending_documents(
+        trigger: impl FnOnce(&CompositeEngine),
+        expected_ids: &[&str],
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = vector_engine(directory.path());
+        engine
+            .add_document("a", json!({"emb": [1.0, 0.0, 0.0]}))
+            .unwrap();
+        engine
+            .add_document("deleted", json!({"emb": [1.0, 0.0, 0.0]}))
+            .unwrap();
+        engine.refresh().unwrap();
+        let pending = engine
+            .add_document_with_receipt("b", json!({"emb": [0.0, 1.0, 0.0]}))
+            .unwrap();
+        let updated = engine
+            .add_document_with_receipt("a", json!({"emb": [0.0, 0.0, 1.0]}))
+            .unwrap();
+        engine.delete_document("deleted").unwrap();
+        engine.mark_vectors_stale().unwrap();
+        assert!(!engine.text.writer_requires_rebuild());
+        assert!(engine.get_document("b").unwrap().is_none());
+        assert_eq!(
+            engine
+                .get_document_with_metadata("b", true)
+                .unwrap()
+                .unwrap()
+                .seq_no,
+            pending.seq_no
+        );
+
+        trigger(&engine);
+        assert!(!engine.vectors_are_stale().unwrap());
+        assert!(
+            engine.get_document("b").unwrap().is_none(),
+            "a stale-vector repair must not refresh pending documents"
+        );
+        engine.refresh().unwrap();
+        let hits = engine.search_knn("emb", &[0.0, 1.0, 0.0], 10).unwrap();
+        let mut ids = hits
+            .iter()
+            .map(|hit| hit["_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(
+            ids, expected_ids,
+            "rebuild must retain every applied vector, including pending updates and deletes"
+        );
+        let vectors = engine.vector.read().unwrap();
+        let vectors = vectors.as_ref().unwrap();
+        assert_eq!(
+            vectors.version_for_test("b").unwrap().seq_no,
+            pending.seq_no
+        );
+        assert_eq!(
+            vectors.version_for_test("a").unwrap().seq_no,
+            updated.seq_no
+        );
+        assert!(vectors.version_for_test("deleted").is_none());
+    }
+
+    #[test]
+    fn vector_rebuild_healthy_writer_write_covers_unrefreshed_documents() {
+        stale_ready_vector_rebuild_covers_pending_documents(
+            |engine| {
+                engine
+                    .add_document("c", json!({"emb": [1.0, 1.0, 0.0]}))
+                    .unwrap();
+            },
+            &["a", "b", "c"],
+        );
+    }
+
+    #[test]
+    fn vector_rebuild_healthy_writer_bulk_write_covers_unrefreshed_documents() {
+        stale_ready_vector_rebuild_covers_pending_documents(
+            |engine| {
+                engine
+                    .bulk_add_documents(vec![
+                        ("c".into(), json!({"emb": [1.0, 1.0, 0.0]})),
+                        ("d".into(), json!({"emb": [1.0, 0.0, 1.0]})),
+                    ])
+                    .unwrap();
+            },
+            &["a", "b", "c", "d"],
+        );
+    }
+
+    #[test]
+    fn vector_rebuild_healthy_writer_delete_covers_unrefreshed_documents() {
+        stale_ready_vector_rebuild_covers_pending_documents(
+            |engine| {
+                engine.delete_document("missing").unwrap();
+            },
+            &["a", "b"],
+        );
+    }
+
+    #[test]
+    fn vector_rebuild_healthy_writer_replica_apply_covers_unrefreshed_documents() {
+        stale_ready_vector_rebuild_covers_pending_documents(
+            |engine| {
+                engine
+                    .apply_replica_operation(super::super::SequencedOperation {
+                        seq_no: 5,
+                        primary_term: 1,
+                        mutation: super::super::DocumentMutation::Index {
+                            doc_id: "c".into(),
+                            source: json!({"emb": [1.0, 1.0, 0.0]}),
+                        },
+                    })
+                    .unwrap();
+            },
+            &["a", "b", "c"],
+        );
+    }
+
+    #[test]
+    fn vector_rebuild_healthy_writer_replica_batch_covers_unrefreshed_documents() {
+        stale_ready_vector_rebuild_covers_pending_documents(
+            |engine| {
+                engine
+                    .apply_replica_batch(
+                        ["c", "d"]
+                            .into_iter()
+                            .enumerate()
+                            .map(|(offset, doc_id)| super::super::SequencedOperation {
+                                seq_no: 5 + offset as u64,
+                                primary_term: 1,
+                                mutation: super::super::DocumentMutation::Index {
+                                    doc_id: doc_id.into(),
+                                    source: json!({"emb": [1.0, 1.0, 0.0]}),
+                                },
+                            })
+                            .collect(),
+                    )
+                    .unwrap();
+            },
+            &["a", "b", "c", "d"],
+        );
+    }
+
+    #[test]
+    fn vector_rebuild_healthy_writer_peer_barrier_covers_unrefreshed_documents() {
+        stale_ready_vector_rebuild_covers_pending_documents(
+            |engine| {
+                engine.peer_recovery_barrier().unwrap();
+            },
+            &["a", "b"],
+        );
+    }
+
+    fn peer_snapshot_does_not_publish_pending_documents(prepare: bool) {
+        for stale in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let engine = vector_engine(directory.path());
+            engine
+                .add_document("base", json!({"emb": [1.0, 0.0, 0.0]}))
+                .unwrap();
+            engine.refresh().unwrap();
+            let pending = engine
+                .add_document_with_receipt("pending", json!({"emb": [0.0, 1.0, 0.0]}))
+                .unwrap();
+            if stale {
+                engine.mark_vectors_stale().unwrap();
+            }
+            let snapshot_dir = directory.path().join("snapshot");
+            if prepare {
+                drop(
+                    engine
+                        .prepare_peer_recovery_snapshot(&snapshot_dir)
+                        .unwrap(),
+                );
+            } else {
+                let snapshot = engine.create_peer_recovery_snapshot(&snapshot_dir).unwrap();
+                engine
+                    .release_peer_recovery_pin(snapshot.retention_pin_id)
+                    .unwrap();
+            }
+            assert_eq!(
+                engine.doc_count(),
+                1,
+                "snapshot published with stale={stale}"
+            );
+            assert!(
+                engine
+                    .get_document_with_metadata("pending", false)
+                    .unwrap()
+                    .is_none(),
+                "snapshot must not publish pending documents with stale={stale}"
+            );
+            assert_eq!(
+                engine
+                    .get_document_with_metadata("pending", true)
+                    .unwrap()
+                    .unwrap()
+                    .seq_no,
+                pending.seq_no
+            );
+            assert!(!engine.vectors_are_stale().unwrap());
+            engine.refresh().unwrap();
+            assert_eq!(engine.doc_count(), 2);
+            let hits = engine.search_knn("emb", &[0.0, 1.0, 0.0], 2).unwrap();
+            assert_eq!(hits.len(), 2);
+            assert_eq!(hits[0]["_id"], "pending");
+        }
+    }
+
+    #[test]
+    fn vector_rebuild_prepared_snapshot_never_publishes_pending_documents() {
+        peer_snapshot_does_not_publish_pending_documents(true);
+    }
+
+    #[test]
+    fn vector_rebuild_created_snapshot_never_publishes_pending_documents() {
+        peer_snapshot_does_not_publish_pending_documents(false);
+    }
+
+    #[test]
+    fn vector_rebuild_gap_keeps_stale_marker_until_coverage_is_proven() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = vector_engine(directory.path());
+        for (seq_no, doc_id) in [(0, "base"), (2, "above-gap")] {
+            engine
+                .apply_replica_operation(super::super::SequencedOperation {
+                    seq_no,
+                    primary_term: 1,
+                    mutation: super::super::DocumentMutation::Index {
+                        doc_id: doc_id.into(),
+                        source: json!({"emb": [1.0, 0.0, 0.0]}),
+                    },
+                })
+                .unwrap();
+        }
+        engine.mark_vectors_stale().unwrap();
+        assert_eq!(engine.sequence_stats().processed_checkpoint, Some(0));
+        assert_eq!(engine.sequence_stats().max_seq_no, Some(2));
+
+        let error = engine.rebuild_vectors().unwrap_err();
+        assert!(error.to_string().contains("gap-free"), "{error:#}");
+        assert!(engine.vectors_are_stale().unwrap());
+        assert_eq!(
+            engine.vector.read().unwrap().as_ref().unwrap().len(),
+            2,
+            "unproven coverage must not replace the existing vector index"
+        );
+        engine
+            .apply_replica_operation(super::super::SequencedOperation {
+                seq_no: 1,
+                primary_term: 1,
+                mutation: super::super::DocumentMutation::NoOp {
+                    reason: "close vector rebuild coverage gap".into(),
+                },
+            })
+            .unwrap();
+        assert_eq!(engine.sequence_stats().processed_checkpoint, Some(2));
+        assert!(!engine.vectors_are_stale().unwrap());
+        engine.refresh().unwrap();
+        let hits = engine.search_knn("emb", &[1.0, 0.0, 0.0], 2).unwrap();
+        let ids = hits
+            .iter()
+            .map(|hit| hit["_id"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(ids, std::collections::BTreeSet::from(["above-gap", "base"]));
+    }
+
+    #[test]
+    fn vector_rebuild_empty_covering_commit_clears_stale_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = vector_engine(directory.path());
+        engine.mark_vectors_stale().unwrap();
+        engine.rebuild_vectors().unwrap();
+        assert!(!engine.vectors_are_stale().unwrap());
+        assert!(engine.vector.read().unwrap().is_none());
+        assert_eq!(engine.sequence_stats().processed_checkpoint, None);
     }
 
     fn vector_state_after_failed_write(
