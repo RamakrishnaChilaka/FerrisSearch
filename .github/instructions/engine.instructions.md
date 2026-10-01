@@ -160,10 +160,15 @@ tokio::select! {
   Never rebuild from the last published reader: it can omit applied but
   unrefreshed documents. Never publish the private reader or rotate the realtime
   version map for vector repair. Non-stale writes do not add a rebuild commit.
-- Require a gap-free processed prefix equal to the maximum sequence, then
-  compare the committed and applied checkpoints and maxima after enumeration.
-  If coverage cannot be proven, return an error and keep `vectors.stale` and
-  the current vector index. A gap-closing replica apply retries the repair.
+- Capture the complete in-memory applied set immediately after commit, under
+  one apply-state lock: processed checkpoint, maximum sequence, and missing
+  intervals through that maximum. Require the same triple after enumeration.
+  Replica gaps are valid; include every applied live document above a gap.
+  Never require a gap-free prefix to rebuild or open a vector copy. This proof
+  does not change the persisted recovery-boundary format or the separate
+  gap-free requirement for exporting peer snapshots.
+  If coverage changed or enumeration fails, return the error and keep
+  `vectors.stale` and the current vector index.
   Persist and fsync the covering replacement, atomically swap it into memory,
   and only then clear `vectors.stale`. Mark even explicit rebuilds stale before
   attempting the commit so failures remain durable.
@@ -181,8 +186,11 @@ tokio::select! {
   later failed text operation cannot be hidden by an earlier rebuild clearing
   the marker.
 - Rebuild lock order is `vector_recovery`, maintenance, translog, writer, then
-  `apply_state`. Release the writer after commit, but retain maintenance and
-  translog through private-reader enumeration and coverage validation. Hold
+  `apply_state`. Capture applied-set coverage before releasing the writer.
+  After boundary persistence and private-reader creation, release translog
+  before enumeration so WAL-backed realtime GET does not wait for the scan.
+  Retain maintenance through enumeration and validation to prevent truncation.
+  The private searcher pins its segment files. Hold
   `vector_recovery` through vector persistence, swap, and marker removal.
   Private readers take only Tantivy-internal metadata locks, not the reader
   publication mutex. Text recovery remains responsible for replaying a failed
@@ -242,13 +250,17 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
   other engine locks and releases its mutex before version-map access.
   Never reload while holding the version-map lock. Search and realtime GET
   borrow searchers without taking the reload mutex.
-- If the reader-reload mutex is poisoned, recover its unit-valued guard, clear
-  poison under the guard, log the failure, and return an error for that attempt.
-  The next attempt reloads normally under the same mutex. This recovery is safe
-  because Tantivy constructs the complete searcher before its atomic store; a
-  segment-open panic does not publish partial state. Do not apply this policy
-  to maintenance, translog, apply-state, or version-map locks. A repeated panic
-  or an underlying storage error still fails explicitly.
+- If an isolated reader-reload mutex is poisoned, recover its unit-valued guard,
+  clear poison under the guard, log the failure, and return an error for that
+  attempt. A later call that reaches the helper can retry under the mutex.
+  This is safe because Tantivy constructs the complete searcher before its
+  atomic store; a segment-open panic does not publish partial state.
+  Production callers also hold maintenance or translog. A reload panic poisons
+  those outer locks, so later refresh, flush, or replay can fail before reaching
+  this recovery and remain failed closed until reopen. Do not claim automatic
+  production recovery. Explicit copy-failure escalation is a follow-up.
+  Do not recover maintenance, translog, apply-state, or version-map locks through
+  this policy or hide a repeated panic or underlying storage error.
 - A commit alone does not publish search visibility. Refresh publishes before
   retiring old versions or pruning covered tombstones. Preserve the existing
   explicit publication during flush, force merge, and replay: flush needs a

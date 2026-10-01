@@ -148,6 +148,13 @@ struct SequencePlanningSnapshot {
     max_seq_no_of_updates_or_deletes: Option<u64>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct VectorRebuildCoverage {
+    processed_checkpoint: Option<u64>,
+    max_seq_no: Option<u64>,
+    missing_intervals: Vec<std::ops::RangeInclusive<u64>>,
+}
+
 impl ApplyState {
     fn new(committed: CommittedBoundaryRecord) -> Result<Self> {
         let term_sequences = initialize_term_sequence_state(
@@ -4461,41 +4468,49 @@ impl HotEngine {
             .max(1)
     }
 
+    fn processed_coverage_for_vector_rebuild(&self) -> Result<VectorRebuildCoverage> {
+        let state = self
+            .apply_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+        let max_seq_no = state.checkpoints.max_seq_no();
+        Ok(VectorRebuildCoverage {
+            processed_checkpoint: state.checkpoints.processed_checkpoint(),
+            max_seq_no,
+            missing_intervals: max_seq_no
+                .map(|max_seq_no| state.checkpoints.missing_intervals_through(max_seq_no))
+                .unwrap_or_default(),
+        })
+    }
+
     pub(crate) fn for_each_committed_vector_rebuild_batch(
         &self,
         consume: impl FnMut(Vec<(String, serde_json::Value, u64, u64)>) -> Result<()>,
     ) -> Result<()> {
         let _maintenance = self.maintenance_guard("vector rebuild")?;
-        self.with_translog("vector rebuild", |_| {
-            let mut writer_state = self.writer.write().unwrap_or_else(|error| error.into_inner());
+        let (reader, covered) = self.with_translog("vector rebuild", |_| {
+            let mut writer_state = self
+                .writer
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
             let boundary = self.current_committed_boundary()?;
-            if boundary.processed_checkpoint != boundary.max_seq_no {
-                anyhow::bail!(
-                    "vector rebuild requires gap-free applied history: processed checkpoint {:?} does not equal maximum sequence {:?}",
-                    boundary.processed_checkpoint,
-                    boundary.max_seq_no
-                );
-            }
             let committed =
                 self.commit_writer_at_boundary(&mut writer_state, "vector rebuild", boundary)?;
+            let covered = self.processed_coverage_for_vector_rebuild()?;
             drop(writer_state);
             self.persist_committed_boundary(&committed)?;
-            let reader = self.private_committed_reader()?;
-            self.for_each_vector_rebuild_batch(&reader.searcher(), consume)?;
-            let applied = self.current_committed_boundary()?;
-            if committed.processed_checkpoint != applied.processed_checkpoint
-                || committed.max_seq_no != applied.max_seq_no
-            {
-                anyhow::bail!(
-                    "vector rebuild commit no longer covers applied history: committed checkpoint {:?}, maximum {:?}; applied checkpoint {:?}, maximum {:?}",
-                    committed.processed_checkpoint,
-                    committed.max_seq_no,
-                    applied.processed_checkpoint,
-                    applied.max_seq_no
-                );
-            }
-            Ok(())
-        })
+            Ok((self.private_committed_reader()?, covered))
+        })?;
+        // The private reader pins its files and callers retain vector_recovery.
+        // Realtime GET must not wait on the translog during enumeration.
+        self.for_each_vector_rebuild_batch(&reader.searcher(), consume)?;
+        let applied = self.processed_coverage_for_vector_rebuild()?;
+        if applied != covered {
+            anyhow::bail!(
+                "vector rebuild commit no longer covers applied history: committed {covered:?}; applied {applied:?}"
+            );
+        }
+        Ok(())
     }
 
     fn for_each_vector_rebuild_batch(
