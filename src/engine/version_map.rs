@@ -522,6 +522,24 @@ mod tests {
     }
 
     #[test]
+    fn steady_refresh_rotation_preserves_key_allocation_and_version() {
+        let mut versions = LiveVersionMap::new(usize::MAX);
+        versions.apply_index("doc", 7, 3);
+        let key = versions.current.keys().next().unwrap().as_ptr();
+        let bytes = versions.estimated_bytes();
+        versions.rotate_current_into_old().unwrap();
+        assert!(versions.current.is_empty());
+        assert_eq!(versions.old.keys().next().unwrap().as_ptr(), key);
+        assert_eq!(versions.lookup("doc").unwrap().unwrap().seq_no(), 7);
+        assert_eq!(versions.lookup("doc").unwrap().unwrap().primary_term(), 3);
+        assert_eq!(versions.estimated_bytes(), bytes);
+        assert_eq!(
+            versions.estimated_bytes(),
+            versions.full_recount_estimated_bytes()
+        );
+    }
+
+    #[test]
     fn tombstone_pruning_requires_age_and_visible_checkpoint() {
         let clock = Arc::new(ManualClock::new());
         let mut versions = LiveVersionMap::with_clock(usize::MAX, clock.clone());

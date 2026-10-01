@@ -118,6 +118,12 @@ struct ApplyStateTimer<'a> {
 }
 
 #[cfg(test)]
+struct RefreshMapClearPause {
+    ready: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
 impl Drop for ApplyStateTimer<'_> {
     fn drop(&mut self) {
         let duration = self.started.elapsed();
@@ -429,6 +435,8 @@ pub struct HotEngine {
     refresh_after_commit_sender: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     #[cfg(test)]
     refresh_after_commit_release_receiver: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    #[cfg(test)]
+    refresh_before_map_clear: Mutex<Option<RefreshMapClearPause>>,
     #[cfg(test)]
     replay_after_reset_sender: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     #[cfg(test)]
@@ -1098,6 +1106,8 @@ impl HotEngine {
             refresh_after_commit_sender: Mutex::new(None),
             #[cfg(test)]
             refresh_after_commit_release_receiver: Mutex::new(None),
+            #[cfg(test)]
+            refresh_before_map_clear: Mutex::new(None),
             #[cfg(test)]
             replay_after_reset_sender: Mutex::new(None),
             #[cfg(test)]
@@ -2459,6 +2469,11 @@ impl HotEngine {
         }
 
         self.reader.reload()?;
+        #[cfg(test)]
+        if let Some(pause) = self.refresh_before_map_clear.lock().unwrap().take() {
+            pause.ready.send(()).unwrap();
+            pause.release.recv().unwrap();
+        }
         let pruned = self.version_map_write()?.map.complete_reader_reload(
             committed_boundary.processed_checkpoint,
             self.delete_tombstone_retention,
@@ -9897,6 +9912,7 @@ mod tests {
             refresh_before_writer_sender: Mutex::new(None),
             refresh_after_commit_sender: Mutex::new(None),
             refresh_after_commit_release_receiver: Mutex::new(None),
+            refresh_before_map_clear: Mutex::new(None),
             replay_after_reset_sender: Mutex::new(None),
             replay_after_reset_release_receiver: Mutex::new(None),
             replay_commit_failure: Mutex::new(None),
@@ -11109,6 +11125,63 @@ mod tests {
         assert_eq!(document.source, json!({"value": 1}));
         assert_eq!(document.seq_no, receipt.seq_no);
         assert_eq!(document.primary_term, receipt.primary_term);
+    }
+
+    #[test]
+    fn realtime_get_miss_during_refresh_reload_before_clear_keeps_acknowledged_version() {
+        let (_directory, mut engine) = create_engine();
+        engine.reader = engine
+            .index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
+            .unwrap();
+        engine.add_document("doc", json!({"value": 1})).unwrap();
+        engine.refresh().unwrap();
+        let acknowledged = engine
+            .add_document_with_receipt("doc", json!({"value": 2}))
+            .unwrap();
+        assert_eq!(
+            engine
+                .get_document_with_metadata("doc", false)
+                .unwrap()
+                .unwrap()
+                .source,
+            json!({"value": 1})
+        );
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *engine.refresh_before_map_clear.lock().unwrap() = Some(RefreshMapClearPause {
+            ready: ready_tx,
+            release: release_rx,
+        });
+        let engine = Arc::new(engine);
+        let refresh_engine = engine.clone();
+        let refresh = std::thread::spawn(move || refresh_engine.refresh());
+        ready_rx.recv_timeout(TEST_SYNC_TIMEOUT).unwrap();
+
+        // Force a miss at the publication/clear boundary, rather than a WAL hit.
+        engine
+            .version_map_write()
+            .unwrap()
+            .map
+            .complete_reader_reload(Some(acknowledged.seq_no), engine.delete_tombstone_retention);
+        assert!(
+            engine
+                .version_map_read()
+                .unwrap()
+                .map
+                .lookup("doc")
+                .unwrap()
+                .is_none()
+        );
+        let result = engine.get_document_with_metadata("doc", true);
+        release_tx.send(()).unwrap();
+        refresh.join().unwrap().unwrap();
+        let document = result.unwrap().unwrap();
+        assert_eq!(document.source, json!({"value": 2}));
+        assert_eq!(document.seq_no, acknowledged.seq_no);
+        assert_eq!(document.primary_term, acknowledged.primary_term);
     }
 
     #[test]
