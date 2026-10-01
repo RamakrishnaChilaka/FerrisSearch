@@ -282,7 +282,7 @@ pub(crate) async fn index_cluster_state(
 ) -> Result<crate::cluster::state::ClusterState, (StatusCode, Json<Value>)> {
     state
         .cluster_manager
-        .wait_for_version(state.transport_client.required_state_version())
+        .wait_for_version(state.transport_client.required_state_version(index_name))
         .await
         .map_err(|error| {
             crate::api::error_response(
@@ -351,22 +351,12 @@ async fn auto_create_index(
         "Index '{}' not found, auto-creating with 1 shard",
         index_name
     );
-    let current = state.cluster_manager.get_state();
-    let data_nodes = current
-        .nodes
-        .values()
-        .filter(|node| node.roles.contains(&crate::cluster::state::NodeRole::Data))
-        .map(|node| node.id.clone())
-        .collect::<Vec<_>>();
-    let body = serde_json::json!({
-        "settings": { "number_of_shards": 1, "number_of_replicas": 0 }
-    });
-    let m = IndexMetadata::from_create_request_body(index_name, &body, &data_nodes)
-        .map_err(create_index_error_response)?;
-    let created_metadata = if let Some(master) =
-        resolve_leader_or_master(state, "auto-create index")?
-    {
+    if let Some(master) = resolve_leader_or_master(state, "auto-create index")? {
         // Forward auto-create to the leader via gRPC
+        let body = serde_json::json!({
+            "settings": { "number_of_shards": 1, "number_of_replicas": 0 },
+            "mappings": { "dynamic": true }
+        });
         let body_bytes = serde_json::to_vec(&body).map_err(|error| {
             crate::api::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -374,13 +364,13 @@ async fn auto_create_index(
                 error,
             )
         })?;
-        match state
+        return match state
             .transport_client
             .forward_create_index(&master, index_name, &body_bytes)
             .await
         {
             Ok(_) => match wait_for_index_metadata(state, index_name).await {
-                Some(metadata) => metadata,
+                Some(metadata) => Ok(metadata),
                 None => {
                     return Err(crate::api::error_response(
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -398,20 +388,44 @@ async fn auto_create_index(
                 return Err(crate::api::error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "forward_exception",
-                    format!("Auto-create index forward to master failed: {e}"),
+                    format!("Auto-create index forward to master failed: {e:#}"),
                 ));
             }
-        }
-    } else {
-        let cmd = crate::consensus::types::ClusterCommand::CreateIndex {
-            metadata: m.clone(),
         };
-        raft_write(state, cmd).await?;
-        wait_for_index_metadata(state, index_name).await.ok_or_else(|| crate::api::error_response(
-            StatusCode::SERVICE_UNAVAILABLE, "shard_not_available_exception",
-            format!("index [{index_name}] is not present in local cluster state at version {} after creation", state.cluster_manager.version()),
-        ))?
+    }
+    let mut shard_routing = HashMap::new();
+    shard_routing.insert(
+        0,
+        crate::cluster::state::ShardRoutingEntry {
+            primary: state.local_node_id.clone(),
+            primary_term: 1,
+            replicas: vec![],
+            in_sync_replicas: vec![],
+            unassigned_replicas: 0,
+        },
+    );
+    let metadata = IndexMetadata {
+        name: index_name.to_string(),
+        uuid: crate::cluster::state::IndexUuid::new_random(),
+        number_of_shards: 1,
+        number_of_replicas: 0,
+        shard_routing,
+        mappings: HashMap::new(),
+        dynamic: crate::cluster::state::DynamicMapping::True,
+        settings: crate::cluster::state::IndexSettings::default(),
     };
+    raft_write(
+        state,
+        crate::consensus::types::ClusterCommand::CreateIndex { metadata },
+    )
+    .await?;
+    state
+        .transport_client
+        .acknowledge_state(index_name, state.cluster_manager.version());
+    let created_metadata = wait_for_index_metadata(state, index_name).await.ok_or_else(|| crate::api::error_response(
+        StatusCode::SERVICE_UNAVAILABLE, "shard_not_available_exception",
+        format!("index [{index_name}] is not present in local cluster state at version {} after creation", state.cluster_manager.version()),
+    ))?;
 
     let committed_state = state.cluster_manager.get_state();
     if let Some(routing) = created_metadata.shard_routing.get(&0)
@@ -444,20 +458,6 @@ async fn auto_create_index(
             format!("Failed to open auto-created shard [{index_name}][0]: {e:#}"),
         ));
     }
-
-    state
-        .transport_client
-        .clone()
-        .with_cluster_manager(state.cluster_manager.clone())
-        .open_remote_index_primaries(&committed_state, index_name, &state.local_node_id)
-        .await
-        .map_err(|error| {
-            crate::api::error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "shard_not_available_exception",
-                format!("Auto-created index [{index_name}] primary opening failed: {error:#}"),
-            )
-        })?;
 
     Ok(created_metadata)
 }
@@ -669,11 +669,6 @@ fn forwarded_create_index_error_response(
             "illegal_argument_exception",
             status.message(),
         )),
-        tonic::Code::Unavailable => Some(crate::api::error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "shard_not_available_exception",
-            format!("{error:#}"),
-        )),
         tonic::Code::Internal
             if status.message() == CreateIndexMetadataError::NoDataNodes.to_string() =>
         {
@@ -728,6 +723,7 @@ pub async fn create_index(
 
     let index_settings = metadata.settings.clone();
     let replica_count = metadata.number_of_replicas;
+    let shard_count = metadata.number_of_shards;
 
     // Coordinator: forward to leader or write locally via Raft
     if let Some(master) = match resolve_leader_or_master(&state, "index creation") {
@@ -747,7 +743,7 @@ pub async fn create_index(
                 return crate::api::error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "forward_exception",
-                    format!("Failed to forward index creation to master: {e}"),
+                    format!("Failed to forward index creation to master: {e:#}"),
                 );
             }
         }
@@ -757,73 +753,23 @@ pub async fn create_index(
         return e;
     }
 
-    let committed_state = state.cluster_manager.get_state();
-    let Some(committed_metadata) = committed_state.indices.get(index_name.as_str()) else {
-        return crate::api::error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "master_not_discovered_exception",
-            format!("Index [{index_name}] was committed but is not visible locally"),
-        );
-    };
-
-    // Only the initial primary may create an empty local copy. Initial replicas
-    // remain out of sync and are populated by peer recovery.
-    for (shard_id, routing) in &committed_metadata.shard_routing {
-        if routing.primary == state.local_node_id
-            && let Some(allocation_id) = committed_state.shard_allocation_id(
-                index_name.as_str(),
-                *shard_id,
-                &state.local_node_id,
-            )
-            && let Err(e) = state
-                .shard_manager
-                .open_primary_assigned_shard_with_settings_blocking(
-                    index_name.to_string(),
-                    *shard_id,
-                    committed_metadata.mappings.clone(),
-                    committed_metadata.settings.clone(),
-                    committed_metadata.uuid.clone(),
-                    crate::shard::AssignedShardOpen {
-                        allocation_id,
-                        primary_term: routing.primary_term,
-                        allow_empty_creation: committed_state.may_create_initial_empty_copy(
-                            index_name.as_str(),
-                            *shard_id,
-                            &state.local_node_id,
-                        ),
-                    },
-                )
-                .await
-        {
-            return crate::api::error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "shard_not_available_exception",
-                format!(
-                    "Failed to open primary shard [{index_name}][{shard_id}] after creation: {e:#}"
-                ),
-            );
-        }
-    }
-
-    if let Err(error) = state
+    state
         .transport_client
-        .clone()
-        .with_cluster_manager(state.cluster_manager.clone())
-        .open_remote_index_primaries(&committed_state, &index_name, &state.local_node_id)
-        .await
-    {
-        return crate::api::error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "shard_not_available_exception",
-            format!("Index [{index_name}] was created but primary shard opening failed: {error:#}"),
-        );
-    }
+        .acknowledge_state(&index_name, state.cluster_manager.version());
+    let shards_acknowledged = crate::transport::primary_open::wait_for_index_primaries(
+        &state.cluster_manager,
+        &state.shard_manager,
+        &state.transport_client,
+        &state.local_node_id,
+        &index_name,
+    )
+    .await;
 
     tracing::info!(
         "Created index '{}' with engine {}, {} shards, {} replicas",
         index_name,
         index_settings.engine,
-        committed_metadata.shard_routing.len(),
+        shard_count,
         replica_count
     );
 
@@ -831,7 +777,7 @@ pub async fn create_index(
         StatusCode::OK,
         Json(serde_json::json!({
             "acknowledged": true,
-            "shards_acknowledged": true,
+            "shards_acknowledged": shards_acknowledged,
             "index": index_name
         })),
     )
@@ -2251,6 +2197,9 @@ pub async fn update_index_settings(
         if let Err(e) = raft_write(&state, cmd).await {
             return e;
         }
+        state
+            .transport_client
+            .acknowledge_state(&index_name, state.cluster_manager.version());
     }
 
     // Apply settings to live engines on this node via watch channels

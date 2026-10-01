@@ -80,17 +80,17 @@ pub(super) async fn execute_ordered_bulk(
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let item = if kind == ShardBulkOpKind::Delete {
             match service
-                .delete_doc(
-                    service
-                        .transport_client
-                        .forwarding_request(ShardDeleteRequest {
-                            index_name: request.index_name.clone(),
-                            shard_id: request.shard_id,
-                            doc_id: doc_id.clone(),
-                            if_seq_no: operation.if_seq_no,
-                            if_primary_term: operation.if_primary_term,
-                        }),
-                )
+                .delete_doc(service.transport_client.forwarding_request(
+                    ShardDeleteRequest {
+                        index_name: request.index_name.clone(),
+                        shard_id: request.shard_id,
+                        doc_id: doc_id.clone(),
+                        if_seq_no: operation.if_seq_no,
+                        if_primary_term: operation.if_primary_term,
+                    },
+                    &request.index_name,
+                    Some((request.shard_id, &service.local_node_id)),
+                ))
                 .await
             {
                 Ok(response) => {
@@ -126,20 +126,20 @@ pub(super) async fn execute_ordered_bulk(
             let payload_json =
                 serde_json::to_vec(source).map_err(|error| Status::internal(error.to_string()))?;
             match service
-                .index_doc(
-                    service
-                        .transport_client
-                        .forwarding_request(ShardDocRequest {
-                            index_name: request.index_name.clone(),
-                            shard_id: request.shard_id,
-                            doc_id: doc_id.clone(),
-                            payload_json,
-                            if_seq_no: operation.if_seq_no,
-                            if_primary_term: operation.if_primary_term,
-                            create_only: kind == ShardBulkOpKind::Create,
-                            index_uuid: None,
-                        }),
-                )
+                .index_doc(service.transport_client.forwarding_request(
+                    ShardDocRequest {
+                        index_name: request.index_name.clone(),
+                        shard_id: request.shard_id,
+                        doc_id: doc_id.clone(),
+                        payload_json,
+                        if_seq_no: operation.if_seq_no,
+                        if_primary_term: operation.if_primary_term,
+                        create_only: kind == ShardBulkOpKind::Create,
+                        index_uuid: None,
+                    },
+                    &request.index_name,
+                    Some((request.shard_id, &service.local_node_id)),
+                ))
                 .await
             {
                 Ok(response) => {

@@ -60,7 +60,7 @@ GetShardStats(ShardStatsRequest) → ShardStatsResponse
 GetSegmentStats(SegmentStatsRequest) → SegmentStatsResponse
 
 // Index maintenance (fan-out from coordinator)
-OpenIndex(IndexMaintenanceRequest) → Empty // create-time assigned-primary open barrier
+OpenIndex(IndexMaintenanceRequest) → Empty // bounded create-time primary readiness
 RefreshIndex(IndexMaintenanceRequest) → IndexMaintenanceResponse
 FlushIndex(IndexMaintenanceRequest) → IndexMaintenanceResponse
 ForceMergeIndex(ForceMergeRequest) → ForceMergeResponse
@@ -146,29 +146,50 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   into untyped `success: false` responses. Remote-store leaf batches preserve
   the same parse classification so the root can return HTTP 400 when every
   split fails for a client query error.
-- Forwarded document, bulk, GET, search, SQL, stats, remote-store leaf, and
-  maintenance handlers wait for `x-ferris-cluster-state-version` before local
-  validation or engine work. The client interceptor reads the coordinator's
-  applied version from its shared `ClusterManager`. Production handlers reject
-  missing or malformed watermarks with `INVALID_ARGUMENT`; isolated no-Raft
-  transport test constructors may omit one. Direct production-style test RPCs
-  use `request_with_cluster_state_version()` with an explicit floor.
-- The metadata wait is asynchronous on Tokio, polls only the applied version
-  every 25 ms, and expires after 5 seconds. Expiration is `UNAVAILABLE` with
+- Forwarded document, bulk, GET, search, SQL, index-scoped stats, remote-store
+  leaf, and maintenance handlers validate local metadata before waiting.
+  `x-ferris-cluster-state-version` is a routing hint, not an unconditional
+  cluster-wide barrier. Wait and revalidate missing index/UUID/routing,
+  authority, allocation, or term context only when that hint is ahead.
+  The scoped request builder also carries `x-ferris-index-state-floor` for
+  explicit metadata acknowledgements, UTF-8 binary index name/UUID context,
+  and shard term/allocation context. Always honor an unmet floor for that
+  index, but never apply another index's floor. Unscoped cat stats do not
+  wait for unrelated metadata.
+- Production handlers reject missing routing hints and malformed or
+  inconsistent supplied context with `INVALID_ARGUMENT`; isolated no-Raft
+  transport test constructors may omit a hint. Direct production-style test
+  RPCs use `request_with_cluster_state_version()` for an explicit index floor.
+- The metadata wait is asynchronous on Tokio, polls every 25 ms only while
+  metadata is deficient or an explicit floor is unmet, and expires after
+  5 seconds. Applied state is shared directly with the Raft state machine;
+  no common apply/snapshot notification channel exists. Keep polling for
+  this focused path rather than adding a second state publication mechanism.
+  Expiration is `UNAVAILABLE` with
   the stable `cluster state wait timed out: ` prefix and both required and
   observed versions. Preserve the tonic status through client error contexts.
   REST maps this specific pre-execution failure to 503, not every transport
   timeout or connection loss.
 - `CreateIndex`, `UpdateSettings`, and `AddMappings` successes return their
-  applied version in response metadata. Clients retain a shared monotonic
-  acknowledgement floor. Create and settings wait for local application;
+  applied version in response metadata. Clients retain shared monotonic
+  acknowledgement floors per index, including local leader commits.
+  Settings waits for local application;
   mapping registration keeps the existing committed-schema override/reopen
-  flow and fences subsequent operations with that floor. Missing or malformed response context
+  flow and fences subsequent operations with that index's floor. Missing or malformed response context
   fails decoding; do not add compatibility defaults.
-- `OpenIndex` opens only locally assigned primary copies after the version
-  wait. Create-index awaits all primary opens, using the existing UUID,
-  allocation, and initial-empty-copy rules. It neither activates primaries
-  nor opens initial replicas. Reads still refuse missing UUID directories.
+- `OpenIndex` validates/waits for metadata, then uses an independent 20-second
+  opening budget. The shared `primary_open` helper opens local and remote
+  primary nodes concurrently, with at most four local opens in flight.
+  Readiness has a 25-second bound including remote metadata catch-up.
+  It uses existing UUID, allocation, and initial-empty-copy rules and neither
+  activates primaries nor opens initial replicas. Reads still refuse missing
+  UUID directories.
+- Once creation commits, opening errors/timeouts are logged with their full
+  causes and return `acknowledged: true, shards_acknowledged: false`, not a
+  failed create. A follower coordinator preserves this acknowledgement if
+  its own application wait expires. Only marked pre-execution metadata waits
+  map to safe document 503s; generic `UNAVAILABLE` is not a retryable create
+  error.
 - Do not add these waits to Raft, replication, or recovery RPCs. Their
   authority, allocation, term-fence, and recovery-barrier contracts are
   unchanged.

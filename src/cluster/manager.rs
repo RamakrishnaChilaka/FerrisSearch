@@ -3,6 +3,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 pub const FORWARDING_STATE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+pub const PRIMARY_OPEN_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, thiserror::Error)]
 #[error(
@@ -22,6 +23,8 @@ pub struct ClusterManager {
     pub(crate) primary_open_wait_millis: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     pub(crate) primary_open_delay_millis: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    pub(crate) primary_open_peak: std::sync::atomic::AtomicUsize,
     #[cfg(feature = "protocol-trace")]
     protocol_trace_node: RwLock<Option<String>>,
 }
@@ -36,6 +39,8 @@ impl ClusterManager {
             primary_open_wait_millis: std::sync::atomic::AtomicU64::new(20_000),
             #[cfg(test)]
             primary_open_delay_millis: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            primary_open_peak: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "protocol-trace")]
             protocol_trace_node: RwLock::new(None),
         }
@@ -52,6 +57,8 @@ impl ClusterManager {
             primary_open_wait_millis: std::sync::atomic::AtomicU64::new(20_000),
             #[cfg(test)]
             primary_open_delay_millis: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            primary_open_peak: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "protocol-trace")]
             protocol_trace_node: RwLock::new(None),
         }
@@ -104,6 +111,10 @@ impl ClusterManager {
         self.state.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    pub(crate) fn with_state<T>(&self, read: impl FnOnce(&ClusterState) -> T) -> T {
+        read(&self.state.read().unwrap_or_else(|error| error.into_inner()))
+    }
+
     pub fn version(&self) -> u64 {
         self.state.read().unwrap_or_else(|e| e.into_inner()).version
     }
@@ -119,6 +130,20 @@ impl ClusterManager {
         #[cfg(not(test))]
         {
             FORWARDING_STATE_WAIT_TIMEOUT
+        }
+    }
+
+    pub fn primary_open_wait_timeout(&self) -> Duration {
+        #[cfg(test)]
+        {
+            Duration::from_millis(
+                self.primary_open_wait_millis
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+        }
+        #[cfg(not(test))]
+        {
+            PRIMARY_OPEN_WAIT_TIMEOUT
         }
     }
 

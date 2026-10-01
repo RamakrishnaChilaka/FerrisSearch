@@ -1,5 +1,5 @@
 use super::*;
-use crate::cluster::state::{DynamicMapping, NodeRole};
+use crate::cluster::state::{DynamicMapping, IndexMetadata, NodeRole};
 use std::sync::atomic::Ordering;
 
 async fn enable_leader_data_role(cluster: &ForwardingCluster) {
@@ -209,6 +209,72 @@ async fn forwarding_review_many_slow_primary_opens_are_not_failed_creates() {
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forwarding_review_primary_open_budget_is_independent_and_concurrent() {
+    let cluster = ForwardingCluster::start().await;
+    let index = "review-concurrent-open";
+    let metadata = IndexMetadata::from_create_request_body(
+        index,
+        &json!({"settings": {"number_of_shards": 8, "number_of_replicas": 0}}),
+        &["node-2".to_string()],
+    )
+    .unwrap();
+    cluster.nodes[0]
+        .state
+        .raft
+        .client_write(ClusterCommand::CreateIndex { metadata })
+        .await
+        .unwrap()
+        .data
+        .into_result()
+        .unwrap();
+    cluster.nodes[1]
+        .state
+        .cluster_manager
+        .wait_for_version(cluster.nodes[0].state.cluster_manager.version())
+        .await
+        .unwrap();
+    for node in &cluster.nodes {
+        node.state
+            .cluster_manager
+            .forwarding_wait_millis
+            .store(40, Ordering::Relaxed);
+        node.state
+            .cluster_manager
+            .primary_open_wait_millis
+            .store(2_500, Ordering::Relaxed);
+    }
+    let primary = &cluster.nodes[1].state;
+    primary
+        .cluster_manager
+        .primary_open_delay_millis
+        .store(200, Ordering::Relaxed);
+    let coordinator = &cluster.nodes[0].state;
+    assert!(
+        crate::transport::primary_open::wait_for_index_primaries(
+            &coordinator.cluster_manager,
+            &coordinator.shard_manager,
+            &coordinator.transport_client,
+            &coordinator.local_node_id,
+            index,
+        )
+        .await
+    );
+    assert_eq!(
+        primary
+            .cluster_manager
+            .primary_open_peak
+            .load(Ordering::Relaxed),
+        4
+    );
+    for shard in 0..8 {
+        assert!(
+            primary.shard_manager.get_shard(index, shard).is_some(),
+            "shard {shard}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

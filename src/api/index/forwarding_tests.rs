@@ -616,14 +616,16 @@ async fn forwarding_lag_mapping_and_setting_then_write_waits_for_new_version() {
                 .await;
             assert_eq!(status, StatusCode::OK, "{body}");
         } else {
+            let master = cluster.nodes[0].state.cluster_manager.get_state().nodes["node-1"].clone();
             cluster.nodes[0]
                 .state
-                .raft
-                .client_write(ClusterCommand::AddMappings {
-                    index_name: "lag-metadata".into(),
-                    new_fields: Default::default(),
-                    dynamic: crate::cluster::state::DynamicMapping::Strict,
-                })
+                .transport_client
+                .forward_add_mappings(
+                    &master,
+                    "lag-metadata",
+                    &Default::default(),
+                    &crate::cluster::state::DynamicMapping::Strict,
+                )
                 .await
                 .unwrap();
         }
@@ -755,7 +757,7 @@ async fn forwarding_acknowledged_metadata_fences_following_requests() {
         .await
         .unwrap();
     assert_eq!(
-        follower.transport_client.required_state_version(),
+        follower.transport_client.required_state_version("lag-ack"),
         cluster.nodes[0].state.cluster_manager.version()
     );
     let (status, body) = cluster

@@ -233,7 +233,8 @@ async fn count_docs_from_metadata(
     for (node, shard_ids) in remote_count_targets(&cluster_state, metadata, &local_shard_ids) {
         let client = state.transport_client.clone();
         let node_id = node.id.clone();
-        let handle = tokio::spawn(async move { client.get_shard_stats(&node).await });
+        let index = index_name.to_string();
+        let handle = tokio::spawn(async move { client.get_index_shard_stats(&node, &index).await });
         remote_handles.push(async move { (node_id, shard_ids, handle.await) });
     }
 
