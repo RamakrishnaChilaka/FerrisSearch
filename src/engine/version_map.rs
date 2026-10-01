@@ -70,12 +70,16 @@ pub(crate) struct PrunedTombstone {
     pub primary_term: u64,
 }
 
+pub(crate) type RetiredIndexVersions = HashMap<Box<str>, IndexVersionValue>;
+
 pub(crate) struct LiveVersionMap {
     current: HashMap<Box<str>, IndexVersionValue>,
     old: HashMap<Box<str>, IndexVersionValue>,
     tombstones: HashMap<Box<str>, DeleteVersionValue>,
     reader_visible_checkpoint: Option<u64>,
     estimated_bytes: usize,
+    current_bytes: usize,
+    old_bytes: usize,
     max_bytes: usize,
     clock: Arc<dyn MonotonicClock>,
 }
@@ -92,6 +96,8 @@ impl LiveVersionMap {
             tombstones: HashMap::new(),
             reader_visible_checkpoint: None,
             estimated_bytes: 0,
+            current_bytes: 0,
+            old_bytes: 0,
             max_bytes,
             clock,
         }
@@ -145,6 +151,9 @@ impl LiveVersionMap {
             )
             .is_none()
         {
+            self.current_bytes = self
+                .current_bytes
+                .saturating_add(estimated_entry_bytes(doc_id));
             self.estimated_bytes = self
                 .estimated_bytes
                 .saturating_add(estimated_entry_bytes(doc_id));
@@ -168,6 +177,9 @@ impl LiveVersionMap {
             .is_some_and(|value| value.seq_no < seq_no)
             && let Some((key, _)) = self.current.remove_entry(doc_id)
         {
+            self.current_bytes = self
+                .current_bytes
+                .saturating_sub(estimated_entry_bytes(&key));
             self.estimated_bytes = self
                 .estimated_bytes
                 .saturating_sub(estimated_entry_bytes(&key));
@@ -178,6 +190,7 @@ impl LiveVersionMap {
             .is_some_and(|value| value.seq_no < seq_no)
             && let Some((key, _)) = self.old.remove_entry(doc_id)
         {
+            self.old_bytes = self.old_bytes.saturating_sub(estimated_entry_bytes(&key));
             self.estimated_bytes = self
                 .estimated_bytes
                 .saturating_sub(estimated_entry_bytes(&key));
@@ -201,10 +214,16 @@ impl LiveVersionMap {
     }
 
     pub(crate) fn rotate_current_into_old(&mut self) -> Result<()> {
-        for (doc_id, value) in self.current.drain() {
-            self.estimated_bytes = self
-                .estimated_bytes
-                .saturating_sub(estimated_entry_bytes(&doc_id));
+        if self.old.is_empty() {
+            std::mem::swap(&mut self.current, &mut self.old);
+            std::mem::swap(&mut self.current_bytes, &mut self.old_bytes);
+            return Ok(());
+        }
+        let current = std::mem::take(&mut self.current);
+        self.estimated_bytes = self
+            .estimated_bytes
+            .saturating_sub(std::mem::take(&mut self.current_bytes));
+        for (doc_id, value) in current {
             match self.old.get(doc_id.as_ref()).copied() {
                 Some(existing) if existing.seq_no > value.seq_no => {}
                 Some(existing)
@@ -222,10 +241,10 @@ impl LiveVersionMap {
                     .into());
                 }
                 _ => {
-                    if self.old.insert(doc_id.clone(), value).is_none() {
-                        self.estimated_bytes = self
-                            .estimated_bytes
-                            .saturating_add(estimated_entry_bytes(&doc_id));
+                    let bytes = estimated_entry_bytes(&doc_id);
+                    if self.old.insert(doc_id, value).is_none() {
+                        self.old_bytes = self.old_bytes.saturating_add(bytes);
+                        self.estimated_bytes = self.estimated_bytes.saturating_add(bytes);
                     }
                 }
             }
@@ -234,10 +253,11 @@ impl LiveVersionMap {
     }
 
     pub(crate) fn rollback_refresh(&mut self) -> Result<()> {
-        for (doc_id, value) in self.old.drain() {
-            self.estimated_bytes = self
-                .estimated_bytes
-                .saturating_sub(estimated_entry_bytes(&doc_id));
+        let old = std::mem::take(&mut self.old);
+        self.estimated_bytes = self
+            .estimated_bytes
+            .saturating_sub(std::mem::take(&mut self.old_bytes));
+        for (doc_id, value) in old {
             match self.current.get(doc_id.as_ref()).copied() {
                 Some(existing) if existing.seq_no > value.seq_no => {}
                 Some(existing)
@@ -255,10 +275,10 @@ impl LiveVersionMap {
                     .into());
                 }
                 _ => {
-                    if self.current.insert(doc_id.clone(), value).is_none() {
-                        self.estimated_bytes = self
-                            .estimated_bytes
-                            .saturating_add(estimated_entry_bytes(&doc_id));
+                    let bytes = estimated_entry_bytes(&doc_id);
+                    if self.current.insert(doc_id, value).is_none() {
+                        self.current_bytes = self.current_bytes.saturating_add(bytes);
+                        self.estimated_bytes = self.estimated_bytes.saturating_add(bytes);
                     }
                 }
             }
@@ -266,18 +286,16 @@ impl LiveVersionMap {
         Ok(())
     }
 
+    /// Drop the returned retired map only after releasing the version-map lock.
     pub(crate) fn complete_reader_reload(
         &mut self,
         reader_visible_checkpoint: Option<u64>,
         retention: Duration,
-    ) -> Vec<PrunedTombstone> {
-        self.estimated_bytes = self.estimated_bytes.saturating_sub(
-            self.old
-                .keys()
-                .map(|doc_id| estimated_entry_bytes(doc_id))
-                .sum::<usize>(),
-        );
-        self.old.clear();
+    ) -> (Vec<PrunedTombstone>, RetiredIndexVersions) {
+        self.estimated_bytes = self
+            .estimated_bytes
+            .saturating_sub(std::mem::take(&mut self.old_bytes));
+        let retired = std::mem::take(&mut self.old);
         self.reader_visible_checkpoint = reader_visible_checkpoint;
         let now = self.clock.now();
         let processed_checkpoint = reader_visible_checkpoint;
@@ -308,7 +326,7 @@ impl LiveVersionMap {
             !should_prune
         });
         self.estimated_bytes = self.estimated_bytes.saturating_sub(removed_bytes);
-        pruned
+        (pruned, retired)
     }
 
     pub(crate) fn reset(&mut self) {
@@ -317,6 +335,8 @@ impl LiveVersionMap {
         self.tombstones.clear();
         self.reader_visible_checkpoint = None;
         self.estimated_bytes = 0;
+        self.current_bytes = 0;
+        self.old_bytes = 0;
     }
 
     pub(crate) fn estimated_bytes(&self) -> usize {
@@ -472,6 +492,29 @@ mod tests {
         }
     }
 
+    fn assert_byte_accounting(versions: &LiveVersionMap) {
+        assert_eq!(
+            versions.current_bytes,
+            versions
+                .current
+                .keys()
+                .map(|key| estimated_entry_bytes(key))
+                .sum::<usize>()
+        );
+        assert_eq!(
+            versions.old_bytes,
+            versions
+                .old
+                .keys()
+                .map(|key| estimated_entry_bytes(key))
+                .sum::<usize>()
+        );
+        assert_eq!(
+            versions.estimated_bytes(),
+            versions.full_recount_estimated_bytes()
+        );
+    }
+
     #[test]
     fn lookup_chooses_maximum_sequence_across_all_windows() {
         let mut versions = LiveVersionMap::new(usize::MAX);
@@ -540,6 +583,69 @@ mod tests {
     }
 
     #[test]
+    fn completed_reload_detaches_old_and_keeps_current_accounting() {
+        let mut versions = LiveVersionMap::new(usize::MAX);
+        versions.apply_index("doc", 1, 2);
+        versions.apply_index("other-old", 2, 2);
+        versions.rotate_current_into_old().unwrap();
+        versions.apply_index("doc", 3, 2);
+        versions.apply_index("new-current", 4, 2);
+        let (pruned, retired) = versions.complete_reader_reload(Some(2), Duration::from_secs(60));
+        assert!(pruned.is_empty());
+        assert_eq!(retired.len(), 2);
+        assert_eq!(retired["doc"].seq_no, 1);
+        assert!(versions.old.is_empty());
+        assert_eq!(versions.old_bytes, 0);
+        assert_eq!(versions.lookup("doc").unwrap().unwrap().seq_no(), 3);
+        assert_eq!(versions.lookup("new-current").unwrap().unwrap().seq_no(), 4);
+        assert_byte_accounting(&versions);
+        let bytes = versions.estimated_bytes();
+        drop(retired);
+        assert_eq!(versions.estimated_bytes(), bytes);
+    }
+
+    #[test]
+    fn window_byte_accounting_covers_merge_rollback_delete_and_retirement() {
+        let clock = Arc::new(ManualClock::new());
+        let mut versions = LiveVersionMap::with_clock(usize::MAX, clock.clone());
+        for seq_no in 0..500 {
+            let doc_id = format!("variable-length-document-{}", seq_no % 17);
+            match seq_no % 7 {
+                0 | 1 => versions.apply_index(&doc_id, seq_no, 1),
+                2 => versions.apply_delete(&doc_id, seq_no, 1),
+                3 | 4 => versions.rotate_current_into_old().unwrap(),
+                5 => versions.rollback_refresh().unwrap(),
+                _ => {
+                    let (_, retired) =
+                        versions.complete_reader_reload(Some(seq_no), Duration::ZERO);
+                    drop(retired);
+                }
+            }
+            assert_byte_accounting(&versions);
+            clock.advance(Duration::from_millis(1));
+        }
+        versions.reset();
+        assert_byte_accounting(&versions);
+    }
+
+    #[test]
+    fn failed_merge_keeps_window_byte_accounting_exact() {
+        let mut versions = LiveVersionMap::new(usize::MAX);
+        versions.apply_index("collision", 1, 1);
+        versions.rotate_current_into_old().unwrap();
+        versions.apply_index("collision", 1, 2);
+        versions.apply_index("another-current", 2, 2);
+        let error = versions.rotate_current_into_old().unwrap_err();
+        assert!(error.is::<VersionMapCollisionError>());
+        assert_byte_accounting(&versions);
+
+        versions.apply_index("collision", 1, 2);
+        let error = versions.rollback_refresh().unwrap_err();
+        assert!(error.is::<VersionMapCollisionError>());
+        assert_byte_accounting(&versions);
+    }
+
+    #[test]
     fn tombstone_pruning_requires_age_and_visible_checkpoint() {
         let clock = Arc::new(ManualClock::new());
         let mut versions = LiveVersionMap::with_clock(usize::MAX, clock.clone());
@@ -547,12 +653,13 @@ mod tests {
         assert!(
             versions
                 .complete_reader_reload(Some(3), Duration::from_secs(60))
+                .0
                 .is_empty()
         );
         clock.advance(Duration::from_secs(61));
-        let pruned = versions.complete_reader_reload(Some(2), Duration::from_secs(60));
+        let (pruned, _) = versions.complete_reader_reload(Some(2), Duration::from_secs(60));
         assert!(pruned.is_empty());
-        let pruned = versions.complete_reader_reload(Some(3), Duration::from_secs(60));
+        let (pruned, _) = versions.complete_reader_reload(Some(3), Duration::from_secs(60));
         assert_eq!(pruned.len(), 1);
         assert!(versions.lookup("doc").unwrap().is_none());
     }
@@ -567,6 +674,7 @@ mod tests {
         assert!(
             versions
                 .complete_reader_reload(Some(4), Duration::from_secs(60))
+                .0
                 .is_empty()
         );
         assert_eq!(versions.lookup("doc").unwrap().unwrap().seq_no(), 4);

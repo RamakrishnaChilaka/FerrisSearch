@@ -160,8 +160,8 @@ pub async fn replicate_bulk(
   I/O eventually fails the allocation; persistent primary I/O can only request
   promote-only failover when an in-sync replacement exists.
 - Apply-level escalation leaves search and non-realtime reads open and does
-  not trigger runtime WAL replay. Realtime reads also remain open while the
-  live map is complete, but fail closed after partial replay failure.
+  not itself trigger runtime WAL replay. Realtime reads fail closed after a
+  post-WAL apply failure or a partial replay failure until a successful replay.
   A single-copy primary is marked unavailable without
   changing authority; the first later successful local write conditionally
   clears that status at the same term. Definitive and open-level failures may

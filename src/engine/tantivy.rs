@@ -2474,10 +2474,11 @@ impl HotEngine {
             pause.ready.send(()).unwrap();
             pause.release.recv().unwrap();
         }
-        let pruned = self.version_map_write()?.map.complete_reader_reload(
+        let (pruned, retired) = self.version_map_write()?.map.complete_reader_reload(
             committed_boundary.processed_checkpoint,
             self.delete_tombstone_retention,
         );
+        drop(retired);
         Ok(pruned)
     }
 
@@ -2687,14 +2688,16 @@ impl HotEngine {
                 format!("committed checkpoint persistence failed after {context}")
             });
         }
-        {
+        let retired = {
             let mut versions = self.version_map_write()?;
-            versions.map.complete_reader_reload(
+            let (_, retired) = versions.map.complete_reader_reload(
                 committed_boundary.processed_checkpoint,
                 self.delete_tombstone_retention,
             );
             versions.complete = true;
-        }
+            retired
+        };
+        drop(retired);
         tracing::info!(
             "Translog replay during {} recovered {} operations.",
             context,
@@ -11161,11 +11164,12 @@ mod tests {
         ready_rx.recv_timeout(TEST_SYNC_TIMEOUT).unwrap();
 
         // Force a miss at the publication/clear boundary, rather than a WAL hit.
-        engine
+        let (_, retired) = engine
             .version_map_write()
             .unwrap()
             .map
             .complete_reader_reload(Some(acknowledged.seq_no), engine.delete_tombstone_retention);
+        drop(retired);
         assert!(
             engine
                 .version_map_read()

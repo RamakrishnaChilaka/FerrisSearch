@@ -97,6 +97,7 @@ pub trait SearchEngine: Send + Sync {
   write lock only around map mutation, not WAL I/O, fsync, Tantivy apply, or
   reader lookup. Publish map entries per applied operation; an in-flight
   index hit still waits for the translog mutex before reading its WAL source.
+  A mid-batch delete's tombstone can return immediately before acknowledgement.
 
 ## CompositeEngine (src/engine/composite.rs)
 ```rust
@@ -222,6 +223,11 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
   including an empty suffix. Intermediate commits and failed replay leave the
   map incomplete. Refresh clears old entries only after publishing a covering
   reader; the byte limit forces refresh or rejects writes instead of evicting.
+  Steady rotation swaps current and old when old is empty. Reader reload
+  precedes taking old and subtracting its cached byte total; callers drop the
+  returned retired map only after releasing the version-map write lock.
+  Non-empty-window merge/rollback and tombstone pruning can still do linear
+  work under that lock.
   Failed map rotation, rollback, or post-WAL apply also invalidates completeness
   and the writer. Map state and completeness share the same version-map lock.
 - The durable term-start maximum comes from the copy fence and may be ahead of

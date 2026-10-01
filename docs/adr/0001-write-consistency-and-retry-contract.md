@@ -310,7 +310,11 @@ briefly for lookup or mutation, with apply state before the map whenever both
 are needed. They never hold the map lock through WAL I/O, fsync, Tantivy apply,
 or reader lookup. A realtime GET can observe a map entry for an operation
 already in the WAL but still in flight; its index hit waits for the translog
-mutex before resolving source. The separate lock removes the bulk apply-state
+mutex before resolving source. A mid-batch delete publishes its tombstone
+before the delete is acknowledged. The fast path can return that tombstone
+immediately, without waiting for the batch or acknowledgement. This is the same
+class of read as an in-flight index hit, not an acknowledgement-only snapshot.
+The separate lock removes the bulk apply-state
 wait from map misses and tombstones, not all possible map-lock contention.
 
 Replay clears completeness with the map reset and restores it only after the
@@ -338,6 +342,10 @@ operator setting and add `_mget`. Neither is part of this implementation.
   - A refresh removes an entry only when the entry is at or below the refresh's
     commit boundary, and only after the new reader is visible. As in
     OpenSearch, a current map and an old map cover the refresh window.
+    When old is empty, rotation swaps the maps without cloning keys. Reader
+    publication precedes taking the old map; destruction of its entries runs
+    after releasing the version-map write lock. Cached window byte totals keep
+    rotation and retirement accounting constant-time.
   - Delete tombstones stay until they are older than the retention window and
     at or below the processed checkpoint, because Tantivy has no soft
     deletes that record a delete's `seq_no`.
