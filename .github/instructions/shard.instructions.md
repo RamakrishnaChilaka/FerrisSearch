@@ -218,7 +218,11 @@ pub struct ReplicaCheckpoint {
    contiguous processed/persisted checkpoints
 3. Primary updates a monotonic maximum per index UUID, allocation ID, and
    primary term; reordered lower responses cannot regress it. An identity
-   change resets processed and persisted observations.
+   change resets processed and persisted observations, except that reports
+   from an older primary term for the same UUID are ignored. Ignoring such a
+   report also preserves gap identity, target, deadline, and progress. A
+   different UUID may reset at a lower term; allocation changes reset within
+   the same or a newer term.
 4. A leader that also hosts the primary may use `replica_checkpoints()` to
    prefer the highest observed candidate within the authoritative in-sync set;
    otherwise it chooses a live in-sync cluster member without checkpoint

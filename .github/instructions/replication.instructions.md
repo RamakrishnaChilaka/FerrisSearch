@@ -118,6 +118,15 @@ pub async fn replicate_bulk(
 - Primary write handlers hold the shard's shared write-barrier guard from
   before engine mutation through synchronous replication. Finalization holds
   the exclusive guard.
+- Every caller of `record_replica_checkpoints` must hold the shared recovery
+  write guard through the fresh-state snapshot and calculation. Snapshot
+  freshness depends on excluding in-sync admission during that interval.
+- Promotion-NoOp retries acquire the per-copy `noop_replication` mutex before
+  the shared recovery guard and retain both through fan-out and recording.
+  Retry callers must not already hold a recovery guard. Client handlers
+  activate before acquiring their guard; local activation releases its
+  exclusive guard before retrying. Reversing this order can deadlock behind
+  Tokio's queued exclusive recovery writer.
 - After acquiring the shared guard, handlers revalidate local primary and the
   activated index UUID and term, then mutate and replicate using that exact
   cluster-state snapshot. Never re-read a newer acknowledgement set after
@@ -136,7 +145,9 @@ pub async fn replicate_bulk(
   inside the lock. The highest-sequence round covers the no-replica case.
   Do not use the pre-replication primary snapshot or only the current round's
   replica values. Reset an observation when its UUID, allocation, or primary
-  term changes. Never move the global checkpoint backward.
+  term changes, except that older-term reports for the same UUID must not
+  replace newer checkpoint or gap state. A different UUID can restart at a
+  lower term. Never move the global checkpoint backward.
 - Dynamic-mapping reopen and async index close abort safe pre-finalize source
   sessions and await pin/snapshot/engine-Arc cleanup before replacing or
   deleting the primary engine. Encountering an admitting/settling source

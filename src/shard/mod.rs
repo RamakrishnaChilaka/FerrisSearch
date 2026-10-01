@@ -560,6 +560,15 @@ impl IsrTracker {
         let shard_replicas = replicas.entry(key.clone()).or_default();
         let shard_gaps = gaps.entry(key).or_default();
         for checkpoint in checkpoints {
+            if shard_replicas
+                .get(&checkpoint.node_id)
+                .is_some_and(|stored| {
+                    stored.index_uuid == context.index_uuid
+                        && stored.primary_term > context.primary_term
+                })
+            {
+                continue;
+            }
             let stored = shard_replicas
                 .entry(checkpoint.node_id.clone())
                 .or_insert_with(|| ReplicaCheckpoint {

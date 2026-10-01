@@ -5509,7 +5509,10 @@ impl TransportService {
         }
 
         let activation_locks = self.primary_activation_state.copy_locks(&activation_key);
+        // Callers must enter without a recovery guard: a queued exclusive writer
+        // can deadlock a shared-guard holder waiting for this retry mutex.
         let _replication_guard = activation_locks.noop_replication.lock().await;
+        let _write_guard = self.peer_recovery_write_guard(index_name, shard_id).await?;
         let operations = self
             .primary_activation_state
             .pending_noops
