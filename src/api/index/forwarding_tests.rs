@@ -127,6 +127,12 @@ impl ForwardingCluster {
         .await
         .unwrap();
         leader
+            .client_write(ClusterCommand::SetMaster {
+                node_id: "node-1".into(),
+            })
+            .await
+            .unwrap();
+        leader
             .add_learner(
                 2,
                 openraft::BasicNode {
@@ -134,6 +140,12 @@ impl ForwardingCluster {
                 },
                 true,
             )
+            .await
+            .unwrap();
+        leader
+            .client_write(ClusterCommand::SetMaster {
+                node_id: "node-1".into(),
+            })
             .await
             .unwrap();
         leader.change_membership([1, 2], false).await.unwrap();
