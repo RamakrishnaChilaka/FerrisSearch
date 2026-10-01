@@ -272,11 +272,20 @@ resends too.
 
 ### D8. Visibility
 
-**Status (2026-09-30):** Implemented for `local_shards`: search remains
+**Status (2026-10-01):** Implemented for `local_shards`: search remains
 near-real-time, GET by ID is realtime by default, and `realtime=false` uses
 the search-visible reader. Remaining: all-copy `refresh=true`,
 `refresh=wait_for`, and acknowledgement-preserving refresh-failure reporting.
 Current post-write refresh dispatch remains coordinator-local.
+
+HotEngine uses manual reader publication, not Tantivy's background commit
+watcher. A commit alone does not make documents searchable. FerrisSearch keeps
+its existing explicit publication during flush, force merge, and recovery
+replay; in particular, flush publishes a covering reader before pruning WAL
+history. This differs from OpenSearch's separation of flush and refresh.
+An ordinary peer-recovery snapshot commit does not refresh search visibility.
+When snapshot creation must repair stale vectors, the composite engine
+publishes that commit before scanning it for the rebuild.
 
 - **Search:** an acknowledgement does not imply search visibility. Search sees
   a write after the next refresh.
@@ -291,7 +300,7 @@ Current post-write refresh dispatch remains coordinator-local.
 
 ### D9. Realtime reads and update
 
-**Status (2026-09-30):** Implemented for `local_shards`. Primary, replica,
+**Status (2026-10-01):** Implemented for `local_shards`. Primary, replica,
 replay, and recovery index applies retain physical WAL cursors in the existing
 live version map. Realtime GET checks map completeness and the document entry
 under one short version-map read lock, separate from `ApplyState`. A
@@ -303,6 +312,14 @@ truncating under that mutex; a missing cursor can therefore fall back to a
 reader covering the live version. A behind or missing fallback fails
 explicitly, rather than returning stale data. Replay carries cursors from the
 streaming decoder without rescanning the WAL per document.
+
+Every explicit reader reload uses one shard-local mutex that covers segment
+opening and searcher publication. The helper does not acquire another engine
+lock, and callers do not hold the version-map lock while reloading. Reader
+publication is monotonic: a complete-map miss cannot obtain a reader older
+than the reload that authorized clearing old versions or pruning a tombstone.
+Search and GET do not take the reload mutex. Previously borrowed searchers
+keep their pinned snapshot.
 
 D1 planning, term state, checkpoints, and planning-snapshot restore still hold
 the apply-state mutex for the whole batch. Writers take the version-map lock

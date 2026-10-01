@@ -593,9 +593,9 @@ fn writes_regression_wal_positions_cross_buffer_boundaries() {
 
 #[test]
 fn writes_regression_reactivation_after_unpublished_commit_keeps_realtime_occ() {
-    // The unpublished commit races Tantivy's commit watcher, which can reload
-    // the reader first. Repeat the schedule so the stale-reader window is hit
-    // on every run of the unfixed code.
+    // Repeat the committed-but-unpublished activation schedule. The old
+    // Tantivy watcher sometimes hid the missing pre-reset reload; Manual
+    // readers keep this visibility boundary explicit.
     for attempt in 0..10 {
         reactivation_after_unpublished_commit_keeps_realtime_occ(attempt);
     }

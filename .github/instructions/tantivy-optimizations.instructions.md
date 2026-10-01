@@ -8,6 +8,26 @@ applyTo: "src/engine/tantivy.rs,src/api/search/**,src/hybrid/**,src/transport/**
 ## Goal
 Keep explicit-column `tantivy_fast_fields` SQL queries columnar and bounded-memory, while preserving correct planner metadata and residual DataFusion semantics.
 
+## Reader Publication
+
+Use `ReloadPolicy::Manual` for every `HotEngine` reader. Call
+`HotEngine::reload_reader()` for explicit publication; never call the reader's
+`reload()` directly or enable its commit watcher. The helper serializes segment
+opening and searcher publication with a shard-local leaf mutex. Callers may
+hold maintenance, translog, or writer locks before taking it, but the helper
+must not acquire another engine lock. Release the mutex before accessing the
+version map, and never reload while holding the version-map lock.
+
+Refresh publishes a covering reader before retiring old versions or pruning
+checkpoint-covered tombstones. Flush publishes before WAL truncation. A
+complete-map realtime GET miss acquires its searcher after releasing the map
+lock; monotonic publication keeps that searcher at or beyond the reload that
+authorized the miss. GET and search do not take the reload mutex.
+
+SQL batch and streaming handles retain their borrowed searcher for the request.
+A later reload does not replace that pinned snapshot. Column-cache entries use
+immutable segment identities, not the mutable current-reader generation.
+
 ## Current Status
 - Local GROUP BY-fallback and explicit-column fast-field queries can stream lazily from `HotEngine` via `BitSetCollector` + `SqlStreamingBatchHandle`.
 - Local SQL string fast-field reads share the same direct-ordinal helper (`StringFastFieldReader`) across grouped keys, selective/full Arrow array builders, `_id` reads, and bitset streaming.

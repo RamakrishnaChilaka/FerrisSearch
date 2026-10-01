@@ -721,6 +721,11 @@ impl CompositeEngine {
         Ok(())
     }
 
+    fn rebuild_vectors_from_snapshot_locked(&self) -> Result<()> {
+        self.text.reload_reader()?;
+        self.rebuild_vectors_locked()
+    }
+
     /// Rebuild the vector index from the authoritative Tantivy document view.
     /// The rebuild is persisted before durable stale state is cleared.
     pub fn rebuild_vectors(&self) -> Result<()> {
@@ -1335,7 +1340,7 @@ impl SearchEngine for CompositeEngine {
                 ));
             }
         };
-        if rebuild_vectors && let Err(error) = self.rebuild_vectors_locked() {
+        if rebuild_vectors && let Err(error) = self.rebuild_vectors_from_snapshot_locked() {
             let release_result = self
                 .text
                 .release_peer_recovery_pin(snapshot.retention_pin_id);
@@ -1368,7 +1373,7 @@ impl SearchEngine for CompositeEngine {
                 ));
             }
         };
-        if rebuild_vectors && let Err(error) = self.rebuild_vectors_locked() {
+        if rebuild_vectors && let Err(error) = self.rebuild_vectors_from_snapshot_locked() {
             drop(preparation);
             let _ = std::fs::remove_dir_all(snapshot_dir);
             return Err(error);

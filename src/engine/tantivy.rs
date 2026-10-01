@@ -412,6 +412,7 @@ impl MergePolicy for SharedMergePolicy {
 pub struct HotEngine {
     index: Index,
     reader: IndexReader,
+    reader_reload_lock: Mutex<()>,
     writer: Arc<RwLock<WriterState>>,
     maintenance_lock: Mutex<()>,
     automatic_merge_policy: RwLock<Arc<dyn MergePolicy>>,
@@ -1054,7 +1055,7 @@ impl HotEngine {
         let automatic_merge_policy = writer.get_merge_policy();
         let reader = index
             .reader_builder()
-            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .reload_policy(ReloadPolicy::Manual)
             .try_into()?;
 
         // Open or create the translog in the data directory (not index_path)
@@ -1083,6 +1084,7 @@ impl HotEngine {
         let engine = Self {
             index,
             reader,
+            reader_reload_lock: Mutex::new(()),
             writer: Arc::new(RwLock::new(WriterState::ready(writer))),
             maintenance_lock: Mutex::new(()),
             automatic_merge_policy: RwLock::new(automatic_merge_policy),
@@ -1177,7 +1179,13 @@ impl HotEngine {
             .map_err(|_| anyhow::anyhow!("maintenance lock poisoned during {context}"))
     }
 
-    fn reload_reader(&self) -> Result<()> {
+    pub(super) fn reload_reader(&self) -> Result<()> {
+        // This leaf lock covers segment opening and searcher publication.
+        // Do not acquire another engine lock while holding it.
+        let _reload = self
+            .reader_reload_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("reader reload lock poisoned"))?;
         self.reader.reload().map_err(Into::into)
     }
 
@@ -9569,6 +9577,7 @@ mod tests {
         acknowledged: super::super::IndexWriteReceipt,
         generations: Vec<u64>,
         observer_generations: Vec<Vec<u64>>,
+        reload_mutex_held: bool,
         second_reload_waited: bool,
     }
 
@@ -9618,6 +9627,10 @@ mod tests {
             .spawn(move || older_engine.reload_reader())
             .unwrap();
         entered_rx.recv_timeout(TEST_SYNC_TIMEOUT).unwrap();
+        let reload_mutex_held = matches!(
+            engine.reader_reload_lock.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
 
         let acknowledged = engine
             .add_document_with_receipt("doc", json!({"value": 2}))
@@ -9666,6 +9679,7 @@ mod tests {
             acknowledged,
             generations: vec![initial, before_release, final_generation],
             observer_generations,
+            reload_mutex_held,
             second_reload_waited,
         }
     }
@@ -9681,6 +9695,10 @@ mod tests {
                 "reader generations regressed: {generations:?}"
             );
         }
+        assert!(
+            schedule.reload_mutex_held,
+            "the reload mutex must cover the paused pre-publication searcher"
+        );
         assert!(
             schedule.second_reload_waited,
             "the second reload must wait while the first holds an older searcher"
@@ -9735,6 +9753,42 @@ mod tests {
                 .is_none(),
             "an older reader must not resurrect a checkpoint-covered delete"
         );
+    }
+
+    #[test]
+    fn reader_publication_poisoned_reload_lock_preserves_reader_and_wal() {
+        let (_directory, engine) = create_engine();
+        let acknowledged = engine
+            .add_document_with_receipt("doc", json!({"value": 1}))
+            .unwrap();
+        let generation = engine.reader.searcher().generation().generation_id();
+        let engine = Arc::new(engine);
+        let poison_engine = engine.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _reload = poison_engine.reader_reload_lock.lock().unwrap();
+                panic!("poison reader reload lock");
+            })
+            .join()
+            .is_err()
+        );
+
+        let error = engine.flush().unwrap_err();
+        assert!(
+            error.to_string().contains("reader reload lock poisoned"),
+            "{error:#}"
+        );
+        assert_eq!(
+            engine.reader.searcher().generation().generation_id(),
+            generation
+        );
+        assert_eq!(engine.translog.lock().unwrap().read_all().unwrap().len(), 1);
+        let document = engine
+            .get_document_with_metadata("doc", true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(document.source, json!({"value": 1}));
+        assert_eq!(document.seq_no, acknowledged.seq_no);
     }
 
     fn realtime_get_while_apply_state_is_held(
@@ -10223,7 +10277,7 @@ mod tests {
         let automatic_merge_policy = writer.get_merge_policy();
         let reader = index
             .reader_builder()
-            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .reload_policy(ReloadPolicy::Manual)
             .try_into()
             .unwrap();
         let translog =
@@ -10237,6 +10291,7 @@ mod tests {
         let engine = HotEngine {
             index,
             reader,
+            reader_reload_lock: Mutex::new(()),
             writer: Arc::new(RwLock::new(WriterState::ready(writer))),
             maintenance_lock: Mutex::new(()),
             automatic_merge_policy: RwLock::new(automatic_merge_policy),
@@ -14578,7 +14633,11 @@ mod tests {
 
         let snapshot_index =
             Index::open(tantivy::directory::MmapDirectory::open(&snapshot_dir).unwrap()).unwrap();
-        let snapshot_reader = snapshot_index.reader().unwrap();
+        let snapshot_reader = snapshot_index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
+            .unwrap();
         assert_eq!(snapshot_reader.searcher().num_docs(), 2);
 
         let suffix = engine.retained_recovery_ops(2, 16, 1024 * 1024).unwrap();
