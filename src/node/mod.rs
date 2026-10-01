@@ -450,6 +450,7 @@ impl Node {
             let _ = &transport_tls;
             TransportClient::new()
         };
+        let transport_client = transport_client.with_cluster_manager(cluster_manager.clone());
 
         let durability = match config.translog_durability.as_str() {
             "async" => TranslogDurability::Async {

@@ -81,7 +81,10 @@ pub async fn count_documents(
 
 /// Fast path for match_all count: sum doc_count() from all shards without running a query.
 async fn count_match_all_fast(state: &AppState, index_name: &str) -> (StatusCode, Json<Value>) {
-    let cluster_state = state.cluster_manager.get_state();
+    let cluster_state = match crate::api::index::index_cluster_state(state, index_name).await {
+        Ok(current) => current,
+        Err(error) => return error,
+    };
     let metadata = match cluster_state.indices.get(index_name) {
         Some(m) => m.clone(),
         None => {
@@ -113,7 +116,10 @@ async fn count_match_all_fast(state: &AppState, index_name: &str) -> (StatusCode
         };
     }
 
-    let result = count_docs_from_metadata(state, index_name, &metadata).await;
+    let result = match count_docs_from_metadata(state, index_name, &metadata).await {
+        Ok(result) => result,
+        Err(error) => return error,
+    };
     if let Some(error) = all_shards_failed_response(result.successful, &result.failures) {
         return error;
     }
@@ -185,7 +191,7 @@ async fn count_docs_from_metadata(
     state: &AppState,
     index_name: &str,
     metadata: &crate::cluster::state::IndexMetadata,
-) -> MetadataDocCount {
+) -> Result<MetadataDocCount, (StatusCode, Json<Value>)> {
     let cluster_state = state.cluster_manager.get_state();
     let local_shards = crate::api::index::ensure_local_index_shards_open(
         state,
@@ -258,6 +264,10 @@ async fn count_docs_from_metadata(
                 }
             }
             Err(error) => {
+                if let Some(response) = crate::api::index::retryable_forward_error_response(&error)
+                {
+                    return Err(response);
+                }
                 tracing::error!("Shard count on node {} failed: {:#}", node_id, error);
                 for shard_id in shard_ids {
                     failures.push(ShardFailure::from_error(
@@ -268,11 +278,11 @@ async fn count_docs_from_metadata(
         }
     }
 
-    MetadataDocCount {
+    Ok(MetadataDocCount {
         count,
         successful,
         failures,
-    }
+    })
 }
 
 fn remote_count_targets(
@@ -987,7 +997,7 @@ async fn execute_sql_query_with_plan(
     total_start: Instant,
     record_metrics: bool,
 ) -> Result<SqlExecutionResult, (StatusCode, Json<Value>)> {
-    let cluster_state = state.cluster_manager.get_state();
+    let cluster_state = crate::api::index::index_cluster_state(state, &plan.index_name).await?;
     let metadata = match cluster_state.indices.get(&plan.index_name) {
         Some(m) => m.clone(),
         None => {
@@ -1024,7 +1034,7 @@ async fn execute_sql_query_with_plan(
     // count(*) fast path: answer from doc_count() metadata without scanning docs
     if plan.is_count_star_only() {
         let search_start = Instant::now();
-        let counts = count_docs_from_metadata(state, &plan.index_name, &metadata).await;
+        let counts = count_docs_from_metadata(state, &plan.index_name, &metadata).await?;
         if let Some(error) = all_shards_failed_response(counts.successful, &counts.failures) {
             return Err(error);
         }
@@ -1198,6 +1208,10 @@ async fn execute_sql_query_with_plan(
         {
             Ok(result) => Some(result),
             Err(error) => {
+                if let Some(response) = crate::api::index::retryable_forward_error_response(&error)
+                {
+                    return Err(response);
+                }
                 tracing::warn!(
                     "Falling back to materialized SQL execution for [{}]: {}",
                     plan.index_name,
@@ -1587,7 +1601,7 @@ async fn execute_sql_stream_query(
         return Ok(stream_json_response(sql_stream_response_body(&result)));
     }
 
-    let cluster_state = state.cluster_manager.get_state();
+    let cluster_state = crate::api::index::index_cluster_state(state, index_name).await?;
     let metadata = match cluster_state.indices.get(index_name) {
         Some(metadata) => metadata.clone(),
         None => {
@@ -1642,6 +1656,9 @@ async fn execute_sql_stream_query(
     {
         Ok(result) => result,
         Err(error) => {
+            if let Some(response) = crate::api::index::retryable_forward_error_response(&error) {
+                return Err(response);
+            }
             tracing::warn!(
                 "Falling back to buffered SQL execution for streamed endpoint [{}]: {}",
                 index_name,
@@ -2004,7 +2021,10 @@ async fn handle_show_tables(
         let field_count = metadata.mappings.len();
 
         // Count docs across all shards
-        let doc_count = count_docs_from_metadata(state, name, metadata).await.count;
+        let doc_count = match count_docs_from_metadata(state, name, metadata).await {
+            Ok(result) => result.count,
+            Err(error) => return error,
+        };
 
         rows.push(serde_json::json!({
             "index": name,

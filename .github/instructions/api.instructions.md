@@ -185,6 +185,39 @@ values return `400 illegal_argument_exception` without enqueueing work.
   allocation ID rather than calling a synchronous shard-open helper inline.
 - Read and maintenance paths must fail closed when the authoritative shard UUID path is missing. Do not create a fresh shard directory on `/_search`, `/_count`, SQL, or maintenance fan-out just because a local reopen is needed.
 
+### Wait for applied metadata before routing
+
+- Bind the API transport client to the node's shared `ClusterManager`.
+  Forwarded operations carry its applied `ClusterState.version`.
+- If a follower coordinator does not know an index, obtain the leader's
+  applied version through `Ping` and wait up to 5 seconds before returning
+  404 or auto-creating. Re-read routing and node metadata after auto-create.
+  Do not install a snapshot or mutate follower state to catch up.
+- Targets wait for the forwarded version before index, mapping, allocation,
+  or shard validation. Metadata-wait expiration returns
+  `503 shard_not_available_exception`, including bulk item failures and
+  update's realtime GET. Preserve the version and underlying cause.
+- Propagate metadata-wait failures from search, count, and both SQL paths.
+  Do not turn them into partial success, zero counts, or a SQL fallback.
+  Unrelated shard-search partial-failure behavior is unchanged.
+- Create-index and auto-create wait for assigned primary copies to open.
+  Remote primaries use `OpenIndex`; local opens use the existing blocking
+  wrappers and UUID/allocation guards. This makes the default
+  `wait_for_active_shards=1` useful without relaxing read-side directory guards.
+  Replicas do not participate in this barrier. Primary activation remains
+  on the existing first-write and lifecycle paths.
+- Forwarded create, settings, and mapping acknowledgements carry an applied
+  version. Create and settings wait locally before reporting success.
+  Clients retain the maximum acknowledged version across clones; subsequent
+  coordinator lookups and forwarded operations wait for that floor.
+  Dynamic ingestion keeps its existing committed-mapping override and reopen
+  path instead of adding a new wait between mapping commit and reopen.
+  This is not an all-node application acknowledgement or a cross-engine
+  snapshot guarantee.
+- Only the stable metadata-wait `UNAVAILABLE` marker is retryable for document
+  operations. Generic gRPC `UNAVAILABLE` and `DEADLINE_EXCEEDED` can describe
+  an unknown post-WAL outcome; do not classify them as safe-to-retry 503s.
+
 ### Document Operations — src/api/index/mod.rs (routed to shard primary)
 | HTTP | Path | Handler |
 |------|------|---------|
@@ -386,8 +419,9 @@ paired conditions and update retries. `_create` accepts only absent or
 `create` for `op_type`; DELETE rejects any `op_type`.
 
 Accept `wait_for_active_shards` only when absent or exactly `1`; bulk metadata
-may also use numeric `1`. Reject `all` even with zero replicas. This accepts
-the default, not a new active-copy wait or pre-flight implementation.
+may also use numeric `1`. Reject `all` even with zero replicas. Create-index waits for primary copies to open. Document and bulk writes do
+not add a replica-count pre-flight check; their existing activation and
+synchronous in-sync replication contracts remain unchanged.
 Use `illegal_argument()` / `error_response()` and name the rejected key.
 New safety-relevant write parameters must be implemented with result-level
 tests or added to this shared rejection helper. Do not use

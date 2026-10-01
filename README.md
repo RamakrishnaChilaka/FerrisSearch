@@ -78,6 +78,13 @@ Any HTTP node can accept a request. FerrisSearch forwards leader-only metadata
 mutations and shard-owned operations internally, so clients do not have to
 discover the Raft leader or shard primary.
 
+Forwarded operations wait up to five seconds for the target to apply the
+coordinator's index metadata. If that wait expires, the operation returns a
+retryable `503 shard_not_available_exception` with the cause; bulk reports
+the 503 per item. Index creation waits for primary copies to open before
+returning `shards_acknowledged: true`. It does not wait for replicas or for
+every node to apply the state.
+
 ### Two useful execution paths—and one intended future
 
 | Engine | What exists now | Write path | Query path |

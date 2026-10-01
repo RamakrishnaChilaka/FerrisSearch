@@ -18,7 +18,8 @@ use crate::api::{raft_write, resolve_leader_or_master};
 
 fn is_document_validation_error(error: &anyhow::Error) -> bool {
     error
-        .downcast_ref::<tonic::Status>()
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<tonic::Status>())
         .is_some_and(|status| status.code() == tonic::Code::InvalidArgument)
 }
 
@@ -26,7 +27,9 @@ fn forwarded_write_error_classification(error: &anyhow::Error) -> (StatusCode, &
     if is_document_validation_error(error) {
         return (StatusCode::BAD_REQUEST, "mapper_parsing_exception");
     }
-    let status = error.downcast_ref::<tonic::Status>();
+    let status = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<tonic::Status>());
     match status.map(tonic::Status::code) {
         Some(tonic::Code::AlreadyExists) => {
             (StatusCode::CONFLICT, "version_conflict_engine_exception")
@@ -48,8 +51,24 @@ fn forwarded_write_error_classification(error: &anyhow::Error) -> (StatusCode, &
             StatusCode::SERVICE_UNAVAILABLE,
             "shard_not_available_exception",
         ),
+        Some(tonic::Code::Unavailable)
+            if status.is_some_and(crate::transport::state_wait::is_state_wait_timeout) =>
+        {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "shard_not_available_exception",
+            )
+        }
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "forward_exception"),
     }
+}
+
+pub(crate) fn retryable_forward_error_response(
+    error: &anyhow::Error,
+) -> Option<(StatusCode, Json<Value>)> {
+    let (status, error_type) = forwarded_write_error_classification(error);
+    (status == StatusCode::SERVICE_UNAVAILABLE)
+        .then(|| crate::api::error_response(status, error_type, format!("{error:#}")))
 }
 
 fn document_write_error_response(
@@ -58,7 +77,9 @@ fn document_write_error_response(
 ) -> (StatusCode, Json<Value>) {
     let (status, error_type) = forwarded_write_error_classification(&error);
     if matches!(status, StatusCode::CONFLICT | StatusCode::NOT_FOUND)
-        && let Some(error) = error.downcast_ref::<tonic::Status>()
+        && let Some(error) = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<tonic::Status>())
     {
         return crate::api::error_response(status, error_type, error.message());
     }
@@ -255,22 +276,68 @@ pub(crate) async fn ensure_local_index_shards_open(
         .collect()
 }
 
-async fn wait_for_index_metadata(state: &AppState, index_name: &str) -> Option<IndexMetadata> {
-    const MAX_ATTEMPTS: usize = 20;
-    const RETRY_DELAY_MS: u64 = 50;
+pub(crate) async fn index_cluster_state(
+    state: &AppState,
+    index_name: &str,
+) -> Result<crate::cluster::state::ClusterState, (StatusCode, Json<Value>)> {
+    state
+        .cluster_manager
+        .wait_for_version(state.transport_client.required_state_version())
+        .await
+        .map_err(|error| {
+            crate::api::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "shard_not_available_exception",
+                error,
+            )
+        })?;
+    let current = state.cluster_manager.get_state();
+    if current.indices.contains_key(index_name) || state.raft.is_leader() {
+        return Ok(current);
+    }
+    let Some(master) = resolve_leader_or_master(state, "index metadata lookup")? else {
+        return Ok(current);
+    };
+    let catch_up = async {
+        let version = state
+            .transport_client
+            .get_cluster_state_version(&master, &state.local_node_id)
+            .await?;
+        state.cluster_manager.wait_for_version(version).await?;
+        Ok::<_, anyhow::Error>(state.cluster_manager.get_state())
+    };
+    match tokio::time::timeout(state.cluster_manager.forwarding_wait_timeout(), catch_up).await {
+        Ok(Ok(current)) => Ok(current),
+        Ok(Err(error)) => Err(crate::api::error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "shard_not_available_exception",
+            format!("index [{index_name}] cluster state catch-up failed: {error:#}"),
+        )),
+        Err(error) => Err(crate::api::error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "shard_not_available_exception",
+            format!(
+                "timed out waiting for index [{index_name}] cluster state; local version {}: {error}",
+                state.cluster_manager.version()
+            ),
+        )),
+    }
+}
 
-    for attempt in 0..MAX_ATTEMPTS {
+async fn wait_for_index_metadata(state: &AppState, index_name: &str) -> Option<IndexMetadata> {
+    let deadline = tokio::time::Instant::now() + state.cluster_manager.forwarding_wait_timeout();
+    loop {
         let cluster_state = state.cluster_manager.get_state();
         if let Some(metadata) = cluster_state.indices.get(index_name) {
             return Some(metadata.clone());
         }
 
-        if attempt + 1 < MAX_ATTEMPTS {
-            tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return None;
         }
+        tokio::time::sleep_until(deadline.min(now + std::time::Duration::from_millis(25))).await;
     }
-
-    None
 }
 
 /// Auto-create an index with 1 shard, respecting the coordinator pattern.
@@ -284,35 +351,29 @@ async fn auto_create_index(
         "Index '{}' not found, auto-creating with 1 shard",
         index_name
     );
-    let mut shard_routing = HashMap::new();
-    shard_routing.insert(
-        0u32,
-        crate::cluster::state::ShardRoutingEntry {
-            primary: state.local_node_id.clone(),
-            primary_term: 1,
-            replicas: vec![],
-            in_sync_replicas: vec![],
-            unassigned_replicas: 0,
-        },
-    );
-    let m = IndexMetadata {
-        name: index_name.to_string(),
-        uuid: crate::cluster::state::IndexUuid::new_random(),
-        number_of_shards: 1,
-        number_of_replicas: 0,
-        shard_routing,
-        mappings: HashMap::new(),
-        dynamic: crate::cluster::state::DynamicMapping::True,
-        settings: crate::cluster::state::IndexSettings::default(),
-    };
+    let current = state.cluster_manager.get_state();
+    let data_nodes = current
+        .nodes
+        .values()
+        .filter(|node| node.roles.contains(&crate::cluster::state::NodeRole::Data))
+        .map(|node| node.id.clone())
+        .collect::<Vec<_>>();
+    let body = serde_json::json!({
+        "settings": { "number_of_shards": 1, "number_of_replicas": 0 }
+    });
+    let m = IndexMetadata::from_create_request_body(index_name, &body, &data_nodes)
+        .map_err(create_index_error_response)?;
     let created_metadata = if let Some(master) =
         resolve_leader_or_master(state, "auto-create index")?
     {
         // Forward auto-create to the leader via gRPC
-        let body = serde_json::json!({
-            "settings": { "number_of_shards": 1, "number_of_replicas": 0 }
-        });
-        let body_bytes = serde_json::to_vec(&body).unwrap_or_default();
+        let body_bytes = serde_json::to_vec(&body).map_err(|error| {
+            crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "serialization_exception",
+                error,
+            )
+        })?;
         match state
             .transport_client
             .forward_create_index(&master, index_name, &body_bytes)
@@ -346,9 +407,10 @@ async fn auto_create_index(
             metadata: m.clone(),
         };
         raft_write(state, cmd).await?;
-        wait_for_index_metadata(state, index_name)
-            .await
-            .unwrap_or_else(|| m.clone())
+        wait_for_index_metadata(state, index_name).await.ok_or_else(|| crate::api::error_response(
+            StatusCode::SERVICE_UNAVAILABLE, "shard_not_available_exception",
+            format!("index [{index_name}] is not present in local cluster state at version {} after creation", state.cluster_manager.version()),
+        ))?
     };
 
     let committed_state = state.cluster_manager.get_state();
@@ -376,13 +438,26 @@ async fn auto_create_index(
             )
             .await
     {
-        tracing::error!(
-            "Failed to open auto-created shard {}/0 with authoritative UUID {}: {}",
-            created_metadata.name,
-            created_metadata.uuid,
-            e
-        );
+        return Err(crate::api::error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "shard_not_available_exception",
+            format!("Failed to open auto-created shard [{index_name}][0]: {e:#}"),
+        ));
     }
+
+    state
+        .transport_client
+        .clone()
+        .with_cluster_manager(state.cluster_manager.clone())
+        .open_remote_index_primaries(&committed_state, index_name, &state.local_node_id)
+        .await
+        .map_err(|error| {
+            crate::api::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "shard_not_available_exception",
+                format!("Auto-created index [{index_name}] primary opening failed: {error:#}"),
+            )
+        })?;
 
     Ok(created_metadata)
 }
@@ -594,6 +669,11 @@ fn forwarded_create_index_error_response(
             "illegal_argument_exception",
             status.message(),
         )),
+        tonic::Code::Unavailable => Some(crate::api::error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "shard_not_available_exception",
+            format!("{error:#}"),
+        )),
         tonic::Code::Internal
             if status.message() == CreateIndexMetadataError::NoDataNodes.to_string() =>
         {
@@ -715,13 +795,28 @@ pub async fn create_index(
                 )
                 .await
         {
-            tracing::error!(
-                "Failed to open shard {} for {}: {}",
-                shard_id,
-                index_name,
-                e
+            return crate::api::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "shard_not_available_exception",
+                format!(
+                    "Failed to open primary shard [{index_name}][{shard_id}] after creation: {e:#}"
+                ),
             );
         }
+    }
+
+    if let Err(error) = state
+        .transport_client
+        .clone()
+        .with_cluster_manager(state.cluster_manager.clone())
+        .open_remote_index_primaries(&committed_state, &index_name, &state.local_node_id)
+        .await
+    {
+        return crate::api::error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "shard_not_available_exception",
+            format!("Index [{index_name}] was created but primary shard opening failed: {error:#}"),
+        );
     }
 
     tracing::info!(
@@ -762,7 +857,10 @@ pub async fn index_document(
     }
     let doc_id = uuid::Uuid::new_v4().to_string();
 
-    let cluster_state = state.cluster_manager.get_state();
+    let mut cluster_state = match index_cluster_state(&state, &index_name).await {
+        Ok(current) => current,
+        Err(error) => return error,
+    };
 
     // Auto-create index with 1 shard if it doesn't exist (like OpenSearch)
     let metadata = if let Some(m) = cluster_state.indices.get(index_name.as_str()) {
@@ -777,6 +875,7 @@ pub async fn index_document(
     if let Some(resp) = crate::api::reject_write_if_engine_read_only(&metadata) {
         return resp;
     }
+    cluster_state = state.cluster_manager.get_state();
 
     // Route document to the correct shard
     let shard_id = crate::engine::routing::calculate_shard(&doc_id, metadata.number_of_shards);
@@ -859,7 +958,10 @@ pub async fn index_document_with_id(
         return response;
     }
 
-    let cluster_state = state.cluster_manager.get_state();
+    let mut cluster_state = match index_cluster_state(&state, &index_name).await {
+        Ok(current) => current,
+        Err(error) => return error,
+    };
 
     // Auto-create index with 1 shard if it doesn't exist (like OpenSearch)
     let metadata = if let Some(m) = cluster_state.indices.get(index_name.as_str()) {
@@ -874,6 +976,7 @@ pub async fn index_document_with_id(
     if let Some(resp) = crate::api::reject_write_if_engine_read_only(&metadata) {
         return resp;
     }
+    cluster_state = state.cluster_manager.get_state();
 
     // Route document to the correct shard
     let shard_id = crate::engine::routing::calculate_shard(&doc_id, metadata.number_of_shards);
@@ -972,7 +1075,7 @@ pub(crate) async fn execute_distributed_dsl_search(
         ));
     }
 
-    let cluster_state = state.cluster_manager.get_state();
+    let cluster_state = index_cluster_state(state, index_name).await?;
     let metadata = match cluster_state.indices.get(index_name) {
         Some(m) => m.clone(),
         None => {
@@ -1182,6 +1285,9 @@ pub(crate) async fn execute_distributed_dsl_search(
                 }
             }
             Err(e) => {
+                if let Some(response) = retryable_forward_error_response(&e) {
+                    return Err(response);
+                }
                 tracing::error!(
                     "Remote shard {}/{} search failed: {:#}",
                     index_name,
@@ -1354,7 +1460,10 @@ pub async fn get_document(
 ) -> (StatusCode, Json<Value>) {
     // IndexName is validated at extraction time
 
-    let cluster_state = state.cluster_manager.get_state();
+    let cluster_state = match index_cluster_state(&state, &index_name).await {
+        Ok(current) => current,
+        Err(error) => return error,
+    };
     let metadata = match cluster_state.indices.get(index_name.as_str()) {
         Some(m) => m.clone(),
         None => {
@@ -1419,9 +1528,13 @@ pub async fn get_document(
             ),
         },
         Err(error)
-            if error.downcast_ref::<tonic::Status>().is_some_and(|status| {
-                matches!(status.code(), tonic::Code::NotFound | tonic::Code::Aborted)
-            }) =>
+            if error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<tonic::Status>())
+                .is_some_and(|status| {
+                    matches!(status.code(), tonic::Code::NotFound | tonic::Code::Aborted)
+                        || crate::transport::state_wait::is_state_wait_timeout(status)
+                }) =>
         {
             document_write_error_response("Get", error)
         }
@@ -1506,12 +1619,12 @@ fn merge_update_source(target: &mut Value, partial: Value) -> bool {
     }
 }
 
-fn resolve_document_primary(
+async fn resolve_document_primary(
     state: &AppState,
     index_name: &str,
     doc_id: &str,
 ) -> Result<(IndexMetadata, u32, crate::cluster::state::NodeInfo), (StatusCode, Json<Value>)> {
-    let cluster_state = state.cluster_manager.get_state();
+    let cluster_state = index_cluster_state(state, index_name).await?;
     let metadata = match cluster_state.indices.get(index_name) {
         Some(m) => m.clone(),
         None => {
@@ -1575,10 +1688,11 @@ async fn execute_update(
     let mut retries = params.retry_on_conflict;
     let mut index_uuid: Option<String> = None;
     loop {
-        let (_, shard_id, target_node) = match resolve_document_primary(state, index_name, doc_id) {
-            Ok(target) => target,
-            Err(response) => return response,
-        };
+        let (_, shard_id, target_node) =
+            match resolve_document_primary(state, index_name, doc_id).await {
+                Ok(target) => target,
+                Err(response) => return response,
+            };
         let read = match state
             .transport_client
             .forward_get_with_index_uuid_to_shard(&target_node, index_name, shard_id, doc_id, true)
@@ -1586,9 +1700,13 @@ async fn execute_update(
         {
             Ok(document) => document,
             Err(error)
-                if error.downcast_ref::<tonic::Status>().is_some_and(|status| {
-                    matches!(status.code(), tonic::Code::NotFound | tonic::Code::Aborted)
-                }) =>
+                if error
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<tonic::Status>())
+                    .is_some_and(|status| {
+                        matches!(status.code(), tonic::Code::NotFound | tonic::Code::Aborted)
+                            || crate::transport::state_wait::is_state_wait_timeout(status)
+                    }) =>
             {
                 return document_write_error_response("Get", error);
             }
@@ -1757,7 +1875,10 @@ pub async fn delete_document(
     };
     // IndexName is validated at extraction time
 
-    let cluster_state = state.cluster_manager.get_state();
+    let cluster_state = match index_cluster_state(&state, &index_name).await {
+        Ok(current) => current,
+        Err(error) => return error,
+    };
     let metadata = match cluster_state.indices.get(index_name.as_str()) {
         Some(m) => m.clone(),
         None => {
@@ -2113,10 +2234,13 @@ pub async fn update_index_settings(
         {
             Ok(()) => {}
             Err(e) => {
+                if let Some(response) = retryable_forward_error_response(&e) {
+                    return response;
+                }
                 return crate::api::error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "forward_exception",
-                    format!("Failed to forward settings update to master: {e}"),
+                    format!("Failed to forward settings update to master: {e:#}"),
                 );
             }
         }

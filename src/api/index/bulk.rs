@@ -487,6 +487,15 @@ async fn bulk_metadata(
             error_type: error.error_type.into(),
             reason: error.reason.to_string(),
         })?;
+    let current;
+    let cluster_state = if cluster_state.indices.contains_key(index) {
+        cluster_state
+    } else {
+        current = super::index_cluster_state(state, index)
+            .await
+            .map_err(BulkTargetFailure::from_api_response)?;
+        &current
+    };
     let metadata = match cluster_state.indices.get(index) {
         Some(metadata) => metadata.clone(),
         None => auto_create_index(state, index, cluster_state)
@@ -523,7 +532,7 @@ async fn execute_bulk(
             Json(serde_json::json!({"took": 0, "errors": false, "items": []})),
         );
     }
-    let cluster_state = state.cluster_manager.get_state();
+    let mut cluster_state = state.cluster_manager.get_state();
     if let Some(index) = default_index
         && let Some(metadata) = cluster_state.indices.get(index)
         && documents
@@ -570,6 +579,7 @@ async fn execute_bulk(
                 index.clone(),
                 bulk_metadata(state, &cluster_state, principal, &index).await,
             );
+            cluster_state = state.cluster_manager.get_state();
         }
         let index_metadata = match &metadata[&index] {
             Ok(metadata) => metadata,

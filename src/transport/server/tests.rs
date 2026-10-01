@@ -10,6 +10,10 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::time::Duration;
 
+fn forwarding_request<T>(message: T) -> Request<T> {
+    crate::transport::request_with_cluster_state_version(message, 0)
+}
+
 fn test_storage_manager(data_dir: &std::path::Path) -> Arc<crate::storage::StorageManager> {
     Arc::new(crate::storage::StorageManager::new_in_path(data_dir).unwrap())
 }
@@ -1768,7 +1772,7 @@ async fn version_map_capacity_rejection_is_resource_exhausted_before_wal_append(
     };
 
     let error = service
-        .index_doc(Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: "idx".into(),
             shard_id: 0,
             doc_id: "doc".into(),
@@ -1922,7 +1926,7 @@ async fn get_doc_reopens_persisted_shard_via_metadata() {
     };
 
     let response = service
-        .get_doc(Request::new(ShardGetRequest {
+        .get_doc(forwarding_request(ShardGetRequest {
             index_name: "restart-idx".into(),
             shard_id: 0,
             doc_id: "d1".into(),
@@ -1960,7 +1964,7 @@ async fn get_shard_stats_only_reports_open_shards() {
     };
 
     let response = service
-        .get_shard_stats(Request::new(ShardStatsRequest {}))
+        .get_shard_stats(forwarding_request(ShardStatsRequest {}))
         .await
         .unwrap()
         .into_inner();
@@ -1999,7 +2003,7 @@ async fn get_segment_stats_only_reports_open_shard_segments() {
     };
 
     let response = service
-        .get_segment_stats(Request::new(SegmentStatsRequest {}))
+        .get_segment_stats(forwarding_request(SegmentStatsRequest {}))
         .await
         .unwrap()
         .into_inner();
@@ -2350,7 +2354,7 @@ async fn flush_index_reopens_assigned_shard_before_running_maintenance() {
     };
 
     let response = service
-        .flush_index(Request::new(IndexMaintenanceRequest {
+        .flush_index(forwarding_request(IndexMaintenanceRequest {
             index_name: "maint-idx".into(),
         }))
         .await
@@ -2447,7 +2451,7 @@ async fn blocked_refresh_does_not_exhaust_write_pool_for_replica_apply() {
     let refresh_service = service.clone();
     let refresh_task = tokio::spawn(async move {
         refresh_service
-            .refresh_index(Request::new(IndexMaintenanceRequest {
+            .refresh_index(forwarding_request(IndexMaintenanceRequest {
                 index_name: "maintenance-idx".into(),
             }))
             .await
@@ -2550,7 +2554,7 @@ async fn force_merge_rpc_returns_immediately_after_enqueue() {
     };
 
     let error = service
-        .force_merge_index(Request::new(ForceMergeRequest {
+        .force_merge_index(forwarding_request(ForceMergeRequest {
             index_name: "force-merge-idx".into(),
             max_num_segments: 0,
         }))
@@ -2559,7 +2563,7 @@ async fn force_merge_rpc_returns_immediately_after_enqueue() {
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
 
     let response = service
-        .force_merge_index(Request::new(ForceMergeRequest {
+        .force_merge_index(forwarding_request(ForceMergeRequest {
             index_name: "force-merge-idx".into(),
             max_num_segments: 1,
         }))
@@ -2655,7 +2659,7 @@ async fn force_merge_task_counts_missing_assigned_shard_as_failure() {
     };
 
     let response = service
-        .force_merge_index(Request::new(ForceMergeRequest {
+        .force_merge_index(forwarding_request(ForceMergeRequest {
             index_name: "force-merge-idx".into(),
             max_num_segments: 1,
         }))
@@ -2731,7 +2735,7 @@ async fn flush_index_refuses_to_create_missing_uuid_dir() {
     };
 
     let response = service
-        .flush_index(Request::new(IndexMaintenanceRequest {
+        .flush_index(forwarding_request(IndexMaintenanceRequest {
             index_name: "maint-idx".into(),
         }))
         .await
@@ -4283,7 +4287,7 @@ async fn promotion_noop_retry_on_one_shard_does_not_block_other_shards() {
     let started = std::time::Instant::now();
     let response = tokio::time::timeout(
         Duration::from_secs(2),
-        source_service.index_doc(Request::new(ShardDocRequest {
+        source_service.index_doc(forwarding_request(ShardDocRequest {
             index_name: "idx".into(),
             shard_id: 0,
             payload_json: serde_json::to_vec(&json!({"value": 1})).unwrap(),
@@ -4403,7 +4407,7 @@ async fn promoted_primary_replays_multiple_batches_and_reopens_cleanly() {
             .await
             .unwrap();
         let response = service
-            .index_doc(Request::new(ShardDocRequest {
+            .index_doc(forwarding_request(ShardDocRequest {
                 index_name: "idx".into(),
                 shard_id: 0,
                 doc_id: "after-promotion".into(),
@@ -4561,7 +4565,7 @@ async fn write_only_primary_fault_stays_unavailable_without_term_flapping_and_cl
     primary_engine.inject_wal_write_failures_for_test(28, usize::MAX);
     for _ in 0..3 {
         let response = service
-            .index_doc(Request::new(ShardDocRequest {
+            .index_doc(forwarding_request(ShardDocRequest {
                 index_name: "idx".into(),
                 shard_id: 0,
                 doc_id: "doc".into(),
@@ -4603,7 +4607,7 @@ async fn write_only_primary_fault_stays_unavailable_without_term_flapping_and_cl
             .unwrap();
         for attempt in 0..3 {
             let response = service
-                .index_doc(Request::new(ShardDocRequest {
+                .index_doc(forwarding_request(ShardDocRequest {
                     index_name: "idx".into(),
                     shard_id: 0,
                     doc_id: format!("still-failing-{interval}-{attempt}"),
@@ -4637,7 +4641,7 @@ async fn write_only_primary_fault_stays_unavailable_without_term_flapping_and_cl
     let version_before_repair = shared_state.read().unwrap().version;
     primary_engine.inject_wal_write_failures_for_test(28, 0);
     let repaired = service
-        .index_doc(Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: "idx".into(),
             shard_id: 0,
             doc_id: "repaired".into(),
@@ -4746,7 +4750,7 @@ async fn successful_write_does_not_wait_for_primary_available_report() {
         .await;
     let response = tokio::time::timeout(
         Duration::from_millis(250),
-        service.index_doc(Request::new(ShardDocRequest {
+        service.index_doc(forwarding_request(ShardDocRequest {
             index_name: "idx".into(),
             shard_id: 0,
             doc_id: "fast-response".into(),
@@ -4829,7 +4833,7 @@ async fn ordinary_write_does_not_spawn_primary_available_report() {
         .lock()
         .await;
     let response = service
-        .index_doc(Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: "idx".into(),
             shard_id: 0,
             doc_id: "ordinary".into(),
@@ -5046,7 +5050,7 @@ async fn primary_apply_escalation_keeps_reads_open_without_immediate_wal_replay(
     engine.inject_engine_apply_failures_for_test(28, 3);
     for attempt in 0..3 {
         let response = service
-            .index_doc(Request::new(ShardDocRequest {
+            .index_doc(forwarding_request(ShardDocRequest {
                 index_name: "idx".into(),
                 shard_id: 0,
                 doc_id: format!("failed-after-wal-{attempt}"),
@@ -5295,7 +5299,7 @@ async fn replica_commit_failure_recovers_writes_and_deletes_before_promotion() {
     }
     cluster_manager.update_state(promoted);
     let primary_write = service
-        .index_doc(Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: "idx".into(),
             shard_id: 0,
             doc_id: "after-promotion".into(),
@@ -5556,7 +5560,7 @@ async fn persistent_primary_apply_io_promotes_live_in_sync_replica() {
     };
     for _ in 0..3 {
         let response = service
-            .index_doc(Request::new(ShardDocRequest {
+            .index_doc(forwarding_request(ShardDocRequest {
                 index_name: "idx".into(),
                 shard_id: 0,
                 doc_id: "doc".into(),
@@ -6443,7 +6447,7 @@ async fn collision_marker_persist_failure_keeps_transport_quarantined() {
     assert_eq!(durable["collision_quarantined"], false);
 
     let read = service
-        .get_doc(Request::new(ShardGetRequest {
+        .get_doc(forwarding_request(ShardGetRequest {
             index_name: "idx".into(),
             shard_id: 0,
             doc_id: "doc-5".into(),

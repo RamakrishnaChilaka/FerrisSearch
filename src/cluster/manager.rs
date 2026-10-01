@@ -1,5 +1,17 @@
 use crate::cluster::state::{ClusterState, NodeInfo};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+pub const FORWARDING_STATE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "timed out waiting for local cluster state version {required_version}; applied version is {applied_version}"
+)]
+pub struct ClusterStateWaitTimeout {
+    pub required_version: u64,
+    pub applied_version: u64,
+}
 
 /// Manages thread-safe access to the Cluster State
 pub struct ClusterManager {
@@ -80,6 +92,45 @@ impl ClusterManager {
         self.state.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    pub fn version(&self) -> u64 {
+        self.state.read().unwrap_or_else(|e| e.into_inner()).version
+    }
+
+    pub fn forwarding_wait_timeout(&self) -> Duration {
+        #[cfg(test)]
+        {
+            Duration::from_millis(
+                self.forwarding_wait_millis
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+        }
+        #[cfg(not(test))]
+        {
+            FORWARDING_STATE_WAIT_TIMEOUT
+        }
+    }
+
+    pub async fn wait_for_version(
+        &self,
+        required_version: u64,
+    ) -> Result<(), ClusterStateWaitTimeout> {
+        let deadline = tokio::time::Instant::now() + self.forwarding_wait_timeout();
+        loop {
+            let applied_version = self.version();
+            if applied_version >= required_version {
+                return Ok(());
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(ClusterStateWaitTimeout {
+                    required_version,
+                    applied_version,
+                });
+            }
+            tokio::time::sleep_until(deadline.min(now + Duration::from_millis(25))).await;
+        }
+    }
+
     /// Safely add a node to the cluster
     pub fn add_node(&self, node: NodeInfo) {
         let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
@@ -135,6 +186,30 @@ mod tests {
     use super::*;
     use crate::cluster::state::{ClusterState, NodeRole};
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn forwarding_wait_observes_applied_version_and_has_a_bounded_deadline() {
+        let manager = Arc::new(ClusterManager::new("wait-test".into()));
+        manager
+            .forwarding_wait_millis
+            .store(100, std::sync::atomic::Ordering::Relaxed);
+        manager.wait_for_version(0).await.unwrap();
+        let apply = manager.clone();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let mut state = apply.get_state();
+            state.version = 1;
+            apply.update_state(state);
+        });
+        manager.wait_for_version(1).await.unwrap();
+        task.await.unwrap();
+        let started = std::time::Instant::now();
+        let error = manager.wait_for_version(2).await.unwrap_err();
+        assert_eq!(error.required_version, 2);
+        assert_eq!(error.applied_version, 1);
+        assert!(started.elapsed() >= Duration::from_millis(90));
+        assert_eq!(manager.version(), 1);
+    }
 
     fn make_node(id: &str, raft_id: u64) -> NodeInfo {
         NodeInfo {

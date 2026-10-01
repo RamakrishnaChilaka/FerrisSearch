@@ -351,6 +351,20 @@ primary's UUID across its GET/CAS cycle and every conflict retry. The primary
 rejects a missing or replaced incarnation before sequence assignment or WAL
 append, including requests delayed by the recovery barrier or write pool.
 
+**Forwarding metadata status (2026-10-01):** Coordinators carry their applied
+cluster-state version to shard targets. Targets wait up to five seconds before
+validating index metadata or executing an operation. A metadata-wait deadline
+returns `503 shard_not_available_exception` with required and observed versions,
+before document sequence assignment or WAL append. Bulk preserves that error
+per item; update does not continue from a failed realtime GET. Search, count,
+and SQL propagate the same deadline rather than returning incomplete results.
+Generic transport timeouts and connection loss remain potentially indeterminate
+and are not converted to retryable document 503s.
+
+Creation also waits for each primary copy to open under its existing UUID and
+allocation identity. This is a primary-only readiness barrier, not a replica
+wait, an all-node state acknowledgement, or a new activation/fencing protocol.
+
 Remaining: expose the existing internal version-map memory bound as an
 operator setting and add `_mget`. Neither is part of this implementation.
 
@@ -503,9 +517,10 @@ A write parameter that changes safety semantics and is not implemented returns
 - **Active copies:** accept `wait_for_active_shards` only when absent or
   exactly `1`; bulk metadata also accepts numeric `1`. Reject `all` even
   with zero replicas, higher counts, zero, empty, and invalid values.
-  This preserves the default without adding an active-copy wait or
-  pre-flight protocol. Primary availability checks still gate document
-  writes. Implement a pre-flight check before accepting other values.
+  Index creation waits for primary copies to open. Document and bulk writes
+  keep their existing activation and synchronous in-sync replication paths
+  without a replica-count pre-flight protocol. Implement additional active-copy
+  checks before accepting other values.
 - **Benign options:** keep accepting `timeout`, `pretty`, `human`,
   `error_trace`, and `filter_path`. GET parameter handling, including
   `_source` filtering options and `realtime`, is unchanged. Acceptance

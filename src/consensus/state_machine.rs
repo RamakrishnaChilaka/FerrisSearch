@@ -29,7 +29,8 @@ pub struct ClusterStateMachine {
 
 #[cfg(test)]
 pub(crate) struct TestApplyGate {
-    paused: tokio::sync::watch::Sender<bool>,
+    release: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    pending: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     entered: tokio::sync::watch::Sender<bool>,
 }
 
@@ -37,7 +38,8 @@ pub(crate) struct TestApplyGate {
 impl Default for TestApplyGate {
     fn default() -> Self {
         Self {
-            paused: tokio::sync::watch::channel(false).0,
+            release: std::sync::Mutex::new(None),
+            pending: std::sync::Mutex::new(None),
             entered: tokio::sync::watch::channel(false).0,
         }
     }
@@ -46,12 +48,18 @@ impl Default for TestApplyGate {
 #[cfg(test)]
 impl TestApplyGate {
     pub(crate) fn pause(&self) {
+        let mut release = self.release.lock().unwrap();
+        assert!(release.is_none(), "previous apply gate was not released");
         self.entered.send_replace(false);
-        self.paused.send_replace(true);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        *self.pending.lock().unwrap() = Some(receiver);
+        *release = Some(sender);
     }
 
     pub(crate) fn resume(&self) {
-        self.paused.send_replace(false);
+        if let Some(release) = self.release.lock().unwrap().take() {
+            let _ = release.send(());
+        }
     }
 
     pub(crate) async fn wait_until_entered(&self) {
@@ -63,13 +71,12 @@ impl TestApplyGate {
     }
 
     async fn before_apply(&self) {
-        let mut paused = self.paused.subscribe();
-        if *paused.borrow_and_update() {
+        let pending = self.pending.lock().unwrap().take();
+        if let Some(pending) = pending {
             self.entered.send_replace(true);
-            paused
-                .wait_for(|paused| !*paused)
+            pending
                 .await
-                .expect("apply gate remains alive");
+                .expect("apply gate must be explicitly released");
         }
     }
 }
@@ -829,7 +836,9 @@ impl RaftStateMachine<TypeConfig> for ClusterStateMachine {
             let (entry, responder) = entry_result?;
 
             #[cfg(test)]
-            if let Some(gate) = &self.apply_gate {
+            if matches!(&entry.payload, EntryPayload::Normal(_))
+                && let Some(gate) = &self.apply_gate
+            {
                 gate.before_apply().await;
             }
 

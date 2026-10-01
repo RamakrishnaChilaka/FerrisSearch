@@ -1128,6 +1128,9 @@ async fn complete_with_observed_settlement(
 
 #[cfg(test)]
 mod tests {
+    fn forwarding_request<T>(message: T) -> tonic::Request<T> {
+        crate::transport::request_with_cluster_state_version(message, 0)
+    }
     use super::*;
     use crate::cluster::state::{
         DynamicMapping, IndexMetadata, IndexSettings, IndexUuid, NodeRole, ShardRoutingEntry,
@@ -1422,7 +1425,7 @@ mod tests {
 
         let mut source_client = connect(source_address).await;
         let write = source_client
-            .index_doc(tonic::Request::new(ShardDocRequest {
+            .index_doc(forwarding_request(ShardDocRequest {
                 index_name: "docs".into(),
                 shard_id: 0,
                 doc_id: "snapshot-doc".into(),
@@ -1619,7 +1622,7 @@ mod tests {
 
         for (doc_id, value) in [("first", 1), ("second", 2)] {
             let response = client
-                .index_doc(tonic::Request::new(ShardDocRequest {
+                .index_doc(forwarding_request(ShardDocRequest {
                     index_name: "dynamic-docs".into(),
                     shard_id: 0,
                     doc_id: doc_id.into(),
@@ -2774,7 +2777,7 @@ mod tests {
         let large_value = "x".repeat(8 * 1024);
         for doc in 0..20 {
             let response = source_client
-                .index_doc(tonic::Request::new(ShardDocRequest {
+                .index_doc(forwarding_request(ShardDocRequest {
                     index_name: "docs".into(),
                     shard_id: 0,
                     doc_id: format!("doc-{doc}"),
@@ -2794,7 +2797,7 @@ mod tests {
         source_engine.flush().unwrap();
         for doc in 20..25 {
             let response = source_client
-                .index_doc(tonic::Request::new(ShardDocRequest {
+                .index_doc(forwarding_request(ShardDocRequest {
                     index_name: "docs".into(),
                     shard_id: 0,
                     doc_id: format!("doc-{doc}"),
@@ -2810,7 +2813,7 @@ mod tests {
             assert!(response.success, "{}", response.error);
         }
         let delete_seed = source_client
-            .index_doc(tonic::Request::new(ShardDocRequest {
+            .index_doc(forwarding_request(ShardDocRequest {
                 index_name: "docs".into(),
                 shard_id: 0,
                 doc_id: "delete-me".into(),
@@ -2824,7 +2827,7 @@ mod tests {
 
         let index_dir = source_dir.path().join("docs-uuid/shard_0/index");
         let idle_before_recovery = source_client
-            .index_doc(tonic::Request::new(ShardDocRequest {
+            .index_doc(forwarding_request(ShardDocRequest {
                 index_name: "docs".into(),
                 shard_id: 0,
                 doc_id: "idle-before-recovery".into(),
@@ -2883,7 +2886,7 @@ mod tests {
         }
 
         let delete_response = source_client
-            .delete_doc(tonic::Request::new(ShardDeleteRequest {
+            .delete_doc(forwarding_request(ShardDeleteRequest {
                 index_name: "docs".into(),
                 shard_id: 0,
                 doc_id: "delete-me".into(),
@@ -2902,7 +2905,7 @@ mod tests {
         while !recovery.is_finished() && concurrent_ids.len() < 50 {
             let doc_id = format!("during-{}", concurrent_ids.len());
             let response = source_client
-                .index_doc(tonic::Request::new(ShardDocRequest {
+                .index_doc(forwarding_request(ShardDocRequest {
                     index_name: "docs".into(),
                     shard_id: 0,
                     doc_id: doc_id.clone(),
@@ -2925,7 +2928,7 @@ mod tests {
         assert!(stats.bytes > 0);
 
         let post = source_client
-            .index_doc(tonic::Request::new(ShardDocRequest {
+            .index_doc(forwarding_request(ShardDocRequest {
                 index_name: "docs".into(),
                 shard_id: 0,
                 doc_id: "post-finalize".into(),

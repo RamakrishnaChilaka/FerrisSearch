@@ -60,6 +60,7 @@ GetShardStats(ShardStatsRequest) → ShardStatsResponse
 GetSegmentStats(SegmentStatsRequest) → SegmentStatsResponse
 
 // Index maintenance (fan-out from coordinator)
+OpenIndex(IndexMaintenanceRequest) → Empty // create-time assigned-primary open barrier
 RefreshIndex(IndexMaintenanceRequest) → IndexMaintenanceResponse
 FlushIndex(IndexMaintenanceRequest) → IndexMaintenanceResponse
 ForceMergeIndex(ForceMergeRequest) → ForceMergeResponse
@@ -145,6 +146,32 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   into untyped `success: false` responses. Remote-store leaf batches preserve
   the same parse classification so the root can return HTTP 400 when every
   split fails for a client query error.
+- Forwarded document, bulk, GET, search, SQL, stats, remote-store leaf, and
+  maintenance handlers wait for `x-ferris-cluster-state-version` before local
+  validation or engine work. The client interceptor reads the coordinator's
+  applied version from its shared `ClusterManager`. Production handlers reject
+  missing or malformed watermarks with `INVALID_ARGUMENT`; isolated no-Raft
+  transport test constructors may omit one. Direct production-style test RPCs
+  use `request_with_cluster_state_version()` with an explicit floor.
+- The metadata wait is asynchronous on Tokio, polls only the applied version
+  every 25 ms, and expires after 5 seconds. Expiration is `UNAVAILABLE` with
+  the stable `cluster state wait timed out: ` prefix and both required and
+  observed versions. Preserve the tonic status through client error contexts.
+  REST maps this specific pre-execution failure to 503, not every transport
+  timeout or connection loss.
+- `CreateIndex`, `UpdateSettings`, and `AddMappings` successes return their
+  applied version in response metadata. Clients retain a shared monotonic
+  acknowledgement floor. Create and settings wait for local application;
+  mapping registration keeps the existing committed-schema override/reopen
+  flow and fences subsequent operations with that floor. Missing or malformed response context
+  fails decoding; do not add compatibility defaults.
+- `OpenIndex` opens only locally assigned primary copies after the version
+  wait. Create-index awaits all primary opens, using the existing UUID,
+  allocation, and initial-empty-copy rules. It neither activates primaries
+  nor opens initial replicas. Reads still refuse missing UUID directories.
+- Do not add these waits to Raft, replication, or recovery RPCs. Their
+  authority, allocation, term-fence, and recovery-barrier contracts are
+  unchanged.
 - Primary `ShardDocRequest`/`ShardDeleteRequest` carry optional paired
   conditions; index also carries create-only intent. Evaluate inside the
   engine's translog critical section before assignment/append.
@@ -427,6 +454,9 @@ results, and receipts. Delete's 404 has no error and is not a shard failure.
 ### gRPC Limits
 - **Max message size**: 64MB (`max_decoding_message_size` / `max_encoding_message_size`) on both client and server. Default tonic limit is 4MB, insufficient for high-cardinality GROUP BY partial results (~7MB for 200K groups).
 - **Request timeout**: 30s (set on the tonic `Endpoint`). Full-table GROUP BY on large shards can take 10s+.
+- **Applied-metadata wait**: 5s before forwarded operation validation. This
+  does not implement the user-facing `timeout` parameter or cancellation of
+  already-dispatched blocking engine work.
 - **Connect timeout**: 5s (separate from request timeout).
 - Both limits are set in `TransportClient::connect()` (client-side) and `create_transport_service*()` (server-side).
 

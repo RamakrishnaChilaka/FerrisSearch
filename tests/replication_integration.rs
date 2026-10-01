@@ -30,6 +30,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+fn forwarding_request<T>(message: T) -> tonic::Request<T> {
+    ferrissearch::transport::request_with_cluster_state_version(message, 0)
+}
+
 #[cfg(feature = "transport-tls")]
 const TEST_TRANSPORT_TLS_CERT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
 MIIC7TCCAdWgAwIBAgIUDrtYB6ruoGKUSdC6xKA7NJiIIPwwDQYJKoZIhvcNAQEL
@@ -228,7 +232,7 @@ async fn connect_client(
 async fn connect_tls_client(
     addr: std::net::SocketAddr,
     tls_files: &TransportTlsTestFiles,
-) -> InternalTransportClient<tonic::transport::Channel> {
+) -> ferrissearch::transport::ConnectedTransportClient {
     let connector = TonicTlsConnector::from_ca_file(tls_files.ca_path.to_str().unwrap()).unwrap();
     let transport_client = TransportClient::with_tls_connector(Arc::new(connector));
     transport_client
@@ -483,7 +487,7 @@ async fn index_and_get_document_via_grpc() {
     // Index a document
     let payload = serde_json::json!({"title": "Integration Test", "score": 42});
     let resp = client
-        .index_doc(tonic::Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: "test-index".into(),
             shard_id: 0,
             doc_id: "doc-1".into(),
@@ -502,7 +506,7 @@ async fn index_and_get_document_via_grpc() {
 
     // Get the document back
     let resp = client
-        .get_doc(tonic::Request::new(ShardGetRequest {
+        .get_doc(forwarding_request(ShardGetRequest {
             index_name: "test-index".into(),
             shard_id: 0,
             doc_id: "doc-1".into(),
@@ -569,7 +573,7 @@ async fn index_and_get_document_via_grpc_with_tls() {
 
     let payload = serde_json::json!({"title": "TLS Integration Test", "score": 7});
     let resp = client
-        .index_doc(tonic::Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: "tls-index".into(),
             shard_id: 0,
             doc_id: "tls-doc-1".into(),
@@ -584,7 +588,7 @@ async fn index_and_get_document_via_grpc_with_tls() {
     refresh_all(&sm);
 
     let resp = client
-        .get_doc(tonic::Request::new(ShardGetRequest {
+        .get_doc(forwarding_request(ShardGetRequest {
             index_name: "tls-index".into(),
             shard_id: 0,
             doc_id: "tls-doc-1".into(),
@@ -630,7 +634,7 @@ async fn primary_write_handlers_reject_non_primary_without_mutation() {
     let mut client = connect_client(addr).await;
 
     let index_response = client
-        .index_doc(tonic::Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: "non-primary-index".into(),
             shard_id: 0,
             doc_id: "doc-1".into(),
@@ -644,7 +648,7 @@ async fn primary_write_handlers_reject_non_primary_without_mutation() {
     assert!(index_response.error.contains("not the primary"));
 
     let bulk_response = client
-        .bulk_index(tonic::Request::new(ShardBulkRequest {
+        .bulk_index(forwarding_request(ShardBulkRequest {
             index_name: "non-primary-index".into(),
             shard_id: 0,
             documents_json: vec![
@@ -663,7 +667,7 @@ async fn primary_write_handlers_reject_non_primary_without_mutation() {
     assert!(bulk_response.error.contains("not the primary"));
 
     let delete_response = client
-        .delete_doc(tonic::Request::new(ShardDeleteRequest {
+        .delete_doc(forwarding_request(ShardDeleteRequest {
             index_name: "non-primary-index".into(),
             shard_id: 0,
             doc_id: "doc-1".into(),
@@ -702,7 +706,7 @@ async fn bulk_index_via_grpc() {
         .collect();
 
     let resp = client
-        .bulk_index(tonic::Request::new(ShardBulkRequest {
+        .bulk_index(forwarding_request(ShardBulkRequest {
             index_name: "bulk-idx".into(),
             shard_id: 0,
             documents_json: documents,
@@ -729,7 +733,7 @@ async fn delete_document_via_grpc() {
     // Index then delete
     let payload = serde_json::json!({"content": "to be deleted"});
     client
-        .index_doc(tonic::Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: "del-idx".into(),
             shard_id: 0,
             doc_id: "doomed".into(),
@@ -740,7 +744,7 @@ async fn delete_document_via_grpc() {
         .unwrap();
 
     let resp = client
-        .delete_doc(tonic::Request::new(ShardDeleteRequest {
+        .delete_doc(forwarding_request(ShardDeleteRequest {
             index_name: "del-idx".into(),
             shard_id: 0,
             doc_id: "doomed".into(),
@@ -754,7 +758,7 @@ async fn delete_document_via_grpc() {
 
     // Verify it's gone
     let resp = client
-        .get_doc(tonic::Request::new(ShardGetRequest {
+        .get_doc(forwarding_request(ShardGetRequest {
             index_name: "del-idx".into(),
             shard_id: 0,
             doc_id: "doomed".into(),
@@ -801,7 +805,7 @@ async fn replicate_doc_index_via_grpc() {
 
     // Verify replica has the document
     let resp = client
-        .get_doc(tonic::Request::new(ShardGetRequest {
+        .get_doc(forwarding_request(ShardGetRequest {
             index_name: "replica-idx".into(),
             shard_id: 0,
             doc_id: "rep-1".into(),
@@ -855,7 +859,7 @@ async fn out_of_order_replica_delivery_keeps_the_newer_document_value() {
 
     refresh_all(&shard_manager);
     let response = client
-        .get_doc(tonic::Request::new(ShardGetRequest {
+        .get_doc(forwarding_request(ShardGetRequest {
             index_name: "d1-ordering".into(),
             shard_id: 0,
             doc_id: "shared".into(),
@@ -964,7 +968,7 @@ async fn deterministic_reordering_survives_promotion_and_new_write() {
         .primary_initialized = true;
     cluster_manager.update_state(promoted);
     let response = client
-        .index_doc(tonic::Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: "d1-full-ordering".into(),
             shard_id: 0,
             doc_id: "post-promotion".into(),
@@ -1052,7 +1056,7 @@ async fn replicate_doc_delete_via_grpc() {
     // Verify deleted
     refresh_all(&sm);
     let resp = client
-        .get_doc(tonic::Request::new(ShardGetRequest {
+        .get_doc(forwarding_request(ShardGetRequest {
             index_name: "rep-del-idx".into(),
             shard_id: 0,
             doc_id: "to-delete".into(),
@@ -1110,7 +1114,7 @@ async fn replicate_bulk_via_grpc() {
     // Verify all docs exist
     for i in 0..3 {
         let resp = client
-            .get_doc(tonic::Request::new(ShardGetRequest {
+            .get_doc(forwarding_request(ShardGetRequest {
                 index_name: "bulk-rep-idx".into(),
                 shard_id: 0,
                 doc_id: format!("bulk-rep-{i}"),
@@ -1693,7 +1697,7 @@ async fn primary_write_replicates_to_replica_node() {
     // Write a document to the primary
     let payload = serde_json::json!({"message": "hello from primary", "version": 1});
     let resp = client
-        .index_doc(tonic::Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: "replicated-idx".into(),
             shard_id: 0,
             doc_id: "replicated-doc".into(),
@@ -1712,7 +1716,7 @@ async fn primary_write_replicates_to_replica_node() {
     // Connect to the replica and verify the document was replicated
     let mut replica_client = connect_client(replica_addr).await;
     let resp = replica_client
-        .get_doc(tonic::Request::new(ShardGetRequest {
+        .get_doc(forwarding_request(ShardGetRequest {
             index_name: "replicated-idx".into(),
             shard_id: 0,
             doc_id: "replicated-doc".into(),
@@ -1765,7 +1769,7 @@ async fn reserved_source_never_mutates_primary_or_replica() {
     let mut primary_client = connect_client(primary_addr).await;
 
     let error = primary_client
-        .index_doc(tonic::Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: "reserved-source-idx".into(),
             shard_id: 0,
             doc_id: "poison".into(),
@@ -1782,7 +1786,7 @@ async fn reserved_source_never_mutates_primary_or_replica() {
     );
 
     let error = primary_client
-        .bulk_index(tonic::Request::new(ShardBulkRequest {
+        .bulk_index(forwarding_request(ShardBulkRequest {
             index_name: "reserved-source-idx".into(),
             shard_id: 0,
             documents_json: vec![
@@ -1815,7 +1819,7 @@ async fn reserved_source_never_mutates_primary_or_replica() {
     }
 
     let response = primary_client
-        .index_doc(tonic::Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: "reserved-source-idx".into(),
             shard_id: 0,
             doc_id: "healthy".into(),
@@ -1832,7 +1836,7 @@ async fn reserved_source_never_mutates_primary_or_replica() {
     for address in [primary_addr, replica_addr] {
         let mut client = connect_client(address).await;
         let response = client
-            .get_doc(tonic::Request::new(ShardGetRequest {
+            .get_doc(forwarding_request(ShardGetRequest {
                 index_name: "reserved-source-idx".into(),
                 shard_id: 0,
                 doc_id: "healthy".into(),
@@ -1875,7 +1879,7 @@ async fn out_of_sync_replica_receives_no_live_writes_and_cannot_fail_them() {
     let mut client = connect_client(primary_addr).await;
 
     let first = client
-        .index_doc(tonic::Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: "out-of-sync-idx".into(),
             shard_id: 0,
             doc_id: "not-replicated".into(),
@@ -1903,7 +1907,7 @@ async fn out_of_sync_replica_receives_no_live_writes_and_cannot_fail_them() {
     primary_cm.update_state(state);
 
     let second = client
-        .index_doc(tonic::Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: "out-of-sync-idx".into(),
             shard_id: 0,
             doc_id: "still-acknowledged".into(),
@@ -1944,7 +1948,7 @@ async fn unreachable_in_sync_replica_still_fails_live_write() {
     let primary_addr = start_primary_grpc_server(primary_cm, primary_sm).await;
     let mut client = connect_client(primary_addr).await;
     let response = client
-        .index_doc(tonic::Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: "required-replica-idx".into(),
             shard_id: 0,
             doc_id: "must-fail".into(),
@@ -1994,7 +1998,7 @@ async fn primary_delete_replicates_to_replica_node() {
     // Index a document
     let payload = serde_json::json!({"data": "will be deleted"});
     client
-        .index_doc(tonic::Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: "del-repl-idx".into(),
             shard_id: 0,
             doc_id: "del-doc".into(),
@@ -2006,7 +2010,7 @@ async fn primary_delete_replicates_to_replica_node() {
 
     // Delete it on the primary
     let resp = client
-        .delete_doc(tonic::Request::new(ShardDeleteRequest {
+        .delete_doc(forwarding_request(ShardDeleteRequest {
             index_name: "del-repl-idx".into(),
             shard_id: 0,
             doc_id: "del-doc".into(),
@@ -2021,7 +2025,7 @@ async fn primary_delete_replicates_to_replica_node() {
     refresh_all(&replica_sm);
     let mut replica_client = connect_client(replica_addr).await;
     let resp = replica_client
-        .get_doc(tonic::Request::new(ShardGetRequest {
+        .get_doc(forwarding_request(ShardGetRequest {
             index_name: "del-repl-idx".into(),
             shard_id: 0,
             doc_id: "del-doc".into(),
@@ -2073,7 +2077,7 @@ async fn primary_bulk_replicates_to_replica_node() {
         .collect();
 
     let resp = client
-        .bulk_index(tonic::Request::new(ShardBulkRequest {
+        .bulk_index(forwarding_request(ShardBulkRequest {
             index_name: "bulk-repl-idx".into(),
             shard_id: 0,
             documents_json: documents,
@@ -2091,7 +2095,7 @@ async fn primary_bulk_replicates_to_replica_node() {
     let mut replica_client = connect_client(replica_addr).await;
     for i in 0..5 {
         let resp = replica_client
-            .get_doc(tonic::Request::new(ShardGetRequest {
+            .get_doc(forwarding_request(ShardGetRequest {
                 index_name: "bulk-repl-idx".into(),
                 shard_id: 0,
                 doc_id: format!("repl-bulk-{i}"),
@@ -2125,7 +2129,7 @@ async fn index_doc_with_vectors(
     payload: serde_json::Value,
 ) -> bool {
     let resp = client
-        .index_doc(tonic::Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: index_name.into(),
             shard_id,
             doc_id: doc_id.into(),
@@ -2157,7 +2161,7 @@ async fn search_shard_simple_query_string_via_grpc() {
 
     // Simple query string search
     let resp = client
-        .search_shard(tonic::Request::new(ShardSearchRequest {
+        .search_shard(forwarding_request(ShardSearchRequest {
             index_name: "search-idx".into(),
             shard_id: 0,
             query: "rust".into(),
@@ -2218,7 +2222,7 @@ async fn search_shard_reopens_persisted_shard_after_restart() {
     let mut client = connect_client(addr).await;
 
     let resp = client
-        .search_shard(tonic::Request::new(ShardSearchRequest {
+        .search_shard(forwarding_request(ShardSearchRequest {
             index_name: "restart-idx".into(),
             shard_id: 0,
             query: "rust".into(),
@@ -2287,7 +2291,7 @@ async fn search_shard_dsl_match_query_via_grpc() {
         "from": 0
     });
     let resp = client
-        .search_shard_dsl(tonic::Request::new(ShardSearchDslRequest {
+        .search_shard_dsl(forwarding_request(ShardSearchDslRequest {
             index_name: "dsl-idx".into(),
             shard_id: 0,
             search_request_json: serde_json::to_vec(&search_req).unwrap(),
@@ -2353,7 +2357,7 @@ async fn search_shard_dsl_reopens_persisted_shard_after_restart() {
         "from": 0
     });
     let resp = client
-        .search_shard_dsl(tonic::Request::new(ShardSearchDslRequest {
+        .search_shard_dsl(forwarding_request(ShardSearchDslRequest {
             index_name: "restart-dsl-idx".into(),
             shard_id: 0,
             search_request_json: serde_json::to_vec(&search_req).unwrap(),
@@ -2460,7 +2464,7 @@ async fn search_shard_dsl_reopens_mapped_shard_with_reordered_metadata_after_res
         "from": 0
     });
     let resp = client
-        .search_shard_dsl(tonic::Request::new(ShardSearchDslRequest {
+        .search_shard_dsl(forwarding_request(ShardSearchDslRequest {
             index_name: "restart-mapped-idx".into(),
             shard_id: 0,
             search_request_json: serde_json::to_vec(&search_req).unwrap(),
@@ -2548,7 +2552,7 @@ async fn search_shard_dsl_restart_replays_only_uncommitted_entries_after_refresh
         "from": 0
     });
     let resp = client
-        .search_shard_dsl(tonic::Request::new(ShardSearchDslRequest {
+        .search_shard_dsl(forwarding_request(ShardSearchDslRequest {
             index_name: "restart-replay-idx".into(),
             shard_id: 0,
             search_request_json: serde_json::to_vec(&search_req).unwrap(),
@@ -2600,7 +2604,7 @@ async fn search_shard_dsl_match_all_via_grpc() {
 
     let search_req = serde_json::json!({"query": {"match_all": {}}, "size": 10});
     let resp = client
-        .search_shard_dsl(tonic::Request::new(ShardSearchDslRequest {
+        .search_shard_dsl(forwarding_request(ShardSearchDslRequest {
             index_name: "all-idx".into(),
             shard_id: 0,
             search_request_json: serde_json::to_vec(&search_req).unwrap(),
@@ -2704,7 +2708,7 @@ async fn search_shard_dsl_aggs_roundtrip_via_grpc() {
         }
     });
     let resp = client
-        .search_shard_dsl(tonic::Request::new(ShardSearchDslRequest {
+        .search_shard_dsl(forwarding_request(ShardSearchDslRequest {
             index_name: "agg-idx".into(),
             shard_id: 0,
             search_request_json: serde_json::to_vec(&search_req).unwrap(),
@@ -2981,7 +2985,7 @@ async fn search_shard_dsl_knn_only_via_grpc() {
         "knn": {"emb": {"vector": [1.0, 0.0, 0.0], "k": 2}}
     });
     let resp = client
-        .search_shard_dsl(tonic::Request::new(ShardSearchDslRequest {
+        .search_shard_dsl(forwarding_request(ShardSearchDslRequest {
             index_name: "knn-idx".into(),
             shard_id: 0,
             search_request_json: serde_json::to_vec(&search_req).unwrap(),
@@ -3074,7 +3078,7 @@ async fn search_shard_dsl_hybrid_text_and_knn_via_grpc() {
         "knn": {"emb": {"vector": [0.9, 0.1, 0.0], "k": 3}}
     });
     let resp = client
-        .search_shard_dsl(tonic::Request::new(ShardSearchDslRequest {
+        .search_shard_dsl(forwarding_request(ShardSearchDslRequest {
             index_name: "hybrid-idx".into(),
             shard_id: 0,
             search_request_json: serde_json::to_vec(&search_req).unwrap(),
@@ -3155,7 +3159,7 @@ async fn search_shard_dsl_knn_returns_empty_when_no_vectors() {
         "knn": {"emb": {"vector": [1.0, 0.0, 0.0], "k": 5}}
     });
     let resp = client
-        .search_shard_dsl(tonic::Request::new(ShardSearchDslRequest {
+        .search_shard_dsl(forwarding_request(ShardSearchDslRequest {
             index_name: "novecs-idx".into(),
             shard_id: 0,
             search_request_json: serde_json::to_vec(&search_req).unwrap(),
@@ -3193,7 +3197,7 @@ async fn search_shard_dsl_nonexistent_shard_returns_error() {
 
     let search_req = serde_json::json!({"query": {"match_all": {}}});
     let error = client
-        .search_shard_dsl(tonic::Request::new(ShardSearchDslRequest {
+        .search_shard_dsl(forwarding_request(ShardSearchDslRequest {
             index_name: "nonexistent".into(),
             shard_id: 99,
             search_request_json: serde_json::to_vec(&search_req).unwrap(),
@@ -3260,7 +3264,7 @@ async fn search_shard_dsl_knn_with_filter_via_grpc() {
         "knn": { "emb": { "vector": [1.0, 0.0, 0.0], "k": 3, "filter": { "match": { "title": "rust" } } } }
     });
     let resp = client
-        .search_shard_dsl(tonic::Request::new(ShardSearchDslRequest {
+        .search_shard_dsl(forwarding_request(ShardSearchDslRequest {
             index_name: "filter-idx".into(),
             shard_id: 0,
             search_request_json: serde_json::to_vec(&search_req).unwrap(),
@@ -3318,7 +3322,7 @@ async fn search_shard_dsl_knn_filter_no_matches_returns_empty_knn() {
         "knn": { "emb": { "vector": [1.0, 0.0, 0.0], "k": 5, "filter": { "match": { "title": "python" } } } }
     });
     let resp = client
-        .search_shard_dsl(tonic::Request::new(ShardSearchDslRequest {
+        .search_shard_dsl(forwarding_request(ShardSearchDslRequest {
             index_name: "nofilter-idx".into(),
             shard_id: 0,
             search_request_json: serde_json::to_vec(&search_req).unwrap(),
@@ -3362,7 +3366,7 @@ async fn update_document_merges_fields_via_grpc() {
     // Index a document
     let payload = serde_json::json!({"title": "The Matrix", "year": 1999, "rating": 8.7});
     let resp = client
-        .index_doc(tonic::Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: "update-idx".into(),
             shard_id: 0,
             doc_id: "doc-1".into(),
@@ -3377,7 +3381,7 @@ async fn update_document_merges_fields_via_grpc() {
 
     // Get the document
     let resp = client
-        .get_doc(tonic::Request::new(ShardGetRequest {
+        .get_doc(forwarding_request(ShardGetRequest {
             index_name: "update-idx".into(),
             shard_id: 0,
             doc_id: "doc-1".into(),
@@ -3401,7 +3405,7 @@ async fn update_document_merges_fields_via_grpc() {
 
     // Re-index the merged document
     let resp = client
-        .index_doc(tonic::Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: "update-idx".into(),
             shard_id: 0,
             doc_id: "doc-1".into(),
@@ -3416,7 +3420,7 @@ async fn update_document_merges_fields_via_grpc() {
 
     // Verify the merged document
     let resp = client
-        .get_doc(tonic::Request::new(ShardGetRequest {
+        .get_doc(forwarding_request(ShardGetRequest {
             index_name: "update-idx".into(),
             shard_id: 0,
             doc_id: "doc-1".into(),
@@ -3446,7 +3450,7 @@ async fn update_nonexistent_document_returns_not_found() {
     // Index a doc so the shard exists
     let payload = serde_json::json!({"title": "exists"});
     client
-        .index_doc(tonic::Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: "update-404-idx".into(),
             shard_id: 0,
             doc_id: "exists".into(),
@@ -3459,7 +3463,7 @@ async fn update_nonexistent_document_returns_not_found() {
 
     // Try to get a nonexistent doc (simulating what update_document does)
     let resp = client
-        .get_doc(tonic::Request::new(ShardGetRequest {
+        .get_doc(forwarding_request(ShardGetRequest {
             index_name: "update-404-idx".into(),
             shard_id: 0,
             doc_id: "nonexistent".into(),
@@ -3672,7 +3676,7 @@ async fn sequence_state_probe_reports_exact_open_copy_and_activation() {
     let mut client = connect_client(addr).await;
 
     let write = client
-        .index_doc(tonic::Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: "probe-idx".into(),
             shard_id: 0,
             doc_id: "doc".into(),
@@ -3745,7 +3749,7 @@ async fn primary_write_advances_global_checkpoint() {
     for i in 0..3 {
         let payload = serde_json::json!({"msg": format!("gc-doc-{}", i)});
         let resp = client
-            .index_doc(tonic::Request::new(ShardDocRequest {
+            .index_doc(forwarding_request(ShardDocRequest {
                 index_name: "gc-idx".into(),
                 shard_id: 0,
                 doc_id: format!("gc-{i}"),
@@ -4019,7 +4023,7 @@ async fn gcp_transport_rejects_checkpoint_observations_from_previous_copy_author
                 .await;
         let mut client = connect_client(primary_addr).await;
         let response = client
-            .index_doc(tonic::Request::new(ShardDocRequest {
+            .index_doc(forwarding_request(ShardDocRequest {
                 index_name: index.into(),
                 shard_id: 0,
                 doc_id: "new-term".into(),
@@ -4170,7 +4174,7 @@ async fn two_replica_concurrent_writes_converge_and_preserve_live_checkpoint_saf
         two_replica_checkpoint_cluster(index).await;
     let mut client = connect_client(address).await;
     let seed = client
-        .index_doc(tonic::Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: index.into(),
             shard_id: 0,
             doc_id: "seed".into(),
@@ -4230,7 +4234,7 @@ async fn two_replica_concurrent_writes_converge_and_preserve_live_checkpoint_saf
                 0 => {
                     let id = format!("single-{number}");
                     let response = client
-                        .index_doc(tonic::Request::new(ShardDocRequest {
+                        .index_doc(forwarding_request(ShardDocRequest {
                             index_name: index.into(),
                             shard_id: 0,
                             doc_id: id.clone(),
@@ -4247,7 +4251,7 @@ async fn two_replica_concurrent_writes_converge_and_preserve_live_checkpoint_saf
                 1 => {
                     let ids: Vec<_> = (0..3).map(|item| format!("bulk-{number}-{item}")).collect();
                     let response = client
-                        .bulk_index(tonic::Request::new(ShardBulkRequest {
+                        .bulk_index(forwarding_request(ShardBulkRequest {
                             index_name: index.into(),
                             shard_id: 0,
                             documents_json: ids
@@ -4271,7 +4275,7 @@ async fn two_replica_concurrent_writes_converge_and_preserve_live_checkpoint_saf
                 }
                 _ => {
                     let response = client
-                        .delete_doc(tonic::Request::new(ShardDeleteRequest {
+                        .delete_doc(forwarding_request(ShardDeleteRequest {
                             index_name: index.into(),
                             shard_id: 0,
                             doc_id: format!("single-{}", number - 2),
@@ -4343,7 +4347,7 @@ async fn concurrent_primary_receipts_match_primary_and_replica_wal() {
     let primary_addr = start_primary_grpc_server(primary_cm, primary_sm.clone()).await;
     let mut client = connect_client(primary_addr).await;
     let seed = client
-        .index_doc(tonic::Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: index.into(),
             shard_id: 0,
             doc_id: "seed".into(),
@@ -4363,7 +4367,7 @@ async fn concurrent_primary_receipts_match_primary_and_replica_wal() {
                 0 => {
                     let id = format!("single-{number}");
                     let response = client
-                        .index_doc(tonic::Request::new(ShardDocRequest {
+                        .index_doc(forwarding_request(ShardDocRequest {
                             index_name: index.into(),
                             shard_id: 0,
                             doc_id: id.clone(),
@@ -4383,7 +4387,7 @@ async fn concurrent_primary_receipts_match_primary_and_replica_wal() {
                 1 => {
                     let ids: Vec<_> = (0..3).map(|item| format!("bulk-{number}-{item}")).collect();
                     let response = client
-                        .bulk_index(tonic::Request::new(ShardBulkRequest {
+                        .bulk_index(forwarding_request(ShardBulkRequest {
                             index_name: index.into(),
                             shard_id: 0,
                             documents_json: ids
@@ -4414,7 +4418,7 @@ async fn concurrent_primary_receipts_match_primary_and_replica_wal() {
                 _ => {
                     let id = format!("delete-{number}");
                     let response = client
-                        .delete_doc(tonic::Request::new(ShardDeleteRequest {
+                        .delete_doc(forwarding_request(ShardDeleteRequest {
                             index_name: index.into(),
                             shard_id: 0,
                             doc_id: id.clone(),
@@ -4563,7 +4567,7 @@ async fn bulk_replication_advances_global_checkpoint() {
         .collect();
 
     let resp = client
-        .bulk_index(tonic::Request::new(proto::ShardBulkRequest {
+        .bulk_index(forwarding_request(proto::ShardBulkRequest {
             index_name: "bgc-idx".into(),
             shard_id: 0,
             documents_json,
@@ -4615,7 +4619,7 @@ async fn delete_replication_advances_global_checkpoint() {
     // Index a doc first
     let payload = serde_json::json!({"msg": "to-delete"});
     client
-        .index_doc(tonic::Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: "dgc-idx".into(),
             shard_id: 0,
             doc_id: "del-1".into(),
@@ -4632,7 +4636,7 @@ async fn delete_replication_advances_global_checkpoint() {
 
     // Delete the doc
     let resp = client
-        .delete_doc(tonic::Request::new(proto::ShardDeleteRequest {
+        .delete_doc(forwarding_request(proto::ShardDeleteRequest {
             index_name: "dgc-idx".into(),
             shard_id: 0,
             doc_id: "del-1".into(),
@@ -4679,7 +4683,7 @@ async fn isr_tracker_updated_after_replication() {
     for i in 0..3 {
         let payload = serde_json::json!({"data": i});
         client
-            .index_doc(tonic::Request::new(ShardDocRequest {
+            .index_doc(forwarding_request(ShardDocRequest {
                 index_name: "isr-idx".into(),
                 shard_id: 0,
                 doc_id: format!("isr-{i}"),
@@ -4719,7 +4723,7 @@ async fn get_shard_stats_returns_empty_when_no_shards() {
     let mut client = connect_client(addr).await;
 
     let resp = client
-        .get_shard_stats(tonic::Request::new(proto::ShardStatsRequest {}))
+        .get_shard_stats(forwarding_request(proto::ShardStatsRequest {}))
         .await
         .unwrap()
         .into_inner();
@@ -4741,7 +4745,7 @@ async fn get_shard_stats_returns_doc_counts_for_open_shards() {
     for i in 0..5 {
         let payload = serde_json::json!({"title": format!("doc-{}", i)});
         let resp = client
-            .index_doc(tonic::Request::new(ShardDocRequest {
+            .index_doc(forwarding_request(ShardDocRequest {
                 index_name: "stats-test".into(),
                 shard_id: 0,
                 doc_id: format!("doc-{i}"),
@@ -4757,7 +4761,7 @@ async fn get_shard_stats_returns_doc_counts_for_open_shards() {
     refresh_all(&sm);
 
     let resp = client
-        .get_shard_stats(tonic::Request::new(proto::ShardStatsRequest {}))
+        .get_shard_stats(forwarding_request(proto::ShardStatsRequest {}))
         .await
         .unwrap()
         .into_inner();
@@ -4784,7 +4788,7 @@ async fn get_shard_stats_returns_multiple_shards() {
         for i in 0..count {
             let payload = serde_json::json!({"n": i});
             let resp = client
-                .index_doc(tonic::Request::new(ShardDocRequest {
+                .index_doc(forwarding_request(ShardDocRequest {
                     index_name: "multi-shard".into(),
                     shard_id: shard,
                     doc_id: format!("s{shard}-doc-{i}"),
@@ -4801,7 +4805,7 @@ async fn get_shard_stats_returns_multiple_shards() {
     refresh_all(&sm);
 
     let resp = client
-        .get_shard_stats(tonic::Request::new(proto::ShardStatsRequest {}))
+        .get_shard_stats(forwarding_request(proto::ShardStatsRequest {}))
         .await
         .unwrap()
         .into_inner();

@@ -1902,6 +1902,10 @@ impl TransportService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn forwarding_request<T>(message: T) -> tonic::Request<T> {
+        crate::transport::request_with_cluster_state_version(message, 0)
+    }
     use crate::cluster::manager::ClusterManager;
     use crate::cluster::state::{
         ClusterState, DynamicMapping, IndexMetadata, IndexSettings, IndexUuid, NodeInfo, NodeRole,
@@ -2944,7 +2948,7 @@ mod tests {
         let writer = service.clone();
         let write = tokio::spawn(async move {
             writer
-                .index_doc(tonic::Request::new(ShardDocRequest {
+                .index_doc(forwarding_request(ShardDocRequest {
                     index_name: "idx".into(),
                     shard_id: 0,
                     doc_id: "doc".into(),
@@ -3008,7 +3012,7 @@ mod tests {
         let writer = service.clone();
         let index = tokio::spawn(async move {
             writer
-                .index_doc(tonic::Request::new(ShardDocRequest {
+                .index_doc(forwarding_request(ShardDocRequest {
                     index_name: "idx".into(),
                     shard_id: 0,
                     doc_id: "queued-index".into(),
@@ -3042,7 +3046,7 @@ mod tests {
         let writer = service.clone();
         let bulk = tokio::spawn(async move {
             writer
-                .bulk_index(tonic::Request::new(ShardBulkRequest {
+                .bulk_index(forwarding_request(ShardBulkRequest {
                     index_name: "idx".into(),
                     shard_id: 0,
                     documents_json: vec![
@@ -3080,7 +3084,7 @@ mod tests {
         let writer = service.clone();
         let delete = tokio::spawn(async move {
             writer
-                .delete_doc(tonic::Request::new(ShardDeleteRequest {
+                .delete_doc(forwarding_request(ShardDeleteRequest {
                     index_name: "idx".into(),
                     shard_id: 0,
                     doc_id: "delete-me".into(),
@@ -3192,7 +3196,7 @@ mod tests {
         let writer = service.clone();
         let write = tokio::spawn(async move {
             writer
-                .index_doc(tonic::Request::new(ShardDocRequest {
+                .index_doc(forwarding_request(ShardDocRequest {
                     index_name: "idx".into(),
                     shard_id: 0,
                     doc_id: "stale".into(),
@@ -3321,7 +3325,7 @@ mod tests {
         let writer = service.clone();
         let write = tokio::spawn(async move {
             writer
-                .index_doc(tonic::Request::new(ShardDocRequest {
+                .index_doc(forwarding_request(ShardDocRequest {
                     index_name: "idx".into(),
                     shard_id: 0,
                     doc_id: "stale".into(),
@@ -3494,7 +3498,7 @@ mod tests {
         let writer = service.clone();
         let write = tokio::spawn(async move {
             writer
-                .index_doc(tonic::Request::new(ShardDocRequest {
+                .index_doc(forwarding_request(ShardDocRequest {
                     index_name: "idx".into(),
                     shard_id: 0,
                     doc_id: "stale".into(),

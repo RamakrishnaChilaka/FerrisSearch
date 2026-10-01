@@ -22,6 +22,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Barrier;
 
+fn forwarding_request<T>(message: T) -> tonic::Request<T> {
+    ferrissearch::transport::request_with_cluster_state_version(message, 0)
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 fn make_node(id: &str) -> NodeInfo {
@@ -2026,7 +2030,7 @@ async fn first_write_after_transport_restart_reactivates_primary() {
 
     for doc_id in ["first", "same-incarnation"] {
         let response = first_client
-            .index_doc(tonic::Request::new(ShardDocRequest {
+            .index_doc(forwarding_request(ShardDocRequest {
                 index_name: "restart-activation".into(),
                 shard_id: 0,
                 payload_json: serde_json::to_vec(&serde_json::json!({"value": doc_id})).unwrap(),
@@ -2057,7 +2061,7 @@ async fn first_write_after_transport_restart_reactivates_primary() {
     .await;
     let mut second_client = connect_grpc(second_addr).await;
     let response = second_client
-        .index_doc(tonic::Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: "restart-activation".into(),
             shard_id: 0,
             payload_json: serde_json::to_vec(&serde_json::json!({"value": "after-restart"}))

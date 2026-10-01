@@ -643,3 +643,157 @@ async fn forwarding_lag_mapping_and_setting_then_write_waits_for_new_version() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["_source"]["value"], 42);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forwarding_rpc_rejects_missing_or_malformed_watermark_before_mutation() {
+    let cluster = ForwardingCluster::start().await;
+    let node = &cluster.nodes[0].state.cluster_manager.get_state().nodes["node-2"];
+    let mut client =
+        crate::transport::proto::internal_transport_client::InternalTransportClient::connect(
+            format!("http://{}:{}", node.host, node.transport_port),
+        )
+        .await
+        .unwrap();
+    for header in [None, Some("not-a-version"), Some("-1")] {
+        let mut request = tonic::Request::new(crate::transport::proto::ShardDocRequest {
+            index_name: "invalid-context".into(),
+            shard_id: 0,
+            doc_id: "a".into(),
+            payload_json: serde_json::to_vec(&json!({"body": "never written"})).unwrap(),
+            ..Default::default()
+        });
+        if let Some(value) = header {
+            request.metadata_mut().insert(
+                crate::transport::state_wait::STATE_VERSION_HEADER,
+                value.parse().unwrap(),
+            );
+        }
+
+        let error = client.index_doc(request).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument, "{error}");
+        assert!(
+            error.message().contains("cluster-state-version")
+                || error.message().contains("cluster state version"),
+            "{error}"
+        );
+    }
+    assert!(
+        cluster.nodes[1]
+            .state
+            .shard_manager
+            .get_shard("invalid-context", 0)
+            .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forwarding_acknowledged_metadata_fences_following_requests() {
+    let cluster = ForwardingCluster::start().await;
+    let (status, body) = cluster.create("lag-ack").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let follower = &cluster.nodes[1].state;
+    follower
+        .cluster_manager
+        .forwarding_wait_millis
+        .store(100, std::sync::atomic::Ordering::Relaxed);
+    cluster.gate.pause();
+    let (status, body) = cluster
+        .request(
+            1,
+            reqwest::Method::PUT,
+            "/lag-ack/_settings",
+            Some(json!({"index": {"refresh_interval_ms": 321_000}})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        body["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("version"),
+        "{body}"
+    );
+    cluster.gate.resume();
+    follower
+        .cluster_manager
+        .forwarding_wait_millis
+        .store(5_000, std::sync::atomic::Ordering::Relaxed);
+    follower
+        .cluster_manager
+        .wait_for_version(cluster.nodes[0].state.cluster_manager.version())
+        .await
+        .unwrap();
+    follower
+        .cluster_manager
+        .forwarding_wait_millis
+        .store(100, std::sync::atomic::Ordering::Relaxed);
+    cluster.gate.pause();
+    let master = cluster.nodes[0].state.cluster_manager.get_state().nodes["node-1"].clone();
+    follower
+        .transport_client
+        .forward_add_mappings(
+            &master,
+            "lag-ack",
+            &Default::default(),
+            &crate::cluster::state::DynamicMapping::Strict,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        follower.transport_client.required_state_version(),
+        cluster.nodes[0].state.cluster_manager.version()
+    );
+    let (status, body) = cluster
+        .request(
+            1,
+            reqwest::Method::PUT,
+            "/lag-ack/_doc/a",
+            Some(json!({"value": 7})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        follower
+            .shard_manager
+            .get_shard("lag-ack", 0)
+            .unwrap()
+            .sequence_stats()
+            .processed_checkpoint
+            .is_none()
+    );
+    cluster.gate.resume();
+    follower
+        .cluster_manager
+        .forwarding_wait_millis
+        .store(5_000, std::sync::atomic::Ordering::Relaxed);
+    follower
+        .cluster_manager
+        .wait_for_version(cluster.nodes[0].state.cluster_manager.version())
+        .await
+        .unwrap();
+    let (status, body) = cluster
+        .request(
+            1,
+            reqwest::Method::PUT,
+            "/lag-ack/_doc/a",
+            Some(json!({"value": 7})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = cluster
+        .request(
+            1,
+            reqwest::Method::PUT,
+            "/lag-ack/_doc/b",
+            Some(json!({"unmapped": 1})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("strict mapping"),
+        "{body}"
+    );
+}

@@ -276,7 +276,10 @@ async fn handle_metrics(State(state): State<AppState>) -> Response {
         .unwrap()
 }
 
-pub fn create_router(state: AppState) -> Router {
+pub fn create_router(mut state: AppState) -> Router {
+    state.transport_client = state
+        .transport_client
+        .with_cluster_manager(state.cluster_manager.clone());
     let security_manager = state.security_manager.clone();
 
     let bulk_router = Router::new()

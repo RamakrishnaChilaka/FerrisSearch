@@ -157,6 +157,15 @@ pub struct ClusterManager { state: Arc<RwLock<ClusterState>> }
 ```
 - `new(cluster_name)` / `with_shared_state(state)` — Raft SM shares the same `Arc<RwLock<ClusterState>>`
 - `get_state() -> ClusterState` — cloned snapshot (read lock)
+- `version()` reads only the applied version under the shared read lock.
+  `wait_for_version()` waits asynchronously for a minimum applied
+  `ClusterState.version`, with a 5-second deadline and 25 ms polling.
+  The version comes from successful Raft mutations and snapshots; it is not
+  a second sequencing authority. A wait never changes local state.
+- Forwarding clients bind to this same manager, not a copied snapshot.
+  On timeout, preserve the required and observed versions. Raft applies and
+  control-plane futures stay on Tokio; engine opens remain on the blocking
+  pool.
 - `add_node(node)`, `ping_node(node_id)`
 - `update_state(new_state)` — full overwrite, preserves `last_seen`
 - **WARNING**: `update_state()` should never replace Raft-managed state.
