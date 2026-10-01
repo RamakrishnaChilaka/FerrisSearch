@@ -1453,6 +1453,490 @@ async fn create_write_contract_index(harness: &RestTestHarness, index: &str) -> 
     Ok(())
 }
 
+const WRITE_PARAMETER_ENDPOINTS: &[(&str, &str)] = &[
+    ("POST", "_doc"),
+    ("PUT", "_doc/candidate"),
+    ("POST", "_doc/candidate"),
+    ("PUT", "_create/candidate"),
+    ("POST", "_create/candidate"),
+    ("POST", "_update/seed"),
+    ("DELETE", "_doc/seed"),
+    ("POST", "_bulk"),
+    ("POST", "global_bulk"),
+];
+
+async fn write_parameter_request(
+    harness: &RestTestHarness,
+    index: &str,
+    method: &str,
+    endpoint: &str,
+    query: &str,
+) -> Result<(StatusCode, Value)> {
+    let path = if endpoint == "global_bulk" {
+        format!("/_bulk{query}")
+    } else {
+        format!("/{index}/{endpoint}{query}")
+    };
+    if matches!(endpoint, "_bulk" | "global_bulk") {
+        return harness
+            .post_ndjson(
+                &path,
+                &format!(
+                    "{{\"index\":{{\"_index\":\"{index}\",\"_id\":\"candidate\"}}}}\n{{\"value\":\"changed\"}}\n"
+                ),
+            )
+            .await;
+    }
+    let body = if endpoint.starts_with("_update/") {
+        json!({"doc": {"value": "changed"}})
+    } else {
+        json!({"value": "changed"})
+    };
+    match method {
+        "PUT" => harness.put_json(&path, body).await,
+        "POST" => harness.post_json(&path, body).await,
+        "DELETE" => harness.delete_json(&path).await,
+        _ => unreachable!("test endpoint uses a write method"),
+    }
+}
+
+fn assert_write_parameter_rejection(status: StatusCode, body: &Value, parameter: &str) {
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{parameter}: {body}");
+    assert_eq!(body["status"], 400, "{parameter}: {body}");
+    assert_eq!(
+        body["error"]["type"], "illegal_argument_exception",
+        "{parameter}: {body}"
+    );
+    assert!(
+        body["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("[{parameter}]")),
+        "{parameter}: {body}"
+    );
+}
+
+async fn assert_write_parameter_no_writes(
+    harness: &RestTestHarness,
+    index: &str,
+    seed: &Value,
+) -> Result<()> {
+    let (status, document) = harness
+        .get_json(&format!("/{index}/_doc/seed?realtime=true"))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{document}");
+    assert_eq!(document["_source"], json!({"value": "original"}));
+    assert_eq!(document["_seq_no"], seed["_seq_no"], "{document}");
+    assert_eq!(
+        harness
+            .get_json(&format!("/{index}/_doc/candidate?realtime=true"))
+            .await?
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    let (status, refreshed) = harness
+        .post_json(&format!("/{index}/_refresh"), json!({}))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{refreshed}");
+    let (status, count) = harness.get_json(&format!("/{index}/_count")).await?;
+    assert_eq!(status, StatusCode::OK, "{count}");
+    assert_eq!(count["count"], 1, "unexpected write: {count}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn writes_regression_write_params_rejects_unsupported_query_keys_without_writes() -> Result<()>
+{
+    let harness = RestTestHarness::start().await?;
+    let index = "write-params";
+    create_write_contract_index(&harness, index).await?;
+    let (status, seed) = harness
+        .put_json(&format!("/{index}/_doc/seed"), json!({"value": "original"}))
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{seed}");
+    for &(method, endpoint) in WRITE_PARAMETER_ENDPOINTS {
+        for (parameter, value) in [
+            ("routing", "tenant"),
+            ("routing", ""),
+            ("_routing", "tenant"),
+            ("pipeline", "ingest"),
+            ("version", "2"),
+            ("_version", "2"),
+            ("version_type", "external"),
+            ("_version_type", "external"),
+            ("require_alias", "true"),
+            ("require_alias", "false"),
+            ("require_data_stream", "true"),
+            ("dynamic_templates", "%7B%7D"),
+            ("wait_for_active_shards", "2"),
+            ("wait_for_active_shards", "all"),
+            ("wait_for_active_shards", "0"),
+            ("wait_for_active_shards", "-1"),
+            ("wait_for_active_shards", "foo"),
+            ("wait_for_active_shards", ""),
+        ] {
+            let (status, error) = write_parameter_request(
+                &harness,
+                index,
+                method,
+                endpoint,
+                &format!("?{parameter}={value}"),
+            )
+            .await?;
+            assert_write_parameter_rejection(status, &error, parameter);
+            assert_write_parameter_no_writes(&harness, index, &seed).await?;
+        }
+        let additional = if endpoint.starts_with("_update/") {
+            vec![("op_type", "create")]
+        } else if matches!(endpoint, "_bulk" | "global_bulk") {
+            vec![
+                ("retry_on_conflict", "0"),
+                ("retry_on_conflict", "2"),
+                ("if_seq_no", "0"),
+                ("if_primary_term", "1"),
+                ("op_type", "create"),
+            ]
+        } else {
+            vec![("retry_on_conflict", "0"), ("retry_on_conflict", "2")]
+        };
+        for (parameter, value) in additional {
+            let (status, error) = write_parameter_request(
+                &harness,
+                index,
+                method,
+                endpoint,
+                &format!("?{parameter}={value}"),
+            )
+            .await?;
+            assert_write_parameter_rejection(status, &error, parameter);
+            assert_write_parameter_no_writes(&harness, index, &seed).await?;
+        }
+    }
+    for path in [
+        "/params-no-auto-create/_doc/1?routing=tenant",
+        "/params-no-auto-create/_create/1?pipeline=ingest",
+    ] {
+        let (status, error) = harness.put_json(path, json!({"value": 1})).await?;
+        assert_write_parameter_rejection(
+            status,
+            &error,
+            if path.contains("routing") {
+                "routing"
+            } else {
+                "pipeline"
+            },
+        );
+        assert_eq!(
+            harness.head_status("/params-no-auto-create").await?,
+            StatusCode::NOT_FOUND
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn writes_regression_write_params_rejects_invalid_refresh_without_writes() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let index = "write-refresh-params";
+    create_write_contract_index(&harness, index).await?;
+    let (_, seed) = harness
+        .put_json(&format!("/{index}/_doc/seed"), json!({"value": "original"}))
+        .await?;
+    for &(method, endpoint) in WRITE_PARAMETER_ENDPOINTS {
+        for value in ["foo", "wait_for", "TRUE", "1"] {
+            let (status, error) = write_parameter_request(
+                &harness,
+                index,
+                method,
+                endpoint,
+                &format!("?refresh={value}"),
+            )
+            .await?;
+            assert_write_parameter_rejection(status, &error, "refresh");
+            assert!(error["error"]["reason"].as_str().unwrap().contains(value));
+            assert_write_parameter_no_writes(&harness, index, &seed).await?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn writes_regression_write_params_bulk_metadata_rejects_whole_request_without_writes()
+-> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let index = "bulk-metadata-params";
+    create_write_contract_index(&harness, index).await?;
+    let (_, seed) = harness
+        .put_json(&format!("/{index}/_doc/seed"), json!({"value": "original"}))
+        .await?;
+    for endpoint in ["_bulk", "global_bulk"] {
+        for action in ["index", "create", "update", "delete"] {
+            let mut parameters = vec![
+                ("routing", json!("tenant")),
+                ("_routing", json!("tenant")),
+                ("pipeline", json!("ingest")),
+                ("version", json!(2)),
+                ("_version", json!(2)),
+                ("version_type", json!("external")),
+                ("_version_type", json!("external")),
+                ("require_alias", json!(true)),
+                ("require_alias", json!(false)),
+                ("require_data_stream", json!(true)),
+                ("dynamic_templates", json!({"field": "template"})),
+                ("op_type", json!("create")),
+                ("refresh", json!(true)),
+                ("wait_for_active_shards", json!(2)),
+                ("wait_for_active_shards", json!("all")),
+            ];
+            if action != "update" {
+                parameters.extend([
+                    ("retry_on_conflict", json!(0)),
+                    ("retry_on_conflict", json!(2)),
+                ]);
+            }
+            for (offset, (parameter, value)) in parameters.into_iter().enumerate() {
+                let rejected_position = offset % 3 + 1;
+                let mut request = String::new();
+                for position in 1..=3 {
+                    if position == rejected_position {
+                        request.push_str(
+                            &json!({(action): {
+                                "_index": index,
+                                "_id": if matches!(action, "update" | "delete") {
+                                    "seed"
+                                } else {
+                                    "candidate"
+                                },
+                                (parameter): value
+                            }})
+                            .to_string(),
+                        );
+                        request.push('\n');
+                        if action != "delete" {
+                            request.push_str(if action == "update" {
+                                "{\"doc\":{\"value\":\"changed\"}}\n"
+                            } else {
+                                "{\"value\":\"changed\"}\n"
+                            });
+                        }
+                    } else {
+                        request.push_str(
+                            &format!(
+                                "{{\"index\":{{\"_index\":\"{index}\",\"_id\":\"candidate-{position}\"}}}}\n{{\"value\":\"changed\"}}\n"
+                            ),
+                        );
+                    }
+                }
+                let path = if endpoint == "global_bulk" {
+                    "/_bulk".to_string()
+                } else {
+                    format!("/{index}/_bulk")
+                };
+                let (status, error) = harness.post_ndjson(&path, &request).await?;
+                assert_write_parameter_rejection(status, &error, parameter);
+                assert!(
+                    error["error"]["reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains(&format!("item [{rejected_position}]")),
+                    "{error}"
+                );
+                assert_write_parameter_no_writes(&harness, index, &seed).await?;
+                for position in 1..=3 {
+                    assert_eq!(
+                        harness
+                            .get_json(&format!("/{index}/_doc/candidate-{position}?realtime=true"))
+                            .await?
+                            .0,
+                        StatusCode::NOT_FOUND
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn writes_regression_write_params_preserves_supported_and_benign_query_parameters()
+-> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let index = "accepted-write-params";
+    create_write_contract_index(&harness, index).await?;
+    for &(method, endpoint) in WRITE_PARAMETER_ENDPOINTS {
+        for query in [
+            "",
+            "?wait_for_active_shards=1",
+            "?refresh=true",
+            "?refresh=false",
+            "?refresh",
+            "?refresh=",
+            "?timeout=1s&pretty&human=true&error_trace=true&filter_path=_id&wait_for_active_shards=1",
+        ] {
+            let (_, seed) = harness
+                .put_json(&format!("/{index}/_doc/seed"), json!({"value": "original"}))
+                .await?;
+            let query = if endpoint.starts_with("_update/") {
+                format!(
+                    "{}{}retry_on_conflict=2&if_seq_no={}&if_primary_term={}",
+                    query,
+                    if query.is_empty() { "?" } else { "&" },
+                    seed["_seq_no"],
+                    seed["_primary_term"]
+                )
+            } else if endpoint == "_doc/candidate" {
+                format!(
+                    "{}{}op_type=create",
+                    query,
+                    if query.is_empty() { "?" } else { "&" }
+                )
+            } else if method == "DELETE" {
+                format!(
+                    "{}{}if_seq_no={}&if_primary_term={}",
+                    query,
+                    if query.is_empty() { "?" } else { "&" },
+                    seed["_seq_no"],
+                    seed["_primary_term"]
+                )
+            } else {
+                query.to_string()
+            };
+            let (status, body) =
+                write_parameter_request(&harness, index, method, endpoint, &query).await?;
+            assert!(status.is_success(), "{method} {endpoint}{query}: {body}");
+            if matches!(endpoint, "_bulk" | "global_bulk") {
+                assert_eq!(body["errors"], false, "{body}");
+                assert_eq!(
+                    harness
+                        .get_json(&format!("/{index}/_doc/candidate?realtime=true"))
+                        .await?
+                        .1["_source"],
+                    json!({"value": "changed"})
+                );
+                assert_eq!(
+                    harness
+                        .delete_json(&format!("/{index}/_doc/candidate"))
+                        .await?
+                        .0,
+                    StatusCode::OK
+                );
+            } else if method == "DELETE" {
+                assert_eq!(body["result"], "deleted", "{body}");
+            } else {
+                let id = body["_id"].as_str().unwrap();
+                let (status, document) = harness
+                    .get_json(&format!(
+                        "/{index}/_doc/{id}?realtime=true&_source=value&_source_includes=value&_source_excludes=missing&pretty&filter_path=_source"
+                    ))
+                    .await?;
+                assert_eq!(status, StatusCode::OK, "{document}");
+                assert_eq!(document["_source"], json!({"value": "changed"}));
+                assert_eq!(
+                    harness.delete_json(&format!("/{index}/_doc/{id}")).await?.0,
+                    StatusCode::OK
+                );
+            }
+        }
+    }
+    let index = "accepted-bulk-update-params";
+    create_write_contract_index(&harness, index).await?;
+    let (_, first) = harness
+        .put_json(&format!("/{index}/_doc/seed"), json!({"value": 1}))
+        .await?;
+    let request = format!(
+        "{{\"update\":{{\"_id\":\"seed\",\"retry_on_conflict\":2,\"if_seq_no\":{},\"if_primary_term\":{}}}}}\n{{\"doc\":{{\"value\":2}}}}\n",
+        first["_seq_no"], first["_primary_term"]
+    );
+    let (status, body) = harness
+        .post_ndjson(
+            &format!("/{index}/_bulk?refresh=true&timeout=1s&pretty"),
+            &request,
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["errors"], false, "{body}");
+    assert_eq!(
+        body["items"][0]["update"]["_seq_no"],
+        first["_seq_no"].as_u64().unwrap() + 1
+    );
+    assert_eq!(
+        harness.get_json(&format!("/{index}/_doc/seed")).await?.1["_source"],
+        json!({"value": 2})
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn writes_regression_write_params_delete_refreshes_local_reader() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let index = "delete-refresh-params";
+    create_write_contract_index(&harness, index).await?;
+    for query in ["?refresh=true", "?refresh", "?refresh="] {
+        let (status, body) = harness
+            .put_json(
+                &format!("/{index}/_doc/seed?refresh=true"),
+                json!({"value": 1}),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(
+            harness
+                .get_json(&format!("/{index}/_doc/seed?realtime=false"))
+                .await?
+                .0,
+            StatusCode::OK
+        );
+        let (status, body) = harness
+            .delete_json(&format!("/{index}/_doc/seed{query}"))
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            harness
+                .get_json(&format!("/{index}/_doc/seed?realtime=false"))
+                .await?
+                .0,
+            StatusCode::NOT_FOUND
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn writes_regression_write_params_index_creation_rejects_unsupported_safety_parameters()
+-> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    for (parameter, value) in [
+        ("routing", "tenant"),
+        ("pipeline", "ingest"),
+        ("version", "2"),
+        ("version_type", "external"),
+        ("wait_for_active_shards", "2"),
+        ("wait_for_active_shards", "all"),
+        ("refresh", "wait_for"),
+    ] {
+        let (status, body) = harness
+            .put_json(
+                &format!("/rejected-create-params?{parameter}={value}"),
+                json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}}),
+            )
+            .await?;
+        assert_write_parameter_rejection(status, &body, parameter);
+        assert_eq!(
+            harness.head_status("/rejected-create-params").await?,
+            StatusCode::NOT_FOUND
+        );
+    }
+    let (status, body) = harness
+        .put_json(
+            "/accepted-create-params?wait_for_active_shards=1&timeout=1s&pretty&human=true&error_trace=true&filter_path=acknowledged",
+            json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}}),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["acknowledged"], true);
+    Ok(())
+}
+
 #[tokio::test]
 async fn writes_regression_update_preserves_unrefreshed_put() -> Result<()> {
     let harness = RestTestHarness::start().await?;
