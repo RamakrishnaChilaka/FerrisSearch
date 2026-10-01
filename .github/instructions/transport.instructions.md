@@ -138,6 +138,13 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   cache; `create_transport_service_for_test()` supplies isolated defaults.
 
 ### Key Handler Patterns
+- `SearchShard` and `SearchShardDsl` return query parse/validation failures as
+  `INVALID_ARGUMENT`, with the query reason and parser cause in structured
+  status details. Other engine failures remain `INTERNAL`; unavailable-copy
+  statuses retain their original classification. Do not flatten query errors
+  into untyped `success: false` responses. Remote-store leaf batches preserve
+  the same parse classification so the root can return HTTP 400 when every
+  split fails for a client query error.
 - Primary `ShardDocRequest`/`ShardDeleteRequest` carry optional paired
   conditions; index also carries create-only intent. Evaluate inside the
   engine's translog critical section before assignment/append.

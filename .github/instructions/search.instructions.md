@@ -23,6 +23,7 @@ pub struct SearchRequest {
 |---------|-------------|
 | `MatchAll(Value)` | Match all documents |
 | `Match(HashMap<String, Value>)` | Full-text match on a field |
+| `QueryString(QueryStringParams)` | Tantivy-backed query-string subset with `query` and optional `default_field` |
 | `Term(HashMap<String, Value>)` | Exact term match |
 | `Wildcard(HashMap<String, Value>)` | Wildcard pattern (`*` any, `?` single) |
 | `Prefix(HashMap<String, Value>)` | Prefix match |
@@ -32,6 +33,67 @@ pub struct SearchRequest {
 
 ### QueryClause Helpers
 - `is_match_all()` — returns true if this is a `MatchAll` query. Used by `_count` fast path and SQL `count(*)` detection.
+
+## Query-string subset
+
+- URI `GET /{index}/_search?q=...` lowers to `QueryString`, then uses the same
+  distributed DSL gatherer as `POST /{index}/_search`. Do not restore the
+  separate URI path that counted a capped hit list instead of all matches.
+- Omitted `q` defaults to `*:*`. Standalone `*:*` matches every live document,
+  including documents with no indexed `body` terms.
+- URI `df` and DSL `default_field` are optional literal field selectors.
+  Bare `*` without either selector matches all documents, including documents
+  with no indexed text. Ordinary unqualified terms still fall back to `body`.
+  The DSL accepts only `query` and `default_field`.
+- Presence applies only to standalone `field:*` or `*` with an explicit field.
+  Fast fields use Tantivy's `ExistsQuery`; indexed text with field norms checks
+  document lengths without enumerating terms. Text without field norms uses
+  an all-terms fallback whose cost grows with vocabulary and postings.
+  Missing fields match no documents. Do not fall back to `body` for an unknown
+  named field.
+- Keyword presence includes empty strings, and numeric presence includes zero.
+  Text presence requires an indexed token; empty or analyzer-empty text does
+  not match. This is an explicit difference from OpenSearch field existence.
+- These wildcard rewrites apply only to standalone expressions. All other
+  strings use the existing Tantivy parser; this is not full Lucene syntax.
+- Parse failures retain the complete input query and typed parser cause.
+  Transport must preserve that classification and cause rather than flattening
+  it into an untyped success-false envelope.
+- Keep parser and engine execution on the existing search worker pools.
+  Existing `match` and SQL `text_match` success semantics stay unchanged.
+- Before constructing a Tantivy hit collector, bound the window by the shard's
+  live document count and saturate `from + size`. Never pass a user-controlled
+  huge capacity directly to TopDocs. Coordinator pagination overflow remains
+  HTTP 400, while valid huge windows preserve total counts and result values.
+
+## Shard failure responses
+
+- When no shard succeeds and at least one fails, return
+  `search_phase_execution_exception`, `reason: "all shards failed"`, and
+  `failed_shards` with index, shard (or remote split), node, and nested reason.
+- Return HTTP 400 only when every failure is a client parse or validation
+  error. Preserve `query_shard_exception` and its `parse_exception` cause.
+  Unavailable targets return 503; other engine failures return 500. A server
+  failure must not be downgraded to 400 because another shard had a parse error.
+  An unknown tokenizer is a server configuration failure, even though Tantivy
+  reports it through `QueryParserError`.
+- Partial failures remain HTTP 200 with `_shards.failed` and
+  `_shards.failures`. A successful shard with zero hits is still successful.
+  `allow_partial_search_results=false` is not implemented.
+- Missing primary nodes and unavailable routed copies count as failures, not
+  silently skipped work.
+- Query-body `_count` and materialized/distributed SQL inherit these rules.
+  Metadata-only `_count` and SQL `count(*)` reject an entirely unavailable shard
+  set. SQL planning, fast-field execution, and grouped-result shaping remain
+  unchanged; SQL paths using the shared gatherer inherit its error policy.
+  Catalog listing semantics remain unchanged.
+- Remote-store search identifies split failures and preserves the final cause
+  after leaf retries; successful retries must not remain failed. An empty
+  manifest or an entirely pruned candidate set remains a successful empty search.
+- Empty remote-store candidate sets still validate query strings against the
+  canonical mapping-derived schema on the search pool. Invalid queries return
+  400 with their parser cause; no shard failed because no split was dispatched.
+- `_count?q=...` and `_msearch` are not implemented. Do not claim otherwise.
 
 ## FuzzyParams
 ```rust

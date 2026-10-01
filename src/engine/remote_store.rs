@@ -31,6 +31,9 @@ use serde_json::Value;
 
 use crate::api::AppState;
 use crate::api::index::{DistributedDslSearchResult, RemoteStoreSearchStats};
+use crate::api::search::failures::{
+    ShardFailure, all_shards_failed_response, query_error_response,
+};
 use crate::cluster::state::{FieldMapping, FieldType, IndexMetadata};
 use crate::engine::tantivy::{canonical_keyword_scalar, visit_indexed_keyword_values};
 use crate::engine::{DocumentValidationError, SearchEngine};
@@ -802,12 +805,17 @@ pub(crate) async fn execute_leaf_search_batch(
                         partial_aggs,
                         error: None,
                     },
+                    Ok(Err(error))
+                        if crate::search::query_string::query_error_is_client(&error) =>
+                    {
+                        return Err(error);
+                    }
                     Ok(Err(error)) | Err(error) => LeafSplitSearchOutcome {
                         split_id: split.split_id.clone(),
                         hits: Vec::new(),
                         total_hits: 0,
                         partial_aggs: HashMap::new(),
-                        error: Some(error.to_string()),
+                        error: Some(format!("{error:#}")),
                     },
                 }
             }
@@ -816,7 +824,7 @@ pub(crate) async fn execute_leaf_search_batch(
                 hits: Vec::new(),
                 total_hits: 0,
                 partial_aggs: HashMap::new(),
-                error: Some(error.to_string()),
+                error: Some(format!("{error:#}")),
             },
         };
         outcomes.push(outcome);
@@ -955,6 +963,7 @@ struct RemoteStoreSearchAccumulator {
     total_hits: usize,
     successful: u32,
     partial_aggs: Vec<HashMap<String, PartialAggResult>>,
+    failures: BTreeMap<String, ShardFailure>,
 }
 
 struct RemoteStoreRoundOutcome {
@@ -1003,10 +1012,22 @@ fn apply_remote_store_batch_results(
                         if let Some(split) = split_lookup.get(&split_id) {
                             next_pending.push(split.clone());
                         }
+                        accumulator.failures.insert(
+                            split_id.clone(),
+                            ShardFailure::new(
+                                index_name,
+                                split_id,
+                                &node_id,
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "search_exception",
+                                error,
+                            ),
+                        );
                         node_failed = true;
                         continue;
                     }
 
+                    accumulator.failures.remove(&split_id);
                     made_progress = true;
                     accumulator.successful += 1;
                     accumulator.total_hits += total_hits;
@@ -1040,6 +1061,17 @@ fn apply_remote_store_batch_results(
                     index_name,
                     error
                 );
+                for split in &assigned_splits {
+                    accumulator.failures.insert(
+                        split.split_id.clone(),
+                        ShardFailure::from_error(
+                            index_name,
+                            split.split_id.clone(),
+                            &node_id,
+                            &error,
+                        ),
+                    );
+                }
                 newly_unhealthy_nodes.insert(node_id);
                 next_pending.extend(assigned_splits);
             }
@@ -1051,6 +1083,23 @@ fn apply_remote_store_batch_results(
         newly_unhealthy_nodes,
         made_progress,
     }
+}
+
+async fn validate_empty_query_strings(
+    state: &AppState,
+    metadata: &IndexMetadata,
+    search_req: &SearchRequest,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let query = search_req.query.clone();
+    let mappings = metadata.mappings.clone();
+    state
+        .worker_pools
+        .spawn_search(move || {
+            crate::engine::tantivy::validate_query_strings_with_mappings(&query, &mappings)
+        })
+        .await
+        .map_err(query_error_response)?
+        .map_err(query_error_response)
 }
 
 /// Entry point invoked from `execute_distributed_dsl_search` when an index's
@@ -1087,11 +1136,13 @@ pub(crate) async fn search(
     {
         Ok(Some(m)) => m,
         Ok(None) => {
+            validate_empty_query_strings(state, metadata, search_req).await?;
             return Ok(DistributedDslSearchResult {
                 all_hits: Vec::new(),
                 total_hits: 0,
                 successful_shards: 0,
                 failed_shards: 0,
+                shard_failures: Vec::new(),
                 aggregations: HashMap::new(),
                 partial_aggs: Vec::new(),
                 remote_store_stats: Some(RemoteStoreSearchStats::default()),
@@ -1126,11 +1177,13 @@ pub(crate) async fn search(
         assigned_splits: 0,
     };
     if split_plans.is_empty() {
+        validate_empty_query_strings(state, metadata, search_req).await?;
         return Ok(DistributedDslSearchResult {
             all_hits: Vec::new(),
             total_hits: 0,
             successful_shards: 0,
             failed_shards: 0,
+            shard_failures: Vec::new(),
             aggregations: HashMap::new(),
             partial_aggs: Vec::new(),
             remote_store_stats: Some(remote_store_stats),
@@ -1149,11 +1202,22 @@ pub(crate) async fn search(
         .cloned()
         .collect();
     if leaf_nodes.is_empty() {
-        return Err(crate::api::error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "remote_store_leaf_unavailable_exception",
-            format!("no remote_store-capable leaf nodes available for index [{index_name}]"),
-        ));
+        let failures: Vec<_> = split_plans
+            .iter()
+            .map(|split| {
+                ShardFailure::new(
+                    index_name,
+                    split.split_id.clone(),
+                    "unassigned",
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "remote_store_leaf_unavailable_exception",
+                    format!(
+                        "no remote_store-capable leaf nodes available for index [{index_name}]"
+                    ),
+                )
+            })
+            .collect();
+        return Err(all_shards_failed_response(0, &failures).expect("non-empty split plans"));
     }
 
     let leaf_context = LeafExecutionContext {
@@ -1192,6 +1256,21 @@ pub(crate) async fn search(
         );
         if assignments.is_empty() {
             failed += pending_splits.len() as u32;
+            for split in &pending_splits {
+                accumulator
+                    .failures
+                    .entry(split.split_id.clone())
+                    .or_insert_with(|| {
+                        ShardFailure::new(
+                            index_name,
+                            split.split_id.clone(),
+                            "unassigned",
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "remote_store_leaf_unavailable_exception",
+                            format!("no healthy leaf available for split [{}]", split.split_id),
+                        )
+                    });
+            }
             break;
         }
         for split in assignments.values().flatten() {
@@ -1272,6 +1351,10 @@ pub(crate) async fn search(
         pending_splits = dedupe_pending_splits(round.next_pending);
     }
     remote_store_stats.assigned_splits = assigned_split_ids.len();
+    let shard_failures: Vec<_> = accumulator.failures.into_values().collect();
+    if let Some(error) = all_shards_failed_response(accumulator.successful, &shard_failures) {
+        return Err(error);
+    }
 
     let all_hits =
         crate::search::merge_sorted_hit_lists(accumulator.split_hit_lists, &search_req.sort);
@@ -1286,6 +1369,7 @@ pub(crate) async fn search(
         total_hits: accumulator.total_hits,
         successful_shards: accumulator.successful,
         failed_shards: failed,
+        shard_failures,
         aggregations,
         partial_aggs: accumulator.partial_aggs,
         remote_store_stats: Some(remote_store_stats),

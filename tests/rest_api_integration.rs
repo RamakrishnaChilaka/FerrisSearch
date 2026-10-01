@@ -2717,6 +2717,733 @@ async fn moved_bulk_and_update_sources_preserve_values_and_receipt_order() -> Re
     Ok(())
 }
 
+fn qsearch_url(base_url: &str, path: &str, params: &[(&str, &str)]) -> Result<url::Url> {
+    let mut url = url::Url::parse(&format!("{base_url}{path}"))?;
+    url.query_pairs_mut().extend_pairs(params.iter().copied());
+    Ok(url)
+}
+
+#[tokio::test]
+async fn rest_qsearch_match_all_counts_every_document_across_three_shards() -> Result<()> {
+    let harness = MultiNodeRestHarness::start_three_nodes().await?;
+    create_distributed_stories_index_and_docs(&harness).await?;
+    for (shard_id, node) in harness.nodes.iter().enumerate() {
+        let engine = node
+            .app_state
+            .shard_manager
+            .get_shard("stories", shard_id as u32)
+            .unwrap();
+        let docs = (0..105)
+            .map(|id| {
+                (
+                    format!("extra-{shard_id}-{id}"),
+                    json!({"title": "extra", "author": "extra", "upvotes": id}),
+                )
+            })
+            .collect();
+        engine.bulk_add_documents(docs)?;
+        engine.refresh()?;
+    }
+
+    for (query, expected) in [("*:*", 323), ("author:alice", 3), ("*", 323)] {
+        let response = harness
+            .client
+            .get(qsearch_url(
+                &harness.nodes[1].base_url,
+                "/stories/_search",
+                &[("q", query), ("size", "400")],
+            )?)
+            .send()
+            .await?;
+        let status = response.status();
+        let body: Value = response.json().await?;
+        assert_eq!(status, StatusCode::OK, "query [{query}]: {body}");
+        assert_eq!(body["_shards"]["successful"], 3, "{body}");
+        assert_eq!(body["_shards"]["failed"], 0, "{body}");
+        assert_eq!(body["hits"]["total"]["value"], expected, "{body}");
+        assert_eq!(
+            body["hits"]["hits"].as_array().map(Vec::len),
+            Some(expected as usize),
+            "{body}"
+        );
+
+        let (status, body) = post_json_to_base_url(
+            &harness.client,
+            &harness.nodes[1].base_url,
+            "/stories/_search",
+            json!({"query": {"query_string": {"query": query}}, "size": 400}),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "query [{query}]: {body}");
+        assert_eq!(body["hits"]["total"]["value"], expected, "{body}");
+        assert_eq!(
+            body["hits"]["hits"].as_array().map(Vec::len),
+            Some(expected as usize),
+            "{body}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_qsearch_wildcards_distinguish_missing_null_and_empty_keyword_values() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let (status, body) = harness
+        .put_json(
+            "/presence",
+            json!({
+                "settings": {"number_of_shards": 2, "number_of_replicas": 0},
+                "mappings": {
+                    "dynamic": "strict",
+                    "properties": {"tag": {"type": "keyword"}, "number": {"type": "integer"}}
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = harness
+        .post_ndjson(
+            "/presence/_bulk?refresh=true",
+            concat!(
+                "{\"index\":{\"_id\":\"value\"}}\n{\"tag\":\"rust\",\"number\":0}\n",
+                "{\"index\":{\"_id\":\"empty\"}}\n{\"tag\":\"\"}\n",
+                "{\"index\":{\"_id\":\"null\"}}\n{\"tag\":null}\n",
+                "{\"index\":{\"_id\":\"missing\"}}\n{}\n"
+            ),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["errors"], false, "{body}");
+    for (params, expected) in [
+        (
+            vec![("q", "*:*")],
+            vec!["empty", "missing", "null", "value"],
+        ),
+        (vec![("q", "*")], vec!["empty", "missing", "null", "value"]),
+        (vec![("q", "*"), ("df", "body")], vec!["value"]),
+        (vec![("q", "tag:*")], vec!["empty", "value"]),
+        (vec![("q", "*"), ("df", "tag")], vec!["empty", "value"]),
+        (vec![("q", "number:*")], vec!["value"]),
+        (vec![("q", "unknown:*")], vec![]),
+        (vec![], vec!["empty", "missing", "null", "value"]),
+    ] {
+        let response = harness
+            .client
+            .get(qsearch_url(
+                &harness.base_url,
+                "/presence/_search",
+                &params,
+            )?)
+            .send()
+            .await?;
+        let status = response.status();
+        let body: Value = response.json().await?;
+        assert_eq!(status, StatusCode::OK, "{params:?}: {body}");
+        assert_eq!(body["hits"]["total"]["value"], expected.len(), "{body}");
+        let mut ids: Vec<_> = body["hits"]["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["_id"].as_str().unwrap())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, expected, "{params:?}: {body}");
+    }
+    let (status, body) = harness
+        .post_json(
+            "/presence/_count",
+            json!({"query": {"query_string": {"query": "*", "default_field": "tag"}}}),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["count"], 2, "{body}");
+    Ok(())
+}
+
+fn assert_qsearch_all_parse_failures(status: StatusCode, body: &Value, query: &str, count: usize) {
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["status"], 400, "{body}");
+    assert_eq!(
+        body["error"]["type"], "search_phase_execution_exception",
+        "{body}"
+    );
+    assert_eq!(body["error"]["reason"], "all shards failed", "{body}");
+    let failures = body["error"]["failed_shards"].as_array().unwrap();
+    assert_eq!(failures.len(), count, "{body}");
+    for failure in failures {
+        assert_eq!(failure["index"], "stories", "{body}");
+        assert_eq!(failure["reason"]["type"], "query_shard_exception", "{body}");
+        assert!(
+            failure["reason"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains(query),
+            "{body}"
+        );
+        assert_eq!(
+            failure["reason"]["caused_by"]["type"], "parse_exception",
+            "{body}"
+        );
+        assert!(
+            failure["reason"]["caused_by"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("Syntax"),
+            "{body}"
+        );
+    }
+    let mut shards: Vec<_> = failures
+        .iter()
+        .map(|failure| failure["shard"].as_u64().unwrap())
+        .collect();
+    shards.sort_unstable();
+    assert_eq!(shards, (0..count as u64).collect::<Vec<_>>(), "{body}");
+}
+
+#[tokio::test]
+async fn rest_qsearch_invalid_syntax_returns_400_with_all_shard_causes() -> Result<()> {
+    let harness = MultiNodeRestHarness::start_three_nodes().await?;
+    create_distributed_stories_index_and_docs(&harness).await?;
+    let query = "title:(";
+    let response = harness
+        .client
+        .get(qsearch_url(
+            &harness.nodes[1].base_url,
+            "/stories/_search",
+            &[("q", query)],
+        )?)
+        .send()
+        .await?;
+    let status = response.status();
+    let body: Value = response.json().await?;
+    assert_qsearch_all_parse_failures(status, &body, query, 3);
+
+    for route in ["/stories/_search", "/stories/_count"] {
+        let (status, body) = post_json_to_base_url(
+            &harness.client,
+            &harness.nodes[1].base_url,
+            route,
+            json!({"query": {"query_string": {"query": query}}}),
+        )
+        .await?;
+        assert_qsearch_all_parse_failures(status, &body, query, 3);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_qsearch_all_unavailable_shards_return_503_with_reasons() -> Result<()> {
+    let harness = MultiNodeRestHarness::start_three_nodes().await?;
+    create_distributed_stories_index_and_docs(&harness).await?;
+    let mut cluster_state = harness.nodes[1].app_state.cluster_manager.get_state();
+    for routing in cluster_state
+        .indices
+        .get_mut("stories")
+        .unwrap()
+        .shard_routing
+        .values_mut()
+    {
+        routing.primary = "absent-node".to_string();
+    }
+    harness.nodes[1]
+        .app_state
+        .cluster_manager
+        .update_state(cluster_state);
+
+    for route in ["/stories/_search", "/stories/_count"] {
+        let (status, body) =
+            get_json_from_base_url(&harness.client, &harness.nodes[1].base_url, route).await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{route}: {body}");
+        assert_eq!(
+            body["error"]["type"], "search_phase_execution_exception",
+            "{body}"
+        );
+        let failures = body["error"]["failed_shards"].as_array().unwrap();
+        assert_eq!(failures.len(), 3, "{body}");
+        for failure in failures {
+            assert_eq!(
+                failure["reason"]["type"], "shard_not_available_exception",
+                "{body}"
+            );
+            assert!(
+                failure["reason"]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("absent-node"),
+                "{body}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_qsearch_partial_remote_failure_stays_200_and_keeps_healthy_hits() -> Result<()> {
+    let harness = MultiNodeRestHarness::start_three_nodes().await?;
+    create_distributed_stories_index_and_docs(&harness).await?;
+    harness.nodes[2].transport_handle.abort();
+    for body in [None, Some(json!({"query": {"match_all": {}}}))] {
+        let (status, response) = match body {
+            Some(body) => {
+                post_json_to_base_url(
+                    &harness.client,
+                    &harness.nodes[1].base_url,
+                    "/stories/_search",
+                    body,
+                )
+                .await?
+            }
+            None => {
+                get_json_from_base_url(
+                    &harness.client,
+                    &harness.nodes[1].base_url,
+                    "/stories/_search",
+                )
+                .await?
+            }
+        };
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["_shards"]["total"], 3, "{response}");
+        assert_eq!(response["_shards"]["successful"], 2, "{response}");
+        assert_eq!(response["_shards"]["failed"], 1, "{response}");
+        assert_eq!(response["hits"]["total"]["value"], 6, "{response}");
+        assert_eq!(
+            response["hits"]["hits"].as_array().map(Vec::len),
+            Some(6),
+            "{response}"
+        );
+        assert_eq!(
+            response["_shards"]["failures"].as_array().map(Vec::len),
+            Some(1),
+            "{response}"
+        );
+        let failure = &response["_shards"]["failures"][0];
+        assert_eq!(failure["shard"], 2, "{response}");
+        assert_eq!(failure["index"], "stories", "{response}");
+        assert_eq!(failure["node"], "node-3", "{response}");
+        assert!(
+            !failure["reason"]["reason"].as_str().unwrap().is_empty(),
+            "{response}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_qsearch_existing_match_parse_errors_are_not_success_shaped() -> Result<()> {
+    let harness = MultiNodeRestHarness::start_three_nodes().await?;
+    create_distributed_stories_index_and_docs(&harness).await?;
+    let (status, body) = post_json_to_base_url(
+        &harness.client,
+        &harness.nodes[1].base_url,
+        "/stories/_search",
+        json!({"query": {"match": {"title": "("}}}),
+    )
+    .await?;
+    assert_qsearch_all_parse_failures(status, &body, "(", 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_qsearch_shared_sql_paths_keep_counts_and_surface_all_failed_shards() -> Result<()> {
+    let harness = MultiNodeRestHarness::start_three_nodes().await?;
+    create_distributed_stories_index_and_docs(&harness).await?;
+    let coordinator = &harness.nodes[1];
+    for (query, mode) in [
+        ("SELECT count(*) AS n FROM stories", "count_star_fast"),
+        ("SELECT * FROM stories", "materialized_hits_fallback"),
+    ] {
+        let (status, body) = post_json_to_base_url(
+            &harness.client,
+            &coordinator.base_url,
+            "/stories/_sql",
+            json!({"query": query}),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["execution_mode"], mode, "{body}");
+        assert_eq!(body["matched_hits"], 8, "{body}");
+        if mode == "count_star_fast" {
+            assert_eq!(body["rows"][0]["n"], 8, "{body}");
+        } else {
+            assert_eq!(body["rows"].as_array().map(Vec::len), Some(8), "{body}");
+        }
+    }
+    let mut cluster_state = coordinator.app_state.cluster_manager.get_state();
+    for routing in cluster_state
+        .indices
+        .get_mut("stories")
+        .unwrap()
+        .shard_routing
+        .values_mut()
+    {
+        routing.primary = "absent-node".to_string();
+    }
+    coordinator
+        .app_state
+        .cluster_manager
+        .update_state(cluster_state);
+    for route in ["/stories/_sql", "/stories/_sql/stream"] {
+        for query in ["SELECT count(*) AS n FROM stories", "SELECT * FROM stories"] {
+            let (status, body) = post_json_to_base_url(
+                &harness.client,
+                &coordinator.base_url,
+                route,
+                json!({"query": query}),
+            )
+            .await?;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{route}: {body}");
+            assert_eq!(
+                body["error"]["type"], "search_phase_execution_exception",
+                "{body}"
+            );
+            assert_eq!(
+                body["error"]["failed_shards"].as_array().map(Vec::len),
+                Some(3),
+                "{body}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_qsearch_pagination_overflow_returns_400_before_worker_dispatch() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_products_index_and_docs(&harness).await?;
+    let (status, body) = harness
+        .get_json(&format!(
+            "/products/_search?q=*:*&from=1&size={}",
+            usize::MAX
+        ))
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"]["type"], "illegal_argument_exception",
+        "{body}"
+    );
+    assert!(
+        body["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("pagination"),
+        "{body}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_qsearch_empty_remote_store_rejects_syntax_and_typed_value_errors() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let (status, body) = harness
+        .put_json(
+            "/remote-empty-query",
+            json!({
+                "engine": "remote_store",
+                "mappings": {"properties": {"number": {"type": "integer"}}}
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = harness
+        .get_json("/remote-empty-query/_search?q=*:*")
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["hits"]["total"]["value"], 0, "{body}");
+    for query in ["body:(", "number:not-a-number"] {
+        let response = harness
+            .client
+            .get(qsearch_url(
+                &harness.base_url,
+                "/remote-empty-query/_search",
+                &[("q", query)],
+            )?)
+            .send()
+            .await?;
+        let status = response.status();
+        let body: Value = response.json().await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["type"], "query_shard_exception", "{body}");
+        assert!(
+            body["error"]["reason"].as_str().unwrap().contains(query),
+            "{body}"
+        );
+        assert_eq!(
+            body["error"]["caused_by"]["type"], "parse_exception",
+            "{body}"
+        );
+        for route in ["/remote-empty-query/_search", "/remote-empty-query/_count"] {
+            let (status, body) = harness
+                .post_json(route, json!({"query": {"query_string": {"query": query}}}))
+                .await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(
+                body["error"]["reason"].as_str().unwrap().contains(query),
+                "{body}"
+            );
+            assert_eq!(
+                body["error"]["caused_by"]["type"], "parse_exception",
+                "{body}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_qsearch_remote_store_match_all_and_parse_errors() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let (status, body) = harness
+        .put_json("/remote-qsearch", json!({"engine": "remote_store"}))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = harness
+        .post_json(
+            "/remote-qsearch/_remote_store/publish",
+            json!({"docs": [{"_id": "text", "body": "rust"}, {"_id": "empty"}]}),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for (query, expected_status, expected_count) in [
+        ("*:*", StatusCode::OK, 2),
+        ("*", StatusCode::OK, 2),
+        ("body:(", StatusCode::BAD_REQUEST, 0),
+    ] {
+        let response = harness
+            .client
+            .get(qsearch_url(
+                &harness.base_url,
+                "/remote-qsearch/_search",
+                &[("q", query)],
+            )?)
+            .send()
+            .await?;
+        let status = response.status();
+        let body: Value = response.json().await?;
+        assert_eq!(status, expected_status, "query [{query}]: {body}");
+        if status == StatusCode::OK {
+            assert_eq!(body["hits"]["total"]["value"], expected_count, "{body}");
+        } else {
+            assert_eq!(
+                body["error"]["type"], "search_phase_execution_exception",
+                "{body}"
+            );
+            assert_eq!(
+                body["error"]["failed_shards"].as_array().map(Vec::len),
+                Some(1),
+                "{body}"
+            );
+            assert!(
+                body["error"]["failed_shards"][0]["reason"]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains(query),
+                "{body}"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn qsearch_review_seed_semantics(harness: &RestTestHarness) -> Result<()> {
+    let (status, body) = harness
+        .put_json(
+            "/sem",
+            json!({
+                "settings": {"number_of_shards": 2, "number_of_replicas": 0},
+                "mappings": {"properties": {
+                    "title": {"type": "text"}, "tag": {"type": "keyword"}, "n": {"type": "integer"}
+                }}
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = harness.post_ndjson("/sem/_bulk?refresh=true", concat!(
+        "{\"index\":{\"_id\":\"d1\"}}\n{\"title\":\"hello world\",\"tag\":\"rust\",\"n\":1}\n",
+        "{\"index\":{\"_id\":\"d2\"}}\n{\"title\":\"hello there\",\"tag\":\"python\",\"n\":5}\n",
+        "{\"index\":{\"_id\":\"d3\"}}\n{\"title\":\"goodbye world\",\"tag\":\"Rust\",\"n\":10}\n",
+        "{\"index\":{\"_id\":\"d4\"}}\n{\"tag\":\"\"}\n",
+        "{\"index\":{\"_id\":\"d5\"}}\n{\"n\":0}\n",
+        "{\"index\":{\"_id\":\"d6\"}}\n{}\n",
+        "{\"index\":{\"_id\":\"d7\"}}\n{\"meta\":{\"k\":\"hello\"}}\n",
+        "{\"index\":{\"_id\":\"d8\"}}\n{\"title\":\"!!!\"}\n",
+        "{\"index\":{\"_id\":\"d9\"}}\n{\"title\":null,\"tag\":null}\n",
+        "{\"index\":{\"_id\":\"d10\"}}\n{\"words\":[\"hello\",\"array\"]}\n"
+    )).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["errors"], false, "{body}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_qsearch_review_bare_star_matches_all_without_an_explicit_field() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    qsearch_review_seed_semantics(&harness).await?;
+    let expected = ["d1", "d10", "d2", "d3", "d4", "d5", "d6", "d7", "d8", "d9"];
+    for query in ["*", " * ", "(*)", "*:*"] {
+        let response = harness
+            .client
+            .get(qsearch_url(
+                &harness.base_url,
+                "/sem/_search",
+                &[("q", query), ("size", "50")],
+            )?)
+            .send()
+            .await?;
+        let status = response.status();
+        let body: Value = response.json().await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["_shards"]["successful"], 2, "{body}");
+        assert_eq!(body["_shards"]["failed"], 0, "{body}");
+        assert_eq!(body["hits"]["total"]["value"], 10, "{body}");
+        let mut ids: Vec<_> = body["hits"]["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["_id"].as_str().unwrap())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, expected, "{query}: {body}");
+    }
+    for query in [json!({"query": "*"}), json!({"query": "*:*"})] {
+        let (status, body) = harness
+            .post_json(
+                "/sem/_search",
+                json!({
+                    "query": {"query_string": query}, "size": 50
+                }),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["hits"]["total"]["value"], 10, "{body}");
+        assert_eq!(
+            body["hits"]["hits"].as_array().map(Vec::len),
+            Some(10),
+            "{body}"
+        );
+        let (status, body) = harness
+            .post_json(
+                "/sem/_count",
+                json!({
+                    "query": {"query_string": query}
+                }),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["count"], 10, "{body}");
+    }
+    for (field, expected) in [("tag", 4), ("n", 4), ("title", 3), ("body", 4)] {
+        let response = harness
+            .client
+            .get(qsearch_url(
+                &harness.base_url,
+                "/sem/_search",
+                &[("q", "*"), ("df", field)],
+            )?)
+            .send()
+            .await?;
+        let status = response.status();
+        let body: Value = response.json().await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["hits"]["total"]["value"], expected, "{field}: {body}");
+        let (status, body) = harness
+            .post_json(
+                "/sem/_search",
+                json!({
+                    "query": {"query_string": {"query": "*", "default_field": field}}
+                }),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["hits"]["total"]["value"], expected, "{field}: {body}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_qsearch_review_huge_windows_preserve_node_liveness() -> Result<()> {
+    const CHILD: &str = "FERRIS_QSEARCH_HUGE_WINDOW_CHILD";
+    if std::env::var(CHILD).as_deref() != Ok("1") {
+        let output = tokio::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "rest_qsearch_review_huge_windows_preserve_node_liveness",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .await?;
+        assert!(
+            output.status.success(),
+            "isolated search node/test failed: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(());
+    }
+    let harness = RestTestHarness::start().await?;
+    qsearch_review_seed_semantics(&harness).await?;
+    for (from, size) in [
+        (0_u64, u64::MAX),
+        (1, u64::MAX),
+        (u64::MAX, 1),
+        (u64::MAX - 1, 1),
+        (u64::MAX - 1, 2),
+        (0, u64::MAX / 4 + 1),
+        (0, 10_000_000_000),
+    ] {
+        for dsl in [false, true] {
+            let (status, body) = if dsl {
+                harness
+                    .post_json(
+                        "/sem/_search",
+                        json!({
+                            "query": {"match_all": {}}, "from": from, "size": size
+                        }),
+                    )
+                    .await?
+            } else {
+                harness
+                    .get_json(&format!("/sem/_search?q=*:*&from={from}&size={size}"))
+                    .await?
+            };
+            if from.checked_add(size).is_none() {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+                assert_eq!(
+                    body["error"]["type"], "illegal_argument_exception",
+                    "{body}"
+                );
+                assert!(
+                    body["error"]["reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains("pagination"),
+                    "{body}"
+                );
+            } else {
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body["_shards"]["failed"], 0, "{body}");
+                assert_eq!(body["hits"]["total"]["value"], 10, "{body}");
+                assert_eq!(
+                    body["hits"]["hits"].as_array().map(Vec::len),
+                    Some(if from < 10 { 10 - from as usize } else { 0 }),
+                    "{body}"
+                );
+            }
+            let (status, body) = harness.get_json("/sem/_search?q=*:*&size=50").await?;
+            assert_eq!(status, StatusCode::OK, "follow-up failed: {body}");
+            assert_eq!(body["hits"]["total"]["value"], 10, "{body}");
+            assert_eq!(
+                body["hits"]["hits"].as_array().map(Vec::len),
+                Some(10),
+                "{body}"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn rest_can_bulk_index_and_search_via_query_and_dsl() -> Result<()> {
     let harness = RestTestHarness::start().await?;

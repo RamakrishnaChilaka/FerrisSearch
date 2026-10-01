@@ -189,6 +189,10 @@ Notes:
 - `title` is a `text` field here, so `term` queries against the full title string are not a good validation query. Use `match` instead.
 - This runbook intentionally uses the DSL `POST /_search` path because that is the path already covered by the current `remote_store` REST integration tests.
 - `GET /{index}/_search?q=...` and match-all `POST /{index}/_count` now have dedicated REST regressions, so they are part of the supported remote_store read surface for this flow.
+- URI search and DSL `query_string` use the same documented
+  [query-string subset](../README.md#query-string-search). Standalone `*:*`
+  matches every published document. All-split parse failures return HTTP 400
+  with per-split causes; partial failures remain HTTP 200.
 
 ## 6. Verify The Published Split
 

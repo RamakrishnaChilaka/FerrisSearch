@@ -13,6 +13,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::api::search::failures::{ShardFailure, all_shards_failed_response, shard_stats};
 use crate::api::{raft_write, resolve_leader_or_master};
 
 fn is_document_validation_error(error: &anyhow::Error) -> bool {
@@ -93,6 +94,7 @@ pub(crate) struct DistributedDslSearchResult {
     pub total_hits: usize,
     pub successful_shards: u32,
     pub failed_shards: u32,
+    pub shard_failures: Vec<ShardFailure>,
     pub aggregations: HashMap<String, Value>,
     pub partial_aggs: Vec<HashMap<String, crate::search::PartialAggResult>>,
     pub remote_store_stats: Option<RemoteStoreSearchStats>,
@@ -957,6 +959,17 @@ pub(crate) async fn execute_distributed_dsl_search(
 ) -> Result<DistributedDslSearchResult, (StatusCode, Json<Value>)> {
     // IndexName is validated at extraction time
 
+    if search_req.from.checked_add(search_req.size).is_none() {
+        return Err(crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            format!(
+                "from [{}] plus size [{}] exceeds the supported pagination range",
+                search_req.from, search_req.size
+            ),
+        ));
+    }
+
     let cluster_state = state.cluster_manager.get_state();
     let metadata = match cluster_state.indices.get(index_name) {
         Some(m) => m.clone(),
@@ -981,6 +994,7 @@ pub(crate) async fn execute_distributed_dsl_search(
     let mut knn_hits = Vec::new();
     let mut successful = 0u32;
     let mut failed = 0u32;
+    let mut shard_failures = Vec::new();
     let mut total_hits: usize = 0;
     let is_hybrid = search_req.knn.is_some();
 
@@ -1031,7 +1045,13 @@ pub(crate) async fn execute_distributed_dsl_search(
                 shard_hit_lists.push(shard_list);
             }
             Ok(Err(e)) | Err(e) => {
-                tracing::error!("Shard {}/{} search failed: {}", index_name, shard_id, e);
+                tracing::error!("Shard {}/{} search failed: {:#}", index_name, shard_id, e);
+                shard_failures.push(ShardFailure::from_error(
+                    index_name,
+                    shard_id,
+                    &state.local_node_id,
+                    &e,
+                ));
                 failed += 1;
             }
         }
@@ -1074,6 +1094,12 @@ pub(crate) async fn execute_distributed_dsl_search(
                         shard_id,
                         e
                     );
+                    shard_failures.push(ShardFailure::from_error(
+                        index_name,
+                        shard_id,
+                        &state.local_node_id,
+                        &e,
+                    ));
                     failed += 1;
                 }
             }
@@ -1094,21 +1120,37 @@ pub(crate) async fn execute_distributed_dsl_search(
             let index = index_name.to_string();
             let sid = *shard_id;
             let req_clone = search_req.clone();
-            remote_futures.push(tokio::spawn(async move {
-                (
-                    sid,
-                    client
-                        .forward_search_dsl_to_shard(&node_info, &index, sid, &req_clone)
-                        .await,
-                )
-            }));
+            let node_id = node_info.id.clone();
+            let handle = tokio::spawn(async move {
+                client
+                    .forward_search_dsl_to_shard(&node_info, &index, sid, &req_clone)
+                    .await
+            });
+            remote_futures.push(async move { (sid, node_id, handle.await) });
+        } else {
+            failed += 1;
+            shard_failures.push(ShardFailure::new(
+                index_name,
+                *shard_id,
+                &routing.primary,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "shard_not_available_exception",
+                format!(
+                    "primary node [{}] is not available for shard [{index_name}][{shard_id}]",
+                    routing.primary
+                ),
+            ));
         }
     }
 
     let remote_results = join_all(remote_futures).await;
-    for result in remote_results {
+    for (shard_id, node_id, result) in remote_results {
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => Err(error.into()),
+        };
         match result {
-            Ok((shard_id, Ok((hits, shard_total, partial_aggs)))) => {
+            Ok((hits, shard_total, partial_aggs)) => {
                 successful += 1;
                 total_hits += shard_total;
                 if !partial_aggs.is_empty() {
@@ -1137,20 +1179,21 @@ pub(crate) async fn execute_distributed_dsl_search(
                     shard_hit_lists.push(shard_text);
                 }
             }
-            Ok((shard_id, Err(e))) => {
+            Err(e) => {
                 tracing::error!(
-                    "Remote shard {}/{} search failed: {}",
+                    "Remote shard {}/{} search failed: {:#}",
                     index_name,
                     shard_id,
                     e
                 );
-                failed += 1;
-            }
-            Err(e) => {
-                tracing::error!("Remote shard search task panicked: {}", e);
+                shard_failures.push(ShardFailure::from_error(index_name, shard_id, &node_id, &e));
                 failed += 1;
             }
         }
+    }
+
+    if let Some(error) = all_shards_failed_response(successful, &shard_failures) {
+        return Err(error);
     }
 
     let mut all_hits = if is_hybrid {
@@ -1176,6 +1219,7 @@ pub(crate) async fn execute_distributed_dsl_search(
         total_hits,
         successful_shards: successful,
         failed_shards: failed,
+        shard_failures,
         aggregations: merged_aggs,
         partial_aggs: all_partial_aggs,
         remote_store_stats: None,
@@ -1283,11 +1327,7 @@ pub async fn search_documents_dsl(
     };
 
     let mut response = serde_json::json!({
-        "_shards": {
-            "total": result.successful_shards + result.failed_shards,
-            "successful": result.successful_shards,
-            "failed": result.failed_shards
-        },
+        "_shards": shard_stats(result.successful_shards, result.failed_shards, &result.shard_failures),
         "hits": {
             "total": { "value": result.total_hits, "relation": "eq" },
             "max_score": max_score,

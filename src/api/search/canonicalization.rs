@@ -100,9 +100,9 @@ pub(super) fn canonicalize_query_clause_fields(
             }
             Ok(())
         }
-        crate::search::QueryClause::MatchAll(_) | crate::search::QueryClause::MatchNone(_) => {
-            Ok(())
-        }
+        crate::search::QueryClause::MatchAll(_)
+        | crate::search::QueryClause::MatchNone(_)
+        | crate::search::QueryClause::QueryString(_) => Ok(()),
     }
 }
 

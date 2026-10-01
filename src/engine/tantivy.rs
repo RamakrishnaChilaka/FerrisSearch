@@ -583,6 +583,62 @@ fn add_mapping_field_to_schema(
     Ok(Some(field))
 }
 
+fn build_schema_with_mappings(
+    mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+    purpose: HotEnginePurpose,
+) -> Result<Schema> {
+    let mut builder = Schema::builder();
+    builder.add_text_field("_id", (STRING | STORED).set_fast(None));
+    builder.add_text_field("_source", STORED);
+    if purpose.requires_sequence_fields() {
+        builder.add_u64_field(SEQ_NO_FIELD_NAME, FAST | STORED);
+        builder.add_u64_field(PRIMARY_TERM_FIELD_NAME, FAST | STORED);
+    }
+    builder.add_text_field("body", TEXT | STORED);
+    let mut names: Vec<_> = mappings.keys().collect();
+    names.sort();
+    for name in names {
+        add_mapping_field_to_schema(&mut builder, name, &mappings[name])?;
+    }
+    Ok(builder.build())
+}
+
+pub(crate) fn validate_query_strings_with_mappings(
+    clause: &crate::search::QueryClause,
+    mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+) -> Result<()> {
+    fn validate(index: &Index, clause: &crate::search::QueryClause) -> Result<()> {
+        match clause {
+            crate::search::QueryClause::QueryString(params) => {
+                crate::search::query_string::parse_query_string(
+                    index,
+                    &params.query,
+                    params.default_field.as_deref(),
+                )?;
+            }
+            crate::search::QueryClause::Bool(query) => {
+                for clause in query
+                    .must
+                    .iter()
+                    .chain(&query.should)
+                    .chain(&query.must_not)
+                    .chain(&query.filter)
+                {
+                    validate(index, clause)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    validate_authoritative_mappings(mappings)?;
+    let index = Index::create_in_ram(build_schema_with_mappings(
+        mappings,
+        HotEnginePurpose::RemoteSplit,
+    )?);
+    validate(&index, clause)
+}
+
 fn validate_authoritative_mapping_entry(
     name: &str,
     mapping: &crate::cluster::state::FieldMapping,
@@ -997,23 +1053,7 @@ impl HotEngine {
             let mmap_dir = tantivy::directory::MmapDirectory::open(&index_path)?;
             Index::open(mmap_dir)?
         } else {
-            let mut schema_builder = Schema::builder();
-            schema_builder.add_text_field("_id", (STRING | STORED).set_fast(None));
-            schema_builder.add_text_field("_source", STORED);
-            if purpose.requires_sequence_fields() {
-                schema_builder.add_u64_field(SEQ_NO_FIELD_NAME, FAST | STORED);
-                schema_builder.add_u64_field(PRIMARY_TERM_FIELD_NAME, FAST | STORED);
-            }
-            schema_builder.add_text_field("body", TEXT | STORED);
-
-            let mut mapping_names: Vec<_> = mappings.keys().cloned().collect();
-            mapping_names.sort();
-            for name in mapping_names {
-                let mapping = &mappings[&name];
-                add_mapping_field_to_schema(&mut schema_builder, &name, mapping)?;
-            }
-
-            let schema = schema_builder.build();
+            let schema = build_schema_with_mappings(mappings, purpose)?;
             let mmap_dir = tantivy::directory::MmapDirectory::open(&index_path)?;
             Index::open_or_create(mmap_dir, schema)?
         };
@@ -4088,12 +4128,19 @@ impl HotEngine {
                     };
                     let target_field = self.resolve_field(field_name);
                     let query_parser = QueryParser::for_index(&self.index, vec![target_field]);
-                    let query = query_parser.parse_query(&query_str)?;
+                    let query = query_parser.parse_query(&query_str).map_err(|error| {
+                        crate::search::query_string::parsing_error(&query_str, error)
+                    })?;
                     Ok(query)
                 } else {
                     Ok(Box::new(AllQuery))
                 }
             }
+            QueryClause::QueryString(params) => crate::search::query_string::parse_query_string(
+                &self.index,
+                &params.query,
+                params.default_field.as_deref(),
+            ),
             QueryClause::Term(fields) => {
                 if let Some((field_name, value)) = fields.iter().next() {
                     let target_field = self.resolve_field(field_name);
@@ -8241,10 +8288,8 @@ impl super::SearchEngine for HotEngine {
     }
 
     fn search(&self, query_str: &str) -> Result<Vec<serde_json::Value>> {
-        let body_field = self.resolve_field("body");
         let searcher = self.reader.searcher();
-        let query_parser = QueryParser::for_index(&self.index, vec![body_field]);
-        let query = query_parser.parse_query(query_str)?;
+        let query = crate::search::query_string::parse_query_string(&self.index, query_str, None)?;
         self.execute_search(searcher, &*query, 100)
     }
 
@@ -8257,9 +8302,11 @@ impl super::SearchEngine for HotEngine {
         std::collections::HashMap<String, crate::search::PartialAggResult>,
     )> {
         let searcher = self.reader.searcher();
-        // Use the exact requested limit when from+size is explicit.
-        // The coordinator handles cross-shard merging at the API layer.
-        let limit = req.from + req.size;
+        // A shard cannot contribute more hits than its live document count.
+        let limit = req
+            .from
+            .saturating_add(req.size)
+            .min(searcher.num_docs() as usize);
         let user_query = self.build_query(&req.query)?;
         // search_after: build a separate hits_query that ANDs the cursor filter
         // onto the user query. The cursor filter must NOT bias total counts or
@@ -11045,6 +11092,171 @@ mod tests {
     }
 
     // ── search ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn qsearch_parser_match_all_includes_documents_without_body_terms() {
+        let (_dir, engine) = create_engine();
+        engine
+            .add_document("text", json!({"body": "rust"}))
+            .unwrap();
+        engine.add_document("empty", json!({})).unwrap();
+        engine.refresh().unwrap();
+
+        for query in ["*:*", "  *:*  "] {
+            let mut ids: Vec<_> = engine
+                .search(query)
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit["_id"].as_str().unwrap().to_string())
+                .collect();
+            ids.sort();
+            assert_eq!(ids, ["empty", "text"], "query [{query}]");
+        }
+    }
+
+    #[test]
+    fn qsearch_parser_bare_wildcard_matches_every_document() {
+        let (_dir, engine) = create_engine();
+        engine
+            .add_document("text", json!({"body": "rust"}))
+            .unwrap();
+        engine.add_document("empty", json!({})).unwrap();
+        engine.add_document("null", json!({"body": null})).unwrap();
+        engine.refresh().unwrap();
+
+        for query in ["*", " * ", "(*)", "*:*"] {
+            let hits = engine.search(query).unwrap();
+            let mut ids: Vec<_> = hits
+                .iter()
+                .map(|hit| hit["_id"].as_str().unwrap())
+                .collect();
+            ids.sort();
+            assert_eq!(ids, ["empty", "null", "text"], "query [{query}]");
+        }
+    }
+
+    #[test]
+    fn qsearch_parser_error_names_query_and_preserves_syntax_cause() {
+        let (_dir, engine) = create_engine();
+        let query = "body:(";
+        let error = engine.search(query).unwrap_err();
+        assert!(error.to_string().contains(query), "{error:#}");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<tantivy::query::QueryParserError>()),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn qsearch_dsl_parser_supports_match_all_and_explicit_default_field() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let (_dir, engine) = create_engine_with_mappings(HashMap::from([(
+            "tag".to_string(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        )]));
+        engine
+            .add_document("value", json!({"tag": "rust"}))
+            .unwrap();
+        engine
+            .add_document("empty-value", json!({"tag": ""}))
+            .unwrap();
+        engine.add_document("missing", json!({})).unwrap();
+        engine.add_document("null", json!({"tag": null})).unwrap();
+        engine.refresh().unwrap();
+
+        for (query, default_field, expected) in [
+            (
+                "*:*",
+                Some("body"),
+                vec!["empty-value", "missing", "null", "value"],
+            ),
+            ("*", None, vec!["empty-value", "missing", "null", "value"]),
+            ("*", Some("body"), vec!["value"]),
+            ("*", Some("tag"), vec!["empty-value", "value"]),
+            ("tag:*", None, vec!["empty-value", "value"]),
+            ("missing:*", None, vec![]),
+            ("tag:rust", None, vec!["value"]),
+            ("", None, vec![]),
+        ] {
+            let mut params = json!({"query": query});
+            if let Some(default_field) = default_field {
+                params["default_field"] = json!(default_field);
+            }
+            let request: SearchRequest = serde_json::from_value(json!({
+                "query": {"query_string": params},
+                "size": 10
+            }))
+            .unwrap();
+            let (hits, total, _) = engine.search_query(&request).unwrap();
+            let mut ids: Vec<_> = hits
+                .iter()
+                .map(|hit| hit["_id"].as_str().unwrap())
+                .collect();
+            ids.sort();
+            assert_eq!(ids, expected, "query [{query}]");
+            assert_eq!(total, expected.len(), "query [{query}]");
+        }
+    }
+
+    #[test]
+    fn qsearch_review_huge_collector_windows_are_bounded_by_live_documents() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let (_dir, engine) = create_engine_with_mappings(HashMap::from([(
+            "number".to_string(),
+            FieldMapping {
+                field_type: FieldType::Integer,
+                dimension: None,
+            },
+        )]));
+        for number in 0..4 {
+            engine
+                .add_document(&number.to_string(), json!({"number": number}))
+                .unwrap();
+        }
+        engine.refresh().unwrap();
+        engine.delete_document("3").unwrap();
+        engine.refresh().unwrap();
+        assert_eq!(engine.doc_count(), 3);
+        for (from, size) in [
+            (0, usize::MAX),
+            (1, usize::MAX),
+            (usize::MAX, usize::MAX),
+            (usize::MAX - 1, 1),
+            (0, usize::MAX / 4 + 1),
+        ] {
+            for sort in [json!([]), json!([{"number": "asc"}])] {
+                let request: SearchRequest = serde_json::from_value(json!({
+                    "query": {"match_all": {}}, "from": from, "size": size, "sort": sort,
+                    "aggs": {"numbers": {"stats": {"field": "number"}}}
+                }))
+                .unwrap();
+                let outcome = catch_unwind(AssertUnwindSafe(|| engine.search_query(&request)));
+                assert!(
+                    outcome.is_ok(),
+                    "collector panicked for from={from}, size={size}"
+                );
+                let (hits, total, partials) = outcome.unwrap().unwrap();
+                assert_eq!(total, 3);
+                assert_eq!(hits.len(), 3);
+                assert!(!partials.is_empty());
+            }
+        }
+        let (_dir, empty) = create_engine();
+        let request: SearchRequest = serde_json::from_value(json!({
+            "query": {"match_all": {}}, "size": usize::MAX
+        }))
+        .unwrap();
+        let outcome = catch_unwind(AssertUnwindSafe(|| empty.search_query(&request)));
+        assert!(outcome.is_ok(), "empty shard collector panicked");
+        let (hits, total, _) = outcome.unwrap().unwrap();
+        assert!(hits.is_empty());
+        assert_eq!(total, 0);
+    }
 
     #[test]
     fn simple_query_string_search() {

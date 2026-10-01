@@ -179,6 +179,63 @@ curl -sS -X POST 'http://localhost:9200/movies/_search?pretty' \
   }'
 ```
 
+#### Query-string search
+
+Use `GET /{index}/_search?q=...` or a `query_string` DSL clause for the
+Tantivy-backed query-string subset:
+
+```bash
+curl -sS --get 'http://localhost:9200/movies/_search' \
+  --data-urlencode 'q=*:*'
+curl -sS -X POST 'http://localhost:9200/movies/_search' \
+  -H 'Content-Type: application/json' \
+  -d '{"query":{"query_string":{"query":"genre:documentary"}}}'
+```
+
+| Query | Behavior |
+|---|---|
+| No `q` parameter, or standalone `*:*` | Match all documents, including documents with no indexed text. |
+| `rust` or `genre:documentary` | Parse terms with Tantivy's query parser. Unqualified terms use the built-in `body` field. |
+| Standalone `*`, without `df` or `default_field` | Match all documents, including empty, null-only, nested-only, array-only, and analyzer-empty documents. |
+| Standalone `*`, with `df` or `default_field` | Match documents with an indexed value in the explicitly selected field. |
+| Standalone `genre:*` | Match documents with an indexed value in the named field. Unknown fields match no documents. |
+
+Select an explicit field with URI parameter `df` or DSL option `default_field`.
+Both options are optional. Unqualified terms still search the built-in `body`
+field when neither option is set. The DSL accepts only `query` and
+`default_field`. Keyword fields include empty
+strings; numeric fields include zero. Text presence means at least one indexed
+token, so empty or analyzer-empty text does not match `*`. This differs from
+OpenSearch's text-field existence semantics.
+
+Explicit text presence uses field norms when available, scanning document
+lengths rather than the term dictionary. Text fields without field norms fall
+back to an all-terms query; that cost grows with vocabulary and postings.
+Fast-field presence uses Tantivy's `ExistsQuery`. Bare `*` without an explicit
+field uses `AllQuery` and does not enumerate terms.
+
+These wildcard rewrites apply only to standalone expressions. Other expressions
+use Tantivy syntax, not the full Lucene query language. Unsupported syntax returns
+an error that names the query and preserves the parser's cause. Partial results
+remain enabled; `allow_partial_search_results=false` is not implemented.
+
+When every shard fails, search returns `search_phase_execution_exception` with
+per-shard reasons: HTTP 400 for client parse or validation errors, 503 for
+unavailable shards, and 500 for other engine failures. Partial failures remain
+HTTP 200 and report `_shards.failed` and `_shards.failures`. These rules also apply
+to query-body `_count`. SQL paths that share distributed search also reject an
+all-failed shard set. Metadata-only `_count` and SQL `count(*)` reject an entirely
+unavailable shard set.
+`_count?q=...` and `_msearch` are not supported.
+Empty remote-store indices also validate query strings against the index mappings
+and return HTTP 400 with a parser cause instead of hiding invalid queries behind
+an empty result.
+
+Search clamps each shard's collector window to its live document count.
+Oversized `size` values cannot allocate more hit slots than the shard can return.
+If `from + size` overflows, URI and query-body search return HTTP 400 with a
+pagination reason before dispatching work.
+
 ### 5. Analyze the matched set
 
 ```bash
@@ -227,7 +284,7 @@ docker run --rm -p 9200:9200 -p 9300:9300 ferrissearch
 ### Search and analytics
 
 - Query DSL: `match`, `term`, `bool`, `range`, `wildcard`, `prefix`, `fuzzy`,
-  and `match_all`
+  `match_all`, and the [query-string subset](#query-string-search)
 - Numeric/date sorting and `search_after` cursor pagination, with documented
   tie limitations
 - Terms, stats, min, max, average, sum, value-count, and histogram aggregations;
