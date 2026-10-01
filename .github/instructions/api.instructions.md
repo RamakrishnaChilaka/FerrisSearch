@@ -243,7 +243,7 @@ Retain only the original patch/upsert input when another retry is possible.
 `upsert`, `doc_as_upsert`, and `detect_noop` body keys; unknown keys are
 400 `illegal_argument_exception`, not document-source mapper errors.
 Write responses omit `_version`. Client retry identity, external versions,
-and D13 rejection of other ignored query parameters remain unimplemented.
+and all-copy refresh remain unimplemented.
 
 Declared keyword fields accept nested arrays of string/number/boolean scalars,
 flatten and coerce them to text for indexing, ignore nulls, and deduplicate a
@@ -351,16 +351,41 @@ Both `refresh_index()` and `flush_index()` fan out to ALL nodes via `fan_out_mai
 - Transport `GetTaskStatus` is node-local and only exposes locally tracked task state; the HTTP task endpoint performs the cluster fan-out/aggregation step.
 
 ## RefreshParam
-```rust
-pub struct RefreshParam { pub refresh: Option<String> }
-// ?refresh=true or ?refresh (empty) → forces refresh after write
-```
 `WriteParams` owns single-write conditions and refresh; `UpdateParams` adds
-retry count; `GetParams` owns realtime selection. `RefreshParam` is used by
-bulk and maintenance paths. All-copy refresh and `refresh=wait_for` remain
-proposed; do not claim them from coordinator-local refresh dispatch.
+retry count; `GetParams` owns realtime selection. `RefreshParam` owns bulk URL
+parameters. Write query structs flatten `UnsupportedWriteParams`, which
+keeps benign unknown parameters accepted and validates unsupported safety
+keys through the shared `validate_write_parameter()` helper.
+
+Run validation before metadata writes, auto-creation, routing, or document
+mutation. Document and bulk URLs accept `refresh=true`, `refresh=false`,
+and an empty value, including bare `?refresh`; reject `wait_for` and every
+other value with `400 illegal_argument_exception`. Index, update, delete,
+and bulk refresh only engines on the coordinator. All-copy refresh remains
+unimplemented; do not accept `wait_for` until refresh covers the primary
+and every in-sync replica. Index creation does not implement `refresh`.
 Post-write refresh waits use Tokio's blocking pool; the document and replica
 write itself remains on the dedicated write pool.
+
+### Unsupported Write Parameters
+`validate_write_parameter()` owns one explicit rejection list shared by
+document queries, bulk URLs, bulk action metadata, and index creation:
+`routing`, `_routing`, `pipeline`, `version`, `_version`, `version_type`,
+`_version_type`, `require_alias`, `require_data_stream`, and
+`dynamic_templates`. Conditions, `op_type`, `retry_on_conflict`, and refresh
+are rejected where the endpoint or action does not implement them. Preserve
+paired conditions and update retries. `_create` accepts only absent or
+`create` for `op_type`; DELETE rejects any `op_type`.
+
+Accept `wait_for_active_shards` only when absent or exactly `1`; bulk metadata
+may also use numeric `1`. Reject `all` even with zero replicas. This accepts
+the default, not a new active-copy wait or pre-flight implementation.
+Use `illegal_argument()` / `error_response()` and name the rejected key.
+New safety-relevant write parameters must be implemented with result-level
+tests or added to this shared rejection helper. Do not use
+`deny_unknown_fields` on query structs: preserve `timeout` (FS-029), `pretty`,
+`human`, `error_trace`, and `filter_path`, and leave read parameter handling
+unchanged.
 
 ## Bulk Index Parsing
 `parse_bulk_ndjson(text)` returns a result and validates the entire action
@@ -370,6 +395,10 @@ actions or missing sources reject the request with a line-numbered
 400 `illegal_argument_exception`. Delete consumes no source; other actions
 consume one. Invalid JSON sources are per-item mapper errors, never dropped.
 Only index/create auto-generate missing IDs.
+Unsupported safety metadata also rejects the whole request before any write
+or auto-creation. Name the key, action line, and one-based item position.
+Preserve action conditions and `retry_on_conflict` on update; reject retry
+counts on other actions, including zero. Per-action `refresh` is unsupported.
 
 Preserve request order per shard, including duplicate IDs and update barriers.
 Updates use `execute_update`; other consecutive actions use the typed shard

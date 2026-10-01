@@ -259,7 +259,7 @@ async fn empty_bulk_does_not_create_an_index() {
         State(state.clone()),
         Path(crate::common::IndexName::new("empty").unwrap()),
         None,
-        Query(RefreshParam { refresh: None }),
+        Query(RefreshParam::default()),
         axum::body::Bytes::new(),
     )
     .await;
@@ -282,7 +282,7 @@ async fn bulk_index_reports_missing_primary_node_as_item_error() {
         State(state),
         Path(crate::common::IndexName::new("idx").unwrap()),
         None,
-        Query(RefreshParam { refresh: None }),
+        Query(RefreshParam::default()),
         input,
     )
     .await;
@@ -305,13 +305,8 @@ async fn bulk_index_global_reports_missing_action_index() {
     let (_tmp, state) = make_test_app_state(cluster_state).await;
     let input = axum::body::Bytes::from("{\"index\":{\"_id\":\"1\"}}\n{\"title\":\"hello\"}\n");
 
-    let (status, Json(body)) = bulk_index_global(
-        State(state),
-        None,
-        Query(RefreshParam { refresh: None }),
-        input,
-    )
-    .await;
+    let (status, Json(body)) =
+        bulk_index_global(State(state), None, Query(RefreshParam::default()), input).await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["errors"], true);
@@ -333,13 +328,8 @@ async fn bulk_index_global_rejects_protected_security_index() {
         "{\"index\":{\"_index\":\".ferris_security\",\"_id\":\"1\"}}\n{\"title\":\"hello\"}\n",
     );
 
-    let (status, Json(body)) = bulk_index_global(
-        State(state),
-        None,
-        Query(RefreshParam { refresh: None }),
-        input,
-    )
-    .await;
+    let (status, Json(body)) =
+        bulk_index_global(State(state), None, Query(RefreshParam::default()), input).await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["errors"], true);
@@ -360,13 +350,8 @@ async fn bulk_index_global_validates_raw_action_index_name() {
         "{\"index\":{\"_index\":\"BadName\",\"_id\":\"1\"}}\n{\"title\":\"hello\"}\n",
     );
 
-    let (status, Json(body)) = bulk_index_global(
-        State(state),
-        None,
-        Query(RefreshParam { refresh: None }),
-        input,
-    )
-    .await;
+    let (status, Json(body)) =
+        bulk_index_global(State(state), None, Query(RefreshParam::default()), input).await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["errors"], true);
@@ -404,7 +389,7 @@ async fn bulk_index_global_enforces_principal_index_permissions() {
     let (status, Json(body)) = bulk_index_global(
         State(state),
         Some(axum::extract::Extension(principal)),
-        Query(RefreshParam { refresh: None }),
+        Query(RefreshParam::default()),
         input,
     )
     .await;
@@ -440,7 +425,7 @@ async fn index_scoped_bulk_authorizes_the_action_index_override() {
         State(state.clone()),
         Path(crate::common::IndexName::new("logs-2026").unwrap()),
         Some(axum::extract::Extension(principal)),
-        Query(RefreshParam { refresh: None }),
+        Query(RefreshParam::default()),
         axum::body::Bytes::from(
             "{\"index\":{\"_index\":\"metrics\",\"_id\":\"1\"}}\n{\"value\":1}\n",
         ),
@@ -612,7 +597,7 @@ async fn realtime_get_update_and_bulk_update_fail_closed_after_partial_replay() 
         State(state.clone()),
         Path(crate::common::IndexName::new("idx").unwrap()),
         None,
-        Query(RefreshParam { refresh: None }),
+        Query(RefreshParam::default()),
         axum::body::Bytes::from(
             "{\"update\":{\"_id\":\"fresh\"}}\n{\"doc\":{\"value\":6},\"doc_as_upsert\":true}\n",
         ),
@@ -786,6 +771,7 @@ async fn create_index_applies_flush_threshold_setting() {
     let (status, _) = create_index(
         State(state.clone()),
         Path(crate::common::IndexName::new("idx").unwrap()),
+        Query(UnsupportedWriteParams::default()),
         body,
     )
     .await;
@@ -817,6 +803,7 @@ async fn create_index_returns_no_data_nodes_exception_when_no_data_nodes_are_ava
     let (status, Json(response)) = create_index(
         State(state),
         Path(crate::common::IndexName::new("idx").unwrap()),
+        Query(UnsupportedWriteParams::default()),
         body,
     )
     .await;
@@ -886,6 +873,7 @@ async fn create_index_accepts_explicit_local_shards_engine() {
     let (status, _) = create_index(
         State(state.clone()),
         Path(crate::common::IndexName::new("idx").unwrap()),
+        Query(UnsupportedWriteParams::default()),
         body,
     )
     .await;
@@ -915,6 +903,7 @@ async fn create_index_with_remote_store_engine_succeeds_but_rejects_writes() {
     let (status, Json(_response)) = create_index(
         State(state.clone()),
         Path(crate::common::IndexName::new("idx").unwrap()),
+        Query(UnsupportedWriteParams::default()),
         body,
     )
     .await;

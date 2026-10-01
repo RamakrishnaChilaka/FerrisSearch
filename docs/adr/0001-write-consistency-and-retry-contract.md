@@ -1,6 +1,6 @@
 # ADR 0001: Write Consistency And Retry Contract
 
-- **Status:** Partially implemented. D1 and the marked parts of D8, D9, D11,
+- **Status:** Partially implemented. D1, D13, and the marked parts of D8, D9, D11,
   and D12 are implemented; the remaining decisions are proposed.
 - **Date:** 2026-09-27
 - **Backlog:** [FS-001](../next-50-tasks.md#fs-001--decide-the-write-consistency-and-retry-contract)
@@ -427,8 +427,7 @@ map or the reader's `_seq_no`/`_primary_term` fast fields. Replicas apply only
 the resulting sequenced mutation, never the condition.
 Coordinator update also carries D9's index-incarnation precondition.
 
-Remaining: loud rejection of `version`/`version_type` is D13; external
-versioning and client operation IDs remain unimplemented.
+Remaining: external versioning and client operation IDs remain unimplemented.
 
 - **Conditional writes:** `if_seq_no` and `if_primary_term` are checked only on
   the primary, against the live version map or the committed index. A mismatch
@@ -472,21 +471,53 @@ proposed.
 
 ### D13. Unimplemented parameters fail loudly
 
+**Status (2026-10-01):** Implemented for document writes, both bulk routes,
+and index creation. Validation runs before routing, auto-creation, or
+mutation. Unsupported bulk action metadata rejects the whole request before
+any item executes; its reason names the key, action-line number, and one-based
+item position.
+
 A write parameter that changes safety semantics and is not implemented returns
-400 `illegal_argument_exception` naming the parameter. This covers:
+400 `illegal_argument_exception` naming the parameter:
 
-- the query parameters `if_seq_no`, `if_primary_term`, `version`,
-  `version_type`, `op_type=create`, `refresh=wait_for`, `routing`, `pipeline`,
-  and `retry_on_conflict`;
-- `wait_for_active_shards` values above 1;
-- the same keys in bulk action metadata.
+- **Honored:** paired `if_seq_no`/`if_primary_term` on index, update, delete,
+  and bulk index, update, and delete actions; `op_type=create` on index and
+  the `_create` route; and `retry_on_conflict` on `_update` and bulk `update`
+  actions.
+- **Rejected:** `routing`, `_routing`, `pipeline`, `version`, `_version`,
+  `version_type`, `_version_type`, `require_alias`, `require_data_stream`,
+  and `dynamic_templates`. Reject conditions, `op_type`, and
+  `retry_on_conflict` on endpoints or actions that do not implement them.
+  `_create` accepts only absent or `create` for `op_type`; DELETE rejects
+  any `op_type`.
+- **Refresh:** document and bulk URL parameters accept `true`, the empty
+  value (including bare `?refresh`), and `false`. Reject `wait_for` and
+  every other value. Post-write refresh uses only engines on the
+  coordinating node: single writes refresh a local shard if available,
+  and bulk refreshes local shards for affected indices. It does not
+  refresh every in-sync copy or necessarily a remote primary, so it
+  cannot implement `wait_for` as a forced all-copy refresh. DELETE now
+  uses the same local refresh helper. Reject per-action bulk `refresh`
+  and index-creation `refresh`, which have no implementation.
+- **Active copies:** accept `wait_for_active_shards` only when absent or
+  exactly `1`; bulk metadata also accepts numeric `1`. Reject `all` even
+  with zero replicas, higher counts, zero, empty, and invalid values.
+  This preserves the default without adding an active-copy wait or
+  pre-flight protocol. Primary availability checks still gate document
+  writes. Implement a pre-flight check before accepting other values.
+- **Benign options:** keep accepting `timeout`, `pretty`, `human`,
+  `error_trace`, and `filter_path`. GET parameter handling, including
+  `_source` filtering options and `realtime`, is unchanged. Acceptance
+  does not imply implementation of response filtering or deadlines;
+  `timeout` becomes the request deadline in FS-029.
 
-Each parameter moves to "honored" when its task lands. Two can be honored early:
-
-- `wait_for_active_shards` as a pre-flight check;
-- `wait_for` as a forced refresh, once `refresh=true` covers every copy.
-
-`timeout` becomes the request deadline (FS-029).
+`validate_write_parameter` in `src/api/index/mod.rs` owns the explicit
+rejection list. Query structs consume implemented parameters before this
+helper checks the remaining keys; the bulk parser applies it to action
+metadata while preserving implemented conditions and update retry counts.
+Move each parameter out of rejection only when its implementation and
+result-level regressions land. `_delete_by_query` and `_update_by_query`
+remain unimplemented.
 
 ### D14. Engine and WAL failures on the write path
 
