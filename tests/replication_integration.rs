@@ -3192,21 +3192,23 @@ async fn search_shard_dsl_nonexistent_shard_returns_error() {
     let mut client = connect_client(addr).await;
 
     let search_req = serde_json::json!({"query": {"match_all": {}}});
-    let resp = client
+    let error = client
         .search_shard_dsl(tonic::Request::new(ShardSearchDslRequest {
             index_name: "nonexistent".into(),
             shard_id: 99,
             search_request_json: serde_json::to_vec(&search_req).unwrap(),
         }))
         .await
-        .unwrap()
-        .into_inner();
+        .unwrap_err();
 
-    assert!(!resp.success, "should fail for nonexistent shard");
+    assert_eq!(error.code(), tonic::Code::NotFound);
     assert!(
-        resp.error.contains("not found"),
-        "error should mention shard not found: {}",
-        resp.error
+        error.message().contains("not found"),
+        "error should mention shard not found: {error}"
+    );
+    assert_eq!(
+        error.message(),
+        "Shard [nonexistent][99] not found on this node"
     );
 }
 

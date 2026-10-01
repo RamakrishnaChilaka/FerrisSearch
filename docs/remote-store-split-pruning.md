@@ -77,7 +77,9 @@ This PR-sized slice should support root-side pruning for:
 
 This slice explicitly does not support:
 
-- full-text split pruning for `match`, query-string `q=`, `wildcard`, `prefix`, or `fuzzy`
+- full-text split pruning for `match`, URI `q=`, DSL `query_string`, `wildcard`,
+  `prefix`, or `fuzzy` (query-string execution uses the
+  [documented subset](../README.md#query-string-search), without split pruning)
 - `must_not` or `should` pruning
 - k-NN pruning
 - reordering result correctness around score-based top docs

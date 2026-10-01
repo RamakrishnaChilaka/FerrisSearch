@@ -3044,6 +3044,152 @@ async fn rest_qsearch_existing_match_parse_errors_are_not_success_shaped() -> Re
 }
 
 #[tokio::test]
+async fn rest_qsearch_shared_sql_paths_keep_counts_and_surface_all_failed_shards() -> Result<()> {
+    let harness = MultiNodeRestHarness::start_three_nodes().await?;
+    create_distributed_stories_index_and_docs(&harness).await?;
+    let coordinator = &harness.nodes[1];
+    for (query, mode) in [
+        ("SELECT count(*) AS n FROM stories", "count_star_fast"),
+        ("SELECT * FROM stories", "materialized_hits_fallback"),
+    ] {
+        let (status, body) = post_json_to_base_url(
+            &harness.client,
+            &coordinator.base_url,
+            "/stories/_sql",
+            json!({"query": query}),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["execution_mode"], mode, "{body}");
+        assert_eq!(body["matched_hits"], 8, "{body}");
+        if mode == "count_star_fast" {
+            assert_eq!(body["rows"][0]["n"], 8, "{body}");
+        } else {
+            assert_eq!(body["rows"].as_array().map(Vec::len), Some(8), "{body}");
+        }
+    }
+    let mut cluster_state = coordinator.app_state.cluster_manager.get_state();
+    for routing in cluster_state
+        .indices
+        .get_mut("stories")
+        .unwrap()
+        .shard_routing
+        .values_mut()
+    {
+        routing.primary = "absent-node".to_string();
+    }
+    coordinator
+        .app_state
+        .cluster_manager
+        .update_state(cluster_state);
+    for route in ["/stories/_sql", "/stories/_sql/stream"] {
+        for query in ["SELECT count(*) AS n FROM stories", "SELECT * FROM stories"] {
+            let (status, body) = post_json_to_base_url(
+                &harness.client,
+                &coordinator.base_url,
+                route,
+                json!({"query": query}),
+            )
+            .await?;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{route}: {body}");
+            assert_eq!(
+                body["error"]["type"], "search_phase_execution_exception",
+                "{body}"
+            );
+            assert_eq!(
+                body["error"]["failed_shards"].as_array().map(Vec::len),
+                Some(3),
+                "{body}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_qsearch_pagination_overflow_returns_400_before_worker_dispatch() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    create_products_index_and_docs(&harness).await?;
+    let (status, body) = harness
+        .get_json(&format!(
+            "/products/_search?q=*:*&from=1&size={}",
+            usize::MAX
+        ))
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"]["type"], "illegal_argument_exception",
+        "{body}"
+    );
+    assert!(
+        body["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("pagination"),
+        "{body}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_qsearch_empty_remote_store_rejects_syntax_and_typed_value_errors() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let (status, body) = harness
+        .put_json(
+            "/remote-empty-query",
+            json!({
+                "engine": "remote_store",
+                "mappings": {"properties": {"number": {"type": "integer"}}}
+            }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = harness
+        .get_json("/remote-empty-query/_search?q=*:*")
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["hits"]["total"]["value"], 0, "{body}");
+    for query in ["body:(", "number:not-a-number"] {
+        let response = harness
+            .client
+            .get(qsearch_url(
+                &harness.base_url,
+                "/remote-empty-query/_search",
+                &[("q", query)],
+            )?)
+            .send()
+            .await?;
+        let status = response.status();
+        let body: Value = response.json().await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["type"], "query_shard_exception", "{body}");
+        assert!(
+            body["error"]["reason"].as_str().unwrap().contains(query),
+            "{body}"
+        );
+        assert_eq!(
+            body["error"]["caused_by"]["type"], "parse_exception",
+            "{body}"
+        );
+        for route in ["/remote-empty-query/_search", "/remote-empty-query/_count"] {
+            let (status, body) = harness
+                .post_json(route, json!({"query": {"query_string": {"query": query}}}))
+                .await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(
+                body["error"]["reason"].as_str().unwrap().contains(query),
+                "{body}"
+            );
+            assert_eq!(
+                body["error"]["caused_by"]["type"], "parse_exception",
+                "{body}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn rest_qsearch_remote_store_match_all_and_parse_errors() -> Result<()> {
     let harness = RestTestHarness::start().await?;
     let (status, body) = harness

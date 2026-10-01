@@ -583,6 +583,62 @@ fn add_mapping_field_to_schema(
     Ok(Some(field))
 }
 
+fn build_schema_with_mappings(
+    mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+    purpose: HotEnginePurpose,
+) -> Result<Schema> {
+    let mut builder = Schema::builder();
+    builder.add_text_field("_id", (STRING | STORED).set_fast(None));
+    builder.add_text_field("_source", STORED);
+    if purpose.requires_sequence_fields() {
+        builder.add_u64_field(SEQ_NO_FIELD_NAME, FAST | STORED);
+        builder.add_u64_field(PRIMARY_TERM_FIELD_NAME, FAST | STORED);
+    }
+    builder.add_text_field("body", TEXT | STORED);
+    let mut names: Vec<_> = mappings.keys().collect();
+    names.sort();
+    for name in names {
+        add_mapping_field_to_schema(&mut builder, name, &mappings[name])?;
+    }
+    Ok(builder.build())
+}
+
+pub(crate) fn validate_query_strings_with_mappings(
+    clause: &crate::search::QueryClause,
+    mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+) -> Result<()> {
+    fn validate(index: &Index, clause: &crate::search::QueryClause) -> Result<()> {
+        match clause {
+            crate::search::QueryClause::QueryString(params) => {
+                crate::search::query_string::parse_query_string(
+                    index,
+                    &params.query,
+                    &params.default_field,
+                )?;
+            }
+            crate::search::QueryClause::Bool(query) => {
+                for clause in query
+                    .must
+                    .iter()
+                    .chain(&query.should)
+                    .chain(&query.must_not)
+                    .chain(&query.filter)
+                {
+                    validate(index, clause)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    validate_authoritative_mappings(mappings)?;
+    let index = Index::create_in_ram(build_schema_with_mappings(
+        mappings,
+        HotEnginePurpose::RemoteSplit,
+    )?);
+    validate(&index, clause)
+}
+
 fn validate_authoritative_mapping_entry(
     name: &str,
     mapping: &crate::cluster::state::FieldMapping,
@@ -997,23 +1053,7 @@ impl HotEngine {
             let mmap_dir = tantivy::directory::MmapDirectory::open(&index_path)?;
             Index::open(mmap_dir)?
         } else {
-            let mut schema_builder = Schema::builder();
-            schema_builder.add_text_field("_id", (STRING | STORED).set_fast(None));
-            schema_builder.add_text_field("_source", STORED);
-            if purpose.requires_sequence_fields() {
-                schema_builder.add_u64_field(SEQ_NO_FIELD_NAME, FAST | STORED);
-                schema_builder.add_u64_field(PRIMARY_TERM_FIELD_NAME, FAST | STORED);
-            }
-            schema_builder.add_text_field("body", TEXT | STORED);
-
-            let mut mapping_names: Vec<_> = mappings.keys().cloned().collect();
-            mapping_names.sort();
-            for name in mapping_names {
-                let mapping = &mappings[&name];
-                add_mapping_field_to_schema(&mut schema_builder, &name, mapping)?;
-            }
-
-            let schema = schema_builder.build();
+            let schema = build_schema_with_mappings(mappings, purpose)?;
             let mmap_dir = tantivy::directory::MmapDirectory::open(&index_path)?;
             Index::open_or_create(mmap_dir, schema)?
         };
@@ -4088,12 +4128,19 @@ impl HotEngine {
                     };
                     let target_field = self.resolve_field(field_name);
                     let query_parser = QueryParser::for_index(&self.index, vec![target_field]);
-                    let query = query_parser.parse_query(&query_str)?;
+                    let query = query_parser.parse_query(&query_str).map_err(|error| {
+                        crate::search::query_string::parsing_error(&query_str, error)
+                    })?;
                     Ok(query)
                 } else {
                     Ok(Box::new(AllQuery))
                 }
             }
+            QueryClause::QueryString(params) => crate::search::query_string::parse_query_string(
+                &self.index,
+                &params.query,
+                &params.default_field,
+            ),
             QueryClause::Term(fields) => {
                 if let Some((field_name, value)) = fields.iter().next() {
                     let target_field = self.resolve_field(field_name);
@@ -8241,10 +8288,9 @@ impl super::SearchEngine for HotEngine {
     }
 
     fn search(&self, query_str: &str) -> Result<Vec<serde_json::Value>> {
-        let body_field = self.resolve_field("body");
         let searcher = self.reader.searcher();
-        let query_parser = QueryParser::for_index(&self.index, vec![body_field]);
-        let query = query_parser.parse_query(query_str)?;
+        let query =
+            crate::search::query_string::parse_query_string(&self.index, query_str, "body")?;
         self.execute_search(searcher, &*query, 100)
     }
 

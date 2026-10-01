@@ -71,6 +71,8 @@ pub fn error_response(
 | `raft_write_exception` | Raft client_write command failed |
 | `master_not_discovered_exception` | No master in cluster state |
 | `illegal_argument_exception` | Request shape rejected by handler-side validation (e.g. invalid `search_after` cursor) |
+| `query_shard_exception` | Shard query parsing or validation failed; retain the input query and parser cause |
+| `search_phase_execution_exception` | Every search/count shard failed; include per-shard reasons and an appropriate error status |
 | `group_by_scan_limit_exceeded` | GROUP BY fallback query matched more docs than `sql_group_by_scan_limit` |
 | `security_exception` | HTTP authentication or authorization failed |
 
@@ -278,6 +280,12 @@ mapping for it and rejects every other type or parameter as
 | POST | `/_sql/stream` | `global_sql_stream()` — global NDJSON SQL stream endpoint |
 
 For `remote_store` indices, `GET /{index}/_search?q=...`, SQL materialized search paths, and match-all `GET/POST /{index}/_count` must not derive work from `shard_routing` because the engine is shardless. Route those entry points through the same manifest + split execution path used by DSL `POST /{index}/_search`, and keep query-string search aligned with the existing catch-all `body` search semantics. Search responses and SQL/EXPLAIN ANALYZE responses that execute through manifest-backed remote_store search include `remote_store.pruning` with `published_splits`, `candidate_splits`, `pruned_splits`, and `assigned_splits`; local_shards responses should not grow this block.
+
+URI search also uses the shared DSL gatherer for local-shard indices. The
+query-string subset and all-shards-failed response contract are owned by
+[`search.instructions.md`](search.instructions.md). Preserve partial-failure
+HTTP 200 responses, parser causes across gRPC, and full hit counts before
+pagination. Do not turn all-shard failures into empty successful responses.
 
 ### Global SQL Endpoint
 - `POST /_sql` handles SQL commands that don't require an index in the URL path.

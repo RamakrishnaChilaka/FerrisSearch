@@ -19,8 +19,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 mod canonicalization;
+pub(crate) mod failures;
 
 use canonicalization::*;
+use failures::{ShardFailure, all_shards_failed_response, shard_stats};
 
 /// GET/POST /{index}/_count — Count documents matching a query.
 /// GET returns total doc count (match_all). POST accepts an optional query body.
@@ -70,11 +72,7 @@ pub async fn count_documents(
             StatusCode::OK,
             Json(serde_json::json!({
                 "count": result.total_hits,
-                "_shards": {
-                    "total": result.successful_shards + result.failed_shards,
-                    "successful": result.successful_shards,
-                    "failed": result.failed_shards
-                }
+                "_shards": shard_stats(result.successful_shards, result.failed_shards, &result.shard_failures)
             })),
         ),
         Err(err) => err,
@@ -115,17 +113,16 @@ async fn count_match_all_fast(state: &AppState, index_name: &str) -> (StatusCode
         };
     }
 
-    let (count, successful, failed) = count_docs_from_metadata(state, index_name, &metadata).await;
+    let result = count_docs_from_metadata(state, index_name, &metadata).await;
+    if let Some(error) = all_shards_failed_response(result.successful, &result.failures) {
+        return error;
+    }
 
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "count": count,
-            "_shards": {
-                "total": successful + failed,
-                "successful": successful,
-                "failed": failed
-            }
+            "count": result.count,
+            "_shards": shard_stats(result.successful, result.failures.len() as u32, &result.failures)
         })),
     )
 }
@@ -177,13 +174,18 @@ fn default_match_all_query() -> crate::search::QueryClause {
     crate::search::QueryClause::MatchAll(serde_json::json!({}))
 }
 
-/// Shared helper: count docs from metadata (doc_count + GetShardStats) without executing a query.
-/// Returns (total_count, successful_shards, failed_shards).
+struct MetadataDocCount {
+    count: u64,
+    successful: u32,
+    failures: Vec<ShardFailure>,
+}
+
+/// Count docs from metadata without executing a query, retaining every failed target.
 async fn count_docs_from_metadata(
     state: &AppState,
     index_name: &str,
     metadata: &crate::cluster::state::IndexMetadata,
-) -> (u64, u32, u32) {
+) -> MetadataDocCount {
     let cluster_state = state.cluster_manager.get_state();
     let local_shards = crate::api::index::ensure_local_index_shards_open(
         state,
@@ -196,45 +198,81 @@ async fn count_docs_from_metadata(
 
     let mut count: u64 = 0;
     let mut successful: u32 = 0;
-    let mut failed: u32 = 0;
+    let mut failures = Vec::new();
 
     for (_shard_id, engine) in &local_shards {
         count += engine.doc_count();
         successful += 1;
     }
 
+    for (shard_id, routing) in &metadata.shard_routing {
+        if !local_shard_ids.contains(shard_id)
+            && !cluster_state.nodes.contains_key(&routing.primary)
+        {
+            failures.push(ShardFailure::new(
+                index_name,
+                *shard_id,
+                &routing.primary,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "shard_not_available_exception",
+                format!(
+                    "primary node [{}] is not available for shard [{index_name}][{shard_id}]",
+                    routing.primary
+                ),
+            ));
+        }
+    }
+
     let mut remote_handles = Vec::new();
     for (node, shard_ids) in remote_count_targets(&cluster_state, metadata, &local_shard_ids) {
         let client = state.transport_client.clone();
-        let idx = index_name.to_string();
-        let num_shards = shard_ids.len() as u32;
-        remote_handles.push(tokio::spawn(async move {
-            let result = client.get_shard_stats(&node).await.map(|stats| {
-                shard_ids
-                    .into_iter()
-                    .map(|shard_id| stats.get(&(idx.clone(), shard_id)).copied().unwrap_or(0))
-                    .sum::<u64>()
-            });
-            (result, num_shards)
-        }));
+        let node_id = node.id.clone();
+        let handle = tokio::spawn(async move { client.get_shard_stats(&node).await });
+        remote_handles.push(async move { (node_id, shard_ids, handle.await) });
     }
 
-    for handle in remote_handles {
-        match handle.await {
-            Ok((Ok(remote_count), num_shards)) => {
-                count += remote_count;
-                successful += num_shards;
+    for (node_id, shard_ids, result) in join_all(remote_handles).await {
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => Err(error.into()),
+        };
+        match result {
+            Ok(stats) => {
+                for shard_id in shard_ids {
+                    match stats.get(&(index_name.to_string(), shard_id)) {
+                        Some(shard_count) => {
+                            count += shard_count;
+                            successful += 1;
+                        }
+                        None => failures.push(ShardFailure::new(
+                            index_name,
+                            shard_id,
+                            &node_id,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "shard_not_available_exception",
+                            format!(
+                                "node [{node_id}] did not report shard [{index_name}][{shard_id}]"
+                            ),
+                        )),
+                    }
+                }
             }
-            Ok((Err(_), num_shards)) => {
-                failed += num_shards;
-            }
-            Err(_) => {
-                failed += 1;
+            Err(error) => {
+                tracing::error!("Shard count on node {} failed: {:#}", node_id, error);
+                for shard_id in shard_ids {
+                    failures.push(ShardFailure::from_error(
+                        index_name, shard_id, &node_id, &error,
+                    ));
+                }
             }
         }
     }
 
-    (count, successful, failed)
+    MetadataDocCount {
+        count,
+        successful,
+        failures,
+    }
 }
 
 fn remote_count_targets(
@@ -263,6 +301,8 @@ fn remote_count_targets(
 pub struct SearchParams {
     #[serde(default = "default_query")]
     q: String,
+    #[serde(default = "crate::search::query_string::default_field")]
+    df: String,
     #[serde(default = "default_size")]
     size: usize,
     #[serde(default)]
@@ -270,7 +310,7 @@ pub struct SearchParams {
 }
 
 fn default_query() -> String {
-    "*".to_string()
+    "*:*".to_string()
 }
 
 fn default_size() -> usize {
@@ -295,17 +335,11 @@ pub(crate) fn max_score_from_hits(hits: &[serde_json::Value]) -> serde_json::Val
 }
 
 fn query_string_search_request(params: &SearchParams) -> crate::search::SearchRequest {
-    let query = if params.q == "*" {
-        crate::search::QueryClause::MatchAll(serde_json::json!({}))
-    } else {
-        crate::search::QueryClause::Match(HashMap::from([(
-            "body".to_string(),
-            Value::String(params.q.clone()),
-        )]))
-    };
-
     crate::search::SearchRequest {
-        query,
+        query: crate::search::QueryClause::QueryString(crate::search::QueryStringParams {
+            query: params.q.clone(),
+            default_field: params.df.clone(),
+        }),
         size: params.size,
         from: params.from,
         knn: None,
@@ -331,201 +365,34 @@ pub async fn search_documents(
 ) -> (StatusCode, Json<Value>) {
     let _timer = crate::metrics::SEARCH_LATENCY_SECONDS.start_timer();
 
-    // IndexName is validated at extraction time
-
-    let cluster_state = state.cluster_manager.get_state();
-    let metadata = match cluster_state.indices.get(index_name.as_str()) {
-        Some(m) => m.clone(),
-        None => {
-            return crate::api::error_response(
-                StatusCode::NOT_FOUND,
-                "index_not_found_exception",
-                format!("no such index [{index_name}]"),
-            );
-        }
-    };
-
-    if matches!(
-        metadata.settings.engine,
-        crate::cluster::state::IndexEngine::RemoteStore
-    ) {
-        let search_req = query_string_search_request(&params);
-        let result = match crate::api::index::execute_distributed_dsl_search(
-            &state,
-            &index_name,
-            &search_req,
-        )
-        .await
+    let search_req = query_string_search_request(&params);
+    let result =
+        match crate::api::index::execute_distributed_dsl_search(&state, &index_name, &search_req)
+            .await
         {
             Ok(result) => result,
-            Err(err) => return err,
+            Err(error) => return error,
         };
 
-        crate::metrics::SEARCH_QUERIES_TOTAL.inc();
-
-        let paginated: Vec<_> = result
-            .all_hits
-            .into_iter()
-            .skip(search_req.from)
-            .take(search_req.size)
-            .collect();
-        // Query-string GET path never sorts, so max_score is the max BM25
-        // score across returned hits (null when there are no hits).
-        let max_score = max_score_from_hits(&paginated);
-
-        let mut response = serde_json::json!({
-            "_shards": {
-                "total": result.successful_shards + result.failed_shards,
-                "successful": result.successful_shards,
-                "failed": result.failed_shards
-            },
-            "hits": {
-                "total": { "value": result.total_hits, "relation": "eq" },
-                "max_score": max_score,
-                "hits": paginated
-            }
-        });
-        if let Some(stats) = result.remote_store_stats {
-            response["remote_store"] = stats.to_response_json();
-        }
-
-        return (StatusCode::OK, Json(response));
-    }
-
-    let mut all_hits = Vec::new();
-    let mut successful_shards = 0u32;
-    let mut failed_shards = 0u32;
-
-    let local_shards = crate::api::index::ensure_local_index_shards_open(
-        &state,
-        &index_name,
-        &metadata,
-        "GET search",
-    )
-    .await;
-    let local_shard_ids: std::collections::HashSet<u32> =
-        local_shards.iter().map(|(id, _)| *id).collect();
-
-    // Dispatch all local shard searches in parallel
-    let search_futures: Vec<_> = local_shards
-        .iter()
-        .map(|(shard_id, engine)| {
-            let engine = engine.clone();
-            let query = params.q.clone();
-            let shard_id = *shard_id;
-            let pools = state.worker_pools.clone();
-            async move {
-                let result = pools.spawn_search(move || engine.search(&query)).await;
-                (shard_id, result)
-            }
-        })
-        .collect();
-    let search_results = futures::future::join_all(search_futures).await;
-
-    for (shard_id, search_result) in search_results {
-        match search_result {
-            Ok(Ok(hits)) => {
-                successful_shards += 1;
-                for hit in hits {
-                    all_hits.push(serde_json::json!({
-                        "_index": index_name,
-                        "_shard": shard_id,
-                        "_id": hit.get("_id").and_then(|v| v.as_str()).unwrap_or(""),
-                        "_score": hit.get("_score"),
-                        "_source": hit.get("_source").unwrap_or(&hit)
-                    }));
-                }
-            }
-            Ok(Err(e)) | Err(e) => {
-                tracing::error!("Shard {}/{} search failed: {}", index_name, shard_id, e);
-                failed_shards += 1;
-            }
-        }
-    }
-
-    // Scatter to remote shards
-    let mut remote_futures = Vec::new();
-    for (shard_id, routing) in &metadata.shard_routing {
-        if local_shard_ids.contains(shard_id) {
-            continue;
-        }
-        if let Some(node_info) = cluster_state.nodes.get(&routing.primary) {
-            let client = state.transport_client.clone();
-            let node_info = node_info.clone();
-            let index = index_name.to_string();
-            let sid = *shard_id;
-            let query = params.q.clone();
-            remote_futures.push(tokio::spawn(async move {
-                (
-                    sid,
-                    client
-                        .forward_search_to_shard(&node_info, &index, sid, &query)
-                        .await,
-                )
-            }));
-        }
-    }
-
-    let remote_results = join_all(remote_futures).await;
-    for result in remote_results {
-        match result {
-            Ok((shard_id, Ok(hits))) => {
-                successful_shards += 1;
-                for hit in hits {
-                    all_hits.push(serde_json::json!({
-                        "_index": index_name, "_shard": shard_id,
-                        "_id": hit.get("_id").and_then(|v| v.as_str()).unwrap_or(""),
-                        "_score": hit.get("_score"),
-                        "_source": hit.get("_source").unwrap_or(&hit)
-                    }));
-                }
-            }
-            Ok((shard_id, Err(e))) => {
-                tracing::error!(
-                    "Remote shard {}/{} search failed: {}",
-                    index_name,
-                    shard_id,
-                    e
-                );
-                failed_shards += 1;
-            }
-            Err(e) => {
-                tracing::error!("Remote shard search task panicked: {}", e);
-                failed_shards += 1;
-            }
-        }
-    }
-
-    // Sort by _score descending, then apply from/size pagination
-    all_hits.sort_by(|a, b| {
-        let sa = a.get("_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let sb = b.get("_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let total = all_hits.len();
-    let from = params.from;
-    let size = params.size;
-    let paginated: Vec<_> = all_hits.into_iter().skip(from).take(size).collect();
-    let max_score = max_score_from_hits(&paginated);
-
     crate::metrics::SEARCH_QUERIES_TOTAL.inc();
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "_shards": {
-                "total": successful_shards + failed_shards,
-                "successful": successful_shards,
-                "failed": failed_shards
-            },
-            "hits": {
-                "total": { "value": total, "relation": "eq" },
-                "max_score": max_score,
-                "hits": paginated
-            }
-        })),
-    )
+    let paginated: Vec<_> = result
+        .all_hits
+        .into_iter()
+        .skip(params.from)
+        .take(params.size)
+        .collect();
+    let mut response = serde_json::json!({
+        "_shards": shard_stats(result.successful_shards, result.failed_shards, &result.shard_failures),
+        "hits": {
+            "total": {"value": result.total_hits, "relation": "eq"},
+            "max_score": max_score_from_hits(&paginated),
+            "hits": paginated
+        }
+    });
+    if let Some(stats) = result.remote_store_stats {
+        response["remote_store"] = stats.to_response_json();
+    }
+    (StatusCode::OK, Json(response))
 }
 
 /// POST /{index}/_sql/explain — Explain the SQL query plan, optionally with execution timings.
@@ -1157,8 +1024,13 @@ async fn execute_sql_query_with_plan(
     // count(*) fast path: answer from doc_count() metadata without scanning docs
     if plan.is_count_star_only() {
         let search_start = Instant::now();
-        let (count, successful_shards, failed_shards) =
-            count_docs_from_metadata(state, &plan.index_name, &metadata).await;
+        let counts = count_docs_from_metadata(state, &plan.index_name, &metadata).await;
+        if let Some(error) = all_shards_failed_response(counts.successful, &counts.failures) {
+            return Err(error);
+        }
+        let count = counts.count;
+        let successful_shards = counts.successful;
+        let failed_shards = counts.failures.len() as u32;
         let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
 
         let Some(grouped_sql) = plan.grouped_sql.as_ref() else {
@@ -2132,7 +2004,7 @@ async fn handle_show_tables(
         let field_count = metadata.mappings.len();
 
         // Count docs across all shards
-        let (doc_count, _, _) = count_docs_from_metadata(state, name, metadata).await;
+        let doc_count = count_docs_from_metadata(state, name, metadata).await.count;
 
         rows.push(serde_json::json!({
             "index": name,

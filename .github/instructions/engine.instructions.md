@@ -47,6 +47,10 @@ pub trait SearchEngine: Send + Sync {
 ```
 
 ### search_query Collector Selection
+- Query-string parsing and shard-failure semantics are owned by
+  [`search.instructions.md`](search.instructions.md). Reuse the canonical schema
+  builder when validating queries for empty remote-store indices; do not make
+  malformed queries appear valid merely because no split is available.
 - `size=0` with no aggs: uses `(None::<AggCollector>, Count)` — skip TopDocs entirely
 - `size=0` with aggs: uses `(AggCollector, Count)` — aggs without hit materialization
 - `size>0` with fast-field sort: uses `TopDocs::order_by_fast_field()` for Tantivy-native sorting

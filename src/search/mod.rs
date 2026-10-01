@@ -4,6 +4,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+pub(crate) mod query_string;
+pub use query_string::QueryStringParams;
+
 const BINCODE_CONFIG: bincode_next::config::Configuration = bincode_next::config::standard();
 
 /// Top-level search request body.
@@ -108,6 +111,8 @@ pub enum QueryClause {
     Term(HashMap<String, serde_json::Value>),
     /// Full-text match: `{ "match": { "field": "text" } }`
     Match(HashMap<String, serde_json::Value>),
+    /// Tantivy-backed query string with one optional default field.
+    QueryString(QueryStringParams),
     /// Match all documents.
     MatchAll(serde_json::Value),
     /// Match no documents.

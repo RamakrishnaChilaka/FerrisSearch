@@ -1228,6 +1228,27 @@ async fn group_by_text_field_returns_error() {
         sql_approximate_top_k: false,
     };
 
+    let metadata = cluster_state.indices.get("texttest").unwrap();
+    let engine = state
+        .shard_manager
+        .open_shard_with_settings(
+            "texttest",
+            0,
+            &metadata.mappings,
+            &metadata.settings,
+            &metadata.uuid,
+        )
+        .unwrap();
+    for id in ["one", "two"] {
+        engine
+            .add_document(
+                id,
+                json!({"description": "text content", "category": "tools"}),
+            )
+            .unwrap();
+    }
+    engine.refresh().unwrap();
+
     // GROUP BY on text field should return error
     let (status, Json(body)) = search_sql(
         State(state.clone()),
@@ -1247,7 +1268,7 @@ async fn group_by_text_field_returns_error() {
     );
 
     // GROUP BY on keyword field should succeed (not error)
-    let (status2, _) = search_sql(
+    let (status2, Json(body2)) = search_sql(
         State(state),
         Path(crate::common::IndexName::new("texttest").unwrap()),
         Json(SqlQueryRequest {
@@ -1258,6 +1279,7 @@ async fn group_by_text_field_returns_error() {
     .await;
 
     assert_eq!(status2, StatusCode::OK, "keyword fields should work");
+    assert_eq!(body2["rows"], json!([{"category": "tools", "cnt": 2}]));
 }
 
 #[tokio::test]

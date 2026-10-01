@@ -1835,21 +1835,9 @@ impl InternalTransport for TransportService {
         request: Request<ShardSearchRequest>,
     ) -> Result<Response<ShardSearchResponse>, Status> {
         let req = request.into_inner();
-        let engine = match self
+        let engine = self
             .get_or_open_search_shard(&req.index_name, req.shard_id)
-            .await
-        {
-            Ok(engine) => engine,
-            Err(status) => {
-                return Ok(Response::new(ShardSearchResponse {
-                    success: false,
-                    hits: vec![],
-                    error: status.message().to_string(),
-                    total_hits: 0,
-                    partial_aggs_json: vec![],
-                }));
-            }
-        };
+            .await?;
 
         let search_result = {
             let engine = engine.clone();
@@ -1880,13 +1868,7 @@ impl InternalTransport for TransportService {
                     partial_aggs_json: vec![],
                 }))
             }
-            Err(e) => Ok(Response::new(ShardSearchResponse {
-                success: false,
-                hits: vec![],
-                error: e.to_string(),
-                total_hits: 0,
-                partial_aggs_json: vec![],
-            })),
+            Err(error) => Err(crate::search::query_string::search_error_status(error)),
         }
     }
 
@@ -1895,21 +1877,9 @@ impl InternalTransport for TransportService {
         request: Request<ShardSearchDslRequest>,
     ) -> Result<Response<ShardSearchResponse>, Status> {
         let req = request.into_inner();
-        let engine = match self
+        let engine = self
             .get_or_open_search_shard(&req.index_name, req.shard_id)
-            .await
-        {
-            Ok(engine) => engine,
-            Err(status) => {
-                return Ok(Response::new(ShardSearchResponse {
-                    success: false,
-                    hits: vec![],
-                    error: status.message().to_string(),
-                    total_hits: 0,
-                    partial_aggs_json: vec![],
-                }));
-            }
-        };
+            .await?;
 
         let search_req: crate::search::SearchRequest =
             serde_json::from_slice(&req.search_request_json).map_err(|e| {
@@ -1977,13 +1947,7 @@ impl InternalTransport for TransportService {
                     partial_aggs_json: aggs_json,
                 }))
             }
-            Err(e) => Ok(Response::new(ShardSearchResponse {
-                success: false,
-                hits: vec![],
-                error: e.to_string(),
-                total_hits: 0,
-                partial_aggs_json: vec![],
-            })),
+            Err(error) => Err(crate::search::query_string::search_error_status(error)),
         }
     }
 
@@ -2086,7 +2050,7 @@ impl InternalTransport for TransportService {
             &live_split_ids,
         )
         .await
-        .map_err(|e| Status::internal(e.to_string()))?;
+        .map_err(crate::search::query_string::search_error_status)?;
 
         let mut results = Vec::with_capacity(outcomes.len());
         for outcome in outcomes {

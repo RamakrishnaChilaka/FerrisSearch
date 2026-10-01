@@ -179,6 +179,49 @@ curl -sS -X POST 'http://localhost:9200/movies/_search?pretty' \
   }'
 ```
 
+#### Query-string search
+
+Use `GET /{index}/_search?q=...` or a `query_string` DSL clause for the
+Tantivy-backed query-string subset:
+
+```bash
+curl -sS --get 'http://localhost:9200/movies/_search' \
+  --data-urlencode 'q=*:*'
+curl -sS -X POST 'http://localhost:9200/movies/_search' \
+  -H 'Content-Type: application/json' \
+  -d '{"query":{"query_string":{"query":"genre:documentary"}}}'
+```
+
+| Query | Behavior |
+|---|---|
+| No `q` parameter, or standalone `*:*` | Match all documents, including documents with no indexed text. |
+| `rust` or `genre:documentary` | Parse terms with Tantivy's query parser. Unqualified terms use the built-in `body` field. |
+| Standalone `*` | Match documents with an indexed value in the default field. |
+| Standalone `genre:*` | Match documents with an indexed value in the named field. Unknown fields match no documents. |
+
+Set the default field with URI parameter `df` or DSL option `default_field`.
+The DSL accepts only `query` and `default_field`. Keyword fields include empty
+strings; numeric fields include zero. Text presence means at least one indexed
+token, so empty or analyzer-empty text does not match `*`. This differs from
+OpenSearch's text-field existence semantics.
+
+These wildcard rewrites apply only to standalone expressions. Other expressions
+use Tantivy syntax, not the full Lucene query language. Unsupported syntax returns
+an error that names the query and preserves the parser's cause. Partial results
+remain enabled; `allow_partial_search_results=false` is not implemented.
+
+When every shard fails, search returns `search_phase_execution_exception` with
+per-shard reasons: HTTP 400 for client parse or validation errors, 503 for
+unavailable shards, and 500 for other engine failures. Partial failures remain
+HTTP 200 and report `_shards.failed` and `_shards.failures`. These rules also apply
+to query-body `_count`. SQL paths that share distributed search also reject an
+all-failed shard set. Metadata-only `_count` and SQL `count(*)` reject an entirely
+unavailable shard set.
+`_count?q=...` and `_msearch` are not supported.
+Empty remote-store indices also validate query strings against the index mappings
+and return HTTP 400 with a parser cause instead of hiding invalid queries behind
+an empty result.
+
 ### 5. Analyze the matched set
 
 ```bash
@@ -227,7 +270,7 @@ docker run --rm -p 9200:9200 -p 9300:9300 ferrissearch
 ### Search and analytics
 
 - Query DSL: `match`, `term`, `bool`, `range`, `wildcard`, `prefix`, `fuzzy`,
-  and `match_all`
+  `match_all`, and the [query-string subset](#query-string-search)
 - Numeric/date sorting and `search_after` cursor pagination, with documented
   tie limitations
 - Terms, stats, min, max, average, sum, value-count, and histogram aggregations;
