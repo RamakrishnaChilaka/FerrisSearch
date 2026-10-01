@@ -71,8 +71,68 @@ pub(crate) struct InternalSequenceFieldError {
 struct ApplyState {
     checkpoints: LocalCheckpointTracker,
     term_sequences: PrimaryTermSequenceState,
-    versions: LiveVersionMap,
     max_seq_no_of_updates_or_deletes: Option<u64>,
+}
+
+struct VersionMapState {
+    map: LiveVersionMap,
+    complete: bool,
+}
+
+impl VersionMapState {
+    fn new() -> Self {
+        Self {
+            map: LiveVersionMap::new(DEFAULT_VERSION_MAP_MAX_BYTES),
+            complete: true,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ApplyStateTiming {
+    enabled: std::sync::atomic::AtomicBool,
+    samples: Mutex<Vec<(&'static str, usize, Duration)>>,
+}
+
+#[cfg(test)]
+impl ApplyStateTiming {
+    fn start(&self, context: &'static str, operations: usize) -> Option<ApplyStateTimer<'_>> {
+        self.enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .then(|| ApplyStateTimer {
+                timing: self,
+                context,
+                operations,
+                started: Instant::now(),
+            })
+    }
+}
+
+#[cfg(test)]
+struct ApplyStateTimer<'a> {
+    timing: &'a ApplyStateTiming,
+    context: &'static str,
+    operations: usize,
+    started: Instant,
+}
+
+#[cfg(test)]
+struct RefreshMapClearPause {
+    ready: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+impl Drop for ApplyStateTimer<'_> {
+    fn drop(&mut self) {
+        let duration = self.started.elapsed();
+        self.timing
+            .samples
+            .lock()
+            .unwrap()
+            .push((self.context, self.operations, duration));
+    }
 }
 
 #[derive(Clone)]
@@ -92,19 +152,23 @@ impl ApplyState {
         Ok(Self {
             checkpoints: LocalCheckpointTracker::new(committed.clone())?,
             term_sequences,
-            versions: LiveVersionMap::new(DEFAULT_VERSION_MAP_MAX_BYTES),
             max_seq_no_of_updates_or_deletes: committed.max_seq_no_of_updates_or_deletes,
         })
     }
 
-    fn reset_to_commit(&mut self, committed: CommittedBoundaryRecord) -> Result<()> {
+    fn reset_to_commit(
+        &mut self,
+        committed: CommittedBoundaryRecord,
+        versions: &mut VersionMapState,
+    ) -> Result<()> {
         self.checkpoints.reset_to_commit(committed.clone())?;
         self.term_sequences = initialize_term_sequence_state(
             committed.term_sequence_state.current_term,
             committed.term_sequence_state.max_seq_no_at_term_start,
             &committed,
         )?;
-        self.versions.reset();
+        versions.map.reset();
+        versions.complete = false;
         self.max_seq_no_of_updates_or_deletes = committed.max_seq_no_of_updates_or_deletes;
         Ok(())
     }
@@ -352,6 +416,8 @@ pub struct HotEngine {
     maintenance_lock: Mutex<()>,
     automatic_merge_policy: RwLock<Arc<dyn MergePolicy>>,
     #[cfg(test)]
+    apply_state_timing: ApplyStateTiming,
+    #[cfg(test)]
     force_merge_entry_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
     #[cfg(test)]
     force_merge_before_wait_sender: Mutex<Option<std::sync::mpsc::Sender<()>>>,
@@ -370,6 +436,14 @@ pub struct HotEngine {
     #[cfg(test)]
     refresh_after_commit_release_receiver: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     #[cfg(test)]
+    refresh_before_map_clear: Mutex<Option<RefreshMapClearPause>>,
+    #[cfg(test)]
+    replay_after_reset_sender: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    #[cfg(test)]
+    replay_after_reset_release_receiver: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    #[cfg(test)]
+    replay_commit_failure: Mutex<Option<(i32, usize)>>,
+    #[cfg(test)]
     peer_recovery_snapshot_ready_sender: Mutex<Option<std::sync::mpsc::Sender<u64>>>,
     #[cfg(test)]
     peer_recovery_snapshot_release_receiver: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
@@ -378,7 +452,9 @@ pub struct HotEngine {
     pub refresh_interval: Duration,
     /// Write-ahead log for crash durability
     translog: Arc<Mutex<dyn WriteAheadLog>>,
+    // Acquire apply state before versions when both locks are needed.
     apply_state: Mutex<ApplyState>,
+    versions: RwLock<VersionMapState>,
     identity_term_state: Mutex<Option<(u64, Option<u64>)>>,
     committed_boundary_path: PathBuf,
     durability: TranslogDurability,
@@ -1011,6 +1087,8 @@ impl HotEngine {
             maintenance_lock: Mutex::new(()),
             automatic_merge_policy: RwLock::new(automatic_merge_policy),
             #[cfg(test)]
+            apply_state_timing: ApplyStateTiming::default(),
+            #[cfg(test)]
             force_merge_entry_barrier: Mutex::new(None),
             #[cfg(test)]
             force_merge_before_wait_sender: Mutex::new(None),
@@ -1029,6 +1107,14 @@ impl HotEngine {
             #[cfg(test)]
             refresh_after_commit_release_receiver: Mutex::new(None),
             #[cfg(test)]
+            refresh_before_map_clear: Mutex::new(None),
+            #[cfg(test)]
+            replay_after_reset_sender: Mutex::new(None),
+            #[cfg(test)]
+            replay_after_reset_release_receiver: Mutex::new(None),
+            #[cfg(test)]
+            replay_commit_failure: Mutex::new(None),
+            #[cfg(test)]
             peer_recovery_snapshot_ready_sender: Mutex::new(None),
             #[cfg(test)]
             peer_recovery_snapshot_release_receiver: Mutex::new(None),
@@ -1036,6 +1122,7 @@ impl HotEngine {
             refresh_interval,
             translog: Arc::new(Mutex::new(translog)),
             apply_state: Mutex::new(apply_state),
+            versions: RwLock::new(VersionMapState::new()),
             identity_term_state: Mutex::new(None),
             committed_boundary_path,
             durability,
@@ -1213,6 +1300,26 @@ impl HotEngine {
         Ok(boundary)
     }
 
+    fn version_map_read(&self) -> Result<std::sync::RwLockReadGuard<'_, VersionMapState>> {
+        self.versions
+            .read()
+            .map_err(|_| anyhow::anyhow!("version map lock poisoned"))
+    }
+
+    fn version_map_write(&self) -> Result<std::sync::RwLockWriteGuard<'_, VersionMapState>> {
+        self.versions
+            .write()
+            .map_err(|_| anyhow::anyhow!("version map lock poisoned"))
+    }
+
+    fn invalidate_version_map(&self) {
+        let mut versions = self.versions.write().unwrap_or_else(|poisoned| {
+            tracing::error!("version map lock poisoned while invalidating incomplete apply");
+            poisoned.into_inner()
+        });
+        versions.complete = false;
+    }
+
     fn reset_apply_state_to_commit(&self, committed: CommittedBoundaryRecord) -> Result<()> {
         let identity_term_state = *self
             .identity_term_state
@@ -1222,7 +1329,10 @@ impl HotEngine {
             .apply_state
             .lock()
             .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
-        state.reset_to_commit(committed.clone())?;
+        {
+            let mut versions = self.version_map_write()?;
+            state.reset_to_commit(committed.clone(), &mut versions)?;
+        }
         if let Some((identity_fence, identity_fence_max_seq_no)) = identity_term_state {
             state.term_sequences = initialize_term_sequence_state(
                 identity_fence,
@@ -1246,8 +1356,9 @@ impl HotEngine {
         Ok(())
     }
 
-    fn current_version(&self, state: &ApplyState, doc_id: &str) -> Result<Option<CurrentVersion>> {
-        if let Some(version) = state.versions.lookup(doc_id)? {
+    fn current_version(&self, _state: &ApplyState, doc_id: &str) -> Result<Option<CurrentVersion>> {
+        let version = self.version_map_read()?.map.lookup(doc_id)?;
+        if let Some(version) = version {
             return Ok(Some(CurrentVersion::Native(version)));
         }
 
@@ -1432,6 +1543,10 @@ impl HotEngine {
             .apply_state
             .lock()
             .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+        #[cfg(test)]
+        let _apply_state_timer = self
+            .apply_state_timing
+            .start("sequenced_batch", operations.len());
         #[cfg(feature = "protocol-trace")]
         let trace_copy = crate::protocol_trace::current_open_copy();
         #[cfg(feature = "protocol-trace")]
@@ -1631,6 +1746,7 @@ impl HotEngine {
             trace_collision_result.context("record protocol trace operation collision")?;
             if wal_disposition.is_already_in_local_wal() {
                 if let Some(writer_state) = writer_override.as_deref_mut() {
+                    self.invalidate_version_map();
                     writer_state.fail(format!(
                         "sequenced operation failed after WAL persistence: {error:#}"
                     ));
@@ -1790,7 +1906,7 @@ impl HotEngine {
                                     )
                                 })?,
                         };
-                        state.versions.apply_index_at(
+                        self.version_map_write()?.map.apply_index_at(
                             doc_id,
                             planned_operation.operation.seq_no,
                             planned_operation.operation.primary_term,
@@ -1809,7 +1925,7 @@ impl HotEngine {
                             .id_field;
                         writer.delete_term(Term::from_field_text(id_field, doc_id));
                         side_effect(planned_operation.operation)?;
-                        state.versions.apply_delete(
+                        self.version_map_write()?.map.apply_delete(
                             doc_id,
                             planned_operation.operation.seq_no,
                             planned_operation.operation.primary_term,
@@ -1846,6 +1962,7 @@ impl HotEngine {
         if let Err(error) = execution_result {
             if appended || wal_disposition.is_already_in_local_wal() {
                 if let Some(writer_state) = writer_state.as_mut() {
+                    self.invalidate_version_map();
                     (*writer_state).fail(format!(
                         "sequenced operation failed after WAL persistence: {error:#}"
                     ));
@@ -2045,6 +2162,10 @@ impl HotEngine {
                         .apply_state
                         .lock()
                         .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+                    #[cfg(test)]
+                    let _apply_state_timer = self
+                        .apply_state_timing
+                        .start("primary_bulk_versions", docs.len());
                     for doc_id in &doc_ids {
                         match initial_versions.entry(doc_id.as_str()) {
                             std::collections::hash_map::Entry::Occupied(_) => created.push(false),
@@ -2199,6 +2320,7 @@ impl HotEngine {
     }
 
     fn fail_writer_after_wal(&self, error: &anyhow::Error) {
+        self.invalidate_version_map();
         self.writer
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2226,15 +2348,12 @@ impl HotEngine {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("translog lock poisoned during {context}"))?;
             let (can_reserve, current_old_empty, estimated_bytes, max_bytes) = {
-                let state = self
-                    .apply_state
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+                let versions = self.version_map_read()?;
                 (
-                    state.versions.can_reserve(reservation_bytes),
-                    state.versions.current_and_old_are_empty(),
-                    state.versions.estimated_bytes(),
-                    state.versions.max_bytes(),
+                    versions.map.can_reserve(reservation_bytes),
+                    versions.map.current_and_old_are_empty(),
+                    versions.map.estimated_bytes(),
+                    versions.map.max_bytes(),
                 )
             };
             let oversized_bulk = reservation_bytes > max_bytes;
@@ -2271,10 +2390,9 @@ impl HotEngine {
 
     #[cfg(test)]
     pub(crate) fn set_version_map_max_bytes_for_test(&self, max_bytes: usize) {
-        self.apply_state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .versions
+        self.version_map_write()
+            .unwrap()
+            .map
             .set_max_bytes_for_test(max_bytes);
     }
 
@@ -2292,21 +2410,40 @@ impl HotEngine {
             }
             let mut writer_state = self.writer_state_with_replay(translog, "refresh")?;
             {
-                let mut state = self
+                let state = self
                     .apply_state
                     .lock()
                     .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
-                state.versions.rotate_current_into_old()?;
+                let mut versions = self.version_map_write()?;
+                if let Err(error) = versions.map.rotate_current_into_old() {
+                    versions.complete = false;
+                    drop(versions);
+                    drop(state);
+                    writer_state.fail(format!(
+                        "version map rotation failed during refresh: {error:#}"
+                    ));
+                    return Err(error);
+                }
             }
             let boundary = self.current_committed_boundary()?;
             match self.commit_writer_at_boundary(&mut writer_state, "refresh", boundary) {
                 Ok(boundary) => Ok(boundary),
                 Err(error) => {
-                    self.apply_state
+                    let state = self
+                        .apply_state
                         .lock()
-                        .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
-                        .versions
-                        .rollback_refresh()?;
+                        .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+                    let mut versions = self.version_map_write()?;
+                    if let Err(rollback_error) = versions.map.rollback_refresh() {
+                        versions.complete = false;
+                        drop(versions);
+                        drop(state);
+                        let context = format!(
+                            "version map rollback failed after refresh commit failure: {error:#}"
+                        );
+                        writer_state.fail(format!("{context}: {rollback_error:#}"));
+                        return Err(rollback_error).context(context);
+                    }
                     Err(error)
                 }
             }
@@ -2332,15 +2469,16 @@ impl HotEngine {
         }
 
         self.reader.reload()?;
-        let pruned = self
-            .apply_state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
-            .versions
-            .complete_reader_reload(
-                committed_boundary.processed_checkpoint,
-                self.delete_tombstone_retention,
-            );
+        #[cfg(test)]
+        if let Some(pause) = self.refresh_before_map_clear.lock().unwrap().take() {
+            pause.ready.send(()).unwrap();
+            pause.release.recv().unwrap();
+        }
+        let (pruned, retired) = self.version_map_write()?.map.complete_reader_reload(
+            committed_boundary.processed_checkpoint,
+            self.delete_tombstone_retention,
+        );
+        drop(retired);
         Ok(pruned)
     }
 
@@ -2351,15 +2489,23 @@ impl HotEngine {
         context: &str,
     ) -> Result<u64> {
         let committed = self.load_committed_boundary()?;
-        // Publish the committed state to the reader before clearing the live
-        // version map. Otherwise a realtime GET or primary condition that
-        // misses the map falls back to an older reader. Some paths commit
-        // without reloading, such as the peer-recovery snapshot, and rely on
-        // the delayed commit watcher.
+        // Publish the commit before resetting the map, including empty replay.
+        // Completeness remains false until the acknowledged suffix is restored.
         self.reader
             .reload()
             .with_context(|| format!("reader reload failed before {context} replay"))?;
         self.reset_apply_state_to_commit(committed.clone())?;
+        #[cfg(test)]
+        if let Some(sender) = self.replay_after_reset_sender.lock().unwrap().take() {
+            sender.send(()).unwrap();
+            self.replay_after_reset_release_receiver
+                .lock()
+                .unwrap()
+                .take()
+                .expect("replay pause requires a release receiver")
+                .recv()
+                .unwrap();
+        }
         #[cfg(feature = "protocol-trace")]
         let trace_copy = crate::protocol_trace::current_open_copy();
         #[cfg(feature = "protocol-trace")]
@@ -2384,6 +2530,7 @@ impl HotEngine {
             if trace_replay && let Some(copy) = trace_copy.as_ref() {
                 crate::protocol_trace::record_replay_finished(copy, "completed")?;
             }
+            self.version_map_write()?.complete = true;
             return Ok(0);
         }
 
@@ -2456,6 +2603,19 @@ impl HotEngine {
                     |_| Ok(()),
                 );
                 result?;
+                #[cfg(test)]
+                {
+                    let mut failure = self.replay_commit_failure.lock().unwrap();
+                    if let Some((raw_os_error, successful_commits)) = failure.as_mut() {
+                        if *successful_commits == 0 {
+                            let error = std::io::Error::from_raw_os_error(*raw_os_error);
+                            *failure = None;
+                            writer_state.fail(format!("injected replay commit failure: {error}"));
+                            return Err(error).context("injected replay commit failure");
+                        }
+                        *successful_commits -= 1;
+                    }
+                }
                 let boundary = self.current_committed_boundary()?;
                 let boundary = self.commit_writer_at_boundary(writer_state, context, boundary)?;
                 self.persist_committed_boundary(&boundary)?;
@@ -2502,6 +2662,7 @@ impl HotEngine {
             if trace_replay && let Some(copy) = trace_copy.as_ref() {
                 crate::protocol_trace::record_replay_finished(copy, "completed")?;
             }
+            self.version_map_write()?.complete = true;
             return Ok(0);
         }
         flush_batch(&mut batch)?;
@@ -2527,14 +2688,16 @@ impl HotEngine {
                 format!("committed checkpoint persistence failed after {context}")
             });
         }
-        self.apply_state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
-            .versions
-            .complete_reader_reload(
+        let retired = {
+            let mut versions = self.version_map_write()?;
+            let (_, retired) = versions.map.complete_reader_reload(
                 committed_boundary.processed_checkpoint,
                 self.delete_tombstone_retention,
             );
+            versions.complete = true;
+            retired
+        };
+        drop(retired);
         tracing::info!(
             "Translog replay during {} recovered {} operations.",
             context,
@@ -3686,6 +3849,25 @@ impl HotEngine {
     }
 
     #[cfg(test)]
+    fn pause_after_replay_reset_for_test(
+        &self,
+        sender: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.replay_after_reset_sender.lock().unwrap() = Some(sender);
+        *self.replay_after_reset_release_receiver.lock().unwrap() = Some(release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_replay_commit_failure_for_test(
+        &self,
+        raw_os_error: i32,
+        successful_commits: usize,
+    ) {
+        *self.replay_commit_failure.lock().unwrap() = Some((raw_os_error, successful_commits));
+    }
+
+    #[cfg(test)]
     fn set_peer_recovery_scan_barrier_for_test(&self, barrier: Arc<std::sync::Barrier>) {
         self.with_translog("set recovery scan barrier", |translog| {
             translog.set_recovery_scan_barrier(Some(barrier));
@@ -4071,12 +4253,13 @@ impl HotEngine {
     #[cfg(feature = "protocol-trace")]
     pub(crate) fn protocol_trace_copy_evidence(&self) -> Result<super::ProtocolTraceCopyEvidence> {
         let live_documents = self.protocol_trace_documents_snapshot()?;
-        let versions = self
-            .apply_state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
-            .versions
-            .protocol_trace_versions()?;
+        let versions = {
+            let _state = self
+                .apply_state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+            self.version_map_read()?.map.protocol_trace_versions()?
+        };
         let mut actual = BTreeMap::new();
         for (doc, source, seq_no, term) in &live_documents {
             actual.insert(
@@ -7728,6 +7911,11 @@ impl tantivy::collector::SegmentCollector for AggSegmentCollector {
 
 impl super::SearchEngine for HotEngine {
     #[cfg(test)]
+    fn inject_replay_commit_failure_for_test(&self, raw_os_error: i32, successful_commits: usize) {
+        HotEngine::inject_replay_commit_failure_for_test(self, raw_os_error, successful_commits);
+    }
+
+    #[cfg(test)]
     fn writer_is_failed_for_test(&self) -> bool {
         HotEngine::writer_is_failed_for_test(self)
     }
@@ -7839,10 +8027,40 @@ impl super::SearchEngine for HotEngine {
         if !realtime {
             return self.read_refreshed_document(doc_id);
         }
+        let (complete, version) = {
+            let versions = self.version_map_read()?;
+            (
+                versions.complete,
+                if versions.complete {
+                    versions.map.lookup(doc_id)?
+                } else {
+                    None
+                },
+            )
+        };
+        if complete {
+            match version {
+                None => return self.read_refreshed_document(doc_id),
+                Some(VersionValue::Delete(_)) => return Ok(None),
+                Some(VersionValue::Index(_)) => {}
+            }
+        }
         self.with_translog("realtime GET", |translog| {
-            let version = self.apply_state.lock()
-                .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?
-                .versions.lookup(doc_id)?;
+            let version = {
+                let versions = self.version_map_read()?;
+                if !versions.complete {
+                    drop(versions);
+                    let writer_state = self.writer.read()
+                        .unwrap_or_else(|error| error.into_inner());
+                    return Err(TantivyWriterUnavailableError {
+                        context: "realtime GET".to_string(),
+                        reason: format!("live version map is incomplete; WAL replay must complete: {}",
+                            writer_state.failure.as_deref()
+                                .unwrap_or("WAL replay has not completed")),
+                    }.into());
+                }
+                versions.map.lookup(doc_id)?
+            };
             let Some(VersionValue::Index(version)) = version else {
                 return if version.is_some() { Ok(None) } else { self.read_refreshed_document(doc_id) };
             };
@@ -9262,6 +9480,215 @@ mod tests {
         (dir, engine)
     }
 
+    fn realtime_get_while_apply_state_is_held(
+        engine: Arc<HotEngine>,
+        doc_id: &'static str,
+    ) -> Result<Option<super::super::DocumentRead>> {
+        let state = engine.apply_state.lock().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let get_engine = engine.clone();
+        let get = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(get_engine.get_document_with_metadata(doc_id, true))
+                .unwrap();
+        });
+        started_rx.recv_timeout(TEST_SYNC_TIMEOUT).unwrap();
+        let result = result_rx.recv_timeout(TEST_SYNC_TIMEOUT);
+        drop(state);
+        get.join().unwrap();
+        result.expect("realtime GET must complete before the apply-state mutex is released")
+    }
+
+    #[test]
+    fn realtime_get_map_miss_does_not_wait_for_apply_state() {
+        let (_directory, engine) = create_engine();
+        let receipt = engine
+            .add_document_with_receipt("old", json!({"value": 1}))
+            .unwrap();
+        engine.refresh().unwrap();
+        let document = realtime_get_while_apply_state_is_held(Arc::new(engine), "old")
+            .unwrap()
+            .unwrap();
+        assert_eq!(document.source, json!({"value": 1}));
+        assert_eq!(document.seq_no, receipt.seq_no);
+        assert_eq!(document.primary_term, receipt.primary_term);
+    }
+
+    #[test]
+    fn realtime_get_tombstone_does_not_wait_for_apply_state() {
+        let (_directory, engine) = create_engine();
+        engine.add_document("deleted", json!({"value": 1})).unwrap();
+        engine.refresh().unwrap();
+        engine.delete_document("deleted").unwrap();
+        assert!(
+            realtime_get_while_apply_state_is_held(Arc::new(engine), "deleted")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[ignore = "release-mode continuous GET benchmark; run explicitly on pinned CPUs"]
+    fn continuous_realtime_get_latency_during_bulk() {
+        const DOCUMENTS: usize = 20_000;
+        const ROUNDS: usize = 3;
+        const CADENCE: Duration = Duration::from_millis(1);
+        let mut miss = Vec::new();
+        let mut hit = Vec::new();
+        let mut reader = Vec::new();
+        let mut bulk_seconds = 0.0;
+        for round in 0..ROUNDS {
+            let directory = tempfile::tempdir().unwrap();
+            let engine = Arc::new(
+                super::super::CompositeEngine::new(directory.path(), Duration::from_secs(3600))
+                    .unwrap(),
+            );
+            let old = engine
+                .add_document_with_receipt("old", json!({"v": 1}))
+                .unwrap();
+            engine.refresh().unwrap();
+            let live = engine
+                .add_document_with_receipt("live", json!({"v": 2}))
+                .unwrap();
+            for _ in 0..100 {
+                for (doc_id, realtime, expected) in [
+                    ("old", true, &old),
+                    ("live", true, &live),
+                    ("old", false, &old),
+                ] {
+                    let document = engine
+                        .get_document_with_metadata(doc_id, realtime)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(document.seq_no, expected.seq_no);
+                    assert_eq!(document.primary_term, expected.primary_term);
+                }
+            }
+            engine
+                .text_engine()
+                .apply_state_timing
+                .enabled
+                .store(true, Ordering::Relaxed);
+            let barrier = Arc::new(std::sync::Barrier::new(5));
+            let done = Arc::new(AtomicBool::new(false));
+            let origin = Instant::now();
+            let writer = {
+                let engine = engine.clone();
+                let barrier = barrier.clone();
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    let docs = (0..DOCUMENTS)
+                        .map(|i| {
+                            (
+                                format!("bulk-{i}"),
+                                json!({"field": format!("value {i}"), "i": i}),
+                            )
+                        })
+                        .collect();
+                    barrier.wait();
+                    let start = Instant::now();
+                    engine.bulk_add_documents(docs).unwrap();
+                    let end = Instant::now();
+                    done.store(true, Ordering::Release);
+                    (start, end)
+                })
+            };
+            let readers = [
+                ("miss", "old", true, old.seq_no, old.primary_term, 1),
+                ("hit", "live", true, live.seq_no, live.primary_term, 2),
+                ("reader", "old", false, old.seq_no, old.primary_term, 1),
+            ]
+            .into_iter()
+            .map(|(path, doc_id, realtime, seq_no, primary_term, value)| {
+                let engine = engine.clone();
+                let barrier = barrier.clone();
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let mut samples = Vec::new();
+                    while !done.load(Ordering::Acquire) {
+                        let start = Instant::now();
+                        let document = engine
+                            .get_document_with_metadata(doc_id, realtime)
+                            .unwrap()
+                            .unwrap();
+                        let latency = start.elapsed();
+                        assert_eq!(document.seq_no, seq_no);
+                        assert_eq!(document.primary_term, primary_term);
+                        assert_eq!(document.source, json!({"v": value}));
+                        samples.push((start, latency));
+                        std::thread::sleep(
+                            (start + CADENCE).saturating_duration_since(Instant::now()),
+                        );
+                    }
+                    (path, samples)
+                })
+            })
+            .collect::<Vec<_>>();
+            barrier.wait();
+            let (bulk_start, bulk_end) = writer.join().unwrap();
+            let bulk = bulk_end.duration_since(bulk_start);
+            bulk_seconds += bulk.as_secs_f64();
+            println!(
+                "P3_CONT_BULK,{round},{DOCUMENTS},{},{},{}",
+                bulk_start.duration_since(origin).as_nanos(),
+                bulk_end.duration_since(origin).as_nanos(),
+                bulk.as_nanos()
+            );
+            for get in readers {
+                let (path, samples) = get.join().unwrap();
+                for (start, latency) in samples {
+                    let overlap = start >= bulk_start && start < bulk_end;
+                    println!(
+                        "P3_CONT_SAMPLE,{round},{path},{},{},{overlap}",
+                        start.duration_since(origin).as_nanos(),
+                        latency.as_nanos()
+                    );
+                    if overlap {
+                        match path {
+                            "miss" => miss.push(latency.as_nanos()),
+                            "hit" => hit.push(latency.as_nanos()),
+                            "reader" => reader.push(latency.as_nanos()),
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+            }
+            for (context, operations, held) in engine
+                .text_engine()
+                .apply_state_timing
+                .samples
+                .lock()
+                .unwrap()
+                .iter()
+            {
+                println!(
+                    "P3_CONT_APPLY_HOLD,{round},{context},{operations},{}",
+                    held.as_nanos()
+                );
+            }
+        }
+        for (path, mut samples) in [("miss", miss), ("hit", hit), ("reader", reader)] {
+            samples.sort_unstable();
+            assert!(!samples.is_empty(), "{path} had no reads during the bulk");
+            let p50 = samples[(samples.len() * 50).div_ceil(100) - 1];
+            let p99 = samples[(samples.len() * 99).div_ceil(100) - 1];
+            println!(
+                "P3_CONT_SUMMARY,{path},samples={},p50_ms={:.6},p99_ms={:.6},max_ms={:.6}",
+                samples.len(),
+                p50 as f64 / 1_000_000.0,
+                p99 as f64 / 1_000_000.0,
+                *samples.last().unwrap() as f64 / 1_000_000.0
+            );
+        }
+        println!(
+            "P3_CONT_THROUGHPUT,docs_per_second={:.3},bulk_seconds={bulk_seconds:.6}",
+            (DOCUMENTS * ROUNDS) as f64 / bulk_seconds
+        );
+    }
+
     #[test]
     fn field_registry_excludes_reserved_internal_metadata_fields() {
         let (_dir, engine) = create_engine();
@@ -9478,6 +9905,7 @@ mod tests {
             writer: Arc::new(RwLock::new(WriterState::ready(writer))),
             maintenance_lock: Mutex::new(()),
             automatic_merge_policy: RwLock::new(automatic_merge_policy),
+            apply_state_timing: ApplyStateTiming::default(),
             force_merge_entry_barrier: Mutex::new(None),
             force_merge_before_wait_sender: Mutex::new(None),
             writer_replacement_failure: Mutex::new(None),
@@ -9487,6 +9915,10 @@ mod tests {
             refresh_before_writer_sender: Mutex::new(None),
             refresh_after_commit_sender: Mutex::new(None),
             refresh_after_commit_release_receiver: Mutex::new(None),
+            refresh_before_map_clear: Mutex::new(None),
+            replay_after_reset_sender: Mutex::new(None),
+            replay_after_reset_release_receiver: Mutex::new(None),
+            replay_commit_failure: Mutex::new(None),
             peer_recovery_snapshot_ready_sender: Mutex::new(None),
             peer_recovery_snapshot_release_receiver: Mutex::new(None),
             field_registry: RwLock::new(FieldRegistry {
@@ -9501,6 +9933,7 @@ mod tests {
             refresh_interval: Duration::from_secs(60),
             translog: Arc::new(Mutex::new(translog)),
             apply_state: Mutex::new(ApplyState::new(committed_boundary).unwrap()),
+            versions: RwLock::new(VersionMapState::new()),
             identity_term_state: Mutex::new(None),
             committed_boundary_path,
             durability: TranslogDurability::Request,
@@ -10650,6 +11083,445 @@ mod tests {
         refresh.join().unwrap().unwrap();
 
         assert_eq!(engine.get_document("doc").unwrap().unwrap()["value"], 2);
+    }
+
+    fn realtime_get_while_translog_is_held(
+        engine: Arc<HotEngine>,
+        doc_id: &'static str,
+    ) -> Result<Option<super::super::DocumentRead>> {
+        let translog = engine.translog.lock().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let get_engine = engine.clone();
+        let get = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(get_engine.get_document_with_metadata(doc_id, true))
+                .unwrap();
+        });
+        started_rx.recv_timeout(TEST_SYNC_TIMEOUT).unwrap();
+        let result = result_rx.recv_timeout(TEST_SYNC_TIMEOUT);
+        drop(translog);
+        get.join().unwrap();
+        result.expect("realtime GET must complete before the translog mutex is released")
+    }
+
+    #[test]
+    fn realtime_get_map_miss_does_not_wait_for_translog() {
+        let (_dir, engine) = create_engine();
+        let receipt = engine
+            .add_document_with_receipt("old", json!({"value": 1}))
+            .unwrap();
+        engine.refresh().unwrap();
+        assert!(
+            engine
+                .version_map_read()
+                .unwrap()
+                .map
+                .lookup("old")
+                .unwrap()
+                .is_none()
+        );
+        let document = realtime_get_while_translog_is_held(Arc::new(engine), "old")
+            .unwrap()
+            .unwrap();
+        assert_eq!(document.source, json!({"value": 1}));
+        assert_eq!(document.seq_no, receipt.seq_no);
+        assert_eq!(document.primary_term, receipt.primary_term);
+    }
+
+    #[test]
+    fn realtime_get_miss_during_refresh_reload_before_clear_keeps_acknowledged_version() {
+        let (_directory, mut engine) = create_engine();
+        engine.reader = engine
+            .index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
+            .unwrap();
+        engine.add_document("doc", json!({"value": 1})).unwrap();
+        engine.refresh().unwrap();
+        let acknowledged = engine
+            .add_document_with_receipt("doc", json!({"value": 2}))
+            .unwrap();
+        assert_eq!(
+            engine
+                .get_document_with_metadata("doc", false)
+                .unwrap()
+                .unwrap()
+                .source,
+            json!({"value": 1})
+        );
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *engine.refresh_before_map_clear.lock().unwrap() = Some(RefreshMapClearPause {
+            ready: ready_tx,
+            release: release_rx,
+        });
+        let engine = Arc::new(engine);
+        let refresh_engine = engine.clone();
+        let refresh = std::thread::spawn(move || refresh_engine.refresh());
+        ready_rx.recv_timeout(TEST_SYNC_TIMEOUT).unwrap();
+
+        // Force a miss at the publication/clear boundary, rather than a WAL hit.
+        let (_, retired) = engine
+            .version_map_write()
+            .unwrap()
+            .map
+            .complete_reader_reload(Some(acknowledged.seq_no), engine.delete_tombstone_retention);
+        drop(retired);
+        assert!(
+            engine
+                .version_map_read()
+                .unwrap()
+                .map
+                .lookup("doc")
+                .unwrap()
+                .is_none()
+        );
+        let result = engine.get_document_with_metadata("doc", true);
+        release_tx.send(()).unwrap();
+        refresh.join().unwrap().unwrap();
+        let document = result.unwrap().unwrap();
+        assert_eq!(document.source, json!({"value": 2}));
+        assert_eq!(document.seq_no, acknowledged.seq_no);
+        assert_eq!(document.primary_term, acknowledged.primary_term);
+    }
+
+    #[test]
+    fn realtime_get_tombstone_does_not_wait_for_translog() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("deleted", json!({"value": 1})).unwrap();
+        engine.refresh().unwrap();
+        engine.delete_document("deleted").unwrap();
+        assert!(matches!(
+            engine
+                .version_map_read()
+                .unwrap()
+                .map
+                .lookup("deleted")
+                .unwrap(),
+            Some(VersionValue::Delete(_))
+        ));
+        assert!(
+            realtime_get_while_translog_is_held(Arc::new(engine), "deleted")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn realtime_get_index_hit_keeps_translog_serialization() {
+        let (_dir, engine) = create_engine();
+        let engine = Arc::new(engine);
+        let receipt = engine
+            .add_document_with_receipt("live", json!({"value": 1}))
+            .unwrap();
+        let translog = engine.translog.lock().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let get_engine = engine.clone();
+        let get = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(get_engine.get_document_with_metadata("live", true))
+                .unwrap();
+        });
+        started_rx.recv_timeout(TEST_SYNC_TIMEOUT).unwrap();
+        let early = result_rx.recv_timeout(Duration::from_millis(100));
+        drop(translog);
+        get.join().unwrap();
+        assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
+        let document = result_rx
+            .recv_timeout(TEST_SYNC_TIMEOUT)
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(document.source, json!({"value": 1}));
+        assert_eq!(document.seq_no, receipt.seq_no);
+        assert_eq!(document.primary_term, receipt.primary_term);
+    }
+
+    #[test]
+    fn realtime_get_after_empty_replay_uses_published_reader_without_translog() {
+        let (directory, engine) = create_engine();
+        engine.add_document("old", json!({"value": 1})).unwrap();
+        engine.refresh().unwrap();
+        let receipt = engine
+            .add_document_with_receipt("old", json!({"value": 2}))
+            .unwrap();
+        drop(
+            engine
+                .prepare_peer_recovery_snapshot(&directory.path().join("snapshot"))
+                .unwrap(),
+        );
+        assert!(
+            engine
+                .prepare_primary_activation(receipt.primary_term + 1)
+                .unwrap()
+                .is_empty()
+        );
+        let document = realtime_get_while_translog_is_held(Arc::new(engine), "old")
+            .unwrap()
+            .unwrap();
+        assert_eq!(document.source, json!({"value": 2}));
+        assert_eq!(document.seq_no, receipt.seq_no);
+        assert_eq!(document.primary_term, receipt.primary_term);
+    }
+
+    #[test]
+    fn realtime_get_after_refresh_rotation_failure_fails_closed() {
+        let (_dir, engine) = create_engine();
+        engine
+            .add_document("collision", json!({"value": 1}))
+            .unwrap();
+        engine
+            .version_map_write()
+            .unwrap()
+            .map
+            .rotate_current_into_old()
+            .unwrap();
+        let receipt = engine
+            .add_document_with_receipt("unrelated", json!({"value": 2}))
+            .unwrap();
+        {
+            let mut versions = engine.version_map_write().unwrap();
+            let Some(VersionValue::Index(version)) = versions.map.lookup("collision").unwrap()
+            else {
+                panic!("collision setup requires a live index version");
+            };
+            versions.map.apply_index_at(
+                "collision",
+                version.seq_no,
+                version.primary_term + 1,
+                version.wal_position.unwrap(),
+            );
+        }
+        let error = engine.refresh().unwrap_err();
+        assert!(error.is::<super::super::version_map::VersionMapCollisionError>());
+        assert!(engine.writer_is_failed_for_test());
+        let error = engine
+            .get_document_with_metadata("unrelated", true)
+            .unwrap_err();
+        assert!(error.is::<TantivyWriterUnavailableError>(), "{error:#}");
+        assert!(format!("{error:#}").contains("rotation failed"));
+        engine.refresh().unwrap();
+        let document = engine
+            .get_document_with_metadata("unrelated", true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(document.source, json!({"value": 2}));
+        assert_eq!(document.seq_no, receipt.seq_no);
+        assert_eq!(document.primary_term, receipt.primary_term);
+    }
+
+    #[test]
+    fn realtime_get_during_replay_never_returns_the_stale_commit() {
+        let (_dir, engine) = create_engine();
+        let engine = Arc::new(engine);
+        engine.add_document("doc", json!({"value": 1})).unwrap();
+        engine.refresh().unwrap();
+        let acknowledged = engine
+            .add_document_with_receipt("doc", json!({"value": 2}))
+            .unwrap();
+        engine.inject_refresh_commit_failures_for_test(1);
+        assert!(engine.refresh().is_err());
+        let (reset_tx, reset_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        engine.pause_after_replay_reset_for_test(reset_tx, release_rx);
+        let replay_engine = engine.clone();
+        let replay = std::thread::spawn(move || replay_engine.refresh());
+        reset_rx.recv_timeout(TEST_SYNC_TIMEOUT).unwrap();
+        assert!(
+            engine
+                .version_map_read()
+                .unwrap()
+                .map
+                .lookup("doc")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            engine
+                .get_document_with_metadata("doc", false)
+                .unwrap()
+                .unwrap()
+                .source,
+            json!({"value": 1})
+        );
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let get_engine = engine.clone();
+        let get = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(get_engine.get_document_with_metadata("doc", true))
+                .unwrap();
+        });
+        started_rx.recv_timeout(TEST_SYNC_TIMEOUT).unwrap();
+        let early = result_rx.recv_timeout(Duration::from_millis(100));
+        release_tx.send(()).unwrap();
+        replay.join().unwrap().unwrap();
+        get.join().unwrap();
+        if let Ok(result) = early {
+            assert!(
+                result.is_err(),
+                "GET returned during incomplete replay: {result:?}"
+            );
+        } else {
+            let document = result_rx
+                .recv_timeout(TEST_SYNC_TIMEOUT)
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(document.source, json!({"value": 2}));
+            assert_eq!(document.seq_no, acknowledged.seq_no);
+            assert_eq!(document.primary_term, acknowledged.primary_term);
+        }
+    }
+
+    #[test]
+    fn realtime_get_after_partial_replay_failure_fails_closed() {
+        let (_dir, engine) = create_engine();
+        let committed = engine
+            .add_document_with_receipt("old", json!({"value": 1}))
+            .unwrap();
+        engine.add_document("deleted", json!({"value": 1})).unwrap();
+        engine.refresh().unwrap();
+        let mut suffix = (0..2 * TRANSLOG_REPLAY_BATCH_SIZE)
+            .map(|i| (format!("filler-{i}"), json!({"value": i})))
+            .collect::<Vec<_>>();
+        suffix.push(("old".into(), json!({"value": 2})));
+        suffix.push(("fresh".into(), json!({"value": 3})));
+        let acknowledged = engine.bulk_add_documents_with_receipt(suffix).unwrap();
+        engine.delete_document("deleted").unwrap();
+        engine.inject_refresh_commit_failures_for_test(1);
+        assert!(engine.refresh().is_err());
+        engine.inject_replay_commit_failure_for_test(28, 1);
+        let replay_error = engine.refresh().unwrap_err();
+        assert!(
+            replay_error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.raw_os_error() == Some(28))
+            }),
+            "{replay_error:#}"
+        );
+        assert!(engine.writer_is_failed_for_test());
+        let reads = ["old", "fresh", "deleted", "filler-0"]
+            .map(|doc_id| (doc_id, engine.get_document_with_metadata(doc_id, true)));
+        for (doc_id, result) in reads {
+            let error = result.expect_err(&format!(
+                "GET [{doc_id}] must not trust a partial version map after replay failure"
+            ));
+            assert!(error.is::<TantivyWriterUnavailableError>(), "{error:#}");
+            assert!(format!("{error:#}").contains("No space left"), "{error:#}");
+        }
+        assert_eq!(
+            engine
+                .get_document_with_metadata("old", false)
+                .unwrap()
+                .unwrap()
+                .source,
+            json!({"value": 1})
+        );
+        let error = engine
+            .add_document_with_condition_at_term(
+                "old",
+                json!({"wrong": true}),
+                committed.primary_term,
+                super::super::WriteCondition::IfMatch {
+                    seq_no: committed.seq_no,
+                    primary_term: committed.primary_term,
+                },
+            )
+            .unwrap_err();
+        assert!(
+            error.is::<super::super::VersionConflictError>(),
+            "{error:#}"
+        );
+        let error = engine
+            .add_document_with_condition_at_term(
+                "fresh",
+                json!({"wrong": true}),
+                acknowledged.primary_term,
+                super::super::WriteCondition::Create,
+            )
+            .unwrap_err();
+        assert!(
+            error.is::<super::super::VersionConflictError>(),
+            "{error:#}"
+        );
+        assert_eq!(
+            engine
+                .get_document_with_metadata("old", true)
+                .unwrap()
+                .unwrap()
+                .source,
+            json!({"value": 2})
+        );
+        assert_eq!(
+            engine
+                .get_document_with_metadata("fresh", true)
+                .unwrap()
+                .unwrap()
+                .source,
+            json!({"value": 3})
+        );
+        assert!(
+            engine
+                .get_document_with_metadata("deleted", true)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn realtime_get_after_post_wal_apply_failure_fails_closed() {
+        let (_directory, engine) = create_engine();
+        engine.add_document("old", json!({"value": 1})).unwrap();
+        engine.refresh().unwrap();
+        engine.inject_engine_apply_failures_for_test(28, 1);
+        let error = engine
+            .add_document("pending", json!({"value": 2}))
+            .unwrap_err();
+        assert!(
+            error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.raw_os_error() == Some(28))
+            }),
+            "{error:#}"
+        );
+        for doc_id in ["old", "pending", "missing"] {
+            let error = engine.get_document_with_metadata(doc_id, true).unwrap_err();
+            assert!(error.is::<TantivyWriterUnavailableError>(), "{error:#}");
+            assert!(format!("{error:#}").contains("No space left"), "{error:#}");
+        }
+        assert_eq!(
+            engine
+                .get_document_with_metadata("old", false)
+                .unwrap()
+                .unwrap()
+                .source,
+            json!({"value": 1})
+        );
+        engine.refresh().unwrap();
+        assert_eq!(
+            engine
+                .get_document_with_metadata("pending", true)
+                .unwrap()
+                .unwrap()
+                .source,
+            json!({"value": 2})
+        );
+        assert!(
+            engine
+                .get_document_with_metadata("missing", true)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

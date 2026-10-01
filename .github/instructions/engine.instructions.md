@@ -82,10 +82,22 @@ pub trait SearchEngine: Send + Sync {
   shadow versions authoritative for duplicate IDs; never reuse the cache
   across refresh, replica apply, or replay.
 - Keep `get_document()` searcher-only for existing internal consumers.
-  REST/OCC uses `get_document_with_metadata()`: realtime checks the live map,
-  resolves full source at its physical WAL cursor, and returns real identity.
-  Tombstones return missing. Reader fallback must cover the live version.
-  Hold the translog mutex so flush cannot prune between lookup and read.
+  REST/OCC uses `get_document_with_metadata()`: realtime checks map completeness
+  and the live version under one short version-map read lock, separate from
+  `ApplyState`. A complete-map miss acquires the searcher after releasing that
+  lock and reads without the apply-state or translog mutex; a complete-map
+  tombstone returns missing. Index hits release the map lock, then hold the translog
+  mutex through re-lookup and WAL cursor reads, so flush cannot prune between
+  lookup and read. Reader fallback must cover the live version. An incomplete
+  map waits for the mutex and fails with the replay cause if it remains
+  incomplete; never return stale source or a false 404 after failed replay.
+- Keep D1 planning, checkpoints, term tracking, and planning-snapshot restore
+  under the whole-batch apply-state mutex. Acquire apply state before the
+  version map whenever both are needed, never the reverse. Hold the map's
+  write lock only around map mutation, not WAL I/O, fsync, Tantivy apply, or
+  reader lookup. Publish map entries per applied operation; an in-flight
+  index hit still waits for the translog mutex before reading its WAL source.
+  A mid-batch delete's tombstone can return immediately before acknowledgement.
 
 ## CompositeEngine (src/engine/composite.rs)
 ```rust
@@ -206,6 +218,18 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
 - Replay holds the translog lock for the entire retained suffix so no new WAL
   entry can be appended before reconstruction is complete. This blocks writes
   to that shard and can be a long critical section when refresh is disabled.
+- Replay clears map completeness together with the map reset. It restores
+  completeness only after successful reader publication and replay completion,
+  including an empty suffix. Intermediate commits and failed replay leave the
+  map incomplete. Refresh clears old entries only after publishing a covering
+  reader; the byte limit forces refresh or rejects writes instead of evicting.
+  Steady rotation swaps current and old when old is empty. Reader reload
+  precedes taking old and subtracting its cached byte total; callers drop the
+  returned retired map only after releasing the version-map write lock.
+  Non-empty-window merge/rollback and tombstone pruning can still do linear
+  work under that lock.
+  Failed map rotation, rollback, or post-WAL apply also invalidates completeness
+  and the writer. Map state and completeness share the same version-map lock.
 - The durable term-start maximum comes from the copy fence and may be ahead of
   `CommittedBoundaryRecord.max_seq_no` at an intermediate replay commit. This is
   valid because WAL-only operations have not reached that batch yet. Validation

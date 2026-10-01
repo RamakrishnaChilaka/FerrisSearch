@@ -4,11 +4,172 @@ use ferrissearch::engine::{
 };
 use ferrissearch::wal::{HotTranslog, WalOperation, WriteAheadLog};
 use serde_json::json;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 fn open(path: &std::path::Path) -> CompositeEngine {
     CompositeEngine::new(path, Duration::from_secs(3600)).unwrap()
+}
+
+#[test]
+fn writes_regression_realtime_get_never_precedes_acknowledged_cas_during_churn() {
+    const WRITERS: usize = 6;
+    const WRITES_PER_WRITER: usize = 20;
+
+    let directory = tempfile::tempdir().unwrap();
+    let engine = Arc::new(open(directory.path()));
+    let old = engine
+        .add_document_with_receipt("old", json!({"stable": true}))
+        .unwrap();
+    engine.refresh().unwrap();
+    let initial = engine
+        .add_document_with_receipt("counter", json!({"n": 0}))
+        .unwrap();
+    let acknowledged = Arc::new(AtomicU64::new(initial.seq_no));
+    let stop = Arc::new(AtomicBool::new(false));
+    let barrier = Arc::new(Barrier::new(WRITERS + 4));
+    let maintenance = {
+        let engine = engine.clone();
+        let stop = stop.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            let mut rounds = 0;
+            while !stop.load(Ordering::Acquire) || rounds < 2 {
+                if rounds % 2 == 0 {
+                    engine.refresh().unwrap();
+                } else {
+                    engine.flush().unwrap();
+                }
+                rounds += 1;
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            rounds
+        })
+    };
+    let readers = (0..2)
+        .map(|_| {
+            let engine = engine.clone();
+            let acknowledged = acknowledged.clone();
+            let stop = stop.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let mut reads = 0;
+                while !stop.load(Ordering::Acquire) || reads < 20 {
+                    let floor = acknowledged.load(Ordering::Acquire);
+                    let document = engine
+                        .get_document_with_metadata("counter", true)
+                        .unwrap()
+                        .expect("acknowledged counter must remain present");
+                    assert!(
+                        document.seq_no >= floor,
+                        "GET at {} preceded the acknowledged version {floor}",
+                        document.seq_no
+                    );
+                    assert_eq!(document.primary_term, initial.primary_term);
+                    assert_eq!(
+                        document.seq_no,
+                        initial.seq_no + document.source["n"].as_u64().unwrap()
+                    );
+                    let stable = engine
+                        .get_document_with_metadata("old", true)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(stable.source, json!({"stable": true}));
+                    assert_eq!(stable.seq_no, old.seq_no);
+                    reads += 1;
+                    std::thread::yield_now();
+                }
+                reads
+            })
+        })
+        .collect::<Vec<_>>();
+    let writers = (0..WRITERS)
+        .map(|writer| {
+            let engine = engine.clone();
+            let acknowledged = acknowledged.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                for write in 0..WRITES_PER_WRITER {
+                    let mut completed = false;
+                    for _ in 0..1_000 {
+                        let floor = acknowledged.load(Ordering::Acquire);
+                        let current = engine
+                            .get_document_with_metadata("counter", true)
+                            .unwrap()
+                            .unwrap();
+                        assert!(current.seq_no >= floor);
+                        let condition = WriteCondition::IfMatch {
+                            seq_no: current.seq_no,
+                            primary_term: current.primary_term,
+                        };
+                        let mut source = current.source;
+                        source["n"] = json!(source["n"].as_u64().unwrap() + 1);
+                        source[format!("writer-{writer}-write-{write}")] = json!(true);
+                        match engine.add_document_with_condition_at_term(
+                            "counter",
+                            source,
+                            current.primary_term,
+                            condition,
+                        ) {
+                            Ok(receipt) => {
+                                acknowledged.fetch_max(receipt.seq_no, Ordering::AcqRel);
+                                completed = true;
+                                break;
+                            }
+                            Err(error) => {
+                                assert!(error.is::<VersionConflictError>(), "{error:#}");
+                            }
+                        }
+                    }
+                    assert!(completed, "CAS writer {writer} exhausted its retry budget");
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    let results = writers
+        .into_iter()
+        .map(|writer| writer.join())
+        .collect::<Vec<_>>();
+    stop.store(true, Ordering::Release);
+    let read_results = readers
+        .into_iter()
+        .map(|reader| reader.join())
+        .collect::<Vec<_>>();
+    let rounds = maintenance.join().unwrap();
+    for result in results {
+        result.unwrap();
+    }
+    for result in read_results {
+        assert!(result.unwrap() >= 20);
+    }
+    assert!(rounds >= 2);
+    let document = engine
+        .get_document_with_metadata("counter", true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(document.source["n"], json!(WRITERS * WRITES_PER_WRITER));
+    assert_eq!(document.seq_no, acknowledged.load(Ordering::Acquire));
+    for writer in 0..WRITERS {
+        for write in 0..WRITES_PER_WRITER {
+            assert_eq!(
+                document.source[format!("writer-{writer}-write-{write}")],
+                true
+            );
+        }
+    }
+    engine.refresh().unwrap();
+    assert_eq!(
+        engine
+            .get_document_with_metadata("counter", false)
+            .unwrap()
+            .unwrap(),
+        document
+    );
 }
 
 #[test]

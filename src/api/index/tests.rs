@@ -503,6 +503,161 @@ fn retryable_aborted_write_maps_to_service_unavailable() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn realtime_get_update_and_bulk_update_fail_closed_after_partial_replay() {
+    use crate::transport::proto::internal_transport_client::InternalTransportClient;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut cluster_state = ClusterState::new("realtime-replay-failure".into());
+    let mut node = make_test_node("node-1");
+    node.transport_port = address.port();
+    cluster_state.add_node(node);
+    let mut metadata = make_test_metadata(Some("node-1"));
+    metadata.settings.refresh_interval_ms = Some(3_600_000);
+    metadata.settings.flush_threshold_bytes = Some(0);
+    let settings = metadata.settings.clone();
+    cluster_state.add_index(metadata);
+    let allocation_id = cluster_state.primary_allocation_id("idx", 0).unwrap();
+    let (_temporary, state) = make_test_app_state(cluster_state).await;
+    let shard_manager = state.shard_manager.clone();
+    let engine = tokio::task::spawn_blocking(move || {
+        shard_manager.open_assigned_shard_with_settings(
+            "idx",
+            0,
+            &HashMap::new(),
+            &settings,
+            "idx-uuid",
+            crate::shard::AssignedShardOpen {
+                allocation_id,
+                primary_term: 1,
+                allow_empty_creation: true,
+            },
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let failure_engine = engine.clone();
+    tokio::task::spawn_blocking(move || {
+        failure_engine
+            .add_document("old", serde_json::json!({"value": 1}))
+            .unwrap();
+        failure_engine.refresh().unwrap();
+        let mut suffix = (0..3_000)
+            .map(|i| (format!("filler-{i}"), serde_json::json!({"value": i})))
+            .collect::<Vec<_>>();
+        suffix.push(("old".into(), serde_json::json!({"value": 2})));
+        suffix.push(("fresh".into(), serde_json::json!({"value": 3})));
+        failure_engine.bulk_add_documents(suffix).unwrap();
+        failure_engine.inject_engine_apply_failures_for_test(28, 1);
+        assert!(
+            failure_engine
+                .add_document("failed", serde_json::json!({"value": 4}))
+                .is_err()
+        );
+        failure_engine.inject_replay_commit_failure_for_test(28, 1);
+        let error = failure_engine.refresh().unwrap_err();
+        assert!(
+            error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.raw_os_error() == Some(28))
+            }),
+            "{error:#}"
+        );
+    })
+    .await
+    .unwrap();
+    let service = crate::transport::server::create_transport_service_for_test(
+        state.cluster_manager.clone(),
+        state.shard_manager.clone(),
+        state.transport_client.clone(),
+        state.task_manager.clone(),
+        "node-1".into(),
+    );
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                async { shutdown_rx.await.unwrap() },
+            )
+            .await
+    });
+    let mut client = InternalTransportClient::connect(format!("http://{address}"))
+        .await
+        .unwrap();
+    client
+        .ping(crate::transport::proto::PingRequest {
+            source_node_id: "node-1".into(),
+        })
+        .await
+        .unwrap();
+    let get = get_document(
+        State(state.clone()),
+        Path((crate::common::IndexName::new("idx").unwrap(), "old".into())),
+        Query(GetParams::default()),
+    )
+    .await;
+    let update = update_document(
+        State(state.clone()),
+        Path((crate::common::IndexName::new("idx").unwrap(), "old".into())),
+        Query(UpdateParams::default()),
+        Json(serde_json::json!({"doc": {"value": 5}})),
+    )
+    .await;
+    let bulk = bulk_index(
+        State(state.clone()),
+        Path(crate::common::IndexName::new("idx").unwrap()),
+        None,
+        Query(RefreshParam { refresh: None }),
+        axum::body::Bytes::from(
+            "{\"update\":{\"_id\":\"fresh\"}}\n{\"doc\":{\"value\":6},\"doc_as_upsert\":true}\n",
+        ),
+    )
+    .await;
+    let reader = get_document(
+        State(state.clone()),
+        Path((crate::common::IndexName::new("idx").unwrap(), "old".into())),
+        Query(GetParams {
+            realtime: Some(false),
+        }),
+    )
+    .await;
+    drop(client);
+    drop(state);
+    shutdown_tx.send(()).unwrap();
+    server.await.unwrap().unwrap();
+
+    for (status, Json(body)) in [get, update] {
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["type"], "shard_not_available_exception");
+        let reason = body["error"]["reason"].as_str().unwrap();
+        assert!(reason.contains("incomplete"), "{reason}");
+        assert!(reason.contains("No space left"), "{reason}");
+    }
+    let (status, Json(body)) = bulk;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["errors"], true, "{body}");
+    let item = &body["items"][0]["update"];
+    assert_eq!(item["status"], 503, "{item}");
+    assert_eq!(item["error"]["type"], "shard_not_available_exception");
+    assert!(
+        item["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("No space left")
+    );
+    assert!(item.get("_seq_no").is_none());
+    let (status, Json(body)) = reader;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["_source"], serde_json::json!({"value": 1}));
+    assert_eq!(body["_index_uuid"], "idx-uuid");
+    assert!(engine.writer_is_failed_for_test());
+}
+
 #[test]
 fn bulk_aborted_failure_remains_attributable_and_retryable() {
     let routed_docs = vec![RoutedBulkDoc {

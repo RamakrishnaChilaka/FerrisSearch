@@ -293,12 +293,39 @@ Current post-write refresh dispatch remains coordinator-local.
 
 **Status (2026-09-30):** Implemented for `local_shards`. Primary, replica,
 replay, and recovery index applies retain physical WAL cursors in the existing
-live version map. Realtime GET holds the translog mutex while resolving the
-source. Flush publishes its reader before truncating under that mutex; a
-missing cursor can therefore fall back to a reader covering the live version.
-A behind or missing fallback fails explicitly, rather than returning stale
-data. Replay carries cursors from the streaming decoder without rescanning
-the WAL per document.
+live version map. Realtime GET checks map completeness and the document entry
+under one short version-map read lock, separate from `ApplyState`. A
+complete-map miss releases that lock and reads from the reader without taking
+the apply-state or translog mutex, acquiring the searcher after the map lookup.
+A complete-map tombstone returns not found without either mutex. Index hits still hold the
+translog mutex while resolving the source. Flush publishes its reader before
+truncating under that mutex; a missing cursor can therefore fall back to a
+reader covering the live version. A behind or missing fallback fails
+explicitly, rather than returning stale data. Replay carries cursors from the
+streaming decoder without rescanning the WAL per document.
+
+D1 planning, term state, checkpoints, and planning-snapshot restore still hold
+the apply-state mutex for the whole batch. Writers take the version-map lock
+briefly for lookup or mutation, with apply state before the map whenever both
+are needed. They never hold the map lock through WAL I/O, fsync, Tantivy apply,
+or reader lookup. A realtime GET can observe a map entry for an operation
+already in the WAL but still in flight; its index hit waits for the translog
+mutex before resolving source. A mid-batch delete publishes its tombstone
+before the delete is acknowledged. The fast path can return that tombstone
+immediately, without waiting for the batch or acknowledgement. This is the same
+class of read as an in-flight index hit, not an acknowledgement-only snapshot.
+The separate lock removes the bulk apply-state
+wait from map misses and tombstones, not all possible map-lock contention.
+
+Replay clears completeness with the map reset and restores it only after the
+successful final reader reload, or after a successful empty replay. A realtime
+GET that observes an incomplete map waits for the translog mutex. If the map
+remains incomplete, GET returns `503 shard_not_available_exception` with the
+apply or replay failure cause. Post-WAL apply failure also marks the map
+incomplete. Single and bulk update propagate that failure instead
+of merging stale source or treating the document as missing. Search and
+`realtime=false` keep their reader-only semantics. Conditional writes, create,
+and upsert still complete replay before checking the document version.
 
 **Index-incarnation status (2026-09-30):** GET also returns `_index_uuid`,
 including when the document is missing. Coordinator update pins the serving
@@ -315,6 +342,10 @@ operator setting and add `_mget`. Neither is part of this implementation.
   - A refresh removes an entry only when the entry is at or below the refresh's
     commit boundary, and only after the new reader is visible. As in
     OpenSearch, a current map and an old map cover the refresh window.
+    When old is empty, rotation swaps the maps without cloning keys. Reader
+    publication precedes taking the old map; destruction of its entries runs
+    after releasing the version-map write lock. Cached window byte totals keep
+    rotation and retirement accounting constant-time.
   - Delete tombstones stay until they are older than the retention window and
     at or below the processed checkpoint, because Tantivy has no soft
     deletes that record a delete's `seq_no`.
@@ -322,7 +353,8 @@ operator setting and add `_mget`. Neither is part of this implementation.
 - **Realtime GET:** checks the map first. A tombstone returns not found, and a
   changed document is read from its WAL entry, which stores the full `_source`.
   If that WAL position has been truncated, or the entry is absent, GET reads the
-  refreshed reader.
+  refreshed reader. These fallbacks require a complete map; an incomplete map
+  never authorizes a reader miss or stale version.
 - **`_update`:** the coordinating node performs a realtime GET from the
   primary, recursively merges `doc`, and sends a primary conditional index
   write using the index UUID, `seq_no`, and term it read. The primary compares and appends

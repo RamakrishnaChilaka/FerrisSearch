@@ -1818,10 +1818,13 @@ impl InternalTransport for TransportService {
                 index_uuid,
                 ..Default::default()
             })),
+            Err(error) if error.is::<crate::engine::tantivy::TantivyWriterUnavailableError>() => {
+                Err(Status::aborted(format!("{error:#}")))
+            }
             Err(e) => Ok(Response::new(ShardGetResponse {
                 found: false,
                 source_json: vec![],
-                error: e.to_string(),
+                error: format!("{e:#}"),
                 ..Default::default()
             })),
         }
