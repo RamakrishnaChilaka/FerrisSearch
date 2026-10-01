@@ -155,8 +155,18 @@ tokio::select! {
 - On `add_document()`: scans payload for arrays of numbers
 - Auto-creates VectorIndex if a `knn_vector` field is encountered
 - `rebuild_vectors()` constructs a replacement USearch index from the
-  authoritative Tantivy document view, persists and fsyncs it, atomically swaps
-  it into memory, and only then clears `vectors.stale`.
+  authoritative Tantivy document view. Every rebuild commits the healthy text
+  writer and opens a private `ReloadPolicy::Manual` reader on that commit.
+  Never rebuild from the last published reader: it can omit applied but
+  unrefreshed documents. Never publish the private reader or rotate the realtime
+  version map for vector repair. Non-stale writes do not add a rebuild commit.
+- Require a gap-free processed prefix equal to the maximum sequence, then
+  compare the committed and applied checkpoints and maxima after enumeration.
+  If coverage cannot be proven, return an error and keep `vectors.stale` and
+  the current vector index. A gap-closing replica apply retries the repair.
+  Persist and fsync the covering replacement, atomically swap it into memory,
+  and only then clear `vectors.stale`. Mark even explicit rebuilds stale before
+  attempting the commit so failures remain durable.
 - Vector rebuild enumerates every live document directly from each Tantivy
   segment and feeds the replacement index in bounded batches. Never use
   `TopDocs` or a search-result limit for rebuild input; deleted documents must
@@ -170,6 +180,13 @@ tokio::select! {
 - `vector_recovery` serializes those rebuild paths with vector mutations so a
   later failed text operation cannot be hidden by an earlier rebuild clearing
   the marker.
+- Rebuild lock order is `vector_recovery`, maintenance, translog, writer, then
+  `apply_state`. Release the writer after commit, but retain maintenance and
+  translog through private-reader enumeration and coverage validation. Hold
+  `vector_recovery` through vector persistence, swap, and marker removal.
+  Private readers take only Tantivy-internal metadata locks, not the reader
+  publication mutex. Text recovery remains responsible for replaying a failed
+  writer before a later rebuild; vector repair does not initiate publication.
 - Prepared vector side effects use operation kind, document ID, sequence, term,
   and the prepared vector only; do not retain a deep copy of document JSON for
   post-rebuild application. Replica planning borrows its input operations and
@@ -225,14 +242,22 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
   other engine locks and releases its mutex before version-map access.
   Never reload while holding the version-map lock. Search and realtime GET
   borrow searchers without taking the reload mutex.
+- If the reader-reload mutex is poisoned, recover its unit-valued guard, clear
+  poison under the guard, log the failure, and return an error for that attempt.
+  The next attempt reloads normally under the same mutex. This recovery is safe
+  because Tantivy constructs the complete searcher before its atomic store; a
+  segment-open panic does not publish partial state. Do not apply this policy
+  to maintenance, translog, apply-state, or version-map locks. A repeated panic
+  or an underlying storage error still fails explicitly.
 - A commit alone does not publish search visibility. Refresh publishes before
   retiring old versions or pruning covered tombstones. Preserve the existing
   explicit publication during flush, force merge, and replay: flush needs a
   covering reader before WAL pruning. Ordinary peer-snapshot commits export
   committed index files and leave search publication to the next refresh.
-  Protocol-trace snapshot capture explicitly reloads through the same helper.
-  If snapshot creation must repair stale vectors, the composite engine first
-  publishes that commit so the rebuild includes its updates and deletes.
+  Both composite peer-snapshot APIs repair stale vectors through the same
+  covering private-reader path, without changing search visibility.
+  Protocol-trace snapshot capture also uses a private reader on the committed
+  files instead of publishing them.
 - `replay_translog()` and failed-writer reconstruction share the same WAL-suffix
   replay helper. They stream entries via `for_each_from()` starting at the
   persisted committed checkpoint.
@@ -276,8 +301,9 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
   causes, and primary/replica handlers account persistent failures under the
   shard Apply retry key.
 - Every production Tantivy commit boundary—refresh, flush, checkpoint-aware
-  flush, recovery snapshot, replay batches, and pre-force-merge commit—must
-  fail the `WriterState` on error. No later write may reuse that writer.
+  flush, vector rebuild, recovery snapshot, replay batches, and pre-force-merge
+  commit—must fail the `WriterState` on error. No later write may reuse that
+  writer.
 - Before the next write appends a new WAL entry, or before blocking refresh,
   flush, force-merge preparation, or peer-snapshot commit proceeds, a failed
   writer is rebuilt and the retained suffix

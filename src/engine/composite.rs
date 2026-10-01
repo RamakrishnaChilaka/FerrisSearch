@@ -677,31 +677,33 @@ impl CompositeEngine {
     }
 
     fn rebuild_vectors_locked(&self) -> Result<()> {
+        self.mark_vectors_stale()?;
         let mut rebuilt = None;
         let mut vector_count = 0;
-        self.text.for_each_vector_rebuild_batch(|documents| {
-            for (doc_id, source, seq_no, primary_term) in documents {
-                let expected_dimensions = rebuilt.as_ref().map(VectorIndex::dimensions);
-                let prepared = self.detect_vector_mutation(&source, expected_dimensions)?;
-                if let PreparedVectorMutation::Index { vector } = &prepared
-                    && rebuilt.is_none()
-                {
-                    rebuilt = Some(VectorIndex::new(
-                        vector.len(),
-                        usearch::ffi::MetricKind::Cos,
-                    )?);
+        self.text
+            .for_each_committed_vector_rebuild_batch(|documents| {
+                for (doc_id, source, seq_no, primary_term) in documents {
+                    let expected_dimensions = rebuilt.as_ref().map(VectorIndex::dimensions);
+                    let prepared = self.detect_vector_mutation(&source, expected_dimensions)?;
+                    if let PreparedVectorMutation::Index { vector } = &prepared
+                        && rebuilt.is_none()
+                    {
+                        rebuilt = Some(VectorIndex::new(
+                            vector.len(),
+                            usearch::ffi::MetricKind::Cos,
+                        )?);
+                    }
+                    Self::apply_prepared_vector_mutation_to_index(
+                        rebuilt.as_ref(),
+                        WalOperation::Index,
+                        Some(&doc_id),
+                        seq_no,
+                        primary_term,
+                        &prepared,
+                    )?;
                 }
-                Self::apply_prepared_vector_mutation_to_index(
-                    rebuilt.as_ref(),
-                    WalOperation::Index,
-                    Some(&doc_id),
-                    seq_no,
-                    primary_term,
-                    &prepared,
-                )?;
-            }
-            Ok(())
-        })?;
+                Ok(())
+            })?;
 
         if let Some(index) = rebuilt.as_ref() {
             vector_count = index.len();
@@ -721,12 +723,7 @@ impl CompositeEngine {
         Ok(())
     }
 
-    fn rebuild_vectors_from_snapshot_locked(&self) -> Result<()> {
-        self.text.reload_reader()?;
-        self.rebuild_vectors_locked()
-    }
-
-    /// Rebuild the vector index from the authoritative Tantivy document view.
+    /// Rebuild vectors from a covering commit without publishing a text reader.
     /// The rebuild is persisted before durable stale state is cleared.
     pub fn rebuild_vectors(&self) -> Result<()> {
         let _vector_recovery = self
@@ -1340,7 +1337,7 @@ impl SearchEngine for CompositeEngine {
                 ));
             }
         };
-        if rebuild_vectors && let Err(error) = self.rebuild_vectors_from_snapshot_locked() {
+        if rebuild_vectors && let Err(error) = self.rebuild_vectors_locked() {
             let release_result = self
                 .text
                 .release_peer_recovery_pin(snapshot.retention_pin_id);
@@ -1373,7 +1370,7 @@ impl SearchEngine for CompositeEngine {
                 ));
             }
         };
-        if rebuild_vectors && let Err(error) = self.rebuild_vectors_from_snapshot_locked() {
+        if rebuild_vectors && let Err(error) = self.rebuild_vectors_locked() {
             drop(preparation);
             let _ = std::fs::remove_dir_all(snapshot_dir);
             return Err(error);

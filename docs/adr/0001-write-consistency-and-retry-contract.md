@@ -284,8 +284,9 @@ its existing explicit publication during flush, force merge, and recovery
 replay; in particular, flush publishes a covering reader before pruning WAL
 history. This differs from OpenSearch's separation of flush and refresh.
 An ordinary peer-recovery snapshot commit does not refresh search visibility.
-When snapshot creation must repair stale vectors, the composite engine
-publishes that commit before scanning it for the rebuild.
+When snapshot creation must repair stale vectors, the composite engine rebuilds
+from a covering commit through a private manual reader without publishing it.
+Protocol-trace snapshot capture also uses an unpublished reader.
 
 - **Search:** an acknowledgement does not imply search visibility. Search sees
   a write after the next refresh.

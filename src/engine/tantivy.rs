@@ -1222,11 +1222,31 @@ impl HotEngine {
     pub(super) fn reload_reader(&self) -> Result<()> {
         // This leaf lock covers segment opening and searcher publication.
         // Do not acquire another engine lock while holding it.
-        let _reload = self
-            .reader_reload_lock
-            .lock()
-            .map_err(|_| anyhow::anyhow!("reader reload lock poisoned"))?;
+        let _reload = match self.reader_reload_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let _reload = poisoned.into_inner();
+                // The lock protects only serialization. Tantivy constructs a
+                // searcher before its atomic store, so unwinding cannot leave
+                // a partially published reader that requires reconstruction.
+                self.reader_reload_lock.clear_poison();
+                tracing::error!(
+                    "reader reload lock poisoned; serialization lock recovered, retry reader publication"
+                );
+                anyhow::bail!(
+                    "reader reload lock poisoned; serialization lock recovered, retry reader publication"
+                );
+            }
+        };
         self.reader.reload().map_err(Into::into)
+    }
+
+    fn private_committed_reader(&self) -> Result<IndexReader> {
+        self.index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
+            .context("failed to open private committed Tantivy reader")
     }
 
     fn open_replacement_writer(
@@ -4310,8 +4330,16 @@ impl HotEngine {
     pub(crate) fn protocol_trace_documents_snapshot(
         &self,
     ) -> Result<Vec<(String, serde_json::Value, u64, u64)>> {
+        self.protocol_trace_documents_snapshot_from_searcher(&self.reader.searcher())
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_documents_snapshot_from_searcher(
+        &self,
+        searcher: &tantivy::Searcher,
+    ) -> Result<Vec<(String, serde_json::Value, u64, u64)>> {
         let mut documents = Vec::new();
-        self.for_each_vector_rebuild_batch(|batch| {
+        self.for_each_vector_rebuild_batch(searcher, |batch| {
             documents.extend(batch);
             Ok(())
         })?;
@@ -4413,11 +4441,48 @@ impl HotEngine {
             .max(1)
     }
 
-    pub(crate) fn for_each_vector_rebuild_batch(
+    pub(crate) fn for_each_committed_vector_rebuild_batch(
         &self,
+        consume: impl FnMut(Vec<(String, serde_json::Value, u64, u64)>) -> Result<()>,
+    ) -> Result<()> {
+        let _maintenance = self.maintenance_guard("vector rebuild")?;
+        self.with_translog("vector rebuild", |_| {
+            let mut writer_state = self.writer.write().unwrap_or_else(|error| error.into_inner());
+            let boundary = self.current_committed_boundary()?;
+            if boundary.processed_checkpoint != boundary.max_seq_no {
+                anyhow::bail!(
+                    "vector rebuild requires gap-free applied history: processed checkpoint {:?} does not equal maximum sequence {:?}",
+                    boundary.processed_checkpoint,
+                    boundary.max_seq_no
+                );
+            }
+            let committed =
+                self.commit_writer_at_boundary(&mut writer_state, "vector rebuild", boundary)?;
+            drop(writer_state);
+            self.persist_committed_boundary(&committed)?;
+            let reader = self.private_committed_reader()?;
+            self.for_each_vector_rebuild_batch(&reader.searcher(), consume)?;
+            let applied = self.current_committed_boundary()?;
+            if committed.processed_checkpoint != applied.processed_checkpoint
+                || committed.max_seq_no != applied.max_seq_no
+            {
+                anyhow::bail!(
+                    "vector rebuild commit no longer covers applied history: committed checkpoint {:?}, maximum {:?}; applied checkpoint {:?}, maximum {:?}",
+                    committed.processed_checkpoint,
+                    committed.max_seq_no,
+                    applied.processed_checkpoint,
+                    applied.max_seq_no
+                );
+            }
+            Ok(())
+        })
+    }
+
+    fn for_each_vector_rebuild_batch(
+        &self,
+        searcher: &tantivy::Searcher,
         mut consume: impl FnMut(Vec<(String, serde_json::Value, u64, u64)>) -> Result<()>,
     ) -> Result<()> {
-        let searcher = self.reader.searcher();
         let registry = self
             .field_registry
             .read()
@@ -8589,9 +8654,10 @@ impl super::SearchEngine for HotEngine {
                 std::fs::File::open(snapshot_dir)?.sync_all()?;
                 #[cfg(feature = "protocol-trace")]
                 {
-                    self.reload_reader()?;
+                    let reader = self.private_committed_reader()?;
                     let processed_seqs = self.protocol_trace_processed_sequences()?;
-                    let documents = self.protocol_trace_documents_snapshot()?;
+                    let documents =
+                        self.protocol_trace_documents_snapshot_from_searcher(&reader.searcher())?;
                     Ok((file_names, processed_seqs, documents))
                 }
                 #[cfg(not(feature = "protocol-trace"))]
