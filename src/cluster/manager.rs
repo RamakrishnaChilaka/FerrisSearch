@@ -4,6 +4,8 @@ use std::sync::{Arc, RwLock};
 /// Manages thread-safe access to the Cluster State
 pub struct ClusterManager {
     state: Arc<RwLock<ClusterState>>,
+    #[cfg(test)]
+    pub(crate) forwarding_wait_millis: std::sync::atomic::AtomicU64,
     #[cfg(feature = "protocol-trace")]
     protocol_trace_node: RwLock<Option<String>>,
 }
@@ -12,6 +14,8 @@ impl ClusterManager {
     pub fn new(cluster_name: String) -> Self {
         Self {
             state: Arc::new(RwLock::new(ClusterState::new(cluster_name))),
+            #[cfg(test)]
+            forwarding_wait_millis: std::sync::atomic::AtomicU64::new(5_000),
             #[cfg(feature = "protocol-trace")]
             protocol_trace_node: RwLock::new(None),
         }
@@ -22,6 +26,8 @@ impl ClusterManager {
     pub fn with_shared_state(state: Arc<RwLock<ClusterState>>) -> Self {
         Self {
             state,
+            #[cfg(test)]
+            forwarding_wait_millis: std::sync::atomic::AtomicU64::new(5_000),
             #[cfg(feature = "protocol-trace")]
             protocol_trace_node: RwLock::new(None),
         }

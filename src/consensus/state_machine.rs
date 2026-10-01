@@ -23,6 +23,55 @@ pub struct ClusterStateMachine {
     last_applied: Option<LogId>,
     /// Last applied membership.
     last_membership: StoredMembership,
+    #[cfg(test)]
+    apply_gate: Option<Arc<TestApplyGate>>,
+}
+
+#[cfg(test)]
+pub(crate) struct TestApplyGate {
+    paused: tokio::sync::watch::Sender<bool>,
+    entered: tokio::sync::watch::Sender<bool>,
+}
+
+#[cfg(test)]
+impl Default for TestApplyGate {
+    fn default() -> Self {
+        Self {
+            paused: tokio::sync::watch::channel(false).0,
+            entered: tokio::sync::watch::channel(false).0,
+        }
+    }
+}
+
+#[cfg(test)]
+impl TestApplyGate {
+    pub(crate) fn pause(&self) {
+        self.entered.send_replace(false);
+        self.paused.send_replace(true);
+    }
+
+    pub(crate) fn resume(&self) {
+        self.paused.send_replace(false);
+    }
+
+    pub(crate) async fn wait_until_entered(&self) {
+        self.entered
+            .subscribe()
+            .wait_for(|entered| *entered)
+            .await
+            .expect("apply gate remains alive");
+    }
+
+    async fn before_apply(&self) {
+        let mut paused = self.paused.subscribe();
+        if *paused.borrow_and_update() {
+            self.entered.send_replace(true);
+            paused
+                .wait_for(|paused| !*paused)
+                .await
+                .expect("apply gate remains alive");
+        }
+    }
 }
 
 impl ClusterStateMachine {
@@ -31,7 +80,14 @@ impl ClusterStateMachine {
             state: Arc::new(RwLock::new(ClusterState::new(cluster_name))),
             last_applied: None,
             last_membership: StoredMembership::default(),
+            #[cfg(test)]
+            apply_gate: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_apply_gate(&mut self, gate: Arc<TestApplyGate>) {
+        self.apply_gate = Some(gate);
     }
 
     /// Get a read-only handle to the cluster state (for API queries).
@@ -45,6 +101,8 @@ impl ClusterStateMachine {
             state: Arc::new(RwLock::new(state)),
             last_applied: None,
             last_membership: StoredMembership::default(),
+            #[cfg(test)]
+            apply_gate: None,
         }
     }
 
@@ -769,6 +827,11 @@ impl RaftStateMachine<TypeConfig> for ClusterStateMachine {
 
         while let Some(entry_result) = entries.next().await {
             let (entry, responder) = entry_result?;
+
+            #[cfg(test)]
+            if let Some(gate) = &self.apply_gate {
+                gate.before_apply().await;
+            }
 
             self.last_applied = Some(entry.log_id);
 

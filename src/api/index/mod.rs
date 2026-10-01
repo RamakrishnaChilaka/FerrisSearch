@@ -74,6 +74,8 @@ fn validate_document_source_for_api(source: &Value) -> Result<(), (StatusCode, J
 }
 
 mod bulk;
+#[cfg(test)]
+mod forwarding_tests;
 mod maintenance;
 
 pub use bulk::{bulk_index, bulk_index_global};
