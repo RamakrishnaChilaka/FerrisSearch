@@ -48,10 +48,12 @@ pub async fn replicate_bulk(
    and advances the fence once.
 8. Each replica applies through the sequence-aware planner and returns optional
    processed/persisted checkpoints plus proof that the exact operation was processed
-9. Primary stores monotonic processed observations per exact allocation and
-   creates a fixed-target gap observation when the contiguous prefix lags
-10. Primary advances the global checkpoint only from the minimum persisted
-   checkpoint across every authoritative copy
+9. Primary stores monotonic observations per index UUID, allocation ID, and
+   primary term and creates a fixed-target gap observation when the contiguous
+   processed prefix lags
+10. Primary samples its persisted checkpoint after replication, before taking
+    the tracker lock. It then updates observations and computes the minimum
+    with every current authoritative in-sync replica under one tracker lock
 11. Write acknowledged to client **only after every in-sync replica confirms**
 
 ## File-Based Peer Recovery
@@ -116,10 +118,36 @@ pub async fn replicate_bulk(
 - Primary write handlers hold the shard's shared write-barrier guard from
   before engine mutation through synchronous replication. Finalization holds
   the exclusive guard.
+- Every caller of `record_replica_checkpoints` must hold the shared recovery
+  write guard through the fresh-state snapshot and calculation. Snapshot
+  freshness depends on excluding in-sync admission during that interval.
+- Promotion-NoOp retries acquire the per-copy `noop_replication` mutex before
+  the shared recovery guard and retain both through fan-out and recording.
+  Retry callers must not already hold a recovery guard. Client handlers
+  activate before acquiring their guard; local activation releases its
+  exclusive guard before retrying. Reversing this order can deadlock behind
+  Tokio's queued exclusive recovery writer.
 - After acquiring the shared guard, handlers revalidate local primary and the
   activated index UUID and term, then mutate and replicate using that exact
   cluster-state snapshot. Never re-read a newer acknowledgement set after
   mutation.
+- Global-checkpoint computation uses a fresh applied Raft snapshot, not the
+  write's captured acknowledgement set. Revalidate the activated primary's
+  UUID, allocation, and term before accepting reports. Count only current
+  `in_sync_replicas` with matching allocation IDs. A missing current-identity
+  report holds progress back; a removed copy no longer holds it back.
+- Sample the primary's persisted prefix after replication and before taking
+  the node-wide tracker lock. Engine sequence-state reads can wait behind
+  bulk fsync and apply; never perform them under that lock. Update replica
+  observations and compute from their monotonic maxima in one critical section.
+  Request durability persists each operation on the primary before fan-out,
+  so the last gap-closing round can reach the persisted minimum without sampling
+  inside the lock. The highest-sequence round covers the no-replica case.
+  Do not use the pre-replication primary snapshot or only the current round's
+  replica values. Reset an observation when its UUID, allocation, or primary
+  term changes, except that older-term reports for the same UUID must not
+  replace newer checkpoint or gap state. A different UUID can restart at a
+  lower term. Never move the global checkpoint backward.
 - Dynamic-mapping reopen and async index close abort safe pre-finalize source
   sessions and await pin/snapshot/engine-Arc cleanup before replacing or
   deleting the primary engine. Encountering an admitting/settling source
@@ -166,11 +194,16 @@ pub async fn replicate_bulk(
 - Request durability requires every replica response to prove the exact
   operation persisted; async durability requires processed proof and advances
   persisted checkpoints only after fsync or commit.
+- Async background fsync does not send a new checkpoint report or recompute
+  the primary's global checkpoint. After idle async writes, the global
+  checkpoint can lag the true persisted minimum until another write reports
+  progress. Checkpoint tracking does not add background synchronization.
 - Replica background auto-flush uses its own contiguous persisted prefix when
   no primary global checkpoint exists. It may prune through that committed
   prefix but never through a gap; promotion clears the replica-only bound.
-- `ShardManager.isr_tracker` stores checkpoint observations only. It can rank
-  authoritative candidates only when the reporting leader hosts the primary;
+- `ShardManager.isr_tracker` stores checkpoint proofs, not membership. The
+  primary uses identity- and term-scoped persisted proofs for WAL retention.
+  It can rank authoritative candidates only when the reporting leader hosts the primary;
   otherwise candidate selection falls back to a live in-sync cluster member.
   Checkpoint observations cannot grant membership.
 - Single writes and index-only shard batches return `success: false` when
@@ -187,7 +220,8 @@ pub async fn replicate_bulk(
 - Promotion NoOps are replicated in bounded homogeneous bulk batches, preserving
   each explicit non-contiguous sequence number. A batch transport failure
   remains best-effort, creates the same replica gap observation as the former
-  single-operation path, and retains that failed batch in process memory for
+  single-operation path, and does not advance the global checkpoint from its
+  unknown persistence reports. It retains that failed batch in process memory for
   redelivery on the next activation attempt at the same
   UUID/allocation/term. Restart or an activation failure after local NoOp
   application can lose the pending batch; the WAL does not reconstruct the

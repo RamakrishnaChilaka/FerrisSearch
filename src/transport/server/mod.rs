@@ -72,6 +72,9 @@ fn new_join_lock() -> Arc<Mutex<()>> {
 
 type PrimaryActivationKey = (String, u32, u64);
 
+#[cfg(test)]
+type CheckpointRecordingHook = Box<dyn FnOnce() + Send>;
+
 #[derive(Clone)]
 struct PendingPromotionNoOps {
     primary_term: u64,
@@ -95,6 +98,8 @@ struct PrimaryActivationState {
     available_report_tasks_spawned: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     promotion_noop_bulk_requests_received: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    checkpoint_recording_hook: std::sync::Mutex<Option<CheckpointRecordingHook>>,
 }
 
 impl PrimaryActivationState {
@@ -5504,7 +5509,10 @@ impl TransportService {
         }
 
         let activation_locks = self.primary_activation_state.copy_locks(&activation_key);
+        // Callers must enter without a recovery guard: a queued exclusive writer
+        // can deadlock a shared-guard holder waiting for this retry mutex.
         let _replication_guard = activation_locks.noop_replication.lock().await;
+        let _write_guard = self.peer_recovery_write_guard(index_name, shard_id).await?;
         let operations = self
             .primary_activation_state
             .pending_noops
@@ -5883,19 +5891,96 @@ impl TransportService {
         primary_sequence: crate::engine::SequenceStats,
         replica_checkpoints: &[crate::shard::ReplicaCheckpointUpdate],
     ) {
-        Self::advance_global_checkpoint(
-            engine,
-            primary_sequence.persisted_checkpoint,
-            replica_checkpoints,
-        );
-        self.shard_manager.isr_tracker.update_replica_checkpoints(
-            index_name,
-            &activated_primary.index_uuid,
-            shard_id,
-            activated_primary.primary_term,
-            primary_sequence.processed_checkpoint,
-            replica_checkpoints,
-        );
+        let state =
+            match self.validated_primary_write_state(index_name, shard_id, activated_primary) {
+                Ok(state) => state,
+                Err(reason) => {
+                    tracing::debug!(
+                        index = index_name,
+                        shard_id,
+                        reason,
+                        "Skipping checkpoint reports from obsolete primary authority"
+                    );
+                    return;
+                }
+            };
+        let metadata = &state.indices[index_name];
+        let routing = &metadata.shard_routing[&shard_id];
+        let current_reports = replica_checkpoints
+            .iter()
+            .filter(|checkpoint| {
+                routing.is_replica_in_sync(&checkpoint.node_id)
+                    && state.shard_allocation_id(index_name, shard_id, &checkpoint.node_id)
+                        == Some(checkpoint.allocation_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        {
+            let hook = self
+                .primary_activation_state
+                .checkpoint_recording_hook
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        // Request durability persists before fan-out, so a post-replication sample
+        // covers the primary prefix completed by a last-gap or highest-sequence round.
+        // Serialized tracker maxima then converge without holding the node-wide
+        // tracker lock while waiting for the engine's apply-state mutex.
+        let primary_persisted_checkpoint = engine.sequence_stats().persisted_checkpoint;
+        self.shard_manager
+            .isr_tracker
+            .with_updated_replica_checkpoints_at(
+                index_name,
+                shard_id,
+                crate::shard::ReplicaCheckpointContext {
+                    index_uuid: &activated_primary.index_uuid,
+                    primary_term: activated_primary.primary_term,
+                    primary_processed_checkpoint: primary_sequence.processed_checkpoint,
+                },
+                &current_reports,
+                std::time::Instant::now(),
+                |tracked| {
+                    let authoritative = metadata
+                        .in_sync_replica_nodes(shard_id)
+                        .into_iter()
+                        .map(|node_id| {
+                            let allocation_id =
+                                state.shard_allocation_id(index_name, shard_id, node_id)?;
+                            let checkpoint = tracked.get(node_id)?;
+                            checkpoint
+                                .matches_copy(
+                                    &activated_primary.index_uuid,
+                                    allocation_id,
+                                    activated_primary.primary_term,
+                                )
+                                .then(|| crate::shard::ReplicaCheckpointUpdate {
+                                    node_id: node_id.clone(),
+                                    allocation_id,
+                                    processed_checkpoint: checkpoint.processed_checkpoint,
+                                    persisted_checkpoint: checkpoint.persisted_checkpoint,
+                                })
+                        })
+                        .collect::<Option<Vec<_>>>();
+                    let Some(authoritative) = authoritative else {
+                        tracing::debug!(
+                            index = index_name,
+                            shard_id,
+                            "Waiting for checkpoint reports from every current in-sync copy"
+                        );
+                        return;
+                    };
+                    Self::advance_global_checkpoint(
+                        engine,
+                        primary_persisted_checkpoint,
+                        &authoritative,
+                    );
+                },
+            );
     }
 
     fn replication_failure_message(

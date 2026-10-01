@@ -494,7 +494,10 @@ Falls back to per-doc stored-doc reading when any column requires `SourceFallbac
 - **Persisted checkpoint**: highest contiguous prefix that is both processed
   and WAL-durable.
 - **Global checkpoint**: monotonic minimum persisted checkpoint across the
-  primary and every authoritative in-sync replica.
+  primary and every authoritative in-sync replica. Sample the primary's
+  persisted prefix after replication, before taking the tracker lock, and use
+  each replica's highest reported prefix for its current UUID, allocation ID,
+  and primary term. A missing current-copy report holds progress back.
 - Above-gap interval sets retain exact processed/persisted identities; maximum
   sequence is tracked separately and must never substitute for a checkpoint.
 - `flush_with_global_checkpoint()`: retains WAL entries above global_cp for replica recovery

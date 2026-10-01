@@ -190,7 +190,9 @@ pub struct IsrTracker {
 }
 
 pub struct ReplicaCheckpoint {
+    pub index_uuid: String,
     pub allocation_id: u64,
+    pub primary_term: u64,
     pub processed_checkpoint: Option<u64>,
     pub persisted_checkpoint: Option<u64>,
     pub last_updated: Instant,
@@ -200,6 +202,9 @@ pub struct ReplicaCheckpoint {
 ### Key Methods
 - `update_replica_checkpoint(...)` / `update_replica_checkpoints(...)` take
   exact-allocation typed checkpoint responses plus the captured primary prefix
+- `with_updated_replica_checkpoints_at(...)` updates observations and computes
+  from their monotonic view under the same node-wide lock. Its consumer must
+  not read engine sequence state or perform blocking I/O.
 - `in_sync_replicas(index, shard_id, primary_checkpoint) -> Vec<String>`
   - Returns a lag-based diagnostic view only; it does not grant
     authoritative in-sync membership
@@ -211,8 +216,13 @@ pub struct ReplicaCheckpoint {
    `ShardRoutingEntry.in_sync_replicas`
 2. Each replica proves the exact operation processed and returns optional
    contiguous processed/persisted checkpoints
-3. Primary updates a monotonic maximum per exact allocation; reordered lower
-   responses cannot regress it
+3. Primary updates a monotonic maximum per index UUID, allocation ID, and
+   primary term; reordered lower responses cannot regress it. An identity
+   change resets processed and persisted observations, except that reports
+   from an older primary term for the same UUID are ignored. Ignoring such a
+   report also preserves gap identity, target, deadline, and progress. A
+   different UUID may reset at a lower term; allocation changes reset within
+   the same or a newer term.
 4. A leader that also hosts the primary may use `replica_checkpoints()` to
    prefer the highest observed candidate within the authoritative in-sync set;
    otherwise it chooses a live in-sync cluster member without checkpoint
@@ -221,4 +231,7 @@ pub struct ReplicaCheckpoint {
 Checkpoint observations are contiguous-prefix proofs, not maximum sequence
 numbers. `ReplicaGapObservation` fixes its target at first observation and the
 lifecycle performs an exact-allocation sequence-state probe before removal.
-The tracker remains diagnostic/ranking state and never grants membership.
+The primary also uses scoped persisted observations to compute the global
+checkpoint against fresh Raft-authoritative in-sync membership. A missing
+current-identity observation holds progress back. The tracker never grants
+membership.
