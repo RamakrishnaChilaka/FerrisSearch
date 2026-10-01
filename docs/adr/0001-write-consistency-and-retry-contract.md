@@ -353,9 +353,13 @@ append, including requests delayed by the recovery barrier or write pool.
 
 **Forwarding metadata status (2026-10-01):** Coordinators carry their applied
 cluster-state version as a routing hint to shard targets. Targets validate local
-metadata first, then wait up to five seconds for missing or stale metadata when
-the hint is ahead. Explicit metadata-acknowledgement floors are per index and
-fence subsequent operations; unrelated index changes do not stall valid reads.
+metadata first. They wait up to five seconds only when the hint is ahead and the
+index, UUID, shard routing, allocation ID, or primary term fails validation.
+Explicit metadata-acknowledgement floors are per index and fence subsequent
+operations from the acknowledging coordinator; unrelated index changes do not
+stall valid reads. A settings or mapping change acknowledged through another
+coordinator is not fenced, so a lagging target can still serve requests with the
+older settings or mappings.
 A metadata-wait deadline
 returns `503 shard_not_available_exception` with required and observed versions,
 before document sequence assignment or WAL append. Bulk preserves that error

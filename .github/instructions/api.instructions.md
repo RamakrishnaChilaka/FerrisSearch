@@ -195,8 +195,11 @@ values return `400 illegal_argument_exception` without enqueueing work.
   404 or auto-creating. Re-read routing and node metadata after auto-create.
   Do not install a snapshot or mutate follower state to catch up.
 - Targets validate local index and shard metadata first. Wait and revalidate
-  only when metadata is missing or stale and the coordinator's routing hint
-  is ahead, or an explicit acknowledgement floor for this index has not applied.
+  only when the coordinator's routing hint is ahead and the index, UUID, shard
+  routing, local authority, allocation ID, or primary term fails validation,
+  or when an explicit acknowledgement floor for this index has not applied.
+  Settings and mappings are not validated against the hint; only the floor
+  held by the acknowledging coordinator fences them.
   Unrelated metadata changes must not stall valid reads. The asynchronous
   metadata wait expires after 5 seconds and returns
   `503 shard_not_available_exception`, including bulk item failures and
