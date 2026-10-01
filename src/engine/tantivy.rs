@@ -11047,6 +11047,104 @@ mod tests {
     // ── search ──────────────────────────────────────────────────────────
 
     #[test]
+    fn qsearch_parser_match_all_includes_documents_without_body_terms() {
+        let (_dir, engine) = create_engine();
+        engine
+            .add_document("text", json!({"body": "rust"}))
+            .unwrap();
+        engine.add_document("empty", json!({})).unwrap();
+        engine.refresh().unwrap();
+
+        for query in ["*:*", "  *:*  "] {
+            let mut ids: Vec<_> = engine
+                .search(query)
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit["_id"].as_str().unwrap().to_string())
+                .collect();
+            ids.sort();
+            assert_eq!(ids, ["empty", "text"], "query [{query}]");
+        }
+    }
+
+    #[test]
+    fn qsearch_parser_bare_wildcard_requires_default_field_terms() {
+        let (_dir, engine) = create_engine();
+        engine
+            .add_document("text", json!({"body": "rust"}))
+            .unwrap();
+        engine.add_document("empty", json!({})).unwrap();
+        engine.add_document("null", json!({"body": null})).unwrap();
+        engine.refresh().unwrap();
+
+        let hits = engine.search("*").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["_id"], "text");
+    }
+
+    #[test]
+    fn qsearch_parser_error_names_query_and_preserves_syntax_cause() {
+        let (_dir, engine) = create_engine();
+        let query = "body:(";
+        let error = engine.search(query).unwrap_err();
+        assert!(error.to_string().contains(query), "{error:#}");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<tantivy::query::QueryParserError>()),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn qsearch_dsl_parser_supports_match_all_and_explicit_default_field() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let (_dir, engine) = create_engine_with_mappings(HashMap::from([(
+            "tag".to_string(),
+            FieldMapping {
+                field_type: FieldType::Keyword,
+                dimension: None,
+            },
+        )]));
+        engine
+            .add_document("value", json!({"tag": "rust"}))
+            .unwrap();
+        engine
+            .add_document("empty-value", json!({"tag": ""}))
+            .unwrap();
+        engine.add_document("missing", json!({})).unwrap();
+        engine.add_document("null", json!({"tag": null})).unwrap();
+        engine.refresh().unwrap();
+
+        for (query, default_field, expected) in [
+            (
+                "*:*",
+                "body",
+                vec!["empty-value", "missing", "null", "value"],
+            ),
+            ("*", "tag", vec!["empty-value", "value"]),
+            ("tag:*", "body", vec!["empty-value", "value"]),
+            ("missing:*", "body", vec![]),
+            ("tag:rust", "body", vec!["value"]),
+            ("", "body", vec![]),
+        ] {
+            let request: SearchRequest = serde_json::from_value(json!({
+                "query": {"query_string": {"query": query, "default_field": default_field}},
+                "size": 10
+            }))
+            .unwrap();
+            let (hits, total, _) = engine.search_query(&request).unwrap();
+            let mut ids: Vec<_> = hits
+                .iter()
+                .map(|hit| hit["_id"].as_str().unwrap())
+                .collect();
+            ids.sort();
+            assert_eq!(ids, expected, "query [{query}]");
+            assert_eq!(total, expected.len(), "query [{query}]");
+        }
+    }
+
+    #[test]
     fn simple_query_string_search() {
         let (_dir, engine) = create_engine();
         engine
