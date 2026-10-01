@@ -2717,6 +2717,12 @@ async fn moved_bulk_and_update_sources_preserve_values_and_receipt_order() -> Re
     Ok(())
 }
 
+fn qsearch_url(base_url: &str, path: &str, params: &[(&str, &str)]) -> Result<url::Url> {
+    let mut url = url::Url::parse(&format!("{base_url}{path}"))?;
+    url.query_pairs_mut().extend_pairs(params.iter().copied());
+    Ok(url)
+}
+
 #[tokio::test]
 async fn rest_qsearch_match_all_counts_every_document_across_three_shards() -> Result<()> {
     let harness = MultiNodeRestHarness::start_three_nodes().await?;
@@ -2742,8 +2748,11 @@ async fn rest_qsearch_match_all_counts_every_document_across_three_shards() -> R
     for (query, expected) in [("*:*", 323), ("author:alice", 3), ("*", 323)] {
         let response = harness
             .client
-            .get(format!("{}/stories/_search", harness.nodes[1].base_url))
-            .query(&[("q", query), ("size", "400")])
+            .get(qsearch_url(
+                &harness.nodes[1].base_url,
+                "/stories/_search",
+                &[("q", query), ("size", "400")],
+            )?)
             .send()
             .await?;
         let status = response.status();
@@ -2819,8 +2828,11 @@ async fn rest_qsearch_wildcards_distinguish_missing_null_and_empty_keyword_value
     ] {
         let response = harness
             .client
-            .get(format!("{}/presence/_search", harness.base_url))
-            .query(&params)
+            .get(qsearch_url(
+                &harness.base_url,
+                "/presence/_search",
+                &params,
+            )?)
             .send()
             .await?;
         let status = response.status();
@@ -2894,8 +2906,11 @@ async fn rest_qsearch_invalid_syntax_returns_400_with_all_shard_causes() -> Resu
     let query = "title:(";
     let response = harness
         .client
-        .get(format!("{}/stories/_search", harness.nodes[1].base_url))
-        .query(&[("q", query)])
+        .get(qsearch_url(
+            &harness.nodes[1].base_url,
+            "/stories/_search",
+            &[("q", query)],
+        )?)
         .send()
         .await?;
     let status = response.status();
@@ -2996,6 +3011,19 @@ async fn rest_qsearch_partial_remote_failure_stays_200_and_keeps_healthy_hits() 
             Some(6),
             "{response}"
         );
+        assert_eq!(
+            response["_shards"]["failures"].as_array().map(Vec::len),
+            Some(1),
+            "{response}"
+        );
+        let failure = &response["_shards"]["failures"][0];
+        assert_eq!(failure["shard"], 2, "{response}");
+        assert_eq!(failure["index"], "stories", "{response}");
+        assert_eq!(failure["node"], "node-3", "{response}");
+        assert!(
+            !failure["reason"]["reason"].as_str().unwrap().is_empty(),
+            "{response}"
+        );
     }
     Ok(())
 }
@@ -3036,8 +3064,11 @@ async fn rest_qsearch_remote_store_match_all_and_parse_errors() -> Result<()> {
     ] {
         let response = harness
             .client
-            .get(format!("{}/remote-qsearch/_search", harness.base_url))
-            .query(&[("q", query)])
+            .get(qsearch_url(
+                &harness.base_url,
+                "/remote-qsearch/_search",
+                &[("q", query)],
+            )?)
             .send()
             .await?;
         let status = response.status();
