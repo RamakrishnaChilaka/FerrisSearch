@@ -4291,6 +4291,99 @@ mod tests {
         })
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gapped_vector_assigned_replica_reopens_and_receives_gap_filler() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let directory = tempfile::tempdir().unwrap();
+        let mappings = HashMap::from([(
+            "emb".into(),
+            FieldMapping {
+                field_type: FieldType::KnnVector,
+                dimension: Some(3),
+            },
+        )]);
+        {
+            let manager = Arc::new(ShardManager::new(directory.path(), Duration::from_secs(60)));
+            let engine = manager
+                .open_assigned_shard_with_settings_blocking(
+                    "idx".into(),
+                    0,
+                    mappings.clone(),
+                    IndexSettings::default(),
+                    "uuid-1",
+                    AssignedShardOpen {
+                        allocation_id: 7,
+                        primary_term: 1,
+                        allow_empty_creation: true,
+                    },
+                )
+                .await
+                .unwrap();
+            tokio::task::spawn_blocking(move || {
+                apply_index(&engine, "a", json!({"emb": [1.0, 0.0, 0.0]}), 0, 1).unwrap();
+                apply_index(&engine, "c", json!({"emb": [0.0, 1.0, 0.0]}), 2, 1).unwrap();
+            })
+            .await
+            .unwrap();
+        }
+        let manager = Arc::new(ShardManager::new(directory.path(), Duration::from_secs(60)));
+        let mut engine = manager
+            .open_assigned_shard_with_settings_blocking(
+                "idx".into(),
+                0,
+                mappings.clone(),
+                IndexSettings::default(),
+                "uuid-1",
+                AssignedShardOpen {
+                    allocation_id: 7,
+                    primary_term: 1,
+                    allow_empty_creation: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(engine.sequence_stats().processed_checkpoint, Some(0));
+        assert_eq!(engine.sequence_stats().max_seq_no, Some(2));
+        drop(engine);
+        engine = manager
+            .reopen_shard(
+                "idx".into(),
+                0,
+                mappings,
+                IndexSettings::default(),
+                "uuid-1".into(),
+                7,
+            )
+            .await
+            .unwrap();
+        assert_eq!(engine.sequence_stats().processed_checkpoint, Some(0));
+        assert_eq!(engine.sequence_stats().max_seq_no, Some(2));
+        let marker = directory.path().join("uuid-1/shard_0/vectors.stale");
+        assert!(!marker.exists());
+        tokio::task::spawn_blocking(move || {
+            let hits = engine.search_knn("emb", &[0.0, 1.0, 0.0], 2).unwrap();
+            assert_eq!(hits.len(), 2);
+            assert_eq!(hits[0]["_id"], "c");
+            assert_eq!(
+                engine
+                    .get_document_with_metadata("c", true)
+                    .unwrap()
+                    .unwrap()
+                    .seq_no,
+                2
+            );
+            apply_index(&engine, "b", json!({"emb": [0.0, 0.0, 1.0]}), 1, 1).unwrap();
+            engine.refresh().unwrap();
+            assert_eq!(engine.sequence_stats().processed_checkpoint, Some(2));
+            let hits = engine.search_knn("emb", &[0.0, 0.0, 1.0], 3).unwrap();
+            assert_eq!(hits.len(), 3);
+            assert_eq!(hits[0]["_id"], "b");
+        })
+        .await
+        .unwrap();
+        assert!(!marker.exists());
+    }
+
     // ── ShardKey ─────────────────────────────────────────────────────────
 
     #[test]

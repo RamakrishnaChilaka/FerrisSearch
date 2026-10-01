@@ -677,31 +677,33 @@ impl CompositeEngine {
     }
 
     fn rebuild_vectors_locked(&self) -> Result<()> {
+        self.mark_vectors_stale()?;
         let mut rebuilt = None;
         let mut vector_count = 0;
-        self.text.for_each_vector_rebuild_batch(|documents| {
-            for (doc_id, source, seq_no, primary_term) in documents {
-                let expected_dimensions = rebuilt.as_ref().map(VectorIndex::dimensions);
-                let prepared = self.detect_vector_mutation(&source, expected_dimensions)?;
-                if let PreparedVectorMutation::Index { vector } = &prepared
-                    && rebuilt.is_none()
-                {
-                    rebuilt = Some(VectorIndex::new(
-                        vector.len(),
-                        usearch::ffi::MetricKind::Cos,
-                    )?);
+        self.text
+            .for_each_committed_vector_rebuild_batch(|documents| {
+                for (doc_id, source, seq_no, primary_term) in documents {
+                    let expected_dimensions = rebuilt.as_ref().map(VectorIndex::dimensions);
+                    let prepared = self.detect_vector_mutation(&source, expected_dimensions)?;
+                    if let PreparedVectorMutation::Index { vector } = &prepared
+                        && rebuilt.is_none()
+                    {
+                        rebuilt = Some(VectorIndex::new(
+                            vector.len(),
+                            usearch::ffi::MetricKind::Cos,
+                        )?);
+                    }
+                    Self::apply_prepared_vector_mutation_to_index(
+                        rebuilt.as_ref(),
+                        WalOperation::Index,
+                        Some(&doc_id),
+                        seq_no,
+                        primary_term,
+                        &prepared,
+                    )?;
                 }
-                Self::apply_prepared_vector_mutation_to_index(
-                    rebuilt.as_ref(),
-                    WalOperation::Index,
-                    Some(&doc_id),
-                    seq_no,
-                    primary_term,
-                    &prepared,
-                )?;
-            }
-            Ok(())
-        })?;
+                Ok(())
+            })?;
 
         if let Some(index) = rebuilt.as_ref() {
             vector_count = index.len();
@@ -721,12 +723,7 @@ impl CompositeEngine {
         Ok(())
     }
 
-    fn rebuild_vectors_from_snapshot_locked(&self) -> Result<()> {
-        self.text.reload_reader()?;
-        self.rebuild_vectors_locked()
-    }
-
-    /// Rebuild the vector index from the authoritative Tantivy document view.
+    /// Rebuild vectors from a covering commit without publishing a text reader.
     /// The rebuild is persisted before durable stale state is cleared.
     pub fn rebuild_vectors(&self) -> Result<()> {
         let _vector_recovery = self
@@ -1340,7 +1337,7 @@ impl SearchEngine for CompositeEngine {
                 ));
             }
         };
-        if rebuild_vectors && let Err(error) = self.rebuild_vectors_from_snapshot_locked() {
+        if rebuild_vectors && let Err(error) = self.rebuild_vectors_locked() {
             let release_result = self
                 .text
                 .release_peer_recovery_pin(snapshot.retention_pin_id);
@@ -1373,7 +1370,7 @@ impl SearchEngine for CompositeEngine {
                 ));
             }
         };
-        if rebuild_vectors && let Err(error) = self.rebuild_vectors_from_snapshot_locked() {
+        if rebuild_vectors && let Err(error) = self.rebuild_vectors_locked() {
             drop(preparation);
             let _ = std::fs::remove_dir_all(snapshot_dir);
             return Err(error);
@@ -1814,8 +1811,8 @@ mod tests {
                 .unwrap();
         }
 
-        let vectors = engine.vector.read().unwrap();
-        let vectors = vectors.as_ref().unwrap();
+        let vector_guard = engine.vector.read().unwrap();
+        let vectors = vector_guard.as_ref().unwrap();
         assert_eq!(
             vectors.version_for_test("doc").unwrap().seq_no,
             updated.seq_no,
@@ -1830,8 +1827,18 @@ mod tests {
         assert!(!engine.vectors_are_stale().unwrap());
         assert_eq!(
             engine.get_document("doc").unwrap().unwrap()["emb"],
+            json!([1.0, 0.0, 0.0]),
+            "vector repair must not publish the snapshot commit"
+        );
+        assert!(engine.get_document("fresh").unwrap().is_none());
+        assert!(engine.get_document("deleted").unwrap().is_some());
+        drop(vector_guard);
+        engine.refresh().unwrap();
+        assert_eq!(
+            engine.get_document("doc").unwrap().unwrap()["emb"],
             json!([0.0, 1.0, 0.0])
         );
+        assert!(engine.get_document("deleted").unwrap().is_none());
     }
 
     #[test]
@@ -1842,6 +1849,506 @@ mod tests {
     #[test]
     fn reader_publication_created_snapshot_vector_rebuild_covers_commit() {
         snapshot_vector_rebuild_covers_committed_updates(false);
+    }
+
+    fn stale_ready_vector_rebuild_covers_pending_documents(
+        trigger: impl FnOnce(&CompositeEngine),
+        expected_ids: &[&str],
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = vector_engine(directory.path());
+        engine
+            .add_document("a", json!({"emb": [1.0, 0.0, 0.0]}))
+            .unwrap();
+        engine
+            .add_document("deleted", json!({"emb": [1.0, 0.0, 0.0]}))
+            .unwrap();
+        engine.refresh().unwrap();
+        let pending = engine
+            .add_document_with_receipt("b", json!({"emb": [0.0, 1.0, 0.0]}))
+            .unwrap();
+        let updated = engine
+            .add_document_with_receipt("a", json!({"emb": [0.0, 0.0, 1.0]}))
+            .unwrap();
+        engine.delete_document("deleted").unwrap();
+        engine.mark_vectors_stale().unwrap();
+        assert!(!engine.text.writer_requires_rebuild());
+        assert!(engine.get_document("b").unwrap().is_none());
+        assert_eq!(
+            engine
+                .get_document_with_metadata("b", true)
+                .unwrap()
+                .unwrap()
+                .seq_no,
+            pending.seq_no
+        );
+
+        trigger(&engine);
+        assert!(!engine.vectors_are_stale().unwrap());
+        assert!(
+            engine.get_document("b").unwrap().is_none(),
+            "a stale-vector repair must not refresh pending documents"
+        );
+        engine.refresh().unwrap();
+        let hits = engine.search_knn("emb", &[0.0, 1.0, 0.0], 10).unwrap();
+        let mut ids = hits
+            .iter()
+            .map(|hit| hit["_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(
+            ids, expected_ids,
+            "rebuild must retain every applied vector, including pending updates and deletes"
+        );
+        let vectors = engine.vector.read().unwrap();
+        let vectors = vectors.as_ref().unwrap();
+        assert_eq!(
+            vectors.version_for_test("b").unwrap().seq_no,
+            pending.seq_no
+        );
+        assert_eq!(
+            vectors.version_for_test("a").unwrap().seq_no,
+            updated.seq_no
+        );
+        assert!(vectors.version_for_test("deleted").is_none());
+    }
+
+    #[test]
+    fn vector_rebuild_healthy_writer_write_covers_unrefreshed_documents() {
+        stale_ready_vector_rebuild_covers_pending_documents(
+            |engine| {
+                engine
+                    .add_document("c", json!({"emb": [1.0, 1.0, 0.0]}))
+                    .unwrap();
+            },
+            &["a", "b", "c"],
+        );
+    }
+
+    #[test]
+    fn vector_rebuild_healthy_writer_bulk_write_covers_unrefreshed_documents() {
+        stale_ready_vector_rebuild_covers_pending_documents(
+            |engine| {
+                engine
+                    .bulk_add_documents(vec![
+                        ("c".into(), json!({"emb": [1.0, 1.0, 0.0]})),
+                        ("d".into(), json!({"emb": [1.0, 0.0, 1.0]})),
+                    ])
+                    .unwrap();
+            },
+            &["a", "b", "c", "d"],
+        );
+    }
+
+    #[test]
+    fn vector_rebuild_healthy_writer_delete_covers_unrefreshed_documents() {
+        stale_ready_vector_rebuild_covers_pending_documents(
+            |engine| {
+                engine.delete_document("missing").unwrap();
+            },
+            &["a", "b"],
+        );
+    }
+
+    #[test]
+    fn vector_rebuild_healthy_writer_replica_apply_covers_unrefreshed_documents() {
+        stale_ready_vector_rebuild_covers_pending_documents(
+            |engine| {
+                engine
+                    .apply_replica_operation(super::super::SequencedOperation {
+                        seq_no: 5,
+                        primary_term: 1,
+                        mutation: super::super::DocumentMutation::Index {
+                            doc_id: "c".into(),
+                            source: json!({"emb": [1.0, 1.0, 0.0]}),
+                        },
+                    })
+                    .unwrap();
+            },
+            &["a", "b", "c"],
+        );
+    }
+
+    #[test]
+    fn vector_rebuild_healthy_writer_replica_batch_covers_unrefreshed_documents() {
+        stale_ready_vector_rebuild_covers_pending_documents(
+            |engine| {
+                engine
+                    .apply_replica_batch(
+                        ["c", "d"]
+                            .into_iter()
+                            .enumerate()
+                            .map(|(offset, doc_id)| super::super::SequencedOperation {
+                                seq_no: 5 + offset as u64,
+                                primary_term: 1,
+                                mutation: super::super::DocumentMutation::Index {
+                                    doc_id: doc_id.into(),
+                                    source: json!({"emb": [1.0, 1.0, 0.0]}),
+                                },
+                            })
+                            .collect(),
+                    )
+                    .unwrap();
+            },
+            &["a", "b", "c", "d"],
+        );
+    }
+
+    #[test]
+    fn vector_rebuild_healthy_writer_peer_barrier_covers_unrefreshed_documents() {
+        stale_ready_vector_rebuild_covers_pending_documents(
+            |engine| {
+                engine.peer_recovery_barrier().unwrap();
+            },
+            &["a", "b"],
+        );
+    }
+
+    fn peer_snapshot_does_not_publish_pending_documents(prepare: bool) {
+        for stale in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let engine = vector_engine(directory.path());
+            engine
+                .add_document("base", json!({"emb": [1.0, 0.0, 0.0]}))
+                .unwrap();
+            engine.refresh().unwrap();
+            let pending = engine
+                .add_document_with_receipt("pending", json!({"emb": [0.0, 1.0, 0.0]}))
+                .unwrap();
+            if stale {
+                engine.mark_vectors_stale().unwrap();
+            }
+            let snapshot_dir = directory.path().join("snapshot");
+            if prepare {
+                drop(
+                    engine
+                        .prepare_peer_recovery_snapshot(&snapshot_dir)
+                        .unwrap(),
+                );
+            } else {
+                let snapshot = engine.create_peer_recovery_snapshot(&snapshot_dir).unwrap();
+                engine
+                    .release_peer_recovery_pin(snapshot.retention_pin_id)
+                    .unwrap();
+            }
+            assert_eq!(
+                engine.doc_count(),
+                1,
+                "snapshot published with stale={stale}"
+            );
+            assert!(
+                engine
+                    .get_document_with_metadata("pending", false)
+                    .unwrap()
+                    .is_none(),
+                "snapshot must not publish pending documents with stale={stale}"
+            );
+            assert_eq!(
+                engine
+                    .get_document_with_metadata("pending", true)
+                    .unwrap()
+                    .unwrap()
+                    .seq_no,
+                pending.seq_no
+            );
+            assert!(!engine.vectors_are_stale().unwrap());
+            engine.refresh().unwrap();
+            assert_eq!(engine.doc_count(), 2);
+            let hits = engine.search_knn("emb", &[0.0, 1.0, 0.0], 2).unwrap();
+            assert_eq!(hits.len(), 2);
+            assert_eq!(hits[0]["_id"], "pending");
+        }
+    }
+
+    #[test]
+    fn vector_rebuild_prepared_snapshot_never_publishes_pending_documents() {
+        peer_snapshot_does_not_publish_pending_documents(true);
+    }
+
+    #[test]
+    fn vector_rebuild_created_snapshot_never_publishes_pending_documents() {
+        peer_snapshot_does_not_publish_pending_documents(false);
+    }
+
+    #[test]
+    fn vector_rebuild_gap_covers_applied_set_and_clears_stale_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = vector_engine(directory.path());
+        for (seq_no, doc_id) in [(0, "base"), (2, "above-gap")] {
+            engine
+                .apply_replica_operation(super::super::SequencedOperation {
+                    seq_no,
+                    primary_term: 1,
+                    mutation: super::super::DocumentMutation::Index {
+                        doc_id: doc_id.into(),
+                        source: json!({"emb": [1.0, 0.0, 0.0]}),
+                    },
+                })
+                .unwrap();
+        }
+        engine.mark_vectors_stale().unwrap();
+        assert_eq!(engine.sequence_stats().processed_checkpoint, Some(0));
+        assert_eq!(engine.sequence_stats().max_seq_no, Some(2));
+
+        engine.rebuild_vectors().unwrap();
+        assert!(!engine.vectors_are_stale().unwrap());
+        assert_eq!(engine.sequence_stats().processed_checkpoint, Some(0));
+        assert_eq!(
+            engine.text.missing_sequence_intervals_through(2),
+            vec![1..=1]
+        );
+        assert_eq!(
+            engine.vector.read().unwrap().as_ref().unwrap().len(),
+            2,
+            "a covering rebuild must keep vectors above the gap"
+        );
+        engine
+            .apply_replica_operation(super::super::SequencedOperation {
+                seq_no: 1,
+                primary_term: 1,
+                mutation: super::super::DocumentMutation::NoOp {
+                    reason: "close vector rebuild coverage gap".into(),
+                },
+            })
+            .unwrap();
+        assert_eq!(engine.sequence_stats().processed_checkpoint, Some(2));
+        assert!(!engine.vectors_are_stale().unwrap());
+        engine.refresh().unwrap();
+        let hits = engine.search_knn("emb", &[1.0, 0.0, 0.0], 2).unwrap();
+        let ids = hits
+            .iter()
+            .map(|hit| hit["_id"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(ids, std::collections::BTreeSet::from(["above-gap", "base"]));
+    }
+
+    fn gapped_vector_operation(seq_no: u64, doc_id: &str) -> super::super::SequencedOperation {
+        super::super::SequencedOperation {
+            seq_no,
+            primary_term: 1,
+            mutation: super::super::DocumentMutation::Index {
+                doc_id: doc_id.into(),
+                source: json!({"emb": [1.0, 0.0, 0.0], "value": seq_no}),
+            },
+        }
+    }
+
+    fn assert_applied_vector_ids(engine: &CompositeEngine, expected: &[&str]) {
+        let hits = engine.search_knn("emb", &[1.0, 0.0, 0.0], 10).unwrap();
+        let ids = hits
+            .iter()
+            .map(|hit| hit["_id"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(ids, expected.iter().copied().collect());
+    }
+
+    #[test]
+    fn vector_rebuild_gapped_replica_reopen_keeps_applied_vectors() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let directory = tempfile::tempdir().unwrap();
+        {
+            let engine = vector_engine(directory.path());
+            for (seq_no, doc_id) in [(0, "a"), (2, "c")] {
+                engine
+                    .apply_replica_operation(gapped_vector_operation(seq_no, doc_id))
+                    .unwrap();
+            }
+            assert!(!engine.vectors_are_stale().unwrap());
+        }
+        let mappings = std::collections::HashMap::from([(
+            "emb".into(),
+            FieldMapping {
+                field_type: FieldType::KnnVector,
+                dimension: Some(3),
+            },
+        )]);
+        let reopened = CompositeEngine::open_existing_with_mappings(
+            directory.path(),
+            Duration::from_secs(60),
+            &mappings,
+            TranslogDurability::Request,
+            Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
+        )
+        .unwrap();
+        assert_eq!(reopened.sequence_stats().processed_checkpoint, Some(0));
+        assert_eq!(reopened.sequence_stats().max_seq_no, Some(2));
+        reopened.rebuild_vectors().unwrap();
+        assert!(!reopened.vectors_are_stale().unwrap());
+        assert_applied_vector_ids(&reopened, &["a", "c"]);
+        let vectors = reopened.vector.read().unwrap();
+        assert_eq!(
+            vectors
+                .as_ref()
+                .unwrap()
+                .version_for_test("c")
+                .unwrap()
+                .seq_no,
+            2
+        );
+        drop(vectors);
+        reopened
+            .apply_replica_operation(gapped_vector_operation(1, "b"))
+            .unwrap();
+        reopened.refresh().unwrap();
+        assert_eq!(reopened.sequence_stats().processed_checkpoint, Some(2));
+        assert_applied_vector_ids(&reopened, &["a", "b", "c"]);
+    }
+
+    #[test]
+    fn vector_rebuild_gapped_replica_writer_failure_recovers_applied_vectors() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = vector_engine(directory.path());
+        for (seq_no, doc_id) in [(0, "a"), (2, "c")] {
+            engine
+                .apply_replica_operation(gapped_vector_operation(seq_no, doc_id))
+                .unwrap();
+        }
+        engine.inject_engine_apply_failures_for_test(5, 1);
+        assert!(
+            engine
+                .apply_replica_operation(gapped_vector_operation(3, "d"))
+                .is_err()
+        );
+        assert!(engine.vectors_are_stale().unwrap());
+        engine
+            .apply_replica_operation(gapped_vector_operation(4, "e"))
+            .unwrap();
+        assert!(!engine.vectors_are_stale().unwrap());
+        assert_eq!(engine.sequence_stats().processed_checkpoint, Some(0));
+        assert_eq!(engine.sequence_stats().max_seq_no, Some(4));
+        engine.refresh().unwrap();
+        assert_applied_vector_ids(&engine, &["a", "c", "d", "e"]);
+        let duplicate = engine
+            .apply_replica_operation(gapped_vector_operation(4, "e"))
+            .unwrap();
+        assert_eq!(duplicate.outcome, super::super::ApplyOutcome::Redelivery);
+        assert_applied_vector_ids(&engine, &["a", "c", "d", "e"]);
+    }
+
+    #[test]
+    fn vector_rebuild_scan_does_not_block_realtime_get() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = Arc::new(vector_engine(directory.path()));
+        engine
+            .add_document("base", json!({"emb": [1.0, 0.0, 0.0]}))
+            .unwrap();
+        engine.refresh().unwrap();
+        let hot = engine
+            .add_document_with_receipt("hot", json!({"emb": [0.0, 1.0, 0.0]}))
+            .unwrap();
+        engine.mark_vectors_stale().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        engine
+            .text
+            .pause_vector_rebuild_scan_for_test(ready_tx, release_rx);
+        let rebuilding = engine.clone();
+        let rebuild = std::thread::spawn(move || rebuilding.rebuild_vectors());
+        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (get_tx, get_rx) = std::sync::mpsc::channel();
+        let reading = engine.clone();
+        let get = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            get_tx
+                .send(reading.get_document_with_metadata("hot", true))
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let while_paused = get_rx.recv_timeout(Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        rebuild.join().unwrap().unwrap();
+        get.join().unwrap();
+        let document = while_paused
+            .expect("realtime GET must finish while the vector scan remains paused")
+            .unwrap()
+            .unwrap();
+        assert_eq!(document.seq_no, hot.seq_no);
+        assert_eq!(document.source["emb"], json!([0.0, 1.0, 0.0]));
+        assert!(!engine.vectors_are_stale().unwrap());
+    }
+
+    #[test]
+    fn vector_rebuild_changed_missing_intervals_keeps_stale_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = Arc::new(vector_engine(directory.path()));
+        for (seq_no, doc_id) in [(0, "a"), (3, "d")] {
+            engine
+                .apply_replica_operation(gapped_vector_operation(seq_no, doc_id))
+                .unwrap();
+        }
+        engine.mark_vectors_stale().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        engine
+            .text
+            .pause_vector_rebuild_scan_for_test(ready_tx, release_rx);
+        let rebuilding = engine.clone();
+        let rebuild = std::thread::spawn(move || rebuilding.rebuild_vectors());
+        if let Err(error) = ready_rx.recv_timeout(Duration::from_secs(2)) {
+            let result = rebuild.join().unwrap();
+            panic!("vector scan did not start: {error}; rebuild result: {result:?}");
+        }
+        assert_eq!(
+            engine.text.missing_sequence_intervals_through(3),
+            vec![1..=2]
+        );
+        // Bypass composite exclusion to prove the post-scan guard detects an
+        // applied-set change even when the prefix and maximum are unchanged.
+        let applying = engine.clone();
+        let (applied_tx, applied_rx) = std::sync::mpsc::channel();
+        let apply = std::thread::spawn(move || {
+            applied_tx
+                .send(
+                    applying
+                        .text
+                        .apply_replica_operation(super::super::SequencedOperation {
+                            seq_no: 2,
+                            primary_term: 1,
+                            mutation: super::super::DocumentMutation::NoOp {
+                                reason: "coverage changed during scan".into(),
+                            },
+                        }),
+                )
+                .unwrap();
+        });
+        let applied = applied_rx.recv_timeout(Duration::from_secs(2));
+        release_tx.send(()).unwrap();
+        let result = rebuild.join().unwrap();
+        apply.join().unwrap();
+        applied
+            .expect("translog must be released before the vector scan")
+            .unwrap();
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no longer covers applied history"),
+            "{error:#}"
+        );
+        assert_eq!(engine.sequence_stats().processed_checkpoint, Some(0));
+        assert_eq!(engine.sequence_stats().max_seq_no, Some(3));
+        assert_eq!(
+            engine.text.missing_sequence_intervals_through(3),
+            vec![1..=1]
+        );
+        assert!(engine.vectors_are_stale().unwrap());
+        assert_eq!(engine.vector.read().unwrap().as_ref().unwrap().len(), 2);
+        engine.rebuild_vectors().unwrap();
+        assert!(!engine.vectors_are_stale().unwrap());
+        engine.refresh().unwrap();
+        assert_applied_vector_ids(&engine, &["a", "d"]);
+    }
+
+    #[test]
+    fn vector_rebuild_empty_covering_commit_clears_stale_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = vector_engine(directory.path());
+        engine.mark_vectors_stale().unwrap();
+        engine.rebuild_vectors().unwrap();
+        assert!(!engine.vectors_are_stale().unwrap());
+        assert!(engine.vector.read().unwrap().is_none());
+        assert_eq!(engine.sequence_stats().processed_checkpoint, None);
     }
 
     fn vector_state_after_failed_write(
