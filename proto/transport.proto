@@ -699,6 +699,7 @@ message GetTaskStatusResponse {
 // ─── Service Definition ─────────────────────────────────────────────────────
 
 service InternalTransport {
+    rpc OpenIndex(IndexMaintenanceRequest) returns (Empty);
     // Cluster coordination
     rpc JoinCluster(JoinRequest) returns (JoinResponse);
     rpc PublishState(PublishStateRequest) returns (Empty);

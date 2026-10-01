@@ -1008,12 +1008,15 @@ async fn get_local_document(node: &NodeConfig, doc_id: &str) -> Result<Option<Va
         InternalTransportClient::connect(format!("http://127.0.0.1:{}", node.transport_port))
             .await?;
     let response = client
-        .get_doc(tonic::Request::new(ShardGetRequest {
-            index_name: INDEX_NAME.into(),
-            shard_id: 0,
-            doc_id: doc_id.into(),
-            ..Default::default()
-        }))
+        .get_doc(ferrissearch::transport::request_with_cluster_state_version(
+            ShardGetRequest {
+                index_name: INDEX_NAME.into(),
+                shard_id: 0,
+                doc_id: doc_id.into(),
+                ..Default::default()
+            },
+            0,
+        ))
         .await?
         .into_inner();
     if !response.found {

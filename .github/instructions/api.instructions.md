@@ -185,6 +185,58 @@ values return `400 illegal_argument_exception` without enqueueing work.
   allocation ID rather than calling a synchronous shard-open helper inline.
 - Read and maintenance paths must fail closed when the authoritative shard UUID path is missing. Do not create a fresh shard directory on `/_search`, `/_count`, SQL, or maintenance fan-out just because a local reopen is needed.
 
+### Validate metadata before waiting
+
+- Bind the API transport client to the node's shared `ClusterManager`.
+  Forwarded operations carry its applied `ClusterState.version` as a routing
+  hint, plus index UUID, shard term, and target allocation context when known.
+- If a follower coordinator does not know an index, obtain the leader's
+  applied version through `Ping` and wait up to 5 seconds before returning
+  404 or auto-creating. Re-read routing and node metadata after auto-create.
+  Do not install a snapshot or mutate follower state to catch up.
+- Targets validate local index and shard metadata first. Wait and revalidate
+  only when the coordinator's routing hint is ahead and the index, UUID, shard
+  routing, local authority, allocation ID, or primary term fails validation,
+  or when an explicit acknowledgement floor for this index has not applied.
+  Settings and mappings are not validated against the hint; only the floor
+  held by the acknowledging coordinator fences them.
+  Unrelated metadata changes must not stall valid reads. The asynchronous
+  metadata wait expires after 5 seconds and returns
+  `503 shard_not_available_exception`, including bulk item failures and
+  update's realtime GET. Preserve the version and underlying cause.
+- Propagate metadata-wait failures from search, count, and both SQL paths.
+  Do not turn them into partial success, zero counts, or a SQL fallback.
+  Unrelated shard-search partial-failure behavior is unchanged.
+- After a successful Raft commit, create-index returns HTTP 200 with
+  `acknowledged: true`. Use a separate 20-second primary-open budget, with
+  up to 5 additional seconds for remote metadata catch-up. Open primary nodes
+  concurrently and at most four shards concurrently per node. If opening or
+  coordinator catch-up fails or expires, return `shards_acknowledged: false`
+  and log the full cause; do not report a failed create after its commit.
+  Remote primaries use `OpenIndex`; local opens use the shared primary-open
+  helper and existing blocking wrappers, UUID/allocation guards, and
+  initial-empty-copy rule. Replicas do not participate. Primary activation
+  remains on the existing first-write and lifecycle paths.
+- Auto-create retains leader-local placement for a leader coordinator.
+  Follower coordinators use the leader's existing create-index allocator.
+  Both paths set `dynamic: true`. Do not repeat primary opening after a
+  forwarded create; the receiving write uses the existing lazy-open path.
+- Forwarded create, settings, and mapping acknowledgements carry an applied
+  version. Settings wait locally before reporting success; create preserves
+  its committed acknowledgement when local catch-up expires.
+  Clients retain maximum acknowledged versions **per index** across clones,
+  including local leader acknowledgements. Subsequent coordinator lookups and
+  forwarded operations honor only the floor for the requested index.
+  Dynamic ingestion keeps its existing committed-mapping override and reopen
+  path instead of adding a new wait between mapping commit and reopen.
+  This is not an all-node application acknowledgement or a cross-engine
+  snapshot guarantee.
+- Only the stable metadata-wait `UNAVAILABLE` marker is retryable for document
+  operations. Generic gRPC `UNAVAILABLE` and `DEADLINE_EXCEEDED` can describe
+  an unknown post-WAL outcome; do not classify them as safe-to-retry 503s.
+  Generic create-index transport failures also remain errors with an
+  indeterminate commit outcome, not retryable 503s.
+
 ### Document Operations — src/api/index/mod.rs (routed to shard primary)
 | HTTP | Path | Handler |
 |------|------|---------|
@@ -386,8 +438,9 @@ paired conditions and update retries. `_create` accepts only absent or
 `create` for `op_type`; DELETE rejects any `op_type`.
 
 Accept `wait_for_active_shards` only when absent or exactly `1`; bulk metadata
-may also use numeric `1`. Reject `all` even with zero replicas. This accepts
-the default, not a new active-copy wait or pre-flight implementation.
+may also use numeric `1`. Reject `all` even with zero replicas. Create-index waits for primary copies to open. Document and bulk writes do
+not add a replica-count pre-flight check; their existing activation and
+synchronous in-sync replication contracts remain unchanged.
 Use `illegal_argument()` / `error_response()` and name the rejected key.
 New safety-relevant write parameters must be implemented with result-level
 tests or added to this shared rejection helper. Do not use

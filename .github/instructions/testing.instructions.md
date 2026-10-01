@@ -259,7 +259,15 @@ cargo test -- test_name                         # Single test by name
 - For in-process REST integration harnesses, wait for both the HTTP listener and the gRPC transport listener before issuing the first request; Raft-backed index/settings handlers may still forward through transport before the harness is usable, and any readiness `Ping` must use a registered `source_node_id` because transport rejects unknown nodes.
 - Multi-node REST harnesses that claim coordinator coverage must preserve real `raft_node_id` values in cluster state and route at least one request through a non-master node; otherwise follower-forwarding regressions can hide behind leader-only traffic.
 - Multi-node `remote_store` tests must use a shared object-store root across nodes plus per-node local workdirs/caches; otherwise a coordinator-local read path can masquerade as distributed execution.
-- The current multi-node REST harness uses isolated in-memory Raft instances, so any `remote_store` regression that depends on leaf-side index metadata lookups needs a direct transport-level test in addition to any REST harness fan-out assertion.
+- The multi-node REST harness joins real in-memory Raft voters over gRPC.
+  Wait for applied metadata instead of copying newly created indices into
+  followers. Initial fixtures may still seed state before an operation.
+  Keep direct transport rejection coverage for malformed or missing metadata.
+- Create-then-write regressions use the `cfg(test)` one-shot apply gate in
+  `ClusterStateMachine`. Block application, not log replication, and preserve
+  the real quorum. Keep a short deadline test, exact document results, and
+  the two-node 50-iteration no-hook loop. Do not lengthen client timeouts or
+  weaken assertions to hide a forwarding race.
 - For WAL generation/manifest changes, add regressions for manifest creation on new shards, manifest-required reopen, active-generation-only reopen, and ignored non-generation side files in the WAL directory.
 - For WAL corruption hardening, add regressions that an unknown operation tag in the active generation returns `Err` on reopen instead of panicking, and that an internal active-generation mismatch fails before append writes bytes.
 - For persistent Raft format errors, independently corrupt vote, committed-log,

@@ -4,6 +4,7 @@ use crate::cluster::state::{ClusterState, NodeInfo};
 use crate::transport::proto::internal_transport_client::InternalTransportClient;
 use crate::transport::proto::*;
 use crate::transport::server::proto_to_cluster_state;
+use crate::transport::state_wait::{AppliedStateInterceptor, decode_state_version};
 use anyhow::Context;
 use datafusion::arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
@@ -12,6 +13,10 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
+
+pub type ConnectedTransportClient = InternalTransportClient<
+    tonic::service::interceptor::InterceptedService<Channel, AppliedStateInterceptor>,
+>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplicaApplyResponse {
@@ -29,6 +34,8 @@ pub struct ShardDocumentRead {
 #[derive(Clone)]
 pub struct TransportClient {
     timeout: Duration,
+    cluster_manager: Option<Arc<crate::cluster::ClusterManager>>,
+    acknowledged_versions: Arc<RwLock<HashMap<String, u64>>>,
     /// Cached gRPC channels keyed by "host:port".
     /// Uses RwLock for concurrent reads (cache hits) — only blocks on writes (cache misses).
     /// Tonic channels handle HTTP/2 multiplexing and reconnection internally.
@@ -133,6 +140,8 @@ impl TransportClient {
     pub fn new() -> Self {
         Self {
             timeout: Duration::from_secs(30),
+            cluster_manager: None,
+            acknowledged_versions: Arc::new(RwLock::new(HashMap::new())),
             channels: Arc::new(RwLock::new(HashMap::new())),
             tls_connector: None,
         }
@@ -142,9 +151,131 @@ impl TransportClient {
     pub fn with_tls_connector(connector: Arc<dyn TlsConnector>) -> Self {
         Self {
             timeout: Duration::from_secs(30),
+            cluster_manager: None,
+            acknowledged_versions: Arc::new(RwLock::new(HashMap::new())),
             channels: Arc::new(RwLock::new(HashMap::new())),
             tls_connector: Some(connector),
         }
+    }
+
+    pub fn with_cluster_manager(
+        mut self,
+        cluster_manager: Arc<crate::cluster::ClusterManager>,
+    ) -> Self {
+        self.cluster_manager = Some(cluster_manager);
+        self
+    }
+
+    pub(crate) fn forwarding_request<T>(
+        &self,
+        message: T,
+        index_name: &str,
+        shard: Option<(u32, &str)>,
+    ) -> tonic::Request<T> {
+        use crate::transport::state_wait::*;
+        let mut request = crate::transport::request_with_cluster_state_version(message, 0);
+        request.metadata_mut().insert_bin(
+            INDEX_NAME_HEADER,
+            tonic::metadata::MetadataValue::from_bytes(index_name.as_bytes()),
+        );
+        request.metadata_mut().insert(
+            INDEX_STATE_FLOOR_HEADER,
+            self.required_state_version(index_name)
+                .to_string()
+                .parse()
+                .expect("u64 is valid ASCII metadata"),
+        );
+        if let Some(manager) = &self.cluster_manager {
+            manager.with_state(|state| {
+                request.metadata_mut().insert(
+                    STATE_VERSION_HEADER,
+                    state
+                        .version
+                        .to_string()
+                        .parse()
+                        .expect("u64 is valid ASCII metadata"),
+                );
+                if let Some(metadata) = state.indices.get(index_name) {
+                    request.metadata_mut().insert_bin(
+                        INDEX_UUID_HEADER,
+                        tonic::metadata::MetadataValue::from_bytes(
+                            metadata.uuid.as_str().as_bytes(),
+                        ),
+                    );
+                    if let Some(routing) = shard.and_then(|(id, _)| metadata.shard_routing.get(&id))
+                    {
+                        request.metadata_mut().insert(
+                            PRIMARY_TERM_HEADER,
+                            routing
+                                .primary_term
+                                .to_string()
+                                .parse()
+                                .expect("u64 is valid ASCII metadata"),
+                        );
+                    }
+                    if let Some(allocation) =
+                        shard.and_then(|(id, node)| state.shard_allocation_id(index_name, id, node))
+                    {
+                        request.metadata_mut().insert(
+                            ALLOCATION_ID_HEADER,
+                            allocation
+                                .to_string()
+                                .parse()
+                                .expect("u64 is valid ASCII metadata"),
+                        );
+                    }
+                }
+            });
+        }
+        request
+    }
+
+    pub(crate) fn required_state_version(&self, index_name: &str) -> u64 {
+        self.acknowledged_versions
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(index_name)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn acknowledge_state(&self, index_name: &str, version: u64) {
+        self.acknowledged_versions
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry(index_name.to_string())
+            .and_modify(|floor| *floor = (*floor).max(version))
+            .or_insert(version);
+    }
+
+    fn observe_response_state<T>(
+        &self,
+        response: &tonic::Response<T>,
+        operation: &str,
+        index_name: &str,
+    ) -> anyhow::Result<u64> {
+        let version = decode_state_version(response.metadata())
+            .with_context(|| format!("invalid {operation} response cluster state version"))?;
+        self.acknowledge_state(index_name, version);
+        Ok(version)
+    }
+
+    async fn wait_for_response_state<T>(
+        &self,
+        response: &tonic::Response<T>,
+        operation: &str,
+        index_name: &str,
+    ) -> anyhow::Result<()> {
+        let version = self.observe_response_state(response, operation, index_name)?;
+        if let Some(manager) = &self.cluster_manager {
+            manager.wait_for_version(version).await.map_err(|error| {
+                tonic::Status::unavailable(format!(
+                    "{}{operation}: {error}",
+                    crate::transport::state_wait::STATE_WAIT_STATUS_PREFIX,
+                ))
+            })?;
+        }
+        Ok(())
     }
 
     /// Connect to a remote node's gRPC transport endpoint, reusing cached channels.
@@ -152,16 +283,21 @@ impl TransportClient {
         &self,
         host: &str,
         port: u16,
-    ) -> Result<InternalTransportClient<Channel>, tonic::transport::Error> {
+    ) -> Result<ConnectedTransportClient, tonic::transport::Error> {
         let key = format!("{host}:{port}");
 
         // Fast path: read lock for cache hit (concurrent, non-blocking)
         {
             let cache = self.channels.read().unwrap_or_else(|e| e.into_inner());
             if let Some(channel) = cache.get(&key) {
-                return Ok(InternalTransportClient::new(channel.clone())
-                    .max_decoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE)
-                    .max_encoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE));
+                return Ok(InternalTransportClient::with_interceptor(
+                    channel.clone(),
+                    AppliedStateInterceptor {
+                        cluster_manager: self.cluster_manager.clone(),
+                    },
+                )
+                .max_decoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE)
+                .max_encoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE));
             }
         }
 
@@ -187,9 +323,14 @@ impl TransportClient {
             cache.insert(key, channel.clone());
         }
 
-        Ok(InternalTransportClient::new(channel)
-            .max_decoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE)
-            .max_encoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE))
+        Ok(InternalTransportClient::with_interceptor(
+            channel,
+            AppliedStateInterceptor {
+                cluster_manager: self.cluster_manager.clone(),
+            },
+        )
+        .max_decoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE)
+        .max_encoding_message_size(crate::transport::GRPC_MAX_MESSAGE_SIZE))
     }
 
     #[cfg(feature = "protocol-trace")]
@@ -312,7 +453,7 @@ impl TransportClient {
         let shard_id = request.shard_id;
         let doc_id = request.doc_id.clone();
         let response = client
-            .index_doc(tonic::Request::new(request))
+            .index_doc(self.forwarding_request(request, &index_name, Some((shard_id, &node.id))))
             .await?
             .into_inner();
         decode_shard_doc_response(&index_name, shard_id, &doc_id, response)
@@ -331,12 +472,16 @@ impl TransportClient {
             .iter()
             .map(|(id, payload)| encode_bulk_document(id, payload))
             .collect::<Result<_, _>>()?;
-        let request = tonic::Request::new(ShardBulkRequest {
-            index_name: index_name.to_string(),
-            shard_id,
-            documents_json,
-            ..Default::default()
-        });
+        let request = self.forwarding_request(
+            ShardBulkRequest {
+                index_name: index_name.to_string(),
+                shard_id,
+                documents_json,
+                ..Default::default()
+            },
+            index_name,
+            Some((shard_id, &node.id)),
+        );
         let response = client.bulk_index(request).await?.into_inner();
         decode_shard_bulk_response(docs, response)
     }
@@ -369,13 +514,17 @@ impl TransportClient {
     ) -> Result<serde_json::Value, anyhow::Error> {
         let mut client = self.connect(&node.host, node.transport_port).await?;
         let (if_seq_no, if_primary_term) = condition.expected_version();
-        let request = tonic::Request::new(ShardDeleteRequest {
-            index_name: index_name.to_string(),
-            shard_id,
-            doc_id: doc_id.to_string(),
-            if_seq_no,
-            if_primary_term,
-        });
+        let request = self.forwarding_request(
+            ShardDeleteRequest {
+                index_name: index_name.to_string(),
+                shard_id,
+                doc_id: doc_id.to_string(),
+                if_seq_no,
+                if_primary_term,
+            },
+            index_name,
+            Some((shard_id, &node.id)),
+        );
         let response = client.delete_doc(request).await?.into_inner();
         decode_shard_delete_response(index_name, shard_id, doc_id, response)
     }
@@ -404,12 +553,16 @@ impl TransportClient {
         realtime: bool,
     ) -> Result<ShardDocumentRead, anyhow::Error> {
         let mut client = self.connect(&node.host, node.transport_port).await?;
-        let request = tonic::Request::new(ShardGetRequest {
-            index_name: index_name.to_string(),
-            shard_id,
-            doc_id: doc_id.to_string(),
-            realtime: Some(realtime),
-        });
+        let request = self.forwarding_request(
+            ShardGetRequest {
+                index_name: index_name.to_string(),
+                shard_id,
+                doc_id: doc_id.to_string(),
+                realtime: Some(realtime),
+            },
+            index_name,
+            Some((shard_id, &node.id)),
+        );
         let response = client.get_doc(request).await?.into_inner();
         if !response.error.is_empty() {
             anyhow::bail!("Get failed: {}", response.error);
@@ -455,12 +608,16 @@ impl TransportClient {
             .map(|(doc_id, source, _)| encode_bulk_document(doc_id, source))
             .collect::<Result<Vec<_>, _>>()?;
         let response = client
-            .bulk_index(tonic::Request::new(ShardBulkRequest {
-                index_name: index_name.to_string(),
-                shard_id,
-                documents_json,
-                operations: docs.iter().map(|(_, _, operation)| *operation).collect(),
-            }))
+            .bulk_index(self.forwarding_request(
+                ShardBulkRequest {
+                    index_name: index_name.to_string(),
+                    shard_id,
+                    documents_json,
+                    operations: docs.iter().map(|(_, _, operation)| *operation).collect(),
+                },
+                index_name,
+                Some((shard_id, &node.id)),
+            ))
             .await?
             .into_inner();
         if !response.success {
@@ -509,11 +666,15 @@ impl TransportClient {
         query: &str,
     ) -> Result<Vec<serde_json::Value>, anyhow::Error> {
         let mut client = self.connect(&node.host, node.transport_port).await?;
-        let request = tonic::Request::new(ShardSearchRequest {
-            index_name: index_name.to_string(),
-            shard_id,
-            query: query.to_string(),
-        });
+        let request = self.forwarding_request(
+            ShardSearchRequest {
+                index_name: index_name.to_string(),
+                shard_id,
+                query: query.to_string(),
+            },
+            index_name,
+            Some((shard_id, &node.id)),
+        );
         let response = client.search_shard(request).await?.into_inner();
         if response.success {
             decode_search_hits(&response.hits)
@@ -538,11 +699,15 @@ impl TransportClient {
         anyhow::Error,
     > {
         let mut client = self.connect(&node.host, node.transport_port).await?;
-        let request = tonic::Request::new(ShardSearchDslRequest {
-            index_name: index_name.to_string(),
-            shard_id,
-            search_request_json: serde_json::to_vec(req)?,
-        });
+        let request = self.forwarding_request(
+            ShardSearchDslRequest {
+                index_name: index_name.to_string(),
+                shard_id,
+                search_request_json: serde_json::to_vec(req)?,
+            },
+            index_name,
+            Some((shard_id, &node.id)),
+        );
         let response = client.search_shard_dsl(request).await?.into_inner();
         if response.success {
             let hits = decode_search_hits(&response.hits)?;
@@ -568,11 +733,15 @@ impl TransportClient {
         splits: &[crate::engine::remote_store::AssignedRemoteSplit],
     ) -> Result<crate::engine::remote_store::LeafStatusSnapshot, anyhow::Error> {
         let mut client = self.connect(&node.host, node.transport_port).await?;
-        let request = tonic::Request::new(RemoteStoreLeafStatusRequest {
-            index_name: index_name.to_string(),
-            index_uuid: index_uuid.to_string(),
-            splits: splits.iter().map(remote_store_split_to_proto).collect(),
-        });
+        let request = self.forwarding_request(
+            RemoteStoreLeafStatusRequest {
+                index_name: index_name.to_string(),
+                index_uuid: index_uuid.to_string(),
+                splits: splits.iter().map(remote_store_split_to_proto).collect(),
+            },
+            index_name,
+            None,
+        );
         let response = client
             .get_remote_store_leaf_status(request)
             .await?
@@ -608,13 +777,17 @@ impl TransportClient {
         live_split_ids: &[String],
     ) -> Result<Vec<crate::engine::remote_store::LeafSplitSearchOutcome>, anyhow::Error> {
         let mut client = self.connect(&node.host, node.transport_port).await?;
-        let request = tonic::Request::new(RemoteStoreSearchRequest {
-            index_name: index_name.to_string(),
-            index_uuid: index_uuid.to_string(),
-            search_request_json: serde_json::to_vec(req)?,
-            splits: splits.iter().map(remote_store_split_to_proto).collect(),
-            live_split_ids: live_split_ids.to_vec(),
-        });
+        let request = self.forwarding_request(
+            RemoteStoreSearchRequest {
+                index_name: index_name.to_string(),
+                index_uuid: index_uuid.to_string(),
+                search_request_json: serde_json::to_vec(req)?,
+                splits: splits.iter().map(remote_store_split_to_proto).collect(),
+                live_split_ids: live_split_ids.to_vec(),
+            },
+            index_name,
+            None,
+        );
         let response = client
             .search_remote_store_splits(request)
             .await?
@@ -659,15 +832,19 @@ impl TransportClient {
         needs_score: bool,
     ) -> Result<(datafusion::arrow::record_batch::RecordBatch, usize), anyhow::Error> {
         let mut client = self.connect(&node.host, node.transport_port).await?;
-        let request = tonic::Request::new(SqlRecordBatchRequest {
-            index_name: index_name.to_string(),
-            shard_id,
-            search_request_json: serde_json::to_vec(req)?,
-            columns: columns.to_vec(),
-            needs_id,
-            needs_score,
-            batch_size: 0,
-        });
+        let request = self.forwarding_request(
+            SqlRecordBatchRequest {
+                index_name: index_name.to_string(),
+                shard_id,
+                search_request_json: serde_json::to_vec(req)?,
+                columns: columns.to_vec(),
+                needs_id,
+                needs_score,
+                batch_size: 0,
+            },
+            index_name,
+            Some((shard_id, &node.id)),
+        );
         let response = client.sql_record_batch(request).await?.into_inner();
         let decoded = decode_sql_batch_response(response)?;
         Ok((decoded.batch, decoded.total_hits))
@@ -717,15 +894,19 @@ impl TransportClient {
         batch_size: usize,
     ) -> Result<SqlBatchStream, anyhow::Error> {
         let mut client = self.connect(&node.host, node.transport_port).await?;
-        let request = tonic::Request::new(SqlRecordBatchRequest {
-            index_name: index_name.to_string(),
-            shard_id,
-            search_request_json: serde_json::to_vec(req)?,
-            columns: columns.to_vec(),
-            needs_id,
-            needs_score,
-            batch_size: batch_size as u32,
-        });
+        let request = self.forwarding_request(
+            SqlRecordBatchRequest {
+                index_name: index_name.to_string(),
+                shard_id,
+                search_request_json: serde_json::to_vec(req)?,
+                columns: columns.to_vec(),
+                needs_id,
+                needs_score,
+                batch_size: batch_size as u32,
+            },
+            index_name,
+            Some((shard_id, &node.id)),
+        );
         let mut stream = client.sql_record_batch_stream(request).await?.into_inner();
         let Some(first_response) = stream.message().await? else {
             return Err(anyhow::anyhow!(
@@ -755,6 +936,61 @@ impl TransportClient {
             source_node_id: local_node_id.to_string(),
         });
         client.ping(request).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn get_cluster_state_version(
+        &self,
+        node: &NodeInfo,
+        local_node_id: &str,
+    ) -> anyhow::Result<u64> {
+        let mut client = self.connect(&node.host, node.transport_port).await?;
+        let response = client
+            .ping(tonic::Request::new(PingRequest {
+                source_node_id: local_node_id.to_string(),
+            }))
+            .await?;
+        decode_state_version(response.metadata())
+            .context("invalid Ping response cluster state version")
+    }
+
+    pub(crate) async fn open_remote_index_primaries(
+        &self,
+        state: &ClusterState,
+        index_name: &str,
+        local_node_id: &str,
+    ) -> anyhow::Result<()> {
+        let metadata = state
+            .indices
+            .get(index_name)
+            .ok_or_else(|| tonic::Status::not_found(format!("no such index [{index_name}]")))?;
+        let targets = metadata
+            .shard_routing
+            .values()
+            .map(|routing| routing.primary.as_str())
+            .filter(|node| *node != local_node_id)
+            .collect::<std::collections::HashSet<_>>();
+        let timeout = self.cluster_manager.as_ref().map_or(
+            crate::cluster::manager::FORWARDING_STATE_WAIT_TIMEOUT
+                + crate::cluster::manager::PRIMARY_OPEN_WAIT_TIMEOUT,
+            |manager| manager.forwarding_wait_timeout() + manager.primary_open_wait_timeout(),
+        );
+        let results = tokio::time::timeout(timeout, futures::future::join_all(targets.into_iter().map(|node_id| async move {
+            let node = state.nodes.get(node_id).ok_or_else(|| tonic::Status::unavailable(
+                format!("primary node [{node_id}] for index [{index_name}] is absent from cluster state")
+            ))?;
+            let mut client = self.connect(&node.host, node.transport_port).await
+                .with_context(|| format!("connect to primary [{node_id}] for index [{index_name}]"))?;
+            let request = self.forwarding_request(IndexMaintenanceRequest {
+                index_name: index_name.to_string(),
+            }, index_name, None);
+            client.open_index(request).await.with_context(|| format!("open primary [{node_id}] for index [{index_name}]"))?;
+            Ok::<(), anyhow::Error>(())
+        }))).await.map_err(|error| tonic::Status::unavailable(format!(
+            "timed out opening primary shards for index [{index_name}] at cluster state version {}: {error}",
+            state.version,
+        )))?;
+        results.into_iter().collect::<anyhow::Result<Vec<_>>>()?;
         Ok(())
     }
 
@@ -937,11 +1173,12 @@ impl TransportClient {
         let resp = client
             .update_settings(request)
             .await
-            .map_err(|e| anyhow::anyhow!("UpdateSettings RPC: {e}"))?;
-        let inner = resp.into_inner();
-        if !inner.error.is_empty() {
-            return Err(anyhow::anyhow!("{}", inner.error));
+            .context("UpdateSettings RPC")?;
+        if !resp.get_ref().error.is_empty() {
+            return Err(anyhow::anyhow!("{}", resp.get_ref().error));
         }
+        self.wait_for_response_state(&resp, "UpdateSettings", index_name)
+            .await?;
         Ok(())
     }
 
@@ -1082,12 +1319,36 @@ impl TransportClient {
             .create_index(request)
             .await
             .context("CreateIndex RPC")?;
-        let inner = resp.into_inner();
-        if !inner.error.is_empty() {
-            return Err(anyhow::anyhow!("{}", inner.error));
+        if !resp.get_ref().error.is_empty() {
+            return Err(anyhow::anyhow!("{}", resp.get_ref().error));
         }
-        let response: serde_json::Value = serde_json::from_slice(&inner.response_json)
-            .unwrap_or(serde_json::json!({"acknowledged": inner.acknowledged}));
+        if !resp.get_ref().acknowledged {
+            anyhow::bail!("CreateIndex was not acknowledged");
+        }
+        let mut response: serde_json::Value = serde_json::from_slice(&resp.get_ref().response_json)
+            .context("invalid CreateIndex response JSON")?;
+        if response["acknowledged"].as_bool() != Some(true)
+            || response["shards_acknowledged"].as_bool().is_none()
+            || response["index"].as_str() != Some(index_name)
+        {
+            anyhow::bail!("invalid acknowledged CreateIndex response for index [{index_name}]");
+        }
+        if let Err(error) = self
+            .wait_for_response_state(&resp, "CreateIndex", index_name)
+            .await
+        {
+            if error
+                .chain()
+                .filter_map(|cause| cause.downcast_ref::<tonic::Status>())
+                .any(crate::transport::state_wait::is_state_wait_timeout)
+            {
+                warn!(index = index_name, error = %error,
+                    "Index creation committed but coordinator application exceeded the metadata deadline");
+                response["shards_acknowledged"] = serde_json::Value::Bool(false);
+            } else {
+                return Err(error);
+            }
+        }
         Ok(response)
     }
 
@@ -1171,11 +1432,11 @@ impl TransportClient {
         let resp = client
             .add_mappings(request)
             .await
-            .map_err(|e| anyhow::anyhow!("AddMappings RPC: {e}"))?;
-        let inner = resp.into_inner();
-        if !inner.error.is_empty() {
-            return Err(anyhow::anyhow!("{}", inner.error));
+            .context("AddMappings RPC")?;
+        if !resp.get_ref().error.is_empty() {
+            return Err(anyhow::anyhow!("{}", resp.get_ref().error));
         }
+        self.observe_response_state(&resp, "AddMappings", index_name)?;
         Ok(())
     }
 
@@ -1285,14 +1546,34 @@ impl TransportClient {
         &self,
         node: &NodeInfo,
     ) -> Result<HashMap<(String, u32), u64>, anyhow::Error> {
+        self.fetch_shard_stats(node, None).await
+    }
+
+    pub(crate) async fn get_index_shard_stats(
+        &self,
+        node: &NodeInfo,
+        index_name: &str,
+    ) -> Result<HashMap<(String, u32), u64>, anyhow::Error> {
+        self.fetch_shard_stats(node, Some(index_name)).await
+    }
+
+    async fn fetch_shard_stats(
+        &self,
+        node: &NodeInfo,
+        index_name: Option<&str>,
+    ) -> Result<HashMap<(String, u32), u64>, anyhow::Error> {
         let mut client = self
             .connect(&node.host, node.transport_port)
             .await
             .map_err(|e| anyhow::anyhow!("connect to {}: {}", node.id, e))?;
+        let request = match index_name {
+            Some(index) => self.forwarding_request(ShardStatsRequest {}, index, None),
+            None => tonic::Request::new(ShardStatsRequest {}),
+        };
         let resp = client
-            .get_shard_stats(tonic::Request::new(ShardStatsRequest {}))
+            .get_shard_stats(request)
             .await
-            .map_err(|e| anyhow::anyhow!("GetShardStats RPC to {}: {}", node.id, e))?;
+            .with_context(|| format!("GetShardStats RPC to {}", node.id))?;
         let inner = resp.into_inner();
         let map = inner
             .shards
@@ -1315,7 +1596,7 @@ impl TransportClient {
         let resp = client
             .get_segment_stats(tonic::Request::new(SegmentStatsRequest {}))
             .await
-            .map_err(|e| anyhow::anyhow!("GetSegmentStats RPC to {}: {}", node.id, e))?;
+            .with_context(|| format!("GetSegmentStats RPC to {}", node.id))?;
         let inner = resp.into_inner();
         Ok(inner
             .segments
@@ -1345,11 +1626,15 @@ impl TransportClient {
             .await
             .map_err(|e| anyhow::anyhow!("connect to {}: {}", node.id, e))?;
         let resp = client
-            .refresh_index(tonic::Request::new(IndexMaintenanceRequest {
-                index_name: index_name.to_string(),
-            }))
+            .refresh_index(self.forwarding_request(
+                IndexMaintenanceRequest {
+                    index_name: index_name.to_string(),
+                },
+                index_name,
+                None,
+            ))
             .await
-            .map_err(|e| anyhow::anyhow!("RefreshIndex RPC to {}: {}", node.id, e))?;
+            .with_context(|| format!("RefreshIndex RPC to {}", node.id))?;
         let inner = resp.into_inner();
         Ok((inner.successful_shards, inner.failed_shards))
     }
@@ -1365,11 +1650,15 @@ impl TransportClient {
             .await
             .map_err(|e| anyhow::anyhow!("connect to {}: {}", node.id, e))?;
         let resp = client
-            .flush_index(tonic::Request::new(IndexMaintenanceRequest {
-                index_name: index_name.to_string(),
-            }))
+            .flush_index(self.forwarding_request(
+                IndexMaintenanceRequest {
+                    index_name: index_name.to_string(),
+                },
+                index_name,
+                None,
+            ))
             .await
-            .map_err(|e| anyhow::anyhow!("FlushIndex RPC to {}: {}", node.id, e))?;
+            .with_context(|| format!("FlushIndex RPC to {}", node.id))?;
         let inner = resp.into_inner();
         Ok((inner.successful_shards, inner.failed_shards))
     }
@@ -1386,12 +1675,16 @@ impl TransportClient {
             .await
             .map_err(|e| anyhow::anyhow!("connect to {}: {}", node.id, e))?;
         let resp = client
-            .force_merge_index(tonic::Request::new(ForceMergeRequest {
-                index_name: index_name.to_string(),
-                max_num_segments,
-            }))
+            .force_merge_index(self.forwarding_request(
+                ForceMergeRequest {
+                    index_name: index_name.to_string(),
+                    max_num_segments,
+                },
+                index_name,
+                None,
+            ))
             .await
-            .map_err(|e| anyhow::anyhow!("ForceMergeIndex RPC to {}: {}", node.id, e))?;
+            .with_context(|| format!("ForceMergeIndex RPC to {}", node.id))?;
         Ok(resp.into_inner().task_id)
     }
 

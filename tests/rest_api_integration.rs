@@ -23,6 +23,10 @@ use tempfile::TempDir;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 
+fn forwarding_request<T>(message: T) -> tonic::Request<T> {
+    ferrissearch::transport::request_with_cluster_state_version(message, 0)
+}
+
 const RESERVED_METADATA_KEYS_FOR_TEST: &[&str] = &[
     "_id",
     "_doc_id",
@@ -671,6 +675,19 @@ impl MultiNodeRestHarness {
             nodes,
             _shared_remote_store: shared_remote_store,
         };
+        let leader = &harness.nodes[0].app_state.raft;
+        for (offset, node) in harness.nodes.iter().enumerate().skip(1) {
+            leader
+                .add_learner(
+                    offset as u64 + 1,
+                    openraft::BasicNode {
+                        addr: node.transport_addr.to_string(),
+                    },
+                    true,
+                )
+                .await?;
+        }
+        leader.change_membership([1, 2, 3], false).await?;
         harness.wait_until_ready().await?;
         Ok(harness)
     }
@@ -2029,7 +2046,7 @@ async fn writes_regression_cas_rejects_recreated_index_with_matching_document_to
     let mut client =
         InternalTransportClient::connect(format!("http://{}", harness.transport_addr)).await?;
     let result = client
-        .index_doc(tonic::Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: index.into(),
             shard_id: 0,
             doc_id: "same".into(),
@@ -2050,7 +2067,7 @@ async fn writes_regression_cas_rejects_recreated_index_with_matching_document_to
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(missing["_index_uuid"], new_uuid);
     let missing_upsert = client
-        .index_doc(tonic::Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: index.into(),
             shard_id: 0,
             doc_id: "missing".into(),
@@ -2073,7 +2090,7 @@ async fn writes_regression_cas_rejects_recreated_index_with_matching_document_to
     assert_eq!(after["_seq_no"], current_document["_seq_no"]);
     assert_eq!(after["_primary_term"], current_document["_primary_term"]);
     let valid = client
-        .index_doc(tonic::Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: index.into(),
             shard_id: 0,
             doc_id: "same".into(),
@@ -2095,7 +2112,7 @@ async fn writes_regression_cas_rejects_recreated_index_with_matching_document_to
     let (status, _) = harness.delete_json("/index-incarnation").await?;
     assert_eq!(status, StatusCode::OK);
     let disappeared = client
-        .index_doc(tonic::Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: index.into(),
             shard_id: 0,
             doc_id: "same".into(),
@@ -6746,14 +6763,12 @@ async fn remote_store_search_fans_out_from_master_only_coordinator() -> Result<(
         .get("remotedist")
         .cloned()
         .expect("leader should hold remotedist metadata");
-    // This harness intentionally uses isolated in-memory Raft instances rather
-    // than a fully replicated cluster, so seed follower metadata explicitly.
-    // The leaf-side metadata dependency itself is covered directly in the
-    // transport regression `search_remote_store_splits_requires_local_index_metadata`.
+    // Wait for the real followers rather than installing metadata outside Raft.
     for node in harness.nodes.iter().skip(1) {
-        let mut cluster_state = node.app_state.cluster_manager.get_state();
-        cluster_state.add_index(metadata.clone());
-        node.app_state.cluster_manager.update_state(cluster_state);
+        node.app_state
+            .cluster_manager
+            .wait_for_version(coordinator.app_state.cluster_manager.version())
+            .await?;
     }
 
     let (publish_status, publish_body) = post_json_to_base_url(

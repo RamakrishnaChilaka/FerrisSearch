@@ -518,6 +518,26 @@ fn parse_replica_index_source(
 
 #[tonic::async_trait]
 impl InternalTransport for TransportService {
+    async fn open_index(
+        &self,
+        request: Request<IndexMaintenanceRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        self.wait_for_forwarded_state(&request, Some(&request.get_ref().index_name), None, None)
+            .await?;
+        let index_name = request.into_inner().index_name;
+        tokio::time::timeout(
+            self.cluster_manager.primary_open_wait_timeout(),
+            self.open_local_index_primaries(&index_name),
+        )
+        .await
+        .map_err(|error| {
+            Status::unavailable(format!(
+                "timed out opening primary shards for index [{index_name}]: {error}"
+            ))
+        })??;
+        Ok(Response::new(Empty {}))
+    }
+
     type SqlRecordBatchStreamStream =
         Pin<Box<dyn Stream<Item = Result<SqlRecordBatchResponse, Status>> + Send + 'static>>;
 
@@ -657,13 +677,25 @@ impl InternalTransport for TransportService {
             ));
         }
         self.cluster_manager.ping_node(&req.source_node_id);
-        Ok(Response::new(Empty {}))
+        Ok(
+            crate::transport::state_wait::response_with_cluster_state_version(
+                Empty {},
+                self.cluster_manager.version(),
+            ),
+        )
     }
 
     async fn index_doc(
         &self,
         request: Request<ShardDocRequest>,
     ) -> Result<Response<ShardDocResponse>, Status> {
+        self.wait_for_forwarded_state(
+            &request,
+            Some(&request.get_ref().index_name),
+            Some((request.get_ref().shard_id, true)),
+            request.get_ref().index_uuid.as_deref(),
+        )
+        .await?;
         let req = request.into_inner();
         let condition =
             primary_write_condition(req.if_seq_no, req.if_primary_term, req.create_only)?;
@@ -1083,6 +1115,13 @@ impl InternalTransport for TransportService {
         &self,
         request: Request<ShardBulkRequest>,
     ) -> Result<Response<ShardBulkResponse>, Status> {
+        self.wait_for_forwarded_state(
+            &request,
+            Some(&request.get_ref().index_name),
+            Some((request.get_ref().shard_id, true)),
+            None,
+        )
+        .await?;
         let req = request.into_inner();
         if !req.operations.is_empty() {
             if req.operations.len() != req.documents_json.len() {
@@ -1460,6 +1499,13 @@ impl InternalTransport for TransportService {
         &self,
         request: Request<ShardDeleteRequest>,
     ) -> Result<Response<ShardDeleteResponse>, Status> {
+        self.wait_for_forwarded_state(
+            &request,
+            Some(&request.get_ref().index_name),
+            Some((request.get_ref().shard_id, true)),
+            None,
+        )
+        .await?;
         let req = request.into_inner();
         let condition = primary_write_condition(req.if_seq_no, req.if_primary_term, false)?;
         let activated_primary = match self
@@ -1763,6 +1809,13 @@ impl InternalTransport for TransportService {
         &self,
         request: Request<ShardGetRequest>,
     ) -> Result<Response<ShardGetResponse>, Status> {
+        self.wait_for_forwarded_state(
+            &request,
+            Some(&request.get_ref().index_name),
+            Some((request.get_ref().shard_id, false)),
+            None,
+        )
+        .await?;
         let req = request.into_inner();
         let index_uuid = self
             .cluster_manager
@@ -1834,6 +1887,13 @@ impl InternalTransport for TransportService {
         &self,
         request: Request<ShardSearchRequest>,
     ) -> Result<Response<ShardSearchResponse>, Status> {
+        self.wait_for_forwarded_state(
+            &request,
+            Some(&request.get_ref().index_name),
+            Some((request.get_ref().shard_id, false)),
+            None,
+        )
+        .await?;
         let req = request.into_inner();
         let engine = self
             .get_or_open_search_shard(&req.index_name, req.shard_id)
@@ -1876,6 +1936,13 @@ impl InternalTransport for TransportService {
         &self,
         request: Request<ShardSearchDslRequest>,
     ) -> Result<Response<ShardSearchResponse>, Status> {
+        self.wait_for_forwarded_state(
+            &request,
+            Some(&request.get_ref().index_name),
+            Some((request.get_ref().shard_id, false)),
+            None,
+        )
+        .await?;
         let req = request.into_inner();
         let engine = self
             .get_or_open_search_shard(&req.index_name, req.shard_id)
@@ -1955,6 +2022,13 @@ impl InternalTransport for TransportService {
         &self,
         request: Request<RemoteStoreLeafStatusRequest>,
     ) -> Result<Response<RemoteStoreLeafStatusResponse>, Status> {
+        self.wait_for_forwarded_state(
+            &request,
+            Some(&request.get_ref().index_name),
+            None,
+            Some(&request.get_ref().index_uuid),
+        )
+        .await?;
         let req = request.into_inner();
         let split_plans: Vec<_> = req
             .splits
@@ -1997,6 +2071,13 @@ impl InternalTransport for TransportService {
         &self,
         request: Request<RemoteStoreSearchRequest>,
     ) -> Result<Response<RemoteStoreSearchResponse>, Status> {
+        self.wait_for_forwarded_state(
+            &request,
+            Some(&request.get_ref().index_name),
+            None,
+            Some(&request.get_ref().index_uuid),
+        )
+        .await?;
         let req = request.into_inner();
         let metadata = self
             .cluster_manager
@@ -2087,6 +2168,13 @@ impl InternalTransport for TransportService {
         &self,
         request: Request<SqlRecordBatchRequest>,
     ) -> Result<Response<SqlRecordBatchResponse>, Status> {
+        self.wait_for_forwarded_state(
+            &request,
+            Some(&request.get_ref().index_name),
+            Some((request.get_ref().shard_id, false)),
+            None,
+        )
+        .await?;
         let req = request.into_inner();
         let engine = match self
             .get_or_open_search_shard(&req.index_name, req.shard_id)
@@ -2150,6 +2238,13 @@ impl InternalTransport for TransportService {
         &self,
         request: Request<SqlRecordBatchRequest>,
     ) -> Result<Response<Self::SqlRecordBatchStreamStream>, Status> {
+        self.wait_for_forwarded_state(
+            &request,
+            Some(&request.get_ref().index_name),
+            Some((request.get_ref().shard_id, false)),
+            None,
+        )
+        .await?;
         enum SqlStreamSource {
             Lazy(crate::engine::SqlStreamingBatchHandle),
             Buffered {
@@ -3144,10 +3239,15 @@ impl InternalTransport for TransportService {
         }
 
         if !changed {
-            return Ok(Response::new(UpdateSettingsResponse {
-                acknowledged: true,
-                error: String::new(),
-            }));
+            return Ok(
+                crate::transport::state_wait::response_with_cluster_state_version(
+                    UpdateSettingsResponse {
+                        acknowledged: true,
+                        error: String::new(),
+                    },
+                    self.cluster_manager.version(),
+                ),
+            );
         }
 
         // This RPC should only be handled by the leader
@@ -3169,14 +3269,21 @@ impl InternalTransport for TransportService {
             .map_err(|e| Status::internal(format!("Raft write failed: {e}")))?;
 
         // Apply settings to local engines
+        self.transport_client
+            .acknowledge_state(index_name, self.cluster_manager.version());
         self.shard_manager
             .apply_settings(index_name, &metadata.settings);
 
         tracing::info!("gRPC: updated settings for index '{}'", index_name);
-        Ok(Response::new(UpdateSettingsResponse {
-            acknowledged: true,
-            error: String::new(),
-        }))
+        Ok(
+            crate::transport::state_wait::response_with_cluster_state_version(
+                UpdateSettingsResponse {
+                    acknowledged: true,
+                    error: String::new(),
+                },
+                self.cluster_manager.version(),
+            ),
+        )
     }
 
     async fn mark_replica_in_sync(
@@ -3583,9 +3690,21 @@ impl InternalTransport for TransportService {
             .await
             .map_err(|e| Status::internal(format!("Raft write failed: {e}")))?;
 
+        let committed_version = self.cluster_manager.version();
+        self.transport_client
+            .acknowledge_state(index_name, committed_version);
+        let shards_acknowledged = crate::transport::primary_open::wait_for_index_primaries(
+            &self.cluster_manager,
+            &self.shard_manager,
+            &self.transport_client,
+            &self.local_node_id,
+            index_name,
+        )
+        .await;
+
         let resp_json = serde_json::to_vec(&serde_json::json!({
             "acknowledged": true,
-            "shards_acknowledged": true,
+            "shards_acknowledged": shards_acknowledged,
             "index": index_name
         }))
         .map_err(|e| Status::internal(format!("serialize create index response: {e}")))?;
@@ -3598,11 +3717,16 @@ impl InternalTransport for TransportService {
             num_replicas
         );
 
-        Ok(Response::new(CreateIndexResponse {
-            acknowledged: true,
-            error: String::new(),
-            response_json: resp_json,
-        }))
+        Ok(
+            crate::transport::state_wait::response_with_cluster_state_version(
+                CreateIndexResponse {
+                    acknowledged: true,
+                    error: String::new(),
+                    response_json: resp_json,
+                },
+                committed_version,
+            ),
+        )
     }
 
     async fn delete_index(
@@ -3775,16 +3899,23 @@ impl InternalTransport for TransportService {
         raft.client_write(cmd)
             .await
             .map_err(|e| Status::internal(format!("Raft AddMappings failed: {e}")))?;
+        self.transport_client
+            .acknowledge_state(&req.index_name, self.cluster_manager.version());
 
         tracing::info!(
             "gRPC: added {} dynamic mappings for index '{}'",
             req.new_fields.len(),
             req.index_name
         );
-        Ok(Response::new(AddMappingsResponse {
-            acknowledged: true,
-            error: String::new(),
-        }))
+        Ok(
+            crate::transport::state_wait::response_with_cluster_state_version(
+                AddMappingsResponse {
+                    acknowledged: true,
+                    error: String::new(),
+                },
+                self.cluster_manager.version(),
+            ),
+        )
     }
 
     // ─── Dynamic Security Control Plane ───────────────────────────────────────
@@ -3946,6 +4077,8 @@ impl InternalTransport for TransportService {
         &self,
         _request: Request<ShardStatsRequest>,
     ) -> Result<Response<ShardStatsResponse>, Status> {
+        self.wait_for_forwarded_state(&_request, None, None, None)
+            .await?;
         let all = self.shard_manager.all_shards();
         let shards = all
             .iter()
@@ -3962,6 +4095,8 @@ impl InternalTransport for TransportService {
         &self,
         _request: Request<SegmentStatsRequest>,
     ) -> Result<Response<SegmentStatsResponse>, Status> {
+        self.wait_for_forwarded_state(&_request, None, None, None)
+            .await?;
         let all = self.shard_manager.all_shards();
         let mut segments = Vec::new();
         for (key, engine) in &all {
@@ -3984,6 +4119,8 @@ impl InternalTransport for TransportService {
         &self,
         request: Request<IndexMaintenanceRequest>,
     ) -> Result<Response<IndexMaintenanceResponse>, Status> {
+        self.wait_for_forwarded_state(&request, Some(&request.get_ref().index_name), None, None)
+            .await?;
         let index_name = request.into_inner().index_name;
         let (successful, failed) = run_maintenance_on_assigned_shards_async(
             self.cluster_manager.clone(),
@@ -4003,6 +4140,8 @@ impl InternalTransport for TransportService {
         &self,
         request: Request<IndexMaintenanceRequest>,
     ) -> Result<Response<IndexMaintenanceResponse>, Status> {
+        self.wait_for_forwarded_state(&request, Some(&request.get_ref().index_name), None, None)
+            .await?;
         let index_name = request.into_inner().index_name;
         let (successful, failed) = run_maintenance_on_assigned_shards_async(
             self.cluster_manager.clone(),
@@ -4022,6 +4161,8 @@ impl InternalTransport for TransportService {
         &self,
         request: Request<ForceMergeRequest>,
     ) -> Result<Response<ForceMergeResponse>, Status> {
+        self.wait_for_forwarded_state(&request, Some(&request.get_ref().index_name), None, None)
+            .await?;
         let inner = request.into_inner();
         if inner.max_num_segments == 0 {
             return Err(Status::invalid_argument(
@@ -4175,6 +4316,122 @@ impl InternalTransport for TransportService {
 }
 
 impl TransportService {
+    async fn wait_for_forwarded_state<T>(
+        &self,
+        request: &Request<T>,
+        index_name: Option<&str>,
+        shard: Option<(u32, bool)>,
+        pinned_uuid: Option<&str>,
+    ) -> Result<(), Status> {
+        use crate::transport::state_wait::*;
+        let decode_error = |error: anyhow::Error| Status::invalid_argument(format!("{error:#}"));
+        let version =
+            if self.raft.is_none() && !request.metadata().contains_key(STATE_VERSION_HEADER) {
+                0
+            } else {
+                decode_state_version(request.metadata()).map_err(decode_error)?
+            };
+        let scope =
+            decode_optional_text(request.metadata(), INDEX_NAME_HEADER).map_err(decode_error)?;
+        if let (Some(payload_index), Some(scope_index)) = (index_name, scope.as_deref())
+            && payload_index != scope_index
+        {
+            return Err(Status::invalid_argument(
+                "forwarded index context does not match the request",
+            ));
+        }
+        let index_name = index_name.or(scope.as_deref());
+        let floor = decode_optional_u64(request.metadata(), INDEX_STATE_FLOOR_HEADER)
+            .map_err(decode_error)?
+            .unwrap_or(0);
+        let uuid =
+            decode_optional_text(request.metadata(), INDEX_UUID_HEADER).map_err(decode_error)?;
+        let expected_uuid = pinned_uuid.or(uuid.as_deref());
+        let term =
+            decode_optional_u64(request.metadata(), PRIMARY_TERM_HEADER).map_err(decode_error)?;
+        let allocation =
+            decode_optional_u64(request.metadata(), ALLOCATION_ID_HEADER).map_err(decode_error)?;
+        if expected_uuid.is_some_and(str::is_empty) {
+            return Err(Status::invalid_argument("forwarded index UUID is empty"));
+        }
+        let Some(index_name) = index_name else {
+            if floor != 0 || uuid.is_some() || term.is_some() || allocation.is_some() {
+                return Err(Status::invalid_argument(
+                    "index-scoped context requires an index",
+                ));
+            }
+            return Ok(());
+        };
+        if shard.is_none() && (term.is_some() || allocation.is_some()) {
+            return Err(Status::invalid_argument("shard context requires a shard"));
+        }
+        let deadline = tokio::time::Instant::now() + self.cluster_manager.forwarding_wait_timeout();
+        loop {
+            let applied = self.cluster_manager.version();
+            if applied >= floor && applied >= version {
+                return Ok(());
+            }
+            let state = self.cluster_manager.get_state();
+            let validation_failure = (|| {
+                let metadata = state.indices.get(index_name).ok_or_else(|| {
+                    format!("index [{index_name}] is not present in local cluster state")
+                })?;
+                if let Some(expected_uuid) = expected_uuid
+                    && metadata.uuid.as_str() != expected_uuid
+                {
+                    return Err(format!("index [{index_name}] UUID mismatch: expected [{expected_uuid}], applied [{}]", metadata.uuid));
+                }
+                if let Some((shard_id, primary_only)) = shard {
+                    let routing = metadata.shard_routing.get(&shard_id).ok_or_else(|| {
+                        format!("shard [{index_name}][{shard_id}] is not present in local cluster state")
+                    })?;
+                    if routing.primary != self.local_node_id
+                        && (primary_only || !routing.is_replica_in_sync(&self.local_node_id))
+                    {
+                        return Err(format!("node [{}] is not an authoritative {} for shard [{index_name}][{shard_id}]",
+                            self.local_node_id, if primary_only { "primary" } else { "copy" }));
+                    }
+                    let applied_allocation = state.shard_allocation_id(index_name, shard_id, &self.local_node_id)
+                        .ok_or_else(|| format!("shard [{index_name}][{shard_id}] has no local allocation identity"))?;
+                    if let Some(expected) = allocation && applied_allocation != expected {
+                        return Err(format!("shard [{index_name}][{shard_id}] allocation mismatch: expected [{expected}], applied [{applied_allocation}]"));
+                    }
+                    if let Some(expected) = term && routing.primary_term < expected {
+                        return Err(format!("shard [{index_name}][{shard_id}] primary term is behind: expected [{expected}], applied [{}]", routing.primary_term));
+                    }
+                }
+                Ok::<_, String>(())
+            })().err();
+            if state.version >= floor && (validation_failure.is_none() || state.version >= version)
+            {
+                return Ok(());
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(Status::unavailable(format!(
+                    "{STATE_WAIT_STATUS_PREFIX}index [{index_name}] requires acknowledged version {floor} or routing version {version}; applied version is {}: {}",
+                    state.version,
+                    validation_failure
+                        .as_deref()
+                        .unwrap_or("index metadata acknowledgement has not applied"),
+                )));
+            }
+            tokio::time::sleep_until(deadline.min(now + std::time::Duration::from_millis(25)))
+                .await;
+        }
+    }
+
+    async fn open_local_index_primaries(&self, index_name: &str) -> Result<(), Status> {
+        crate::transport::primary_open::open_local_index_primaries(
+            &self.cluster_manager,
+            &self.shard_manager,
+            &self.local_node_id,
+            index_name,
+        )
+        .await
+        .map_err(|error| Status::unavailable(format!("{error:#}")))
+    }
+
     #[cfg(feature = "protocol-trace")]
     fn record_protocol_trace_replica_rejection(
         &self,
@@ -6258,6 +6515,8 @@ impl TransportService {
                     "Raft AddMappings failed for index '{index_name}': {e}"
                 ))
             })?;
+            self.transport_client
+                .acknowledge_state(index_name, self.cluster_manager.version());
         } else {
             let cs = self.cluster_manager.get_state();
             if let Some(master_id) = cs.master_node.as_ref()
@@ -6381,6 +6640,7 @@ fn build_transport_service_for_test(
     task_manager: Arc<crate::tasks::TaskManager>,
     local_node_id: String,
 ) -> TransportService {
+    let transport_client = transport_client.with_cluster_manager(cluster_manager.clone());
     #[cfg(feature = "protocol-trace")]
     {
         cluster_manager.set_protocol_trace_node(local_node_id.clone());
@@ -6515,6 +6775,7 @@ pub(crate) fn create_transport_service_with_raft_and_storage_handle(
     remote_store_resources: RemoteStoreTransportResources,
     local_node_id: String,
 ) -> (InternalTransportServer<TransportService>, TransportService) {
+    let transport_client = transport_client.with_cluster_manager(cluster_manager.clone());
     #[cfg(feature = "protocol-trace")]
     {
         cluster_manager.set_protocol_trace_node(local_node_id.clone());

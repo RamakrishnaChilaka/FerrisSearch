@@ -22,6 +22,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Barrier;
 
+fn forwarding_request<T>(message: T) -> tonic::Request<T> {
+    ferrissearch::transport::request_with_cluster_state_version(message, 0)
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 fn make_node(id: &str) -> NodeInfo {
@@ -1101,21 +1105,25 @@ async fn start_raft_grpc_server(
     raft: Arc<consensus::types::RaftInstance>,
     state_handle: Arc<std::sync::RwLock<ferrissearch::cluster::state::ClusterState>>,
 ) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
     let cm = Arc::new(ClusterManager::with_shared_state(state_handle));
-    // Add a data node so create_index has nodes to assign shards to
-    {
-        let mut s = cm.get_state();
-        s.add_node(NodeInfo {
-            id: "data-1".into(),
-            name: "data-1".into(),
+    raft.client_write(ClusterCommand::AddNode {
+        node: NodeInfo {
+            id: "node-1".into(),
+            name: "node-1".into(),
             host: "127.0.0.1".into(),
-            transport_port: 9300,
-            http_port: 9200,
-            roles: vec![NodeRole::Data],
-            raft_node_id: 0,
-        });
-        cm.update_state(s);
-    }
+            transport_port: addr.port(),
+            http_port: 0,
+            roles: vec![NodeRole::Master, NodeRole::Data],
+            raft_node_id: 1,
+        },
+    })
+    .await
+    .unwrap()
+    .data
+    .into_result()
+    .unwrap();
     let dir = tempfile::tempdir().unwrap();
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
     let tc = TransportClient::new();
@@ -1123,8 +1131,6 @@ async fn start_raft_grpc_server(
     let service =
         create_transport_service_with_raft(cm, sm, tc, raft, task_manager, "node-1".into());
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
     tokio::spawn(async move {
@@ -2026,7 +2032,7 @@ async fn first_write_after_transport_restart_reactivates_primary() {
 
     for doc_id in ["first", "same-incarnation"] {
         let response = first_client
-            .index_doc(tonic::Request::new(ShardDocRequest {
+            .index_doc(forwarding_request(ShardDocRequest {
                 index_name: "restart-activation".into(),
                 shard_id: 0,
                 payload_json: serde_json::to_vec(&serde_json::json!({"value": doc_id})).unwrap(),
@@ -2057,7 +2063,7 @@ async fn first_write_after_transport_restart_reactivates_primary() {
     .await;
     let mut second_client = connect_grpc(second_addr).await;
     let response = second_client
-        .index_doc(tonic::Request::new(ShardDocRequest {
+        .index_doc(forwarding_request(ShardDocRequest {
             index_name: "restart-activation".into(),
             shard_id: 0,
             payload_json: serde_json::to_vec(&serde_json::json!({"value": "after-restart"}))

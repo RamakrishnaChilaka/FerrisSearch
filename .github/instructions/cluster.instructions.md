@@ -157,6 +157,22 @@ pub struct ClusterManager { state: Arc<RwLock<ClusterState>> }
 ```
 - `new(cluster_name)` / `with_shared_state(state)` — Raft SM shares the same `Arc<RwLock<ClusterState>>`
 - `get_state() -> ClusterState` — cloned snapshot (read lock)
+- `version()` reads only the applied version under the shared read lock.
+  `with_state()` extracts coherent forwarding context under that lock without
+  cloning the full cluster state.
+  `wait_for_version()` waits asynchronously for a minimum applied
+  `ClusterState.version`, with a 5-second deadline and 25 ms polling.
+  The version comes from successful Raft mutations and snapshots; it is not
+  a second sequencing authority. A wait never changes local state.
+- Forwarding clients bind to this same manager, not a copied snapshot.
+  Applied versions are routing hints; healthy index/shard validation must not
+  wait for unrelated changes. Explicit acknowledgement floors are per index.
+  On timeout, preserve the required and observed versions. Raft applies and
+  control-plane futures stay on Tokio; engine opens remain on the blocking
+  pool.
+- `primary_open_wait_timeout()` provides a separate 20-second opening budget,
+  not the 5-second metadata budget. Readiness failure after CreateIndex commits
+  changes `shards_acknowledged` to false, not the committed acknowledgement.
 - `add_node(node)`, `ping_node(node_id)`
 - `update_state(new_state)` — full overwrite, preserves `last_seen`
 - **WARNING**: `update_state()` should never replace Raft-managed state.

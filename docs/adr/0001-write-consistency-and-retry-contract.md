@@ -351,6 +351,33 @@ primary's UUID across its GET/CAS cycle and every conflict retry. The primary
 rejects a missing or replaced incarnation before sequence assignment or WAL
 append, including requests delayed by the recovery barrier or write pool.
 
+**Forwarding metadata status (2026-10-01):** Coordinators carry their applied
+cluster-state version as a routing hint to shard targets. Targets validate local
+metadata first. They wait up to five seconds only when the hint is ahead and the
+index, UUID, shard routing, allocation ID, or primary term fails validation.
+Explicit metadata-acknowledgement floors are per index and fence subsequent
+operations from the acknowledging coordinator; unrelated index changes do not
+stall valid reads. A settings or mapping change acknowledged through another
+coordinator is not fenced, so a lagging target can still serve requests with the
+older settings or mappings.
+A metadata-wait deadline
+returns `503 shard_not_available_exception` with required and observed versions,
+before document sequence assignment or WAL append. Bulk preserves that error
+per item; update does not continue from a failed realtime GET. Search, count,
+and SQL propagate the same deadline rather than returning incomplete results.
+Generic transport timeouts and connection loss remain potentially indeterminate
+and are not converted to retryable document 503s.
+
+Once creation commits, it remains acknowledged even if primary opening fails.
+Primary copies open concurrently under existing UUID/allocation guards, with
+at most four concurrent opens per node and a separate 20-second budget.
+Remote metadata catch-up can add up to five seconds. Readiness failure returns
+`shards_acknowledged: false` and logs the cause. Follower coordinator catch-up
+failure also preserves the committed acknowledgement. This is primary-only
+readiness, not a replica wait, an all-node state acknowledgement, or a new
+activation/fencing protocol. Generic transport failures still have an
+indeterminate commit outcome.
+
 Remaining: expose the existing internal version-map memory bound as an
 operator setting and add `_mget`. Neither is part of this implementation.
 
@@ -503,9 +530,12 @@ A write parameter that changes safety semantics and is not implemented returns
 - **Active copies:** accept `wait_for_active_shards` only when absent or
   exactly `1`; bulk metadata also accepts numeric `1`. Reject `all` even
   with zero replicas, higher counts, zero, empty, and invalid values.
-  This preserves the default without adding an active-copy wait or
-  pre-flight protocol. Primary availability checks still gate document
-  writes. Implement a pre-flight check before accepting other values.
+  Index creation attempts bounded primary opening and reports
+  `shards_acknowledged: false` if readiness fails after commit.
+  Document and bulk writes
+  keep their existing activation and synchronous in-sync replication paths
+  without a replica-count pre-flight protocol. Implement additional active-copy
+  checks before accepting other values.
 - **Benign options:** keep accepting `timeout`, `pretty`, `human`,
   `error_trace`, and `filter_path`. GET parameter handling, including
   `_source` filtering options and `realtime`, is unchanged. Acceptance

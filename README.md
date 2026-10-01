@@ -78,6 +78,21 @@ Any HTTP node can accept a request. FerrisSearch forwards leader-only metadata
 mutations and shard-owned operations internally, so clients do not have to
 discover the Raft leader or shard primary.
 
+Forwarded operations validate local metadata first. A target waits up to five
+seconds only when the coordinator has applied newer metadata and the target's
+index, UUID, shard routing, allocation, or primary term doesn't match the
+request yet. Explicit metadata-acknowledgement floors are scoped to the index,
+so unrelated changes do not stall valid reads. A coordinator's floor covers
+only the changes acknowledged through it. After a settings or mapping change
+acknowledged through another coordinator, a lagging target can still serve
+requests with the older settings or mappings. If a metadata wait expires, the
+operation returns a retryable `503 shard_not_available_exception` with the
+cause; bulk reports the 503 per item. Once index creation commits, it returns
+`acknowledged: true`. Primary opening has a separate 20-second budget, plus
+up to five seconds for remote metadata catch-up. Slow or failed opening returns
+`shards_acknowledged: false`, not a failed create. Creation does not wait for
+replicas or for every node to apply the state.
+
 ### Two useful execution paths—and one intended future
 
 | Engine | What exists now | Write path | Query path |

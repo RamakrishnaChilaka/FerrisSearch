@@ -7,6 +7,37 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[test]
+fn forwarding_metadata_timeout_is_retryable_but_ambiguous_rpc_timeouts_are_not() {
+    for status in [
+        tonic::Status::unavailable("connection lost after write"),
+        tonic::Status::deadline_exceeded("request timed out"),
+    ] {
+        assert_eq!(
+            forwarded_write_error_classification(&anyhow::Error::new(status)),
+            (StatusCode::INTERNAL_SERVER_ERROR, "forward_exception")
+        );
+    }
+    let error = anyhow::Error::new(tonic::Status::unavailable(format!(
+        "{}timed out waiting for local cluster state version 7; applied version is 6",
+        crate::transport::state_wait::STATE_WAIT_STATUS_PREFIX,
+    )))
+    .context("IndexDoc RPC");
+    assert_eq!(
+        forwarded_write_error_classification(&error),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "shard_not_available_exception"
+        )
+    );
+    let (_, Json(body)) = document_write_error_response("Forward", error);
+    assert!(
+        body["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("applied version is 6")
+    );
+}
+#[test]
 fn d1_commit3_version_map_capacity_is_retryable_429() {
     let unrelated = anyhow::Error::new(tonic::Status::resource_exhausted("worker queue full"));
     assert_eq!(
