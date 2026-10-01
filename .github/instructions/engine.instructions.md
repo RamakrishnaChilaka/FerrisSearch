@@ -207,6 +207,24 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
 - **Dynamic fields**: creates Tantivy fields on first encounter
 - **`body` field**: catch-all for unmapped textual content
 - `matching_doc_ids(clause)` — returns doc ID set for k-NN pre-filtering
+- Build every `HotEngine` reader with `ReloadPolicy::Manual`, including
+  remote-split readers and test fixtures. Route every reload through
+  `HotEngine::reload_reader()`. Its shard-local mutex covers both opening
+  segments and publishing the searcher, so an older reload cannot replace a
+  newer reader. Do not enable Tantivy's commit watcher.
+- The reader-reload mutex is a leaf lock. Callers may already hold vector
+  recovery, maintenance, translog, or writer locks. The helper acquires no
+  other engine locks and releases its mutex before version-map access.
+  Never reload while holding the version-map lock. Search and realtime GET
+  borrow searchers without taking the reload mutex.
+- A commit alone does not publish search visibility. Refresh publishes before
+  retiring old versions or pruning covered tombstones. Preserve the existing
+  explicit publication during flush, force merge, and replay: flush needs a
+  covering reader before WAL pruning. Ordinary peer-snapshot commits export
+  committed index files and leave search publication to the next refresh.
+  Protocol-trace snapshot capture explicitly reloads through the same helper.
+  If snapshot creation must repair stale vectors, the composite engine first
+  publishes that commit so the rebuild includes its updates and deletes.
 - `replay_translog()` and failed-writer reconstruction share the same WAL-suffix
   replay helper. They stream entries via `for_each_from()` starting at the
   persisted committed checkpoint.
