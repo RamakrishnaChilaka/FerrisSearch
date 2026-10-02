@@ -134,11 +134,17 @@ applyTo: "src/hybrid/**,src/api/search/**,src/engine/tantivy.rs"
   stream entry points, and retain DataFusion's final LIMIT/OFFSET execution.
 
 ## Planning Rules
-- Validate direct field/literal comparisons inside residual WHERE clauses on
-  the search pool with the canonical schema and shared typed-term conversion.
-  Mixed OR/LIKE, negation, IN, or BETWEEN must not evade numeric/date validation
-  merely because the whole predicate cannot be pushed into Tantivy. This is
-  validation only; do not force those predicates into execution pushdown.
+- Validate applicable string literals in direct mapped numeric/date comparisons
+  inside residual WHERE clauses on the search pool. Numeric literals stay under
+  DataFusion's coercion rules: do not subject fractions or large residual
+  numeric literals to Tantivy's signed-integer domain. Date strings also accept
+  SQL-style `YYYY-MM-DD HH:MM:SS[.f]` timestamps without altering the execution
+  SQL; malformed numeric/date strings still fail with their query cause.
+  Preserve alias guards, including derived aliases shadowing mapped fields.
+  This is validation only, never forced execution pushdown.
+- Pushed integer comparisons, IN, and BETWEEN reuse term/range conversion:
+  fractional equality matches nothing, IN ignores fractional entries, and
+  range bounds round upward/downward without changing integer identity.
 - Leave SQL NULL comparisons, NULL-bearing IN lists, and NULL-bounded BETWEEN
   residual so DataFusion retains three-valued semantics. SQL NULL is not an
   invalid numeric term, and must never become a text term for a numeric field.

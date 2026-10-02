@@ -1227,6 +1227,12 @@ impl SearchEngine for CompositeEngine {
         let guard = self.vector.read().unwrap_or_else(|e| e.into_inner());
         let vi = match *guard {
             Some(ref vi) => vi,
+            None if vector.is_empty() => {
+                return Err(tantivy::TantivyError::InvalidArgument(
+                    "Query vector must not be empty".to_string(),
+                )
+                .into());
+            }
             None => return Ok(vec![]),
         };
         let k = k.min(vi.len());
@@ -1610,6 +1616,25 @@ mod tests {
 
         let hits = engine.search_knn("embedding", &[1.0, 0.0, 0.0], 5).unwrap();
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn reviewed_empty_query_vector_is_invalid_without_a_native_index() {
+        let (_dir, engine) = create_engine();
+        for k in [0, 1, usize::MAX] {
+            let error = engine.search_knn("embedding", &[], k).unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<tantivy::TantivyError>(),
+                Some(tantivy::TantivyError::InvalidArgument(_))
+            ));
+            assert!(error.to_string().contains("empty"), "{error:#}");
+        }
+        assert!(
+            engine
+                .search_knn("embedding", &[1.0, 0.0], usize::MAX)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

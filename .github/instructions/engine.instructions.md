@@ -505,7 +505,7 @@ The `GroupedAggCollector` computes grouped analytics (GROUP BY + aggregate funct
 All Tantivy `Term` objects MUST match the schema field type. A mismatch can
 silently produce zero hits or panic in a fast-field range collector.
 
-Use the `typed_term()` helper for ALL term creation in queries:
+Use the shared schema-typed conversion helpers for all query terms:
 ```rust
 fn typed_term(&self, field: Field, value: &serde_json::Value) -> Result<Term> {
     // Checks schema via self.index.schema().get_field_entry(field).field_type()
@@ -513,21 +513,30 @@ fn typed_term(&self, field: Field, value: &serde_json::Value) -> Result<Term> {
 }
 ```
 
-**Where `typed_term()` is used:**
-- `QueryClause::Term` — exact match queries
-- `QueryClause::Terms` — a set of exact matches
-- `QueryClause::Range` — range bounds (gte/lte/gt/lt)
-- `QueryClause::Fuzzy` — fuzzy term construction
-- `search_after` — cursor equality and range bounds
+- `typed_query_term()` / `typed_query_term_for_schema`: exact term/set queries.
+  `None` means a valid fractional integer value that cannot equal any integer,
+  not a parse failure. Term queries use `EmptyQuery`; sets omit these values.
+- `typed_range_query_for_schema`: validates all supplied bounds and rounds
+  integer lower bounds upward / upper bounds downward. Preserve strictness for
+  integral values, including negative values and i64 extrema; an impossible
+  interval is `EmptyQuery`. Empty range conditions are classified query errors
+  before Tantivy.
+- `typed_term()` / `typed_term_for_schema`: fuzzy terms and cursor equality/
+  range terms, where integer cursor values must remain integral.
 
 Malformed Integer, Float, or Date values must fail with the existing
 `QueryParseError` classification and preserve the field, value, expected type,
 and parser cause. Never fall back to a text term for a numeric field.
 Floats must be finite. Integer JSON values use exact i64/u64 conversion, never
-a float round-trip; integral floating literals must be in the signed range,
-and fractional or out-of-range integer values are rejected.
-Reuse `typed_term_for_schema` when validating empty/pruned remote-store
-requests against their canonical mapping-derived schema.
+a float round-trip. Decimal integer strings also preserve exact integer digits.
+Fractional integer term/set/range values follow the query-specific rules above;
+out-of-range values remain errors. Date epoch milliseconds accept fractional
+values and truncate toward zero; retain the existing ISO 8601 DSL formats.
+Use the same schema helpers when validating empty/pruned remote-store requests
+against their canonical mapping-derived schema.
+Vector query dimension mismatches, including empty vectors, use
+`TantivyError::InvalidArgument` so local/transport shard classification returns
+400 when all shards fail. Validate dimensions before zero/candidate limits.
 
 **Common pitfall:** JSON integer `10` on a float field. `serde_json::Number::as_i64()` succeeds
 before `as_f64()`, creating the wrong term type. `typed_term()` checks the schema first to avoid this.

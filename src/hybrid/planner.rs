@@ -3482,7 +3482,7 @@ pub(crate) fn residual_predicate_validation_clauses(
         value: serde_json::Value,
         clauses: &mut Vec<crate::search::QueryClause>,
     ) {
-        if !value.is_null() && SyntheticColumn::parse(field).is_none() {
+        if value.is_string() && SyntheticColumn::parse(field).is_none() {
             clauses.push(crate::search::QueryClause::Term(HashMap::from([(
                 field.to_string(),
                 value,
@@ -3715,6 +3715,35 @@ fn flip_binary_operator(op: &BinaryOperator) -> BinaryOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reviewed_residual_validation_collects_strings_not_numeric_or_null_literals() {
+        let clauses = residual_predicate_validation_clauses(
+            "SELECT n FROM idx WHERE n >= 1.5 OR n < 18446744073709551615 \
+             OR n IN (1, 'abc', NULL) OR f BETWEEN 1.5 AND 'bad' OR n = 'text'",
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(clauses).unwrap(),
+            serde_json::json!([
+                {"term": {"n": "abc"}},
+                {"term": {"f": "bad"}},
+                {"term": {"n": "text"}}
+            ])
+        );
+    }
+
+    #[test]
+    fn reviewed_residual_validation_preserves_derived_alias_guards() {
+        let clauses = residual_predicate_validation_clauses(
+            "SELECT title AS n FROM idx WHERE n = 'abc' OR f >= '2.5'",
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(clauses).unwrap(),
+            serde_json::json!([{"term": {"f": "2.5"}}])
+        );
+    }
 
     #[test]
     fn synthetic_column_helper_identifies_internal_fields() {

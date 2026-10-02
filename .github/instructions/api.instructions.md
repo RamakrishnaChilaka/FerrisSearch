@@ -346,9 +346,15 @@ Large valid SQL LIMITs and search/kNN/terms sizes retain their normal result
 semantics through data-bounded collectors, not a new result-window cap.
 Sort/explicit SQL ORDER BY lists wider than 64 fields return HTTP 400 before
 cursor expansion or per-hit sort annotation.
-Validate typed literal comparisons in residual SQL before DataFusion, including
-mixed OR/LIKE and negated predicates. Preserve SQL NULL semantics rather than
-submitting NULL to the strict numeric query-term helper.
+Validate applicable string literals in residual numeric/date comparisons before
+DataFusion, including mixed OR/LIKE and negated predicates, but leave numeric
+literals to DataFusion. Accept SQL-style timestamp strings with optional
+fractional seconds; do not impose the stricter DSL date format on residual SQL.
+Preserve SQL NULL and derived-alias semantics.
+Fractional integer term/set/range and pushed SQL semantics are owned by the
+shared engine helpers: non-match, omission, and bound rounding respectively.
+Empty range conditions and kNN dimension mismatches/empty vectors are client
+validation failures locally and remotely, not search-worker panics or 500s.
 Direct SQL remains all-or-nothing for shard errors. A local or forwarded
 worker panic must retain its shard identity and return a server-side search
 failure, not enter the materialized/buffered capability fallback. Late streaming

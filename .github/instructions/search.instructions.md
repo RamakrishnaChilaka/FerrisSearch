@@ -65,6 +65,13 @@ pub struct SearchRequest {
 - Range, term, terms, pushed SQL predicates, kNN filters, and numeric/date
   cursor values share fallible schema-typed conversion. Invalid values return
   classified query errors, not text terms, zero-hit successes, or assertions.
+- Fractional integer term values are valid non-matches; term sets discard them.
+  Integer ranges round lower bounds upward and upper bounds downward, including
+  negative fractions; integral strict bounds retain their strictness.
+  Out-of-range and malformed values remain client errors. Fractional epoch
+  millis on dates truncate toward zero. Do not relax integer cursor validation.
+- Reject a range condition with no bounds before Tantivy, including when
+  validating an empty/pruned remote-store request.
 - Before constructing a Tantivy hit collector, bound the window by the shard's
   live document count and saturate `from + size`. Never pass a user-controlled
   huge capacity directly to TopDocs. Coordinator pagination overflow remains
@@ -136,7 +143,10 @@ pub struct KnnParams {
 ```
 
 Bound `k` and filtered candidate oversampling by the actual vector count before
-native search or allocation. `num_candidates` is not implemented. Terms
+native search or allocation. Query dimension mismatch and empty vectors are
+client validation failures (400 when all shards fail), not server failures.
+Preserve this classification across gRPC and validate before a zero-k return.
+`num_candidates` is not implemented. Terms
 aggregation sizes truncate actual collected buckets; they do not reserve the
 requested size. Composite and top_hits aggregations are not implemented and
 their request variants are rejected before collection.

@@ -744,6 +744,23 @@ async fn review_empty_remote_store_rejects_empty_ranges() -> Result<()> {
         body["error"]["reason"].as_str().unwrap().contains("bound"),
         "{body}"
     );
+    for query in [
+        json!({"term": {"n": 1.5}}),
+        json!({"terms": {"n": [1, 1.5]}}),
+        json!({"range": {"n": {"gte": -1.5}}}),
+    ] {
+        let (status, body) = cluster
+            .request(
+                0,
+                Method::POST,
+                "/empty/_search",
+                Some(json!({"query": query})),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{query}: {body}");
+        assert_eq!(body["hits"]["total"]["value"], 0, "{body}");
+        assert_eq!(body["_shards"]["failed"], 0, "{body}");
+    }
     cluster.normal_search(0).await
 }
 
@@ -760,7 +777,12 @@ async fn review_integer_extrema_and_json_precision_remain_exact() -> Result<()> 
     ];
     cluster.seed_values(&values).await?;
     for n in values {
-        for value in [json!(n), json!(n.to_string())] {
+        for value in [
+            json!(n),
+            json!(n.to_string()),
+            json!(format!("{n}.0")),
+            json!(format!("{n}e0")),
+        ] {
             cluster
                 .assert_search_values(0, json!({"term": {"n": value}}), &[n])
                 .await?;
@@ -1329,7 +1351,6 @@ async fn additional_invalid_numeric_representations_return_400() -> Result<()> {
             vec![
                 json!(u64::MAX),
                 json!("9223372036854775808"),
-                json!(1.5),
                 json!(true),
                 json!([]),
             ],

@@ -1068,9 +1068,34 @@ async fn validate_residual_sql_literals(
     state
         .worker_pools
         .spawn_search(move || -> anyhow::Result<()> {
-            // Residual SQL can coerce a numeric column to text; validate its
-            // mapped literals without changing which predicates execute there.
-            let clauses = crate::hybrid::planner::residual_predicate_validation_clauses(&sql)?;
+            // Validate numeric strings without imposing Tantivy's literal
+            // domain on comparisons that DataFusion evaluates.
+            let clauses = crate::hybrid::planner::residual_predicate_validation_clauses(&sql)?
+                .into_iter()
+                .filter(|clause| {
+                    let crate::search::QueryClause::Term(fields) = clause else {
+                        return false;
+                    };
+                    fields.iter().any(|(name, value)| {
+                        match mappings.get(name).map(|mapping| &mapping.field_type) {
+                            Some(
+                                crate::cluster::state::FieldType::Integer
+                                | crate::cluster::state::FieldType::Float,
+                            ) => true,
+                            Some(crate::cluster::state::FieldType::Date) => {
+                                !value.as_str().is_some_and(|text| {
+                                    chrono::NaiveDateTime::parse_from_str(
+                                        text,
+                                        "%Y-%m-%d %H:%M:%S%.f",
+                                    )
+                                    .is_ok()
+                                })
+                            }
+                            _ => false,
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
             if clauses.is_empty() {
                 return Ok(());
             }

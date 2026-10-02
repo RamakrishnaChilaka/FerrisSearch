@@ -288,11 +288,12 @@ impl VectorIndex {
     /// Returns (keys, distances) sorted by distance ascending.
     pub fn search(&self, query: &[f32], k: usize) -> Result<(Vec<u64>, Vec<f32>)> {
         if query.len() != self.dimensions {
-            return Err(anyhow::anyhow!(
+            return Err(tantivy::TantivyError::InvalidArgument(format!(
                 "Query dimension mismatch: expected {}, got {}",
                 self.dimensions,
                 query.len()
-            ));
+            ))
+            .into());
         }
         let k = k.min(self.len());
         if k == 0 {
@@ -417,6 +418,25 @@ mod tests {
 
         let result = vi.search(&[1.0, 0.0], 1); // 2D query on 3D index
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn reviewed_empty_index_rejects_invalid_query_dimensions_as_client_errors() {
+        let vi = VectorIndex::new(3, MetricKind::Cos).unwrap();
+        for query in [&[][..], &[1.0, 0.0][..]] {
+            for k in [0, 1, usize::MAX] {
+                let error = vi.search(query, k).unwrap_err();
+                assert!(matches!(
+                    error.downcast_ref::<tantivy::TantivyError>(),
+                    Some(tantivy::TantivyError::InvalidArgument(_))
+                ));
+                assert!(error.to_string().contains("expected 3"), "{error:#}");
+            }
+        }
+        assert_eq!(
+            vi.search(&[1.0, 0.0, 0.0], usize::MAX).unwrap(),
+            (vec![], vec![])
+        );
     }
 
     #[test]
