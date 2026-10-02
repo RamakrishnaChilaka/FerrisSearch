@@ -59,18 +59,27 @@ pub async fn replicate_bulk(
 ## Post-Write Visibility
 
 Explicit `refresh=true` runs a separate primary-owned phase after mutation
-replication acknowledges and before the response. Refresh the primary and
-the same captured Raft `in_sync_replicas` used for acknowledgement, never the
-coordinator's view or the diagnostic ISR tracker. Keep the shared recovery
-write guard through this phase. Concurrent `RefreshShardCopy` maintenance
-RPCs preserve UUID/allocation/primary/term identity and use already-open
-engines on the blocking pool.
+replication acknowledges and before the response. Single writes refresh the
+primary and the same captured Raft `in_sync_replicas` used for acknowledgement.
+REST bulk runs every mutation unit with refresh off, then requests one fenced
+`RefreshShardWrites` round per mutated shard. That phase activates the primary
+before taking the shared recovery guard, then captures the current validated
+in-sync set. Never use the coordinator's view or the diagnostic ISR tracker.
+Keep the shared guard through the bounded copy waits. Concurrent
+`RefreshShardCopy` maintenance RPCs preserve UUID/allocation/primary/term
+identity and use already-open engines on the blocking pool. Local and remote
+waits are capped at five seconds and below the caller's remaining deadline;
+timeout releases the guard even if blocking publication finishes later.
 
 Refresh-only errors, including refresh RPC failures, remain attributable
 `_shards` failures without changing write status, receipts, or bulk item
 `errors`. Never convert them to `ReplicaReplicationFailure` or remove a
-copy solely for a refresh error. No refresh/false, detected no-op updates,
-and empty bulk add no refresh work. See
+copy solely for a refresh error. This deliberately differs from OpenSearch's
+whole-request failure on primary refresh error and replica-failure handling
+on replica refresh error: data acknowledgement is already established.
+Data-phase transport ambiguity is unchanged. No refresh/false, detected
+single-update no-ops, and empty/all-error/no-op-only bulk add no refresh work.
+A no-op alongside a mutation shares that bulk shard's report. See
 [ADR 0001 D8](../../docs/adr/0001-write-consistency-and-retry-contract.md#d8-visibility).
 
 ## File-Based Peer Recovery

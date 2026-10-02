@@ -541,11 +541,14 @@ production ready**. The most important limits are:
   Bulk action metadata rejection fails the whole request before any writes.
   `wait_for_active_shards` accepts only absent or `1`, not `all`.
   Document and bulk URLs accept `refresh=true`, an empty value, and
-  `refresh=false`. Explicit refresh waits for the primary and every captured
-  in-sync replica, whichever node coordinates. Refresh failures preserve the
-  acknowledged write status and receipt but appear in `_shards.failures`;
-  inspect `_shards.failed` even on a successful write. `forced_refresh`
-  reflects successful primary publication. No refresh or `refresh=false`
+  `refresh=false`. Explicit refresh uses a bounded primary-owned round for
+  the primary and every authoritative in-sync replica, whichever node
+  coordinates. Bulk pays one round per touched shard after its items finish,
+  not one per item. Reported refresh failures keep the acknowledged status
+  and receipt; inspect `_shards.failed` and `_shards.failures` even on a
+  successful write. `forced_refresh: true` is emitted only after successful
+  primary publication. Data-phase timeouts and transport disconnects can
+  still leave an indeterminate write outcome. No refresh or `refresh=false`
   adds no refresh RPCs. `refresh=wait_for` and invalid values are rejected. See
   [ADR 0001, D8](docs/adr/0001-write-consistency-and-retry-contract.md#d8-visibility)
   for visibility and refresh-failure semantics and

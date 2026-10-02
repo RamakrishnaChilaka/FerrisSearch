@@ -19,6 +19,7 @@ IndexDoc(ShardDocRequest) → ShardDocResponse
 BulkIndex(ShardBulkRequest) → ShardBulkResponse
 DeleteDoc(ShardDeleteRequest) → ShardDeleteResponse
 RefreshShardCopy(ShardCopyRefreshRequest) → ShardCopyRefreshResult
+RefreshShardWrites(ShardCopyRefreshRequest) → ShardWriteRefreshResult
 GetDoc(ShardGetRequest) → ShardGetResponse
 
 // Search (scatter to remote shards)
@@ -87,12 +88,34 @@ compatibility fallbacks or rollout machinery for this protocol change.
 
 Primary document/delete/bulk requests carry `refresh`. Acknowledged
 document/delete responses and acknowledged bulk items require `write_refresh`
-when requested, and omit it otherwise. Homogeneous batches share the report;
-ordered actions propagate each handler's report. The report has one result
-for the primary and each captured in-sync replica. Require unique node IDs,
-positive allocation IDs, exactly one correctly identified primary, and an
-explicit `refreshed`/non-empty `error` oneof. Missing, inconsistent, duplicate,
-or unrequested results fail decoding; never substitute successful defaults.
+when requested, and omit it otherwise. Direct homogeneous and ordered bulk
+handlers coalesce one report across their acknowledged items. REST bulk sends
+all mutation units with refresh off, then calls `RefreshShardWrites` once per
+mutated shard. That fenced phase activates before taking the shared recovery
+guard and captures the primary's current authoritative in-sync set. Forward
+its explicit term/allocation, not stale coordinator routing-header values.
+The report has one result for the primary and each captured in-sync replica.
+Require unique node IDs, exactly one correctly identified primary, and an
+explicit `refreshed`/non-empty `error` oneof. Successful results require a
+positive allocation ID; only explicit invariant failures may omit it.
+Ordinary fenced copy responses must match the requested positive allocation,
+including errors. A known primary allocation in the bulk-phase response must
+also match its request. Missing outcomes, zero/inconsistent allocations,
+duplicate or unrequested results fail decoding; never substitute defaults.
+
+Requested-refresh handlers capture `grpc-timeout` before metadata waits or
+write work. Decode the standard timeout units strictly and cap the enclosing
+budget at the default 30 seconds. Each copy waits at most five seconds and
+the remaining budget minus a reply margin (250 ms or one quarter of a smaller
+remaining duration). Bound local blocking-pool waits and remote connection/RPC
+waits with `tokio::time::timeout`, and set the copy RPC timeout explicitly.
+Timeout is a per-copy visibility failure, not a failed acknowledged write;
+blocking work may finish later without retaining the primary recovery guard.
+The primary bulk phase also bounds activation and guard acquisition. Its
+coordinator already owns receipts, so phase RPC failure becomes a known-primary
+refresh failure without inventing replica results or changing item statuses.
+No-refresh requests add no timeout parsing or refresh RPCs. This is not FS-029
+or a guarantee against data-phase timeouts and disconnects.
 
 `ClusterState.format_version` is required and must equal the one current wire
 version. Missing/unknown versions are rejected with recreate guidance.
