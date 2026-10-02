@@ -14,6 +14,15 @@ struct RefreshCluster {
 
 impl RefreshCluster {
     async fn start(shards: u32) -> Self {
+        Self::start_with_topology(
+            shards,
+            &["node-2".into(), "node-3".into(), "node-4".into()],
+            2,
+        )
+        .await
+    }
+
+    async fn start_with_topology(shards: u32, data_nodes: &[String], in_sync: usize) -> Self {
         let cluster = ForwardingCluster::start_with_roles(&[
             vec![NodeRole::Master],
             vec![NodeRole::Data],
@@ -30,7 +39,7 @@ impl RefreshCluster {
                 },
                 "mappings": {"properties": {"value": {"type": "integer"}}}
             }),
-            &["node-2".into(), "node-3".into(), "node-4".into()],
+            data_nodes,
         )
         .unwrap();
         let leader = &cluster.nodes[0].state;
@@ -105,7 +114,7 @@ impl RefreshCluster {
                 engines.insert((node, shard), engine);
             }
             // All fixture copies are identically empty before their Raft admission.
-            for replica in &routing.replicas {
+            for replica in routing.replicas.iter().take(in_sync) {
                 leader
                     .raft
                     .client_write(ClusterCommand::MarkReplicaInSync {
@@ -144,7 +153,7 @@ impl RefreshCluster {
                 !primary.state.raft.is_leader(),
                 "primary must be a follower"
             );
-            assert_eq!(routing.in_sync_replicas.len(), 2);
+            assert_eq!(routing.in_sync_replicas.len(), in_sync);
         }
         Self { cluster, engines }
     }
@@ -315,6 +324,16 @@ async fn single_visibility(mutation: Mutation, replica_coordinator: bool) {
         )])
         .await;
     harness.assert_refresh_response(&body);
+    assert_eq!(
+        harness
+            .cluster
+            .nodes
+            .iter()
+            .map(|node| node.refresh_requests.load(Ordering::Relaxed))
+            .sum::<usize>(),
+        2,
+        "one dedicated refresh RPC per in-sync replica"
+    );
 }
 
 macro_rules! visibility_test {
@@ -401,6 +420,16 @@ async fn bulk_visibility(global: bool, replica_coordinator: bool, mixed: bool) {
         assert!(result["status"].as_u64().unwrap() < 400, "{item}");
         harness.assert_refresh_response(result);
     }
+    assert_eq!(
+        harness
+            .cluster
+            .nodes
+            .iter()
+            .map(|node| node.refresh_requests.load(Ordering::Relaxed))
+            .sum::<usize>(),
+        if mixed { 24 } else { 6 },
+        "refresh only written shards and preserve existing batch/update barriers"
+    );
 }
 
 macro_rules! bulk_visibility_test {
@@ -490,6 +519,8 @@ async fn refresh_regression_replica_failure_preserves_single_acknowledgement() {
         false,
     );
     assert_eq!(body["forced_refresh"], true, "{body}");
+    let state = harness.cluster.nodes[0].state.cluster_manager.get_state();
+    let query: SearchRequest = serde_json::from_value(json!({"size": 100})).unwrap();
     for node in 1..4 {
         let engine = harness.engines[&(node, 0)].clone();
         let document =
@@ -500,6 +531,26 @@ async fn refresh_regression_replica_failure_preserves_single_acknowledgement() {
                 .unwrap();
         assert_eq!(document.source["value"], 8);
         assert_eq!(document.seq_no, body["_seq_no"].as_u64().unwrap());
+        let (hits, total, _) = harness.cluster.nodes[0]
+            .state
+            .transport_client
+            .forward_search_dsl_to_shard(
+                &state.nodes[&harness.cluster.nodes[node].state.local_node_id],
+                INDEX,
+                0,
+                &query,
+            )
+            .await
+            .unwrap();
+        if node == replica {
+            assert_eq!(
+                total, 0,
+                "failed refresh must not claim new search visibility"
+            );
+        } else {
+            assert_eq!(total, 1);
+            assert_eq!(hits[0]["_source"]["value"], 8);
+        }
     }
 }
 
@@ -595,6 +646,31 @@ async fn refresh_regression_false_and_absent_do_not_refresh_single_writes() {
             .await;
         assert!(status.is_success(), "{body}");
         assert!(body.get("forced_refresh").is_none(), "{body}");
+        for (method, route, source) in [
+            (
+                reqwest::Method::POST,
+                "_update/doc",
+                Some(json!({"doc": {"value": 12}})),
+            ),
+            (
+                reqwest::Method::PUT,
+                "_create/created",
+                Some(json!({"value": 13})),
+            ),
+            (reqwest::Method::DELETE, "_doc/created", None),
+        ] {
+            let (status, body) = harness
+                .cluster
+                .request(
+                    harness.replica(0),
+                    method,
+                    &format!("/{INDEX}/{route}{suffix}"),
+                    source,
+                )
+                .await;
+            assert!(status.is_success(), "{body}");
+            assert!(body.get("forced_refresh").is_none(), "{body}");
+        }
     }
     harness.assert_visible(&[(0, "doc".into(), None)]).await;
     for mut receiver in notifications {
@@ -630,9 +706,14 @@ async fn refresh_regression_false_and_absent_do_not_refresh_bulk() {
                 global,
                 refresh,
                 format!(
-                    "{}\n{}\n",
+                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
                     json!({"index": {"_index": INDEX, "_id": "doc"}}),
-                    json!({"value": 12})
+                    json!({"value": 12}),
+                    json!({"create": {"_index": INDEX, "_id": "created"}}),
+                    json!({"value": 13}),
+                    json!({"update": {"_index": INDEX, "_id": "doc"}}),
+                    json!({"doc": {"value": 14}}),
+                    json!({"delete": {"_index": INDEX, "_id": "created"}}),
                 ),
             )
             .await;
@@ -654,6 +735,344 @@ async fn refresh_regression_false_and_absent_do_not_refresh_bulk() {
             .nodes
             .iter()
             .all(|node| node.refresh_requests.load(Ordering::Relaxed) == 0)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_regression_primary_uses_authority_newer_than_replica_coordinator() {
+    let harness = RefreshCluster::start_with_topology(
+        1,
+        &["node-3".into(), "node-2".into(), "node-4".into()],
+        1,
+    )
+    .await;
+    let coordinator = harness.replica(0);
+    assert_eq!(
+        coordinator, 1,
+        "gate the replica coordinator, not the primary"
+    );
+    harness.cluster.gate.pause();
+    let leader = &harness.cluster.nodes[0].state;
+    let state = leader.cluster_manager.get_state();
+    let metadata = &state.indices[INDEX];
+    let routing = &metadata.shard_routing[&0];
+    leader
+        .raft
+        .client_write(ClusterCommand::MarkReplicaInSync {
+            index_name: INDEX.into(),
+            index_uuid: metadata.uuid.to_string(),
+            shard_id: 0,
+            replica: "node-4".into(),
+            allocation_id: state.shard_allocation_id(INDEX, 0, "node-4").unwrap(),
+            primary: routing.primary.clone(),
+            primary_term: routing.primary_term,
+        })
+        .await
+        .unwrap()
+        .data
+        .into_result()
+        .unwrap();
+    harness.cluster.gate.wait_until_entered().await;
+    let version = leader.cluster_manager.version();
+    for (offset, node) in harness.cluster.nodes.iter().enumerate() {
+        if offset != coordinator {
+            node.state
+                .cluster_manager
+                .wait_for_version(version)
+                .await
+                .unwrap();
+        }
+    }
+    let started = harness.cluster.nodes[coordinator]
+        .refresh_request_started
+        .clone();
+    let manager = harness.cluster.nodes[coordinator]
+        .state
+        .cluster_manager
+        .clone();
+    let gate = harness.cluster.gate.clone();
+    let release = tokio::spawn(async move {
+        let arrived = tokio::time::timeout(Duration::from_secs(10), started.notified()).await;
+        let count = manager.get_state().indices[INDEX].shard_routing[&0]
+            .in_sync_replicas
+            .len();
+        gate.resume();
+        arrived.expect("the primary must dispatch refresh to the stale coordinator");
+        count
+    });
+    let (status, body) = harness
+        .cluster
+        .request(
+            coordinator,
+            reqwest::Method::PUT,
+            &format!("/{INDEX}/_doc/doc?refresh=true"),
+            Some(json!({"value": 19})),
+        )
+        .await;
+    assert_eq!(
+        release.await.unwrap(),
+        1,
+        "coordinator must route from an older in-sync view"
+    );
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    harness.assert_refresh_response(&body);
+    harness.assert_visible(&[(0, "doc".into(), Some(19))]).await;
+    assert_eq!(
+        harness.cluster.nodes[3]
+            .refresh_requests
+            .load(Ordering::Relaxed),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_regression_assigned_out_of_sync_copy_is_not_refreshed() {
+    let harness = RefreshCluster::start_with_topology(
+        1,
+        &["node-2".into(), "node-3".into(), "node-4".into()],
+        1,
+    )
+    .await;
+    let (sender, mut receiver) = tokio::sync::oneshot::channel();
+    harness.engines[&(3, 0)]
+        .text_engine()
+        .notify_before_refresh_writer_for_test(sender);
+    let (status, body) = harness
+        .cluster
+        .request(
+            0,
+            reqwest::Method::PUT,
+            &format!("/{INDEX}/_doc/doc?refresh=true"),
+            Some(json!({"value": 20})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        body["_shards"],
+        json!({"total": 2, "successful": 2, "failed": 0}),
+        "{body}"
+    );
+    harness.assert_visible(&[(0, "doc".into(), Some(20))]).await;
+    assert_eq!(
+        harness.cluster.nodes[3]
+            .refresh_requests
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    let engine = harness.engines[&(3, 0)].clone();
+    assert!(
+        tokio::task::spawn_blocking(move || engine.get_document_with_metadata("doc", true))
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_regression_grpc_refresh_failure_preserves_acknowledgement() {
+    let harness = RefreshCluster::start(1).await;
+    let replica = harness.replica(0);
+    harness.cluster.nodes[replica]
+        .reject_refresh_requests
+        .store(true, Ordering::Relaxed);
+    let (status, body) = harness
+        .cluster
+        .request(
+            0,
+            reqwest::Method::PUT,
+            &format!("/{INDEX}/_doc/doc?refresh=true"),
+            Some(json!({"value": 21})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["result"], "created", "{body}");
+    assert_eq!(body["_shards"]["failed"], 1, "{body}");
+    let failure = &body["_shards"]["failures"][0];
+    assert_eq!(
+        failure["node"],
+        harness.cluster.nodes[replica].state.local_node_id
+    );
+    assert_eq!(
+        failure["reason"]["reason"],
+        tonic::Status::unimplemented("").to_string(),
+        "{body}"
+    );
+    assert!(body.get("error").is_none(), "{body}");
+    let engine = harness.engines[&(replica, 0)].clone();
+    let document =
+        tokio::task::spawn_blocking(move || engine.get_document_with_metadata("doc", true))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    assert_eq!(document.source["value"], 21);
+    assert_eq!(document.seq_no, body["_seq_no"].as_u64().unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_regression_response_waits_for_replica_reader_publication() {
+    let harness = RefreshCluster::start(1).await;
+    let replica = harness.replica(0);
+    let (committed_tx, committed_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    harness.engines[&(replica, 0)]
+        .text_engine()
+        .pause_after_refresh_commit_for_test(committed_tx, release_rx);
+    let client = harness.cluster.client.clone();
+    let url = format!(
+        "{}/{INDEX}/_doc/doc?refresh=true",
+        harness.cluster.nodes[0].url
+    );
+    let response = tokio::spawn(async move {
+        client
+            .put(url)
+            .json(&json!({"value": 22}))
+            .send()
+            .await
+            .unwrap()
+    });
+    tokio::task::spawn_blocking(move || committed_rx.recv_timeout(Duration::from_secs(10)))
+        .await
+        .unwrap()
+        .expect("replica refresh must reach the pre-publication barrier");
+    assert!(
+        !response.is_finished(),
+        "HTTP acknowledgement must wait for reader publication"
+    );
+    let engine = harness.engines[&(replica, 0)].clone();
+    let unrefreshed =
+        tokio::task::spawn_blocking(move || engine.get_document_with_metadata("doc", false))
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(unrefreshed.is_none());
+    release_tx.send(()).unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    harness.assert_refresh_response(&response.json().await.unwrap());
+    harness.assert_visible(&[(0, "doc".into(), Some(22))]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_regression_reports_every_failed_copy_without_unacknowledging() {
+    let harness = RefreshCluster::start(1).await;
+    for engine in harness.engines.values() {
+        engine
+            .text_engine()
+            .inject_refresh_commit_failures_for_test(1);
+    }
+    let (status, body) = harness
+        .cluster
+        .request(
+            0,
+            reqwest::Method::PUT,
+            &format!("/{INDEX}/_doc/doc?refresh=true"),
+            Some(json!({"value": 23})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["result"], "created", "{body}");
+    assert!(body["_seq_no"].is_u64(), "{body}");
+    assert_eq!(body["_shards"]["total"], 3, "{body}");
+    assert_eq!(body["_shards"]["successful"], 0, "{body}");
+    assert_eq!(body["_shards"]["failed"], 3, "{body}");
+    let failures = body["_shards"]["failures"].as_array().unwrap();
+    assert_eq!(failures.len(), 3);
+    let nodes = failures
+        .iter()
+        .map(|failure| failure["node"].as_str().unwrap())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        nodes,
+        std::collections::HashSet::from(["node-2", "node-3", "node-4"])
+    );
+    assert_eq!(body["forced_refresh"], false);
+    assert!(body.get("error").is_none(), "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_regression_copy_rpc_rejects_malformed_and_obsolete_authority() {
+    use crate::transport::proto::{ShardCopyRefreshRequest, shard_copy_refresh_result::Outcome};
+
+    let harness = RefreshCluster::start(1).await;
+    let replica = harness.replica(0);
+    let state = harness.cluster.nodes[0].state.cluster_manager.get_state();
+    let node = &state.nodes[&harness.cluster.nodes[replica].state.local_node_id];
+    let mut client = harness.cluster.nodes[0]
+        .state
+        .transport_client
+        .connect(&node.host, node.transport_port)
+        .await
+        .unwrap();
+    let routing = &state.indices[INDEX].shard_routing[&0];
+    let valid = ShardCopyRefreshRequest {
+        index_name: INDEX.into(),
+        index_uuid: state.indices[INDEX].uuid.to_string(),
+        shard_id: 0,
+        primary_node_id: routing.primary.clone(),
+        primary_term: Some(routing.primary_term),
+        target_allocation_id: state.shard_allocation_id(INDEX, 0, &node.id),
+    };
+    for request in [
+        ShardCopyRefreshRequest {
+            primary_term: None,
+            ..valid.clone()
+        },
+        ShardCopyRefreshRequest {
+            target_allocation_id: Some(0),
+            ..valid.clone()
+        },
+        ShardCopyRefreshRequest {
+            index_uuid: String::new(),
+            ..valid.clone()
+        },
+    ] {
+        let error = client
+            .refresh_shard_copy(crate::transport::request_with_cluster_state_version(
+                request,
+                state.version,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument, "{error}");
+    }
+    for request in [
+        ShardCopyRefreshRequest {
+            primary_term: Some(routing.primary_term + 1),
+            ..valid.clone()
+        },
+        ShardCopyRefreshRequest {
+            target_allocation_id: valid.target_allocation_id.map(|id| id + 1),
+            ..valid.clone()
+        },
+        ShardCopyRefreshRequest {
+            primary_node_id: node.id.clone(),
+            ..valid.clone()
+        },
+    ] {
+        let result = client
+            .refresh_shard_copy(crate::transport::request_with_cluster_state_version(
+                request,
+                state.version,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            matches!(result.outcome, Some(Outcome::Error(ref reason)) if reason.contains("authority changed")),
+            "{result:?}"
+        );
+    }
+    assert!(
+        harness
+            .engines
+            .values()
+            .all(|engine| engine.wal_max_seq_no().is_none())
     );
 }
 

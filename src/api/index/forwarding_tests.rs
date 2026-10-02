@@ -21,6 +21,8 @@ struct ForwardingNode {
     url: String,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     refresh_requests: Arc<std::sync::atomic::AtomicUsize>,
+    refresh_request_started: Arc<tokio::sync::Notify>,
+    reject_refresh_requests: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct ForwardingCluster {
@@ -108,13 +110,24 @@ impl ForwardingCluster {
                 state.local_node_id.clone(),
             );
             let refresh_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let refresh_request_started = Arc::new(tokio::sync::Notify::new());
+            let reject_refresh_requests = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let requests = refresh_requests.clone();
+            let request_started = refresh_request_started.clone();
+            let reject_requests = reject_refresh_requests.clone();
             let grpc_task = tokio::spawn(async move {
                 tonic::transport::Server::builder()
                     .layer(tower::util::MapRequestLayer::new(
-                        move |request: axum::http::Request<tonic::body::Body>| {
+                        move |mut request: axum::http::Request<tonic::body::Body>| {
                             if request.uri().path().ends_with("/RefreshShardCopy") {
                                 requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                request_started.notify_one();
+                                if reject_requests.load(std::sync::atomic::Ordering::Relaxed) {
+                                    *request.uri_mut() =
+                                        "/transport.InternalTransport/TestRejectedRefresh"
+                                            .parse()
+                                            .unwrap();
+                                }
                             }
                             request
                         },
@@ -134,6 +147,8 @@ impl ForwardingCluster {
                 url: format!("http://{http_addr}"),
                 tasks: vec![grpc_task, http_task],
                 refresh_requests,
+                refresh_request_started,
+                reject_refresh_requests,
             });
         }
         let leader = &nodes[0].state.raft;

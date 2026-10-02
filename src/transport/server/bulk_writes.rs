@@ -87,6 +87,7 @@ pub(super) async fn execute_ordered_bulk(
                         doc_id: doc_id.clone(),
                         if_seq_no: operation.if_seq_no,
                         if_primary_term: operation.if_primary_term,
+                        refresh: request.refresh,
                     },
                     &request.index_name,
                     Some((request.shard_id, &service.local_node_id)),
@@ -107,6 +108,7 @@ pub(super) async fn execute_ordered_bulk(
                             .to_string(),
                             seq_no: response.seq_no,
                             primary_term: response.primary_term,
+                            write_refresh: response.write_refresh,
                             ..Default::default()
                         }
                     } else {
@@ -136,6 +138,7 @@ pub(super) async fn execute_ordered_bulk(
                         if_primary_term: operation.if_primary_term,
                         create_only: kind == ShardBulkOpKind::Create,
                         index_uuid: None,
+                        refresh: request.refresh,
                     },
                     &request.index_name,
                     Some((request.shard_id, &service.local_node_id)),
@@ -156,6 +159,7 @@ pub(super) async fn execute_ordered_bulk(
                             .to_string(),
                             seq_no: response.seq_no,
                             primary_term: response.primary_term,
+                            write_refresh: response.write_refresh,
                             ..Default::default()
                         }
                     } else {

@@ -90,7 +90,7 @@ fn bulk_error_item(
     serde_json::json!({(action): result})
 }
 
-fn wire_item_json(index: &str, item: ShardBulkItemResponse) -> Value {
+fn wire_item_json(index: &str, shard: u32, item: ShardBulkItemResponse) -> Value {
     let mut result =
         serde_json::json!({"_index": index, "_id": item.doc_id, "status": item.status});
     if item.error.is_empty() {
@@ -104,6 +104,14 @@ fn wire_item_json(index: &str, item: ShardBulkItemResponse) -> Value {
     }
     if let Some(term) = item.primary_term {
         result["_primary_term"] = serde_json::json!(term);
+    }
+    if let Some(refresh) = &item.write_refresh {
+        crate::transport::write_refresh::add_write_refresh_to_response(
+            &mut result,
+            index,
+            shard,
+            refresh,
+        );
     }
     result
 }
@@ -282,6 +290,7 @@ async fn forward_bulk_batches(
     state: &AppState,
     cluster_state: &crate::cluster::state::ClusterState,
     routed_docs: &mut [RoutedBulkDoc],
+    refresh: bool,
 ) -> BulkTargetResults {
     let mut batches: HashMap<BulkTargetKey, Vec<&mut RoutedBulkDoc>> = HashMap::new();
     for document in routed_docs {
@@ -318,7 +327,7 @@ async fn forward_bulk_batches(
                         if_seq_no,
                         if_primary_term,
                         retry_on_conflict: document.retry_on_conflict,
-                        refresh: None,
+                        refresh: refresh.then(|| "true".to_string()),
                         ..UpdateParams::default()
                     },
                 )
@@ -358,12 +367,14 @@ async fn forward_bulk_batches(
                 .collect::<Vec<_>>();
             match state
                 .transport_client
-                .forward_bulk_operations_to_shard(node, &key.0, key.2, &operations)
+                .forward_bulk_operations_to_shard(node, &key.0, key.2, &operations, refresh)
                 .await
             {
-                Ok(items) => {
-                    results.extend(items.into_iter().map(|item| wire_item_json(&key.0, item)))
-                }
+                Ok(items) => results.extend(
+                    items
+                        .into_iter()
+                        .map(|item| wire_item_json(&key.0, key.2, item)),
+                ),
                 Err(error) => {
                     let failure = BulkTargetFailure::from_forward_error(error);
                     for document in run {
@@ -615,20 +626,8 @@ async fn execute_bulk(
             }
         }
     }
-    let outcomes = forward_bulk_batches(state, &cluster_state, &mut routed).await;
-    if refresh.should_refresh() {
-        let indices = routed
-            .iter()
-            .map(|document| &document.index_name)
-            .collect::<std::collections::HashSet<_>>();
-        for index in indices {
-            for (shard_id, engine) in state.shard_manager.get_index_shards(index) {
-                if let Err(error) = refresh_engine_after_write(engine).await {
-                    tracing::error!("Post-bulk refresh failed for {index}/{shard_id}: {error}");
-                }
-            }
-        }
-    }
+    let outcomes =
+        forward_bulk_batches(state, &cluster_state, &mut routed, refresh.should_refresh()).await;
     let items = finalize_bulk_items(items, routed, &outcomes);
     let errors = items.iter().any(|item| {
         item.as_object()

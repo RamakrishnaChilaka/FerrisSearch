@@ -17,6 +17,7 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, info, trace};
 
 mod bulk_writes;
+mod write_refresh;
 
 fn primary_write_condition(
     if_seq_no: Option<u64>,
@@ -1023,6 +1024,19 @@ impl InternalTransport for TransportService {
                         }));
                     }
                 }
+                let write_refresh = if req.refresh {
+                    Some(
+                        self.refresh_acknowledged_write(
+                            &write_state,
+                            &req.index_name,
+                            req.shard_id,
+                            &activated_primary,
+                        )
+                        .await,
+                    )
+                } else {
+                    None
+                };
                 crate::metrics::DOCS_INDEXED_TOTAL.inc();
                 Ok(Response::new(ShardDocResponse {
                     success: true,
@@ -1031,6 +1045,7 @@ impl InternalTransport for TransportService {
                     seq_no: Some(seq_no),
                     primary_term: Some(primary_term),
                     created,
+                    write_refresh,
                 }))
             }
             Err(e) if e.is::<crate::engine::VersionConflictError>() => {
@@ -1324,7 +1339,7 @@ impl InternalTransport for TransportService {
                 let last_seq_no = receipt
                     .last_seq_no()
                     .map_err(|e| Status::internal(e.to_string()))?;
-                let results = bulk_writes::index_batch_results(&receipt)
+                let mut results = bulk_writes::index_batch_results(&receipt)
                     .map_err(|error| Status::internal(error.to_string()))?;
                 let ids = receipt.doc_ids;
                 let primary_term = receipt.primary_term;
@@ -1418,6 +1433,19 @@ impl InternalTransport for TransportService {
                             primary_term: Some(primary_term),
                             ..Default::default()
                         }));
+                    }
+                }
+                if req.refresh {
+                    let refresh = self
+                        .refresh_acknowledged_write(
+                            &write_state,
+                            &req.index_name,
+                            req.shard_id,
+                            &activated_primary,
+                        )
+                        .await;
+                    for result in &mut results {
+                        result.write_refresh = Some(refresh.clone());
                     }
                 }
                 let doc_count = ids.len() as u64;
@@ -1520,6 +1548,7 @@ impl InternalTransport for TransportService {
                     error,
                     seq_no: None,
                     primary_term: None,
+                    write_refresh: None,
                 }));
             }
         };
@@ -1535,6 +1564,7 @@ impl InternalTransport for TransportService {
                     error,
                     seq_no: None,
                     primary_term: None,
+                    write_refresh: None,
                 }));
             }
         };
@@ -1551,6 +1581,7 @@ impl InternalTransport for TransportService {
                     error,
                     seq_no: None,
                     primary_term: None,
+                    write_refresh: None,
                 }));
             }
         };
@@ -1717,15 +1748,30 @@ impl InternalTransport for TransportService {
                             ),
                             seq_no: Some(seq_no),
                             primary_term: Some(primary_term),
+                            write_refresh: None,
                         }));
                     }
                 }
+                let write_refresh = if req.refresh {
+                    Some(
+                        self.refresh_acknowledged_write(
+                            &write_state,
+                            &req.index_name,
+                            req.shard_id,
+                            &activated_primary,
+                        )
+                        .await,
+                    )
+                } else {
+                    None
+                };
                 Ok(Response::new(ShardDeleteResponse {
                     success: true,
                     deleted,
                     error: String::new(),
                     seq_no: Some(seq_no),
                     primary_term: Some(primary_term),
+                    write_refresh,
                 }))
             }
             Err(e) if e.is::<crate::engine::VersionConflictError>() => {
@@ -1800,6 +1846,7 @@ impl InternalTransport for TransportService {
                     error: e.to_string(),
                     seq_no: None,
                     primary_term: None,
+                    write_refresh: None,
                 }))
             }
         }
@@ -4114,6 +4161,24 @@ impl InternalTransport for TransportService {
     }
 
     // ─── Index Maintenance RPCs ───────────────────────────────────────────────
+
+    async fn refresh_shard_copy(
+        &self,
+        request: Request<ShardCopyRefreshRequest>,
+    ) -> Result<Response<ShardCopyRefreshResult>, Status> {
+        crate::transport::write_refresh::validate_refresh_request(request.get_ref())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        self.wait_for_forwarded_state(
+            &request,
+            Some(&request.get_ref().index_name),
+            Some((request.get_ref().shard_id, false)),
+            Some(&request.get_ref().index_uuid),
+        )
+        .await?;
+        Ok(Response::new(
+            self.refresh_local_copy(request.into_inner()).await,
+        ))
+    }
 
     async fn refresh_index(
         &self,

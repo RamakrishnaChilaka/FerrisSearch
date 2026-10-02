@@ -5,6 +5,7 @@ pub mod client;
 pub(crate) mod primary_open;
 pub mod server;
 pub(crate) mod state_wait;
+pub(crate) mod write_refresh;
 
 /// Generated protobuf types and gRPC service definitions
 // Clippy lints don't apply to tonic-generated code. Rust 1.99 added
@@ -15,7 +16,7 @@ pub mod proto {
     tonic::include_proto!("transport");
 }
 
-pub use client::{ConnectedTransportClient, TransportClient};
+pub use client::{ConnectedTransportClient, TransportClient, WriteOptions};
 pub use state_wait::{AppliedStateInterceptor, request_with_cluster_state_version};
 
 pub const GRPC_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
