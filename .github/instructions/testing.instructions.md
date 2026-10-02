@@ -12,6 +12,7 @@ applyTo: "tests/**,src/**/tests.rs,specs/tla/**,scripts/tla/**"
 - Replication and transport integration (`cargo test --test replication_integration`)
 - REST API integration (`cargo test --test rest_api_integration`)
 - Process-backed restart regression (`cargo test --test restart_regression`)
+- Crash-isolated request regression (`cargo test --test request_crash_regression`)
 - SQL correctness through sqllogictest (`cargo test --test sql_correctness`)
 - S3-compatible remote-store integration (`cargo test --test remote_store_s3_integration`), skipped unless `FERRIS_RUSTFS_ENDPOINT` is set
 - Bounded shard replication/recovery model checking (`./scripts/tla/check.sh`)
@@ -504,6 +505,18 @@ cargo test -- test_name                         # Single test by name
 - This does not prove file recovery, in-sync admission, terms/fencing, or
   restarted-replica gap handling.
 - Asserts destructive delete reasons do not appear in logs during the preserved-data workflow
+
+### Request Crash Regression (tests/request_crash_regression.rs)
+- Use child processes for abort-reproducing requests and worker probes; an
+  abort must fail its parent assertion, not terminate the lib test binary.
+- Own every child with a kill/reap guard, including failed startup, and poll
+  observable membership/readiness rather than relying on fixed settling sleeps.
+- Assert typed errors and exact result rows, then prove subsequent requests
+  succeed. Include two-node remote-shard/gRPC classification coverage.
+- The ignored worker probe is invoked by parent tests for contained search
+  panics, explicit write fail-stop, and bounded SQL streaming allocations.
+- `FERRIS_CRASH_TEST_LOG_DIR` optionally retains child-node logs outside the
+  per-test tempdirs.
 
 ## Test Helper Patterns
 - `tokio::time::timeout()` to prevent hung tests

@@ -8,6 +8,16 @@ pub(crate) mod query_string;
 pub use query_string::QueryStringParams;
 
 const BINCODE_CONFIG: bincode_next::config::Configuration = bincode_next::config::standard();
+const MAX_SORT_FIELDS: usize = 64;
+
+pub(crate) fn validate_sort_width(width: usize) -> tantivy::Result<()> {
+    if width > MAX_SORT_FIELDS {
+        return Err(tantivy::TantivyError::InvalidArgument(format!(
+            "sort supports at most {MAX_SORT_FIELDS} fields; received {width}"
+        )));
+    }
+    Ok(())
+}
 
 /// Top-level search request body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +119,8 @@ pub struct KnnParams {
 pub enum QueryClause {
     /// Exact term match: `{ "term": { "field": "value" } }`
     Term(HashMap<String, serde_json::Value>),
+    /// Match any of the exact terms: `{ "terms": { "field": ["a", "b"] } }`.
+    Terms(HashMap<String, Vec<serde_json::Value>>),
     /// Full-text match: `{ "match": { "field": "text" } }`
     Match(HashMap<String, serde_json::Value>),
     /// Tantivy-backed query string with one optional default field.

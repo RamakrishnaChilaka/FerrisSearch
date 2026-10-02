@@ -25,6 +25,7 @@ pub struct SearchRequest {
 | `Match(HashMap<String, Value>)` | Full-text match on a field |
 | `QueryString(QueryStringParams)` | Tantivy-backed query-string subset with `query` and optional `default_field` |
 | `Term(HashMap<String, Value>)` | Exact term match |
+| `Terms(HashMap<String, Vec<Value>>)` | Match any exact term in a field's set |
 | `Wildcard(HashMap<String, Value>)` | Wildcard pattern (`*` any, `?` single) |
 | `Prefix(HashMap<String, Value>)` | Prefix match |
 | `Fuzzy(HashMap<String, FuzzyParams>)` | Fuzzy match (edit distance 0-2, default 1) |
@@ -61,6 +62,16 @@ pub struct SearchRequest {
   it into an untyped success-false envelope.
 - Keep parser and engine execution on the existing search worker pools.
   Existing `match` and SQL `text_match` success semantics stay unchanged.
+- Range, term, terms, pushed SQL predicates, kNN filters, and numeric/date
+  cursor values share fallible schema-typed conversion. Invalid values return
+  classified query errors, not text terms, zero-hit successes, or assertions.
+- Fractional integer term values are valid non-matches; term sets discard them.
+  Integer ranges round lower bounds upward and upper bounds downward, including
+  negative fractions; integral strict bounds retain their strictness.
+  Out-of-range and malformed values remain client errors. Fractional epoch
+  millis on dates truncate toward zero. Do not relax integer cursor validation.
+- Reject a range condition with no bounds before Tantivy, including when
+  validating an empty/pruned remote-store request.
 - Before constructing a Tantivy hit collector, bound the window by the shard's
   live document count and saturate `from + size`. Never pass a user-controlled
   huge capacity directly to TopDocs. Coordinator pagination overflow remains
@@ -80,6 +91,10 @@ pub struct SearchRequest {
 - Partial failures remain HTTP 200 with `_shards.failed` and
   `_shards.failures`. A successful shard with zero hits is still successful.
   `allow_partial_search_results=false` is not implemented.
+- Contained search-worker panics are server-side shard failures (500 when all
+  shards fail) with the operation and panic message preserved. Keep subsequent
+  requests usable. A local or remote kNN error fails that shard's complete work;
+  a successful text leg must not hide a failing vector leg or count twice.
 - Missing primary nodes and unavailable routed copies count as failures, not
   silently skipped work.
 - Query-body `_count` and materialized/distributed SQL inherit these rules.
@@ -90,8 +105,9 @@ pub struct SearchRequest {
 - Remote-store search identifies split failures and preserves the final cause
   after leaf retries; successful retries must not remain failed. An empty
   manifest or an entirely pruned candidate set remains a successful empty search.
-- Empty remote-store candidate sets still validate query strings against the
-  canonical mapping-derived schema on the search pool. Invalid queries return
+- Empty remote-store candidate sets still validate query strings and typed
+  query/cursor/filter values against the canonical mapping-derived schema on
+  the search pool. Invalid queries return
   400 with their parser cause; no shard failed because no split was dispatched.
 - `_count?q=...` and `_msearch` are not implemented. Do not claim otherwise.
 
@@ -125,6 +141,15 @@ pub struct KnnParams {
     pub filter: Option<QueryClause>,  // optional pre-filter
 }
 ```
+
+Bound `k` and filtered candidate oversampling by the actual vector count before
+native search or allocation. Query dimension mismatch and empty vectors are
+client validation failures (400 when all shards fail), not server failures.
+Preserve this classification across gRPC and validate before a zero-k return.
+`num_candidates` is not implemented. Terms
+aggregation sizes truncate actual collected buckets; they do not reserve the
+requested size. Composite and top_hits aggregations are not implemented and
+their request variants are rejected before collection.
 
 ## Aggregations
 | Type | Struct Fields | Description |
@@ -162,6 +187,10 @@ pub struct KnnParams {
   set; missing or cap-exceeded summaries must keep the split.
 
 ## Sort
+- DSL sort lists and explicit SQL ORDER BY lists support at most 64 fields.
+  Reject wider lists before engine dispatch/collection; enforce the same guard
+  on direct engine/transport paths. This bounds per-hit sort annotation and
+  quadratic cursor prefix expansion, not the result window.
 - `SortClause::Simple(String)` — `"_score"` or field name
 - `SortClause::Field(HashMap<String, SortOrder>)` — `{ "year": "desc" }`
 - Default sort (no `sort` clause): `_score` descending

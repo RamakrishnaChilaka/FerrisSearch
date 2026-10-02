@@ -16,6 +16,44 @@ use std::time::Duration;
 
 struct DropSignal(Option<std::sync::mpsc::Sender<()>>);
 
+#[tokio::test]
+async fn sql_worker_panics_cannot_be_hidden_by_materialized_fallback() {
+    let pools = crate::worker::WorkerPools::new(1, 1);
+    for remote in [false, true] {
+        let mut error = pools
+            .spawn_search(|| panic!("injected SQL shard panic"))
+            .await
+            .unwrap_err();
+        if remote {
+            error = crate::search::query_string::search_error_status(error).into();
+        }
+        let error = sql_shard_error("index", 2, "node", 3, error);
+        let (status, Json(body)) = sql_shard_panic_response(&error).unwrap();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"]["reason"], "SQL shard execution panicked");
+        let failure = &body["error"]["failed_shards"][0];
+        assert_eq!(failure["index"], "index");
+        assert_eq!(failure["shard"], 2);
+        assert_eq!(failure["node"], "node");
+        assert!(
+            failure["reason"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("injected SQL shard panic"),
+            "{body}"
+        );
+    }
+    let ordinary = sql_shard_error(
+        "index",
+        0,
+        "node",
+        1,
+        anyhow::anyhow!("unsupported columns"),
+    );
+    assert!(sql_shard_panic_response(&ordinary).is_none());
+    assert_eq!(pools.spawn_search(|| 42).await.unwrap(), 42);
+}
+
 impl Drop for DropSignal {
     fn drop(&mut self) {
         if let Some(tx) = self.0.take() {

@@ -60,6 +60,18 @@ pub trait SearchEngine: Send + Sync {
   collector capacity of 1 for an empty shard. Clamp before score, fast-field
   sort, grouped aggregation, and cursor collectors. The coordinator applies
   pagination; exact Count totals remain independent of the bounded hit window.
+- Apply the same live-document bound to `sql_record_batch`, shared search
+  helpers, and kNN filter collectors. SQL already folds OFFSET into the
+  requested size. Never pass a user-controlled huge capacity to `TopDocs`,
+  including any fast-field sort variant.
+- Clamp native vector search and filtered oversampling to the indexed vector
+  count, use saturating multiplication, and size hit buffers from returned
+  candidates. Validate filters even when no vector index exists.
+- Bound SQL streaming batch allocations by the existing 8192-row ceiling and
+  the pinned searcher's live docs (minimum capacity 1). Zero grouped top-K
+  sizes produce empty buckets without selecting index `size - 1`.
+- Validate the shared 64-field sort-width bound before cursor expansion or
+  per-hit sort-value allocation, even on direct engine/transport requests.
 
 ### Seq Ownership Rule
 - `add_document()` / `bulk_add_documents()` / `delete_document()` are for local primary-originated writes that allocate new WAL seq_nos
@@ -490,21 +502,41 @@ The `GroupedAggCollector` computes grouped analytics (GROUP BY + aggregate funct
 - `AggKind` / `ResolvedAggSpec` -- resolved from `AggregationRequest` before search
 
 ### Type-Safe Term Creation (CRITICAL)
-All Tantivy `Term` objects MUST match the schema field type. A type mismatch (e.g., `i64` term
-on an `f64` field) causes **silent 0-hit results** — Tantivy won't error, just returns nothing.
+All Tantivy `Term` objects MUST match the schema field type. A mismatch can
+silently produce zero hits or panic in a fast-field range collector.
 
-Use the `typed_term()` helper for ALL term creation in queries:
+Use the shared schema-typed conversion helpers for all query terms:
 ```rust
-fn typed_term(&self, field: Field, value: &serde_json::Value) -> Term {
+fn typed_term(&self, field: Field, value: &serde_json::Value) -> Result<Term> {
     // Checks schema via self.index.schema().get_field_entry(field).field_type()
-    // Returns the correctly typed Term (from_field_f64, from_field_i64, from_field_text, etc.)
+    // Returns a correctly typed term or a classified query parse error.
 }
 ```
 
-**Where `typed_term()` is used:**
-- `QueryClause::Term` — exact match queries
-- `QueryClause::Range` — range bounds (gte/lte/gt/lt)
-- `QueryClause::Fuzzy` — fuzzy term construction
+- `typed_query_term()` / `typed_query_term_for_schema`: exact term/set queries.
+  `None` means a valid fractional integer value that cannot equal any integer,
+  not a parse failure. Term queries use `EmptyQuery`; sets omit these values.
+- `typed_range_query_for_schema`: validates all supplied bounds and rounds
+  integer lower bounds upward / upper bounds downward. Preserve strictness for
+  integral values, including negative values and i64 extrema; an impossible
+  interval is `EmptyQuery`. Empty range conditions are classified query errors
+  before Tantivy.
+- `typed_term()` / `typed_term_for_schema`: fuzzy terms and cursor equality/
+  range terms, where integer cursor values must remain integral.
+
+Malformed Integer, Float, or Date values must fail with the existing
+`QueryParseError` classification and preserve the field, value, expected type,
+and parser cause. Never fall back to a text term for a numeric field.
+Floats must be finite. Integer JSON values use exact i64/u64 conversion, never
+a float round-trip. Decimal integer strings also preserve exact integer digits.
+Fractional integer term/set/range values follow the query-specific rules above;
+out-of-range values remain errors. Date epoch milliseconds accept fractional
+values and truncate toward zero; retain the existing ISO 8601 DSL formats.
+Use the same schema helpers when validating empty/pruned remote-store requests
+against their canonical mapping-derived schema.
+Vector query dimension mismatches, including empty vectors, use
+`TantivyError::InvalidArgument` so local/transport shard classification returns
+400 when all shards fail. Validate dimensions before zero/candidate limits.
 
 **Common pitfall:** JSON integer `10` on a float field. `serde_json::Number::as_i64()` succeeds
 before `as_f64()`, creating the wrong term type. `typed_term()` checks the schema first to avoid this.

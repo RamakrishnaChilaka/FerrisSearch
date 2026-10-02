@@ -1220,31 +1220,36 @@ impl SearchEngine for CompositeEngine {
         k: usize,
         filter: Option<&crate::search::QueryClause>,
     ) -> Result<Vec<serde_json::Value>> {
+        let allowed_ids = match filter {
+            Some(clause) => Some(self.text.matching_doc_ids(clause)?),
+            None => None,
+        };
         let guard = self.vector.read().unwrap_or_else(|e| e.into_inner());
         let vi = match *guard {
             Some(ref vi) => vi,
+            None if vector.is_empty() => {
+                return Err(tantivy::TantivyError::InvalidArgument(
+                    "Query vector must not be empty".to_string(),
+                )
+                .into());
+            }
             None => return Ok(vec![]),
         };
+        let k = k.min(vi.len());
 
         // When a filter is present, oversample to get enough candidates that
         // pass the filter. We fetch k * OVERSAMPLE_FACTOR candidates from the
         // vector index, then post-filter against the Tantivy query.
         const OVERSAMPLE_FACTOR: usize = 10;
         let fetch_k = if filter.is_some() {
-            std::cmp::min(k * OVERSAMPLE_FACTOR, vi.len())
+            k.saturating_mul(OVERSAMPLE_FACTOR).min(vi.len())
         } else {
             k
         };
 
         let (keys, distances) = vi.search(vector, fetch_k)?;
 
-        // Build the allowed doc_id set if a filter is present
-        let allowed_ids = match filter {
-            Some(clause) => Some(self.text.matching_doc_ids(clause)?),
-            None => None,
-        };
-
-        let mut hits = Vec::with_capacity(k);
+        let mut hits = Vec::with_capacity(k.min(keys.len()));
         for (key, distance) in keys.iter().zip(distances.iter()) {
             if hits.len() >= k {
                 break;
@@ -1611,6 +1616,25 @@ mod tests {
 
         let hits = engine.search_knn("embedding", &[1.0, 0.0, 0.0], 5).unwrap();
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn reviewed_empty_query_vector_is_invalid_without_a_native_index() {
+        let (_dir, engine) = create_engine();
+        for k in [0, 1, usize::MAX] {
+            let error = engine.search_knn("embedding", &[], k).unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<tantivy::TantivyError>(),
+                Some(tantivy::TantivyError::InvalidArgument(_))
+            ));
+            assert!(error.to_string().contains("empty"), "{error:#}");
+        }
+        assert!(
+            engine
+                .search_knn("embedding", &[1.0, 0.0], usize::MAX)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

@@ -246,11 +246,16 @@ pub fn execute_grouped_partial_sql_with_timings(
 
     // Top-K selection on native buckets
     let top_k_start = std::time::Instant::now();
-    let needed = plan.offset.unwrap_or(0) + plan.limit.unwrap_or(usize::MAX);
+    let needed = plan
+        .offset
+        .unwrap_or(0)
+        .saturating_add(plan.limit.unwrap_or(usize::MAX));
     let has_order = !grouped_sql.order_by.is_empty();
 
-    if has_order && needed < buckets.len() {
-        let n = needed.min(buckets.len()) - 1;
+    if needed == 0 {
+        buckets.clear();
+    } else if has_order && needed < buckets.len() {
+        let n = needed - 1;
         buckets.select_nth_unstable_by(n, |a, b| {
             compare_native_buckets(a, b, &grouped_sql.order_by, grouped_sql)
         });
@@ -266,7 +271,7 @@ pub fn execute_grouped_partial_sql_with_timings(
         let start = offset.min(buckets.len());
         let end = plan
             .limit
-            .map(|limit| (start + limit).min(buckets.len()))
+            .map(|limit| start.saturating_add(limit).min(buckets.len()))
             .unwrap_or(buckets.len());
         buckets = buckets[start..end].to_vec();
     }

@@ -1115,9 +1115,12 @@ impl QueryPlan {
                     m.output_name == first_order.output_name && m.residual_expr.is_none()
                 });
                 if let Some(metric) = matching_metric {
-                    let needed = self.offset.unwrap_or(0) + self.limit.unwrap_or(0);
+                    let needed = self
+                        .offset
+                        .unwrap_or(0)
+                        .saturating_add(self.limit.unwrap_or(0));
                     Some(crate::search::ShardTopK {
-                        limit: needed * 3 + 10,
+                        limit: needed.saturating_mul(3).saturating_add(10),
                         sort_by: first_order.output_name.clone(),
                         sort_function: metric.function.to_search_function(),
                         descending: first_order.desc,
@@ -1147,7 +1150,10 @@ impl QueryPlan {
                 )]),
             )
         } else if self.limit_pushed_down {
-            let size = self.limit.unwrap_or(SQL_MATCH_LIMIT) + self.offset.unwrap_or(0);
+            let size = self
+                .limit
+                .unwrap_or(SQL_MATCH_LIMIT)
+                .saturating_add(self.offset.unwrap_or(0));
             (size, HashMap::new())
         } else if self.has_ungrouped_aggregate_fallback {
             // Ungrouped aggregates (e.g. ROUND(AVG(...))) MUST scan all matching
@@ -2397,6 +2403,7 @@ fn validate_query_shape(query: &sqlparser::ast::Query) -> Result<()> {
     if let Some(ref order_by) = query.order_by
         && let OrderByKind::Expressions(exprs) = &order_by.kind
     {
+        crate::search::validate_sort_width(exprs.len())?;
         for expr in exprs {
             if expr_contains_subquery(&expr.expr) {
                 bail!(
@@ -3347,6 +3354,9 @@ fn parse_pushdown_predicate(expr: &Expr) -> Result<Option<crate::search::QueryCl
         else {
             return Ok(None);
         };
+        if low_val.is_null() || high_val.is_null() {
+            return Ok(None);
+        }
         return Ok(Some(crate::search::QueryClause::Range(HashMap::from([(
             field,
             crate::search::RangeCondition {
@@ -3375,6 +3385,9 @@ fn parse_pushdown_predicate(expr: &Expr) -> Result<Option<crate::search::QueryCl
             let Some(value) = expr_to_json_value(item)? else {
                 return Ok(None);
             };
+            if value.is_null() {
+                return Ok(None);
+            }
             terms.push(crate::search::QueryClause::Term(HashMap::from([(
                 field.clone(),
                 value,
@@ -3398,6 +3411,9 @@ fn parse_pushdown_predicate(expr: &Expr) -> Result<Option<crate::search::QueryCl
     let Some((field, value, flipped)) = extract_comparison_parts(left, right)? else {
         return Ok(None);
     };
+    if value.is_null() {
+        return Ok(None);
+    }
 
     if SyntheticColumn::parse(&field).is_some() {
         return Ok(None);
@@ -3456,6 +3472,103 @@ fn extract_comparison_parts(
         return Ok(Some((field, value, true)));
     }
     Ok(None)
+}
+
+pub(crate) fn residual_predicate_validation_clauses(
+    sql: &str,
+) -> Result<Vec<crate::search::QueryClause>> {
+    fn push_literal(
+        field: &str,
+        value: serde_json::Value,
+        clauses: &mut Vec<crate::search::QueryClause>,
+    ) {
+        if value.is_string() && SyntheticColumn::parse(field).is_none() {
+            clauses.push(crate::search::QueryClause::Term(HashMap::from([(
+                field.to_string(),
+                value,
+            )])));
+        }
+    }
+
+    fn collect(
+        expr: &Expr,
+        bindings: &BindContext,
+        clauses: &mut Vec<crate::search::QueryClause>,
+    ) -> Result<()> {
+        match expr {
+            Expr::Nested(inner)
+            | Expr::UnaryOp {
+                expr: inner,
+                op: UnaryOperator::Not,
+            } => {
+                collect(inner, bindings, clauses)?;
+            }
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::And | BinaryOperator::Or,
+                right,
+            } => {
+                collect(left, bindings, clauses)?;
+                collect(right, bindings, clauses)?;
+            }
+            _ if predicate_references_alias(
+                expr,
+                &bindings.alias_set,
+                &bindings.identity_source_aliases,
+            ) => {}
+            Expr::BinaryOp {
+                left,
+                op:
+                    BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq,
+                right,
+            } => {
+                if let Some((field, value, _)) = extract_comparison_parts(left, right)? {
+                    push_literal(&field, value, clauses);
+                }
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                if let Some(field) = expr_to_field_name(expr) {
+                    for bound in [low, high] {
+                        if let Some(value) = expr_to_json_value(bound)? {
+                            push_literal(&field, value, clauses);
+                        }
+                    }
+                }
+            }
+            Expr::InList { expr, list, .. } => {
+                if let Some(field) = expr_to_field_name(expr) {
+                    for item in list {
+                        if let Some(value) = expr_to_json_value(item)? {
+                            push_literal(&field, value, clauses);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    let statements = Parser::parse_sql(&GenericDialect, sql)?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        bail!("residual SQL validation requires one SELECT query");
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        bail!("residual SQL validation requires a SELECT body");
+    };
+    let bindings = bind_select(select);
+    let mut clauses = Vec::new();
+    if let Some(predicate) = &select.selection {
+        collect(predicate, &bindings, &mut clauses)?;
+    }
+    Ok(clauses)
 }
 
 /// Returns true if the SELECT clause contains any SQL aggregate function
@@ -3602,6 +3715,35 @@ fn flip_binary_operator(op: &BinaryOperator) -> BinaryOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reviewed_residual_validation_collects_strings_not_numeric_or_null_literals() {
+        let clauses = residual_predicate_validation_clauses(
+            "SELECT n FROM idx WHERE n >= 1.5 OR n < 18446744073709551615 \
+             OR n IN (1, 'abc', NULL) OR f BETWEEN 1.5 AND 'bad' OR n = 'text'",
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(clauses).unwrap(),
+            serde_json::json!([
+                {"term": {"n": "abc"}},
+                {"term": {"f": "bad"}},
+                {"term": {"n": "text"}}
+            ])
+        );
+    }
+
+    #[test]
+    fn reviewed_residual_validation_preserves_derived_alias_guards() {
+        let clauses = residual_predicate_validation_clauses(
+            "SELECT title AS n FROM idx WHERE n = 'abc' OR f >= '2.5'",
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(clauses).unwrap(),
+            serde_json::json!([{"term": {"f": "2.5"}}])
+        );
+    }
 
     #[test]
     fn synthetic_column_helper_identifies_internal_fields() {

@@ -618,11 +618,352 @@ fn build_schema_with_mappings(
     Ok(builder.build())
 }
 
-pub(crate) fn validate_query_strings_with_mappings(
-    clause: &crate::search::QueryClause,
+#[derive(Clone, Copy)]
+struct IntegerQueryValue {
+    truncated: i64,
+    fractional: bool,
+    negative: bool,
+}
+
+impl IntegerQueryValue {
+    fn exact(value: i64) -> Self {
+        Self {
+            truncated: value,
+            fractional: false,
+            negative: value < 0,
+        }
+    }
+}
+
+fn parse_decimal_integer(text: &str) -> std::result::Result<IntegerQueryValue, &'static str> {
+    if let Ok(integer) = text.parse::<i64>() {
+        return Ok(IntegerQueryValue::exact(integer));
+    }
+    let negative = text.starts_with('-');
+    let unsigned = text
+        .strip_prefix('-')
+        .or_else(|| text.strip_prefix('+'))
+        .unwrap_or(text);
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (
+            mantissa,
+            exponent
+                .parse::<i64>()
+                .map_err(|_| "invalid decimal exponent")?,
+        ),
+        None => (unsigned, 0),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if (whole.is_empty() && fraction.is_empty())
+        || !whole
+            .bytes()
+            .chain(fraction.bytes())
+            .all(|b| b.is_ascii_digit())
+    {
+        return Err("unparsable numeric literal");
+    }
+
+    // Decimal strings need exact digit arithmetic even when they contain .0
+    // or an exponent: converting them through f64 loses large integer keys.
+    let digits = || whole.bytes().chain(fraction.bytes());
+    let digit_count = whole.len() + fraction.len();
+    let decimal_position = whole.len() as i128 + i128::from(exponent);
+    let integer_digits = decimal_position.clamp(0, digit_count as i128) as usize;
+    let mut magnitude = digits()
+        .take(integer_digits)
+        .try_fold(0u64, |value, digit| {
+            value
+                .checked_mul(10)
+                .and_then(|value| value.checked_add(u64::from(digit - b'0')))
+                .ok_or("integer is out of range")
+        })?;
+    if magnitude != 0 && decimal_position > digit_count as i128 {
+        let zero_count = decimal_position - digit_count as i128;
+        if zero_count > 19 {
+            return Err("integer is out of range");
+        }
+        for _ in 0..zero_count {
+            magnitude = magnitude.checked_mul(10).ok_or("integer is out of range")?;
+        }
+    }
+    let fractional = digits().skip(integer_digits).any(|digit| digit != b'0');
+    let limit = if negative {
+        i64::MIN.unsigned_abs()
+    } else {
+        i64::MAX as u64
+    };
+    if magnitude > limit || (magnitude == limit && fractional) {
+        return Err("number is out of range");
+    }
+    let truncated = if negative {
+        if magnitude == i64::MIN.unsigned_abs() {
+            i64::MIN
+        } else {
+            -(magnitude as i64)
+        }
+    } else {
+        magnitude as i64
+    };
+    Ok(IntegerQueryValue {
+        truncated,
+        fractional,
+        negative,
+    })
+}
+
+fn parse_integer_query_value(
+    value: &serde_json::Value,
+) -> std::result::Result<IntegerQueryValue, &'static str> {
+    match value {
+        serde_json::Value::String(text) => parse_decimal_integer(text),
+        serde_json::Value::Number(number) => {
+            if let Some(integer) = number.as_i64() {
+                return Ok(IntegerQueryValue::exact(integer));
+            }
+            if number.as_u64().is_some() {
+                return Err("integer is out of range");
+            }
+            let number = number
+                .as_f64()
+                .filter(|number| {
+                    number.is_finite() && (i64::MIN as f64..-(i64::MIN as f64)).contains(number)
+                })
+                .ok_or("number is out of range")?;
+            Ok(IntegerQueryValue {
+                truncated: number as i64,
+                fractional: number.fract() != 0.0,
+                negative: number.is_sign_negative(),
+            })
+        }
+        _ => Err("value is not a string or number"),
+    }
+}
+
+fn invalid_typed_query_value(
+    schema: &Schema,
+    field: Field,
+    value: &serde_json::Value,
+    expected: &str,
+    cause: &str,
+) -> anyhow::Error {
+    let name = schema.get_field_name(field);
+    crate::search::query_string::parsing_error(
+        &format!("{name}:{value}"),
+        tantivy::query::QueryParserError::UnsupportedQuery(format!(
+            "invalid value {value} for field [{name}]; expected {expected}: {cause}"
+        )),
+    )
+}
+
+fn typed_term_for_schema(
+    schema: &Schema,
+    field: Field,
+    logical_type: Option<&crate::cluster::state::FieldType>,
+    value: &serde_json::Value,
+) -> Result<Term> {
+    use tantivy::schema::FieldType;
+
+    let entry = schema.get_field_entry(field);
+    let invalid = |expected: &str, cause: &str| {
+        invalid_typed_query_value(schema, field, value, expected, cause)
+    };
+    match entry.field_type() {
+        FieldType::I64(_) => {
+            let is_date = matches!(logical_type, Some(crate::cluster::state::FieldType::Date));
+            let expected = if is_date {
+                "an ISO 8601 date or signed 64-bit epoch milliseconds"
+            } else {
+                "a signed 64-bit integer"
+            };
+            if is_date
+                && let Some(integer) = value
+                    .as_str()
+                    .and_then(crate::common::date::parse_iso8601_to_epoch_millis)
+            {
+                return Ok(Term::from_field_i64(field, integer));
+            }
+            let integer =
+                parse_integer_query_value(value).map_err(|cause| invalid(expected, cause))?;
+            if integer.fractional && !is_date {
+                return Err(invalid(expected, "value has a fractional part"));
+            }
+            Ok(Term::from_field_i64(field, integer.truncated))
+        }
+        FieldType::U64(_) => {
+            let expected = "an unsigned 64-bit integer";
+            let integer = match value {
+                serde_json::Value::String(text) => text
+                    .parse::<u64>()
+                    .map_err(|error| invalid(expected, &error.to_string()))?,
+                serde_json::Value::Number(number) => number
+                    .as_u64()
+                    .ok_or_else(|| invalid(expected, "non-integral or out-of-range number"))?,
+                _ => return Err(invalid(expected, "value is not a string or number")),
+            };
+            Ok(Term::from_field_u64(field, integer))
+        }
+        FieldType::F64(_) => {
+            let expected = "a finite floating-point number";
+            let number = match value {
+                serde_json::Value::String(text) => text
+                    .parse::<f64>()
+                    .map_err(|error| invalid(expected, &error.to_string()))?,
+                serde_json::Value::Number(number) => number
+                    .as_f64()
+                    .ok_or_else(|| invalid(expected, "number is out of range"))?,
+                _ => return Err(invalid(expected, "value is not a string or number")),
+            };
+            if !number.is_finite() {
+                return Err(invalid(expected, "number is not finite"));
+            }
+            Ok(Term::from_field_f64(field, number))
+        }
+        _ => Ok(match value {
+            serde_json::Value::String(text) => Term::from_field_text(field, text),
+            other => Term::from_field_text(field, &other.to_string()),
+        }),
+    }
+}
+
+fn is_integer_query_field(
+    schema: &Schema,
+    field: Field,
+    logical_type: Option<&crate::cluster::state::FieldType>,
+) -> bool {
+    matches!(
+        schema.get_field_entry(field).field_type(),
+        tantivy::schema::FieldType::I64(_)
+    ) && !matches!(logical_type, Some(crate::cluster::state::FieldType::Date))
+}
+
+fn typed_query_term_for_schema(
+    schema: &Schema,
+    field: Field,
+    logical_type: Option<&crate::cluster::state::FieldType>,
+    value: &serde_json::Value,
+) -> Result<Option<Term>> {
+    if is_integer_query_field(schema, field, logical_type) {
+        let integer = parse_integer_query_value(value).map_err(|cause| {
+            invalid_typed_query_value(schema, field, value, "a signed 64-bit integer", cause)
+        })?;
+        return Ok((!integer.fractional).then(|| Term::from_field_i64(field, integer.truncated)));
+    }
+    typed_term_for_schema(schema, field, logical_type, value).map(Some)
+}
+
+fn typed_range_query_for_schema(
+    schema: &Schema,
+    field: Field,
+    logical_type: Option<&crate::cluster::state::FieldType>,
+    condition: &crate::search::RangeCondition,
+) -> Result<Box<dyn tantivy::query::Query>> {
+    use std::ops::Bound;
+    use tantivy::query::{EmptyQuery, RangeQuery};
+
+    if [&condition.gt, &condition.gte, &condition.lt, &condition.lte]
+        .into_iter()
+        .all(Option::is_none)
+    {
+        let name = schema.get_field_name(field);
+        return Err(crate::search::query_string::parsing_error(
+            &format!("range:{name}"),
+            tantivy::query::QueryParserError::UnsupportedQuery(format!(
+                "range query for field [{name}] requires at least one bound"
+            )),
+        ));
+    }
+    if is_integer_query_field(schema, field, logical_type) {
+        let parse = |value: &serde_json::Value| {
+            parse_integer_query_value(value).map_err(|cause| {
+                invalid_typed_query_value(schema, field, value, "a signed 64-bit integer", cause)
+            })
+        };
+        let gt = condition.gt.as_ref().map(parse).transpose()?;
+        let gte = condition.gte.as_ref().map(parse).transpose()?;
+        let lt = condition.lt.as_ref().map(parse).transpose()?;
+        let lte = condition.lte.as_ref().map(parse).transpose()?;
+        let lower = match gt.or(gte) {
+            Some(value)
+                if (value.fractional && !value.negative) || (!value.fractional && gt.is_some()) =>
+            {
+                let Some(lower) = value.truncated.checked_add(1) else {
+                    return Ok(Box::new(EmptyQuery));
+                };
+                lower
+            }
+            Some(value) => value.truncated,
+            None => i64::MIN,
+        };
+        let upper = match lt.or(lte) {
+            Some(value)
+                if (value.fractional && value.negative) || (!value.fractional && lt.is_some()) =>
+            {
+                let Some(upper) = value.truncated.checked_sub(1) else {
+                    return Ok(Box::new(EmptyQuery));
+                };
+                upper
+            }
+            Some(value) => value.truncated,
+            None => i64::MAX,
+        };
+        if lower > upper {
+            return Ok(Box::new(EmptyQuery));
+        }
+        return Ok(Box::new(RangeQuery::new(
+            Bound::Included(Term::from_field_i64(field, lower)),
+            Bound::Included(Term::from_field_i64(field, upper)),
+        )));
+    }
+    let term = |value| typed_term_for_schema(schema, field, logical_type, value);
+    let gt = condition.gt.as_ref().map(term).transpose()?;
+    let gte = condition.gte.as_ref().map(term).transpose()?;
+    let lt = condition.lt.as_ref().map(term).transpose()?;
+    let lte = condition.lte.as_ref().map(term).transpose()?;
+    let lower = if let Some(term) = gt {
+        Bound::Excluded(term)
+    } else if let Some(term) = gte {
+        Bound::Included(term)
+    } else {
+        Bound::Unbounded
+    };
+    let upper = if let Some(term) = lt {
+        Bound::Excluded(term)
+    } else if let Some(term) = lte {
+        Bound::Included(term)
+    } else {
+        Bound::Unbounded
+    };
+    Ok(Box::new(RangeQuery::new(lower, upper)))
+}
+
+fn bounded_collector_limit(searcher: &tantivy::Searcher, requested: usize) -> usize {
+    requested.min(searcher.num_docs() as usize).max(1)
+}
+
+pub(crate) fn validate_search_request_with_mappings(
+    request: &crate::search::SearchRequest,
     mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
 ) -> Result<()> {
-    fn validate(index: &Index, clause: &crate::search::QueryClause) -> Result<()> {
+    crate::search::validate_sort_width(request.sort.len())?;
+    fn validate(
+        index: &Index,
+        clause: &crate::search::QueryClause,
+        mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+    ) -> Result<()> {
+        let schema = index.schema();
+        let field = |name: &str| {
+            schema
+                .get_field(name)
+                .unwrap_or_else(|_| schema.get_field("body").expect("body field must exist"))
+        };
+        let term = |name: &str, value: &serde_json::Value| {
+            typed_query_term_for_schema(
+                &schema,
+                field(name),
+                mappings.get(name).map(|mapping| &mapping.field_type),
+                value,
+            )
+        };
         match clause {
             crate::search::QueryClause::QueryString(params) => {
                 crate::search::query_string::parse_query_string(
@@ -630,6 +971,51 @@ pub(crate) fn validate_query_strings_with_mappings(
                     &params.query,
                     params.default_field.as_deref(),
                 )?;
+            }
+            crate::search::QueryClause::Match(fields) => {
+                if let Some((name, value)) = fields.iter().next() {
+                    let query = match value {
+                        serde_json::Value::String(text) => text.clone(),
+                        other => other.to_string(),
+                    };
+                    QueryParser::for_index(index, vec![field(name)])
+                        .parse_query(&query)
+                        .map_err(|error| {
+                            crate::search::query_string::parsing_error(&query, error)
+                        })?;
+                }
+            }
+            crate::search::QueryClause::Term(fields) => {
+                if let Some((name, value)) = fields.iter().next() {
+                    term(name, value)?;
+                }
+            }
+            crate::search::QueryClause::Terms(fields) => {
+                if let Some((name, values)) = fields.iter().next() {
+                    for value in values {
+                        term(name, value)?;
+                    }
+                }
+            }
+            crate::search::QueryClause::Range(fields) => {
+                if let Some((name, condition)) = fields.iter().next() {
+                    typed_range_query_for_schema(
+                        &schema,
+                        field(name),
+                        mappings.get(name).map(|mapping| &mapping.field_type),
+                        condition,
+                    )?;
+                }
+            }
+            crate::search::QueryClause::Fuzzy(fields) => {
+                if let Some((name, params)) = fields.iter().next() {
+                    typed_term_for_schema(
+                        &schema,
+                        field(name),
+                        mappings.get(name).map(|mapping| &mapping.field_type),
+                        &serde_json::Value::String(params.value.clone()),
+                    )?;
+                }
             }
             crate::search::QueryClause::Bool(query) => {
                 for clause in query
@@ -639,7 +1025,7 @@ pub(crate) fn validate_query_strings_with_mappings(
                     .chain(&query.must_not)
                     .chain(&query.filter)
                 {
-                    validate(index, clause)?;
+                    validate(index, clause, mappings)?;
                 }
             }
             _ => {}
@@ -651,7 +1037,29 @@ pub(crate) fn validate_query_strings_with_mappings(
         mappings,
         HotEnginePurpose::RemoteSplit,
     )?);
-    validate(&index, clause)
+    validate(&index, &request.query, mappings)?;
+    if let Some(knn) = &request.knn {
+        for params in knn.fields.values() {
+            if let Some(filter) = &params.filter {
+                validate(&index, filter, mappings)?;
+            }
+        }
+    }
+    if let Some(cursor) = &request.search_after {
+        let schema = index.schema();
+        for (sort, value) in request.sort.iter().zip(cursor) {
+            if let Some((name, _)) = crate::search::sort_clause_name_direction(sort) {
+                let field = schema.get_field(name)?;
+                typed_term_for_schema(
+                    &schema,
+                    field,
+                    mappings.get(name).map(|mapping| &mapping.field_type),
+                    value,
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_authoritative_mapping_entry(
@@ -3005,59 +3413,25 @@ impl HotEngine {
     }
 
     /// Create a Tantivy Term that matches the schema type of the target field.
-    /// This prevents type mismatches (e.g., i64 term on an f64 field) that cause
-    /// silent 0-hit results.
-    fn typed_term(&self, field: Field, value: &serde_json::Value) -> Term {
-        use tantivy::schema::FieldType;
-        let schema = self.index.schema();
-        let field_type = schema.get_field_entry(field).field_type();
+    /// Reject malformed typed values before they reach a Tantivy collector.
+    fn typed_term(&self, field: Field, value: &serde_json::Value) -> Result<Term> {
         let logical_field_type = self.logical_field_type_for_field(field);
-        match value {
-            serde_json::Value::String(s) => match logical_field_type {
-                Some(crate::cluster::state::FieldType::Date)
-                    if matches!(field_type, FieldType::I64(_)) =>
-                {
-                    crate::common::date::parse_iso8601_to_epoch_millis(s)
-                        .or_else(|| s.parse::<i64>().ok())
-                        .map(|millis| Term::from_field_i64(field, millis))
-                        .unwrap_or_else(|| Term::from_field_text(field, s))
-                }
-                Some(crate::cluster::state::FieldType::Integer)
-                    if matches!(field_type, FieldType::I64(_)) =>
-                {
-                    s.parse::<i64>()
-                        .map(|value| Term::from_field_i64(field, value))
-                        .unwrap_or_else(|_| Term::from_field_text(field, s))
-                }
-                Some(crate::cluster::state::FieldType::Float)
-                    if matches!(field_type, FieldType::F64(_)) =>
-                {
-                    s.parse::<f64>()
-                        .map(|value| Term::from_field_f64(field, value))
-                        .unwrap_or_else(|_| Term::from_field_text(field, s))
-                }
-                _ => Term::from_field_text(field, s),
-            },
-            serde_json::Value::Number(n) => match field_type {
-                FieldType::I64(_) => {
-                    let i = n.as_i64().unwrap_or(n.as_f64().unwrap_or(0.0) as i64);
-                    Term::from_field_i64(field, i)
-                }
-                FieldType::F64(_) => {
-                    let f = n.as_f64().unwrap_or(n.as_i64().unwrap_or(0) as f64);
-                    Term::from_field_f64(field, f)
-                }
-                FieldType::U64(_) => {
-                    let u = n.as_u64().unwrap_or(n.as_f64().unwrap_or(0.0) as u64);
-                    Term::from_field_u64(field, u)
-                }
-                _ => Term::from_field_text(field, &n.to_string()),
-            },
-            serde_json::Value::Bool(b) => {
-                Term::from_field_text(field, if *b { "true" } else { "false" })
-            }
-            other => Term::from_field_text(field, &other.to_string()),
-        }
+        typed_term_for_schema(
+            &self.index.schema(),
+            field,
+            logical_field_type.as_ref(),
+            value,
+        )
+    }
+
+    fn typed_query_term(&self, field: Field, value: &serde_json::Value) -> Result<Option<Term>> {
+        let logical_field_type = self.logical_field_type_for_field(field);
+        typed_query_term_for_schema(
+            &self.index.schema(),
+            field,
+            logical_field_type.as_ref(),
+            value,
+        )
     }
 
     /// Resolve a named field for sort/search_after use.
@@ -3100,6 +3474,7 @@ impl HotEngine {
         use tantivy::query::{BooleanQuery, Occur, RangeQuery, TermQuery};
         use tantivy::schema::IndexRecordOption;
 
+        crate::search::validate_sort_width(sort.len())?;
         if sort.is_empty() {
             return Err(anyhow::anyhow!("search_after requires a non-empty sort"));
         }
@@ -3137,14 +3512,14 @@ impl HotEngine {
             // Equality clauses for all preceding sort fields.
             for j in 0..i {
                 let (_name_j, _dir_j, field_j) = &resolved[j];
-                let term_j = self.typed_term(*field_j, &cursor[j]);
+                let term_j = self.typed_term(*field_j, &cursor[j])?;
                 let eq = TermQuery::new(term_j, IndexRecordOption::Basic);
                 prefix.push((Occur::Must, Box::new(eq)));
             }
 
             // Strict inequality on the i-th sort field, oriented per direction.
             let (_name_i, dir_i, field_i) = &resolved[i];
-            let term_i = self.typed_term(*field_i, &cursor[i]);
+            let term_i = self.typed_term(*field_i, &cursor[i])?;
             let range: RangeQuery = match dir_i {
                 crate::search::SortDirection::Asc => {
                     RangeQuery::new(Bound::Excluded(term_i), Bound::Unbounded)
@@ -3175,9 +3550,10 @@ impl HotEngine {
         needs_id: bool,
         needs_score: bool,
     ) -> Result<super::SqlBatchResult> {
+        crate::search::validate_sort_width(req.sort.len())?;
         let searcher = self.reader.searcher();
         let query = self.build_query(&req.query)?;
-        let limit = std::cmp::max(req.size, 1);
+        let limit = bounded_collector_limit(&searcher, req.size);
 
         // Use fast-field sort when the SearchRequest includes a sortable field,
         // otherwise fall back to score-based collection.
@@ -4084,7 +4460,7 @@ impl HotEngine {
         query: &dyn tantivy::query::Query,
         limit: usize,
     ) -> Result<Vec<serde_json::Value>> {
-        let effective_limit = if limit == 0 { 1 } else { limit };
+        let effective_limit = bounded_collector_limit(&searcher, limit);
         let top_docs = searcher.search(query, &TopDocs::with_limit(effective_limit))?;
         self.collect_hits(&searcher, top_docs)
     }
@@ -4139,7 +4515,8 @@ impl HotEngine {
             .read()
             .unwrap_or_else(|e| e.into_inner());
         // Collect up to 100k matching docs — a reasonable ceiling for filter sets
-        let top_docs = searcher.search(&*query, &TopDocs::with_limit(100_000))?;
+        let limit = bounded_collector_limit(&searcher, 100_000);
+        let top_docs = searcher.search(&*query, &TopDocs::with_limit(limit))?;
         let mut ids = std::collections::HashSet::new();
         for (_score, doc_address) in top_docs {
             let retrieved_doc = searcher.doc::<TantivyDocument>(doc_address)?;
@@ -4160,7 +4537,6 @@ impl HotEngine {
         clause: &crate::search::QueryClause,
     ) -> Result<Box<dyn tantivy::query::Query>> {
         use crate::search::QueryClause;
-        use tantivy::Term;
         use tantivy::query::{AllQuery, BooleanQuery, EmptyQuery, Occur, TermQuery};
         use tantivy::schema::IndexRecordOption;
 
@@ -4191,10 +4567,28 @@ impl HotEngine {
             QueryClause::Term(fields) => {
                 if let Some((field_name, value)) = fields.iter().next() {
                     let target_field = self.resolve_field(field_name);
-                    let term = self.typed_term(target_field, value);
-                    Ok(Box::new(TermQuery::new(term, IndexRecordOption::Basic)))
+                    match self.typed_query_term(target_field, value)? {
+                        Some(term) => Ok(Box::new(TermQuery::new(term, IndexRecordOption::Basic))),
+                        None => Ok(Box::new(EmptyQuery)),
+                    }
                 } else {
                     Ok(Box::new(AllQuery))
+                }
+            }
+            QueryClause::Terms(fields) => {
+                use tantivy::query::TermSetQuery;
+
+                if let Some((field_name, values)) = fields.iter().next() {
+                    let field = self.resolve_field(field_name);
+                    let terms = values
+                        .iter()
+                        .map(|value| self.typed_query_term(field, value))
+                        .collect::<Result<Vec<_>>>()?
+                        .into_iter()
+                        .flatten();
+                    Ok(Box::new(TermSetQuery::new(terms)))
+                } else {
+                    Ok(Box::new(EmptyQuery))
                 }
             }
             QueryClause::Bool(bq) => {
@@ -4222,32 +4616,15 @@ impl HotEngine {
                 }
             }
             QueryClause::Range(fields) => {
-                use std::ops::Bound;
-                use tantivy::query::RangeQuery;
-
                 if let Some((field_name, condition)) = fields.iter().next() {
                     let target_field = self.resolve_field(field_name);
-
-                    let to_term =
-                        |v: &serde_json::Value| -> Term { self.typed_term(target_field, v) };
-
-                    let lower = if let Some(ref v) = condition.gt {
-                        Bound::Excluded(to_term(v))
-                    } else if let Some(ref v) = condition.gte {
-                        Bound::Included(to_term(v))
-                    } else {
-                        Bound::Unbounded
-                    };
-
-                    let upper = if let Some(ref v) = condition.lt {
-                        Bound::Excluded(to_term(v))
-                    } else if let Some(ref v) = condition.lte {
-                        Bound::Included(to_term(v))
-                    } else {
-                        Bound::Unbounded
-                    };
-
-                    Ok(Box::new(RangeQuery::new(lower, upper)))
+                    let logical_type = self.logical_field_type_for_field(target_field);
+                    typed_range_query_for_schema(
+                        &self.index.schema(),
+                        target_field,
+                        logical_type.as_ref(),
+                        condition,
+                    )
                 } else {
                     Ok(Box::new(AllQuery))
                 }
@@ -4317,7 +4694,7 @@ impl HotEngine {
                     let term = self.typed_term(
                         target_field,
                         &serde_json::Value::String(params.value.clone()),
-                    );
+                    )?;
                     let query = FuzzyTermQuery::new(term, params.fuzziness, true);
                     Ok(Box::new(query))
                 } else {
@@ -6893,6 +7270,10 @@ fn apply_shard_top_k(
         return;
     }
     let k = top_k.limit.min(buckets.len());
+    if k == 0 {
+        buckets.clear();
+        return;
+    }
     // Partial sort: place the top-K elements in [0..k) in O(N) average.
     buckets.select_nth_unstable_by(k - 1, |a, b| {
         let va = bucket_sort_value(a, &top_k.sort_by, &top_k.sort_function);
@@ -7005,15 +7386,17 @@ fn flat_scan_segment(
         && populated_ords.len() > top_k.limit
     {
         let k = top_k.limit.min(populated_ords.len());
-        populated_ords.select_nth_unstable_by(k - 1, |&a, &b| {
-            let va = flat_sort_value(&flat_metrics, metric_entries, &top_k.sort_by, a);
-            let vb = flat_sort_value(&flat_metrics, metric_entries, &top_k.sort_by, b);
-            if top_k.descending {
-                vb.total_cmp(&va)
-            } else {
-                va.total_cmp(&vb)
-            }
-        });
+        if k > 0 {
+            populated_ords.select_nth_unstable_by(k - 1, |&a, &b| {
+                let va = flat_sort_value(&flat_metrics, metric_entries, &top_k.sort_by, a);
+                let vb = flat_sort_value(&flat_metrics, metric_entries, &top_k.sort_by, b);
+                if top_k.descending {
+                    vb.total_cmp(&va)
+                } else {
+                    va.total_cmp(&vb)
+                }
+            });
+        }
         populated_ords.truncate(k);
     }
 
@@ -8415,12 +8798,10 @@ impl super::SearchEngine for HotEngine {
         usize,
         std::collections::HashMap<String, crate::search::PartialAggResult>,
     )> {
+        crate::search::validate_sort_width(req.sort.len())?;
         let searcher = self.reader.searcher();
         // A shard cannot contribute more hits than its live document count.
-        let limit = req
-            .from
-            .saturating_add(req.size)
-            .min(searcher.num_docs() as usize);
+        let effective_limit = bounded_collector_limit(&searcher, req.from.saturating_add(req.size));
         let user_query = self.build_query(&req.query)?;
         // search_after: build a separate hits_query that ANDs the cursor filter
         // onto the user query. The cursor filter must NOT bias total counts or
@@ -8438,8 +8819,6 @@ impl super::SearchEngine for HotEngine {
             } else {
                 None
             };
-        let effective_limit = if limit == 0 { 1 } else { limit };
-
         if GroupedAggCollector::has_grouped_metrics(&req.aggs) {
             // Fast path: match_all + grouped partials → direct columnar scan
             // Bypasses Tantivy's scorer/collector entirely for unfiltered aggregations.
@@ -9307,6 +9686,7 @@ impl HotEngine {
         _needs_score: bool,
         batch_size: usize,
     ) -> Result<super::SqlStreamingBatchHandle> {
+        crate::search::validate_sort_width(req.sort.len())?;
         let searcher = self.reader.searcher();
         let query = self.build_query(&req.query)?;
 
@@ -9342,8 +9722,10 @@ impl HotEngine {
         let batch_size = if batch_size == 0 {
             STREAMING_BATCH_SIZE
         } else {
-            batch_size
-        };
+            batch_size.min(STREAMING_BATCH_SIZE)
+        }
+        .min(searcher.num_docs() as usize)
+        .max(1);
 
         let non_empty: Vec<SegmentBitSet> = segment_bitsets
             .into_iter()
@@ -9661,6 +10043,50 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
         (dir, engine)
+    }
+
+    #[test]
+    fn reviewed_decimal_literals_preserve_integer_digits_and_fraction_signs() {
+        for (text, truncated, fractional, negative) in [
+            ("1.5", 1, true, false),
+            ("-1.5", -1, true, true),
+            ("0.5", 0, true, false),
+            ("-0.5", 0, true, true),
+            ("1.5e1", 15, false, false),
+            ("-15e-1", -1, true, true),
+            (".5", 0, true, false),
+            ("1.", 1, false, false),
+            ("0e999", 0, false, false),
+            ("1e-999", 0, true, false),
+            ("9007199254740993.0", 9_007_199_254_740_993, false, false),
+            ("9007199254740993e0", 9_007_199_254_740_993, false, false),
+            ("9223372036854775807.0", i64::MAX, false, false),
+            ("-9223372036854775808.0", i64::MIN, false, true),
+        ] {
+            let parsed = parse_decimal_integer(text).unwrap();
+            assert_eq!(
+                (parsed.truncated, parsed.fractional, parsed.negative),
+                (truncated, fractional, negative),
+                "{text}"
+            );
+        }
+        for text in [
+            "",
+            ".",
+            "abc",
+            "NaN",
+            "inf",
+            "1.2.3",
+            "1e1e1",
+            "9223372036854775808",
+            "-9223372036854775809",
+            "18446744073709551615",
+            "9223372036854775807.5",
+            "-9223372036854775808.5",
+            "1e999",
+        ] {
+            assert!(parse_decimal_integer(text).is_err(), "{text}");
+        }
     }
 
     fn commit_without_reader_reload(engine: &HotEngine) {
@@ -14097,11 +14523,15 @@ mod tests {
             aggs: HashMap::new(),
         };
 
-        let (hits, _, _) = engine.search_query(&req).unwrap();
+        let error = engine.search_query(&req).unwrap_err();
         assert!(
-            hits.is_empty(),
-            "integer fields must not reinterpret ISO date strings as epoch millis"
+            crate::search::query_string::query_error_is_client(&error),
+            "{error:#}"
         );
+        let reason = format!("{error:#}");
+        assert!(reason.contains("counter"), "{reason}");
+        assert!(reason.contains("2025-01-05T08:15:00Z"), "{reason}");
+        assert!(reason.contains("signed 64-bit integer"), "{reason}");
     }
 
     #[test]

@@ -553,6 +553,56 @@ enum LocalSqlPartitionResult {
     },
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("SQL shard [{index}][{shard}] on [{node}] panicked: {source}")]
+struct SqlShardPanic {
+    index: String,
+    shard: u32,
+    node: String,
+    total_shards: usize,
+    #[source]
+    source: anyhow::Error,
+}
+
+fn sql_shard_error(
+    index: &str,
+    shard: u32,
+    node: &str,
+    total_shards: usize,
+    source: anyhow::Error,
+) -> anyhow::Error {
+    let remote_panic = source
+        .downcast_ref::<tonic::Status>()
+        .is_some_and(|status| {
+            status.code() == tonic::Code::Internal
+                && status
+                    .message()
+                    .starts_with("search worker task panicked during ")
+        });
+    if source.is::<crate::worker::SearchWorkerPanic>() || remote_panic {
+        SqlShardPanic {
+            index: index.to_string(),
+            shard,
+            node: node.to_string(),
+            total_shards,
+            source,
+        }
+        .into()
+    } else {
+        source
+    }
+}
+
+fn sql_shard_panic_response(error: &anyhow::Error) -> Option<(StatusCode, Json<Value>)> {
+    let panic = error.downcast_ref::<SqlShardPanic>()?;
+    let failure = ShardFailure::from_error(&panic.index, panic.shard, &panic.node, &panic.source);
+    let (status, Json(mut body)) = all_shards_failed_response(0, &[failure])?;
+    if panic.total_shards > 1 {
+        body["error"]["reason"] = serde_json::json!("SQL shard execution panicked");
+    }
+    Some((status, Json(body)))
+}
+
 fn search_request_uses_approximate_top_k(search_req: &crate::search::SearchRequest) -> bool {
     search_req.aggs.values().any(|agg| {
         matches!(
@@ -660,7 +710,11 @@ async fn collect_direct_sql_partitions(
 
     let local_futures: Vec<_> = local_shards
         .iter()
-        .map(|(_shard_id, engine)| {
+        .map(|(shard_id, engine)| {
+            let shard_id = *shard_id;
+            let index = index_name.to_string();
+            let node = state.local_node_id.clone();
+            let total_shards = metadata.shard_routing.len();
             let engine = engine.clone();
             let req = search_req.clone();
             let columns = plan.required_columns.clone();
@@ -690,6 +744,9 @@ async fn collect_direct_sql_partitions(
                             }
                         })
                         .await
+                        .map_err(|error| {
+                            sql_shard_error(&index, shard_id, &node, total_shards, error)
+                        })
                 }
                 .boxed()
             } else {
@@ -706,6 +763,9 @@ async fn collect_direct_sql_partitions(
                                 })
                         })
                         .await
+                        .map_err(|error| {
+                            sql_shard_error(&index, shard_id, &node, total_shards, error)
+                        })
                 }
                 .boxed()
             }
@@ -766,8 +826,9 @@ async fn collect_direct_sql_partitions(
             let columns = plan.required_columns.clone();
             let needs_id = plan.needs_id;
             let needs_score = plan.needs_score;
+            let total_shards = metadata.shard_routing.len();
             remote_futures.push(tokio::spawn(async move {
-                if use_streaming {
+                let result = if use_streaming {
                     client
                         .open_sql_batch_stream_to_shard(
                             &node,
@@ -797,7 +858,10 @@ async fn collect_direct_sql_partitions(
                             batch,
                             total_hits: hits,
                         })
-                }
+                };
+                result.map_err(|error| {
+                    sql_shard_error(&index_name, shard_id, &node.id, total_shards, error)
+                })
             }));
         }
     }
@@ -991,6 +1055,69 @@ async fn resolve_semijoin_keys(
     Ok(keys)
 }
 
+async fn validate_residual_sql_literals(
+    state: &AppState,
+    plan: &crate::hybrid::QueryPlan,
+    mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if !plan.has_residual_predicates {
+        return Ok(());
+    }
+    let sql = plan.rewritten_sql.clone();
+    let mappings = mappings.clone();
+    state
+        .worker_pools
+        .spawn_search(move || -> anyhow::Result<()> {
+            // Validate numeric strings without imposing Tantivy's literal
+            // domain on comparisons that DataFusion evaluates.
+            let clauses = crate::hybrid::planner::residual_predicate_validation_clauses(&sql)?
+                .into_iter()
+                .filter(|clause| {
+                    let crate::search::QueryClause::Term(fields) = clause else {
+                        return false;
+                    };
+                    fields.iter().any(|(name, value)| {
+                        match mappings.get(name).map(|mapping| &mapping.field_type) {
+                            Some(
+                                crate::cluster::state::FieldType::Integer
+                                | crate::cluster::state::FieldType::Float,
+                            ) => true,
+                            Some(crate::cluster::state::FieldType::Date) => {
+                                !value.as_str().is_some_and(|text| {
+                                    chrono::NaiveDateTime::parse_from_str(
+                                        text,
+                                        "%Y-%m-%d %H:%M:%S%.f",
+                                    )
+                                    .is_ok()
+                                })
+                            }
+                            _ => false,
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            if clauses.is_empty() {
+                return Ok(());
+            }
+            let request = crate::search::SearchRequest {
+                query: crate::search::QueryClause::Bool(crate::search::BoolQuery {
+                    filter: clauses,
+                    ..Default::default()
+                }),
+                size: 0,
+                from: 0,
+                knn: None,
+                sort: Vec::new(),
+                search_after: None,
+                aggs: HashMap::new(),
+            };
+            crate::engine::tantivy::validate_search_request_with_mappings(&request, &mappings)
+        })
+        .await
+        .map_err(failures::query_error_response)?
+        .map_err(failures::query_error_response)
+}
+
 async fn execute_sql_query_with_plan(
     state: &AppState,
     plan: crate::hybrid::QueryPlan,
@@ -1010,6 +1137,7 @@ async fn execute_sql_query_with_plan(
         }
     };
     let plan = canonicalize_sql_plan_fields(plan, &metadata.mappings)?;
+    validate_residual_sql_literals(state, &plan, &metadata.mappings).await?;
 
     let mut semijoin_key_count = None;
     let mut semijoin_ms = 0.0;
@@ -1209,6 +1337,9 @@ async fn execute_sql_query_with_plan(
         {
             Ok(result) => Some(result),
             Err(error) => {
+                if let Some(response) = sql_shard_panic_response(&error) {
+                    return Err(response);
+                }
                 if let Some(response) = crate::api::index::retryable_forward_error_response(&error)
                 {
                     return Err(response);
@@ -1624,6 +1755,7 @@ async fn execute_sql_stream_query(
         return Ok(stream_json_response(sql_stream_response_body(&result)));
     }
 
+    validate_residual_sql_literals(state, &plan, &metadata.mappings).await?;
     let mut search_req = plan.to_search_request(state.sql_approximate_top_k);
     if plan.has_group_by_fallback || plan.has_ungrouped_aggregate_fallback {
         search_req.size = if state.sql_group_by_scan_limit == 0 {
@@ -1657,6 +1789,9 @@ async fn execute_sql_stream_query(
     {
         Ok(result) => result,
         Err(error) => {
+            if let Some(response) = sql_shard_panic_response(&error) {
+                return Err(response);
+            }
             if let Some(response) = crate::api::index::retryable_forward_error_response(&error) {
                 return Err(response);
             }
