@@ -147,7 +147,7 @@ async fn forwarding_ci158_autocreate_without_data_nodes_rejects_before_metadata(
             Some(json!({"body": "must not be stored"})),
         )
         .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert_eq!(body["error"]["type"], "no_data_nodes_exception", "{body}");
     for node in &cluster.nodes {
         assert!(

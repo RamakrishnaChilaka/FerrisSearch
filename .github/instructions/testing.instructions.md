@@ -268,6 +268,12 @@ cargo test -- test_name                         # Single test by name
   the real quorum. Keep a short deadline test, exact document results, and
   the two-node 50-iteration no-hook loop. Do not lengthen client timeouts or
   weaken assertions to hide a forwarding race.
+- A gate entering does not prove the intended CreateIndex committed: it may
+  have paused an earlier bootstrap Normal entry. Deadline regressions must
+  keep the explicit create request independently polled and observe the
+  leader's committed index before sending writes. Keep the follower paused,
+  assert its metadata/engine remain absent, and verify primary placement on a
+  Data-role node. A primary term of 2 may be initial activation, not reassignment.
 - For WAL generation/manifest changes, add regressions for manifest creation on new shards, manifest-required reopen, active-generation-only reopen, and ignored non-generation side files in the WAL directory.
 - For WAL corruption hardening, add regressions that an unknown operation tag in the active generation returns `Err` on reopen instead of panicking, and that an internal active-generation mismatch fails before append writes bytes.
 - For persistent Raft format errors, independently corrupt vote, committed-log,

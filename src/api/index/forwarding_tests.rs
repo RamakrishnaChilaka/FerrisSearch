@@ -413,25 +413,37 @@ async fn assert_forwarding_lag_deadline(cluster: &ForwardingCluster) {
     let create = cluster
         .client
         .put(format!("{}/lag-timeout", cluster.nodes[0].url))
-        .json(&json!({"settings": {"number_of_replicas": 0}}))
-        .send();
-    tokio::pin!(create);
-    tokio::select! {
-        biased;
-        () = cluster.gate.wait_until_entered() => {}
-        response = &mut create => {
-            assert_eq!(response.unwrap().status(), StatusCode::OK);
-            cluster.gate.wait_until_entered().await;
+        .json(&json!({"settings": {"number_of_replicas": 0}}));
+    let create = tokio::spawn(async move { create.send().await.unwrap() });
+    tokio::time::timeout(Duration::from_secs(5), cluster.gate.wait_until_entered())
+        .await
+        .expect("follower must pause application");
+    let metadata = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(metadata) = cluster.nodes[0]
+                .state
+                .cluster_manager
+                .get_state()
+                .indices
+                .get("lag-timeout")
+                .cloned()
+            {
+                break metadata;
+            }
+            tokio::task::yield_now().await;
         }
-    }
+    })
+    .await
+    .expect("a paused earlier entry must not substitute for explicit index creation");
+    assert_eq!(metadata.primary_node(0).map(String::as_str), Some("node-2"));
+    assert_eq!(metadata.shard_routing[&0].primary_term, 1);
     assert!(
-        cluster.nodes[0]
+        !cluster.nodes[1]
             .state
             .cluster_manager
             .get_state()
             .indices
-            .contains_key("lag-timeout"),
-        "a paused earlier entry must not substitute for explicit index creation"
+            .contains_key("lag-timeout")
     );
     for (method, path, payload) in [
         (
@@ -511,6 +523,18 @@ async fn assert_forwarding_lag_deadline(cluster: &ForwardingCluster) {
             .get_shard("lag-timeout", 0)
             .is_none()
     );
+    assert!(
+        cluster.nodes[0]
+            .state
+            .shard_manager
+            .get_shard("lag-timeout", 0)
+            .is_none()
+    );
+    let response = create.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["acknowledged"], true, "{body}");
+    assert_eq!(body["shards_acknowledged"], false, "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
