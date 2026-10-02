@@ -90,6 +90,10 @@ wrong incarnation is rejected before primary admission without consuming a
 sequence. A queued rejection emits `index_not_found`, not `version_conflict`.
 The model contains one fixed-UUID shard; delete/recreate ABA is covered by the
 REST recreation and queued transport regressions, not by this bounded model.
+Applied index-incarnation retirement, stale routing/quarantine cleanup, and
+source settlement triggered by UUID removal/replacement are also Rust
+regression boundaries, outside this fixed-UUID model. The bounded matrix checks
+the unchanged allocation/fencing/admission protocol, not index-name recreation.
 
 The Rust trace evidence currently scopes out periodic refresh, automatic or
 API-driven flush, force merge, and their WAL truncation. The harness sets a

@@ -161,6 +161,12 @@ pub async fn replicate_bulk(
   session on the shared-write path is a logic error and must fail the operation.
 - Start/reopen/delete share a per-shard lifecycle lock, so no new source session
   can capture the old engine between cleanup and engine replacement.
+- Whole-index retirement additionally excludes opens/reopen/install through an
+  index read/write lifecycle lock. Applied UUID removal/replacement prompts
+  the source reaper to run existing settlement without waiting for its deadline;
+  this is definitive impossibility, not permission to release unknown admission.
+  Cleanup drops the old session engine/WAL pin and never retargets a recreated
+  name's new UUID.
 - Each replicated operation must fit the same 32 MiB encoded WAL-frame limit as
   a primary operation. Oversized explicit-sequence single or bulk writes fail
   validation before replica WAL mutation.

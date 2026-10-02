@@ -69,6 +69,11 @@ the direct fast-field path derives its schema without a persisted mapping.
   identity for an existing index
 - The UUID determines the on-disk data directory: `<data_dir>/<uuid>/shard_<id>`
 - Delete + re-create with the same index name gets a new UUID — stale data never collides
+- ShardManager's name-keyed serving map is not incarnation authority. Production
+  managers bind the shared applied ClusterManager/local-node context, retire
+  removed/replaced UUIDs, and gate serving/publication by exact UUID/allocation.
+  Retirement preserves old disk evidence; destructive cleanup captures the
+  deleted UUID and never follows a newer name-to-UUID mapping.
 - `build_shard_routing()` auto-generates a UUID; `auto_create_index()` generates one explicitly
 
 ### Key ClusterState Methods
@@ -173,6 +178,11 @@ pub struct ClusterManager { state: Arc<RwLock<ClusterState>> }
 - `primary_open_wait_timeout()` provides a separate 20-second opening budget,
   not the 5-second metadata budget. Readiness failure after CreateIndex commits
   changes `shards_acknowledged` to false, not the committed acknowledgement.
+- Local engine retirement observes applied versions with a separate weak-owned
+  100 ms ShardManager poller. It reads this same state rather than introducing
+  an apply/snapshot publication channel, follower-state fallback, or another
+  sequencing authority. It does not change the settings propagation limitation
+  described below.
 - `add_node(node)`, `ping_node(node_id)`
 - `update_state(new_state)` — full overwrite, preserves `last_seen`
 - **WARNING**: `update_state()` should never replace Raft-managed state.
