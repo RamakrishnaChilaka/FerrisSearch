@@ -228,6 +228,14 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   its own application wait expires. Only marked pre-execution metadata waits
   map to safe document 503s; generic `UNAVAILABLE` is not a retryable create
   error.
+- `CreateIndexResponse.error_code` is the typed duplicate-create signal.
+  Both the leader pre-check and serialized Raft apply rejection return
+  `AlreadyExists`, `acknowledged: false`, a nonempty error, empty response JSON,
+  and applied-version response metadata. The client rejects unknown codes or
+  inconsistent response shapes; it preserves `IndexAlreadyExistsError` and
+  records the per-index floor without waiting. Explicit HTTP create must
+  remain 400 on lagging coordinators; auto-create waits for local winning
+  metadata and retains the existing retryable metadata-timeout 503.
 - Raft-backed constructors bind ShardManager to the same applied
   ClusterManager/local-node context and start its incarnation retirement
   poller. A recreated name retires the old serving UUID before assigned

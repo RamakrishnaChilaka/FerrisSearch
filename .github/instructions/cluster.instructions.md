@@ -141,6 +141,10 @@ fn allocate_unassigned_replicas_for_shards(&mut self, data_nodes: &[String], eli
 - Allocation IDs are state-machine owned. CreateIndex assigns its committed log
   index to initial copies; UpdateIndex preserves surviving IDs and assigns its
   own log index to every new copy. Removed copies lose their IDs.
+- CreateIndex applies atomically by name: an existing index rejects without
+  replacing metadata, allocations, routing, or version. Only an applied delete
+  permits a new incarnation. Local/test `add_index*` helpers are not the
+  production existence authority; the Raft state-machine lock and guard are.
 - `MarkReplicaInSync`, `ActivatePrimary`, and `FailShardCopy` are
   UUID/allocation-bound conditional Raft commands. Rejected commands perform no
   partial mutation and do not bump `ClusterState.version`.

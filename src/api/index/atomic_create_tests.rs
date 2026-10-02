@@ -10,6 +10,7 @@ const BULK_INDICES: usize = 3;
 const TEST_WAIT: Duration = Duration::from_secs(60);
 
 async fn catch_up(cluster: &ForwardingCluster) {
+    let version = cluster.nodes[0].state.cluster_manager.version();
     let index = cluster.nodes[0]
         .state
         .raft
@@ -21,13 +22,14 @@ async fn catch_up(cluster: &ForwardingCluster) {
     tokio::time::timeout(TEST_WAIT, async {
         for node in &cluster.nodes {
             loop {
-                if node
-                    .state
-                    .raft
-                    .metrics()
-                    .borrow_watched()
-                    .last_applied
-                    .is_some_and(|applied| applied.index >= index)
+                if node.state.cluster_manager.version() >= version
+                    && node
+                        .state
+                        .raft
+                        .metrics()
+                        .borrow_watched()
+                        .last_applied
+                        .is_some_and(|applied| applied.index >= index)
                 {
                     break;
                 }
@@ -456,6 +458,10 @@ async fn atomic_lagging_coordinator_classifies_existing_create_and_autocreate() 
     println!("ATOMIC_LAG explicit={status} {body} auto={auto:?}");
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"]["type"], "resource_already_exists_exception");
+    assert_eq!(
+        follower.transport_client.required_state_version(index),
+        before.version,
+    );
     let (status, body) = auto.unwrap_err();
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
     assert!(
@@ -480,6 +486,91 @@ async fn atomic_lagging_coordinator_classifies_existing_create_and_autocreate() 
         .unwrap();
     assert_eq!(metadata.uuid, before.indices[index].uuid);
     let source = json!({"body": "write after the winning metadata applies"});
+    let (status, body) = request(
+        &cluster,
+        1,
+        reqwest::Method::PUT,
+        &format!("/{index}/_doc/a"),
+        Some(source.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = request(
+        &cluster,
+        0,
+        reqwest::Method::GET,
+        &format!("/{index}/_doc/a"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_source"], source);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn atomic_lagging_create_uses_leader_allocation_view() {
+    let cluster = ForwardingCluster::start().await;
+    let raft = &cluster.nodes[0].state.raft;
+    let mut data_node = cluster.nodes[0].state.cluster_manager.get_state().nodes["node-2"].clone();
+    data_node.roles = vec![NodeRole::Client];
+    raft.client_write(ClusterCommand::AddNode { node: data_node })
+        .await
+        .unwrap()
+        .data
+        .into_result()
+        .unwrap();
+    catch_up(&cluster).await;
+    cluster.gate.pause();
+    let mut leader = cluster.nodes[0].state.cluster_manager.get_state().nodes["node-1"].clone();
+    leader.roles = vec![NodeRole::Master, NodeRole::Data];
+    raft.client_write(ClusterCommand::AddNode { node: leader })
+        .await
+        .unwrap()
+        .data
+        .into_result()
+        .unwrap();
+    let index = "atomic-lag-allocation";
+    raft.client_write(ClusterCommand::CreateIndex {
+        metadata: candidate(index, "node-1"),
+    })
+    .await
+    .unwrap()
+    .data
+    .into_result()
+    .unwrap();
+    tokio::time::timeout(TEST_WAIT, cluster.gate.wait_until_entered())
+        .await
+        .unwrap();
+    let follower = cluster.nodes[1].state.cluster_manager.get_state();
+    assert!(
+        !follower
+            .nodes
+            .values()
+            .any(|node| node.roles.contains(&NodeRole::Data)),
+    );
+    assert!(!follower.indices.contains_key(index));
+    let before = cluster.nodes[0].state.cluster_manager.get_state();
+    let (status, body) = request(
+        &cluster,
+        1,
+        reqwest::Method::PUT,
+        &format!("/{index}"),
+        Some(json!({"settings": {"number_of_replicas": 0}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["type"], "resource_already_exists_exception");
+    assert_eq!(
+        cluster.nodes[0].state.cluster_manager.get_state().version,
+        before.version,
+    );
+    assert_eq!(
+        cluster.nodes[0].state.cluster_manager.get_state().indices[index].uuid,
+        before.indices[index].uuid,
+    );
+    cluster.gate.resume();
+    catch_up(&cluster).await;
+    let source = json!({"body": "leader metadata, not the lagging allocation view"});
     let (status, body) = request(
         &cluster,
         1,

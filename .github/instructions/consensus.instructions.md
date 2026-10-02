@@ -42,6 +42,11 @@ roundtrip test in `types.rs`, and an `apply_command` arm in `state_machine.rs`.
 ## ClusterResponse
 - `Ok` — command applied successfully
 - `Error(String)` — application error
+- `IndexAlreadyExists { index_name }` — deterministic duplicate-create rejection
+
+`into_result()` and `client_write_checked()` return `anyhow::Result` and
+preserve duplicate rejection as `IndexAlreadyExistsError`. Match that type,
+never the error message. An OpenRaft commit is not application success.
 
 ## State Machine (state_machine.rs)
 ```rust
@@ -56,7 +61,7 @@ pub struct ClusterStateMachine {
 |---------|--------|
 | `AddNode` | `state.add_node()` |
 | `RemoveNode` | `state.remove_node()` |
-| `CreateIndex` | assign initial copy IDs from the committed log index; replicas start out of sync |
+| `CreateIndex` | reject an existing name under the applied-state write lock before validation/mutation; otherwise assign initial copy IDs from the committed log index; replicas start out of sync |
 | `DeleteIndex` | remove from `state.indices` |
 | `SetMaster` | set `state.master_node` |
 | `UpdateIndex` | preserve existing copy IDs (including an unchanged red shard's absent primary ID), assign the current log index to new copies, clear removed IDs, intersect in-sync membership, and reject out-of-sync promotion |
@@ -71,9 +76,18 @@ pub struct ClusterStateMachine {
 
 Successful apply arms bump `state.version += 1`; conditional-command rejection
 returns `ClusterResponse::Error` without partial mutation or a version bump.
+Duplicate CreateIndex returns `ClusterResponse::IndexAlreadyExists` with the
+same no-mutation/no-version-bump contract, even for the same UUID or malformed
+replacement metadata. Only an applied DeleteIndex permits recreation. API and
+gRPC pre-checks are optimizations, not the creation authority.
 Unconditional apply arms bump on idempotent upserts and deletes
 of absent keys (mirrors `DeleteIndex` / `RemoveNode`). `AddNode`/`CreateIndex` bump version
 inside the `state.*` helper they call.
+
+This rejection changes replay semantics for older Raft logs containing duplicate
+CreateIndex entries: they no longer replace the first incarnation. Pre-1.0 has
+no migration or mixed-version replay compatibility; wipe the node data
+directories and recreate the cluster.
 
 ### Snapshot
 - Format: JSON-serialized `ClusterState`

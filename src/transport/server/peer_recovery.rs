@@ -1221,7 +1221,10 @@ impl TransportService {
                 })
                 .await
                 .map_err(|error| error.to_string())?;
-            response.data.into_result()
+            response
+                .data
+                .into_result()
+                .map_err(|error| error.to_string())
         } else {
             let state = self.cluster_manager.get_state();
             let master_id = state
@@ -1278,7 +1281,10 @@ impl TransportService {
                 })
                 .await
                 .map_err(|error| error.to_string())?;
-            response.data.into_result()
+            response
+                .data
+                .into_result()
+                .map_err(|error| error.to_string())
         } else {
             let state = self.cluster_manager.get_state();
             let master_id = state

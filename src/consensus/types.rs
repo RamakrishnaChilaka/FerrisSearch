@@ -203,13 +203,23 @@ impl std::fmt::Display for ClusterCommand {
 pub enum ClusterResponse {
     Ok,
     Error(String),
+    IndexAlreadyExists { index_name: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("index [{index_name}] already exists")]
+pub struct IndexAlreadyExistsError {
+    pub index_name: String,
 }
 
 impl ClusterResponse {
-    pub fn into_result(self) -> Result<(), String> {
+    pub fn into_result(self) -> anyhow::Result<()> {
         match self {
             Self::Ok => Ok(()),
-            Self::Error(error) => Err(error),
+            Self::Error(error) => Err(anyhow::anyhow!("{error}")),
+            Self::IndexAlreadyExists { index_name } => {
+                Err(IndexAlreadyExistsError { index_name }.into())
+            }
         }
     }
 }
@@ -299,6 +309,30 @@ mod tests {
 
         assert!(matches!(ok_back, ClusterResponse::Ok));
         assert!(matches!(err_back, ClusterResponse::Error(msg) if msg == "something went wrong"));
+    }
+
+    #[test]
+    fn atomic_already_exists_response_preserves_typed_rejection() {
+        let response = ClusterResponse::IndexAlreadyExists {
+            index_name: "atomic-index".into(),
+        };
+        let decoded: ClusterResponse =
+            serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+        assert_eq!(decoded, response);
+        let error = decoded
+            .into_result()
+            .map_err(|error| error.context("CreateIndex failed"))
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<IndexAlreadyExistsError>(),
+            Some(&IndexAlreadyExistsError {
+                index_name: "atomic-index".into(),
+            }),
+        );
+        let untyped = ClusterResponse::Error("index [atomic-index] already exists".into())
+            .into_result()
+            .unwrap_err();
+        assert!(untyped.downcast_ref::<IndexAlreadyExistsError>().is_none());
     }
 
     #[test]

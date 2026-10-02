@@ -134,6 +134,11 @@ impl ClusterStateMachine {
                 ClusterResponse::Ok
             }
             ClusterCommand::CreateIndex { metadata } => {
+                if state.indices.contains_key(&metadata.name) {
+                    return ClusterResponse::IndexAlreadyExists {
+                        index_name: metadata.name.clone(),
+                    };
+                }
                 if metadata.shard_routing.len() != metadata.number_of_shards as usize {
                     return ClusterResponse::Error(format!(
                         "index '{}' has {} shard routing entries but declares {} shards",
@@ -1152,6 +1157,40 @@ mod tests {
         assert_eq!(state.primary_allocation_id("atomic-recreate", 0), Some(30));
         assert!(!state.primary_initialized("atomic-recreate", 0));
         assert_eq!(state.version, 3);
+    }
+
+    #[test]
+    fn atomic_duplicate_create_rejects_same_uuid_and_malformed_candidate() {
+        let machine = ClusterStateMachine::new("atomic-create".into());
+        let first = make_index("atomic-existing");
+        assert_eq!(
+            machine.apply_command_at(
+                &ClusterCommand::CreateIndex {
+                    metadata: first.clone(),
+                },
+                10,
+            ),
+            ClusterResponse::Ok,
+        );
+        let before = machine.state_handle().read().unwrap().clone();
+        let mut same_uuid = first.clone();
+        same_uuid.settings.refresh_interval_ms = Some(999);
+        let mut malformed = first;
+        malformed.uuid = crate::cluster::state::IndexUuid::new_random();
+        malformed.shard_routing.clear();
+        for metadata in [same_uuid, malformed] {
+            assert_eq!(
+                machine.apply_command_at(&ClusterCommand::CreateIndex { metadata }, 20),
+                ClusterResponse::IndexAlreadyExists {
+                    index_name: "atomic-existing".into(),
+                },
+            );
+            let after = machine.state_handle().read().unwrap().clone();
+            assert_eq!(
+                serde_json::to_value(&after).unwrap(),
+                serde_json::to_value(&before).unwrap(),
+            );
+        }
     }
 
     #[test]

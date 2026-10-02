@@ -14,7 +14,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::api::search::failures::{ShardFailure, all_shards_failed_response, shard_stats};
-use crate::api::{raft_write, resolve_leader_or_master};
+use crate::api::{raft_write, raft_write_error_response, resolve_leader_or_master};
+use crate::consensus::types::IndexAlreadyExistsError;
 
 fn is_document_validation_error(error: &anyhow::Error) -> bool {
     error
@@ -340,6 +341,24 @@ async fn wait_for_index_metadata(state: &AppState, index_name: &str) -> Option<I
     }
 }
 
+async fn wait_for_created_index_metadata(
+    state: &AppState,
+    index_name: &str,
+) -> Result<IndexMetadata, (StatusCode, Json<Value>)> {
+    wait_for_index_metadata(state, index_name)
+        .await
+        .ok_or_else(|| {
+            crate::api::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "shard_not_available_exception",
+                format!(
+                    "index [{index_name}] is not present in local cluster state at version {} after creation",
+                    state.cluster_manager.version(),
+                ),
+            )
+        })
+}
+
 /// Auto-create an index with 1 shard, respecting the coordinator pattern.
 /// If this node is NOT the Raft leader, forwards to the master.
 async fn auto_create_index(
@@ -347,6 +366,14 @@ async fn auto_create_index(
     index_name: &str,
     _cluster_state: &crate::cluster::state::ClusterState,
 ) -> Result<IndexMetadata, (StatusCode, Json<Value>)> {
+    if state
+        .cluster_manager
+        .get_state()
+        .indices
+        .contains_key(index_name)
+    {
+        return wait_for_created_index_metadata(state, index_name).await;
+    }
     tracing::warn!(
         "Index '{}' not found, auto-creating with 1 shard",
         index_name
@@ -364,23 +391,13 @@ async fn auto_create_index(
                 error,
             )
         })?;
-        return match state
+        match state
             .transport_client
             .forward_create_index(&master, index_name, &body_bytes)
             .await
         {
-            Ok(_) => match wait_for_index_metadata(state, index_name).await {
-                Some(metadata) => Ok(metadata),
-                None => {
-                    return Err(crate::api::error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "master_not_discovered_exception",
-                        format!(
-                            "Index [{index_name}] was created by the leader but the local cluster state has not caught up yet"
-                        ),
-                    ));
-                }
-            },
+            Ok(_) => {}
+            Err(error) if error.downcast_ref::<IndexAlreadyExistsError>().is_some() => {}
             Err(e) => {
                 if let Some(response) = forwarded_create_index_error_response(&e) {
                     return Err(response);
@@ -391,9 +408,13 @@ async fn auto_create_index(
                     format!("Auto-create index forward to master failed: {e:#}"),
                 ));
             }
-        };
+        }
+        return wait_for_created_index_metadata(state, index_name).await;
     }
     let cluster_state = state.cluster_manager.get_state();
+    if cluster_state.indices.contains_key(index_name) {
+        return wait_for_created_index_metadata(state, index_name).await;
+    }
     let mut data_nodes = cluster_state
         .nodes
         .values()
@@ -408,18 +429,19 @@ async fn auto_create_index(
     }
     let metadata = IndexMetadata::from_create_request_body(index_name, &body, &data_nodes)
         .map_err(create_index_error_response)?;
-    raft_write(
-        state,
+    if let Err(error) = crate::consensus::client_write_checked(
+        &state.raft,
         crate::consensus::types::ClusterCommand::CreateIndex { metadata },
     )
-    .await?;
+    .await
+        && error.downcast_ref::<IndexAlreadyExistsError>().is_none()
+    {
+        return Err(raft_write_error_response(error));
+    }
     state
         .transport_client
         .acknowledge_state(index_name, state.cluster_manager.version());
-    let created_metadata = wait_for_index_metadata(state, index_name).await.ok_or_else(|| crate::api::error_response(
-        StatusCode::SERVICE_UNAVAILABLE, "shard_not_available_exception",
-        format!("index [{index_name}] is not present in local cluster state at version {} after creation", state.cluster_manager.version()),
-    ))?;
+    let created_metadata = wait_for_created_index_metadata(state, index_name).await?;
 
     let committed_state = state.cluster_manager.get_state();
     if let Some(routing) = created_metadata.shard_routing.get(&0)
@@ -635,6 +657,13 @@ fn create_index_error_response(error: CreateIndexMetadataError) -> (StatusCode, 
 fn forwarded_create_index_error_response(
     error: &anyhow::Error,
 ) -> Option<(StatusCode, Json<Value>)> {
+    if let Some(error) = error.downcast_ref::<IndexAlreadyExistsError>() {
+        return Some(crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "resource_already_exists_exception",
+            error,
+        ));
+    }
     let status = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<tonic::Status>())?;
@@ -683,8 +712,6 @@ pub async fn create_index(
     }
     // IndexName is validated at extraction time
 
-    let settings: Value = serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
-
     let cluster_state = state.cluster_manager.get_state();
 
     if cluster_state.indices.contains_key(index_name.as_str()) {
@@ -694,24 +721,6 @@ pub async fn create_index(
             format!("index [{index_name}] already exists"),
         );
     }
-
-    // Build shard assignment: distribute shards round-robin across Data nodes
-    let data_nodes: Vec<String> = cluster_state
-        .nodes
-        .values()
-        .filter(|n| n.roles.contains(&crate::cluster::state::NodeRole::Data))
-        .map(|n| n.id.clone())
-        .collect();
-
-    let metadata =
-        match IndexMetadata::from_create_request_body(&index_name, &settings, &data_nodes) {
-            Ok(metadata) => metadata,
-            Err(error) => return create_index_error_response(error),
-        };
-
-    let index_settings = metadata.settings.clone();
-    let replica_count = metadata.number_of_replicas;
-    let shard_count = metadata.number_of_shards;
 
     // Coordinator: forward to leader or write locally via Raft
     if let Some(master) = match resolve_leader_or_master(&state, "index creation") {
@@ -736,6 +745,23 @@ pub async fn create_index(
             }
         }
     }
+
+    let settings: Value = serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
+    let data_nodes: Vec<String> = cluster_state
+        .nodes
+        .values()
+        .filter(|n| n.roles.contains(&crate::cluster::state::NodeRole::Data))
+        .map(|n| n.id.clone())
+        .collect();
+    let metadata =
+        match IndexMetadata::from_create_request_body(&index_name, &settings, &data_nodes) {
+            Ok(metadata) => metadata,
+            Err(error) => return create_index_error_response(error),
+        };
+    let index_settings = metadata.settings.clone();
+    let replica_count = metadata.number_of_replicas;
+    let shard_count = metadata.number_of_shards;
+
     let cmd = crate::consensus::types::ClusterCommand::CreateIndex { metadata };
     if let Err(e) = raft_write(&state, cmd).await {
         return e;

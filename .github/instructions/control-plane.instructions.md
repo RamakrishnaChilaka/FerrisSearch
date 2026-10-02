@@ -26,6 +26,14 @@ OpenRaft transport success is not proof that the application command applied.
 Rejected conditional commands perform no partial mutation and do not bump the
 cluster-state version.
 
+`CreateIndex` is also conditional: the state machine rejects an existing name
+as `ClusterResponse::IndexAlreadyExists`, preserving UUID, routing, allocations,
+and version. Checked writes retain the typed `IndexAlreadyExistsError`.
+Explicit create maps it to HTTP 400 `resource_already_exists_exception`;
+document/bulk auto-create treats only that rejection as success and waits for
+locally applied winning metadata. Never use a candidate UUID after losing
+creation, or infer this rejection by matching a message.
+
 `FailShardCopy.promote_only` is required for primary-copy reports. The state
 machine accepts such a report only when an in-sync replica can be promoted; it
 must reject rather than clear the last primary allocation. Replica reports set
@@ -156,6 +164,11 @@ rpc PutApiKey(PutApiKeyRequest) returns (PutApiKeyResponse);
 - The `{ bool acknowledged; string error; }` response is the house convention: a
   non-empty `error` string means failure (client maps it to `Err`). Don't use a tonic
   `Status` for application-level failures here.
+- `CreateIndexResponse` additionally carries a typed `CreateIndexErrorCode`
+  and applied-version response metadata for already-exists rejections. Its
+  client records the per-index floor without waiting before reporting the
+  rejection, so a lagging explicit-create coordinator still returns HTTP 400.
+  Auto-create then uses the existing local metadata wait/deadline.
 - Carrying the record as a single `record_json` string keeps proto churn minimal and
   reuses the serde structs as the wire contract. Typed sub-messages are also acceptable,
   but `*_json` matches the lowest-friction convention for control-plane records.

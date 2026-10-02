@@ -470,6 +470,24 @@ fn create_index_error_status(error: crate::cluster::state::CreateIndexMetadataEr
     }
 }
 
+fn create_index_already_exists_response(
+    index_name: &str,
+    version: u64,
+) -> Response<CreateIndexResponse> {
+    crate::transport::state_wait::response_with_cluster_state_version(
+        CreateIndexResponse {
+            acknowledged: false,
+            error: crate::consensus::types::IndexAlreadyExistsError {
+                index_name: index_name.to_string(),
+            }
+            .to_string(),
+            response_json: Vec::new(),
+            error_code: CreateIndexErrorCode::AlreadyExists as i32,
+        },
+        version,
+    )
+}
+
 #[cfg(test)]
 static TRACKED_REPLICA_INDEX_PAYLOAD: std::sync::Mutex<Option<Vec<u8>>> =
     std::sync::Mutex::new(None);
@@ -3386,19 +3404,15 @@ impl InternalTransport for TransportService {
             .client_write(command)
             .await
             .map_err(|error| Status::internal(format!("Raft MarkReplicaInSync failed: {error}")))?;
-        match response.data {
-            crate::consensus::types::ClusterResponse::Ok => {
-                Ok(Response::new(MarkReplicaInSyncResponse {
-                    acknowledged: true,
-                    error: String::new(),
-                }))
-            }
-            crate::consensus::types::ClusterResponse::Error(error) => {
-                Ok(Response::new(MarkReplicaInSyncResponse {
-                    acknowledged: false,
-                    error,
-                }))
-            }
+        match response.data.into_result() {
+            Ok(()) => Ok(Response::new(MarkReplicaInSyncResponse {
+                acknowledged: true,
+                error: String::new(),
+            })),
+            Err(error) => Ok(Response::new(MarkReplicaInSyncResponse {
+                acknowledged: false,
+                error: error.to_string(),
+            })),
         }
     }
 
@@ -3437,19 +3451,15 @@ impl InternalTransport for TransportService {
             .client_write(command)
             .await
             .map_err(|error| Status::internal(format!("Raft ActivatePrimary failed: {error}")))?;
-        match response.data {
-            crate::consensus::types::ClusterResponse::Ok => {
-                Ok(Response::new(ActivatePrimaryResponse {
-                    acknowledged: true,
-                    error: String::new(),
-                }))
-            }
-            crate::consensus::types::ClusterResponse::Error(error) => {
-                Ok(Response::new(ActivatePrimaryResponse {
-                    acknowledged: false,
-                    error,
-                }))
-            }
+        match response.data.into_result() {
+            Ok(()) => Ok(Response::new(ActivatePrimaryResponse {
+                acknowledged: true,
+                error: String::new(),
+            })),
+            Err(error) => Ok(Response::new(ActivatePrimaryResponse {
+                acknowledged: false,
+                error: error.to_string(),
+            })),
         }
     }
 
@@ -3511,19 +3521,15 @@ impl InternalTransport for TransportService {
             .map_err(|error| {
                 Status::internal(format!("Raft MarkPrimaryUnavailable failed: {error}"))
             })?;
-        match response.data {
-            crate::consensus::types::ClusterResponse::Ok => {
-                Ok(Response::new(MarkPrimaryUnavailableResponse {
-                    acknowledged: true,
-                    error: String::new(),
-                }))
-            }
-            crate::consensus::types::ClusterResponse::Error(error) => {
-                Ok(Response::new(MarkPrimaryUnavailableResponse {
-                    acknowledged: false,
-                    error,
-                }))
-            }
+        match response.data.into_result() {
+            Ok(()) => Ok(Response::new(MarkPrimaryUnavailableResponse {
+                acknowledged: true,
+                error: String::new(),
+            })),
+            Err(error) => Ok(Response::new(MarkPrimaryUnavailableResponse {
+                acknowledged: false,
+                error: error.to_string(),
+            })),
         }
     }
 
@@ -3569,19 +3575,15 @@ impl InternalTransport for TransportService {
             .map_err(|error| {
                 Status::internal(format!("Raft MarkPrimaryAvailable failed: {error}"))
             })?;
-        match response.data {
-            crate::consensus::types::ClusterResponse::Ok => {
-                Ok(Response::new(MarkPrimaryAvailableResponse {
-                    acknowledged: true,
-                    error: String::new(),
-                }))
-            }
-            crate::consensus::types::ClusterResponse::Error(error) => {
-                Ok(Response::new(MarkPrimaryAvailableResponse {
-                    acknowledged: false,
-                    error,
-                }))
-            }
+        match response.data.into_result() {
+            Ok(()) => Ok(Response::new(MarkPrimaryAvailableResponse {
+                acknowledged: true,
+                error: String::new(),
+            })),
+            Err(error) => Ok(Response::new(MarkPrimaryAvailableResponse {
+                acknowledged: false,
+                error: error.to_string(),
+            })),
         }
     }
 
@@ -3683,19 +3685,15 @@ impl InternalTransport for TransportService {
             .client_write(command)
             .await
             .map_err(|error| Status::internal(format!("Raft FailShardCopy failed: {error}")))?;
-        match response.data {
-            crate::consensus::types::ClusterResponse::Ok => {
-                Ok(Response::new(FailShardCopyResponse {
-                    acknowledged: true,
-                    error: String::new(),
-                }))
-            }
-            crate::consensus::types::ClusterResponse::Error(error) => {
-                Ok(Response::new(FailShardCopyResponse {
-                    acknowledged: false,
-                    error,
-                }))
-            }
+        match response.data.into_result() {
+            Ok(()) => Ok(Response::new(FailShardCopyResponse {
+                acknowledged: true,
+                error: String::new(),
+            })),
+            Err(error) => Ok(Response::new(FailShardCopyResponse {
+                acknowledged: false,
+                error: error.to_string(),
+            })),
         }
     }
 
@@ -3724,11 +3722,10 @@ impl InternalTransport for TransportService {
         let cluster_state = self.cluster_manager.get_state();
 
         if cluster_state.indices.contains_key(index_name) {
-            return Ok(Response::new(CreateIndexResponse {
-                acknowledged: false,
-                error: format!("index [{index_name}] already exists"),
-                response_json: Vec::new(),
-            }));
+            return Ok(create_index_already_exists_response(
+                index_name,
+                cluster_state.version,
+            ));
         }
 
         let data_nodes: Vec<String> = cluster_state
@@ -3750,9 +3747,18 @@ impl InternalTransport for TransportService {
         let num_replicas = metadata.number_of_replicas;
 
         let cmd = crate::consensus::types::ClusterCommand::CreateIndex { metadata };
-        crate::consensus::client_write_checked(raft, cmd)
-            .await
-            .map_err(|e| Status::internal(format!("Raft write failed: {e}")))?;
+        if let Err(error) = crate::consensus::client_write_checked(raft, cmd).await {
+            if error
+                .downcast_ref::<crate::consensus::types::IndexAlreadyExistsError>()
+                .is_some()
+            {
+                return Ok(create_index_already_exists_response(
+                    index_name,
+                    self.cluster_manager.version(),
+                ));
+            }
+            return Err(Status::internal(format!("Raft write failed: {error:#}")));
+        }
 
         let committed_version = self.cluster_manager.version();
         self.transport_client
@@ -3787,6 +3793,7 @@ impl InternalTransport for TransportService {
                     acknowledged: true,
                     error: String::new(),
                     response_json: resp_json,
+                    error_code: CreateIndexErrorCode::None as i32,
                 },
                 committed_version,
             ),
