@@ -1967,15 +1967,12 @@ impl InternalTransport for TransportService {
                     if let Some(ref knn) = search_req.knn
                         && let Some((field_name, params)) = knn.fields.iter().next()
                     {
-                        match engine.search_knn_filtered(
+                        knn_hits = engine.search_knn_filtered(
                             field_name,
                             &params.vector,
                             params.k,
                             params.filter.as_ref(),
-                        ) {
-                            Ok(h) => knn_hits = h,
-                            Err(e) => tracing::error!("Vector search on remote shard failed: {}", e),
-                        }
+                        )?;
                     }
                     Ok((hits, total, partial_aggs, knn_hits))
                 })
@@ -2230,7 +2227,7 @@ impl InternalTransport for TransportService {
             Ok(None) => Ok(Response::new(sql_batch_error_response(
                 "shard does not support sql_record_batch",
             ))),
-            Err(e) => Ok(Response::new(sql_batch_error_response(e.to_string()))),
+            Err(error) => Err(crate::search::query_string::search_error_status(error)),
         }
     }
 
@@ -2349,7 +2346,9 @@ impl InternalTransport for TransportService {
                                 )))
                             }
                             Ok(None) => Ok(None),
-                            Err(error) => Err(Status::internal(error.to_string())),
+                            Err(error) => {
+                                Err(crate::search::query_string::search_error_status(error))
+                            }
                         }
                     },
                 ))
@@ -2381,9 +2380,7 @@ impl InternalTransport for TransportService {
             Ok(None) => Box::pin(stream::iter(vec![Ok(sql_batch_error_response(
                 "shard does not support sql_record_batch_stream",
             ))])),
-            Err(e) => Box::pin(stream::iter(vec![Ok(sql_batch_error_response(
-                e.to_string(),
-            ))])),
+            Err(error) => return Err(crate::search::query_string::search_error_status(error)),
         };
         Ok(Response::new(response_stream))
     }

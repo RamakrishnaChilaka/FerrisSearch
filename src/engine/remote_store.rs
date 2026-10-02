@@ -1085,17 +1085,17 @@ fn apply_remote_store_batch_results(
     }
 }
 
-async fn validate_empty_query_strings(
+async fn validate_empty_search_request(
     state: &AppState,
     metadata: &IndexMetadata,
     search_req: &SearchRequest,
 ) -> Result<(), (StatusCode, Json<Value>)> {
-    let query = search_req.query.clone();
+    let request = search_req.clone();
     let mappings = metadata.mappings.clone();
     state
         .worker_pools
         .spawn_search(move || {
-            crate::engine::tantivy::validate_query_strings_with_mappings(&query, &mappings)
+            crate::engine::tantivy::validate_search_request_with_mappings(&request, &mappings)
         })
         .await
         .map_err(query_error_response)?
@@ -1136,7 +1136,7 @@ pub(crate) async fn search(
     {
         Ok(Some(m)) => m,
         Ok(None) => {
-            validate_empty_query_strings(state, metadata, search_req).await?;
+            validate_empty_search_request(state, metadata, search_req).await?;
             return Ok(DistributedDslSearchResult {
                 all_hits: Vec::new(),
                 total_hits: 0,
@@ -1177,7 +1177,7 @@ pub(crate) async fn search(
         assigned_splits: 0,
     };
     if split_plans.is_empty() {
-        validate_empty_query_strings(state, metadata, search_req).await?;
+        validate_empty_search_request(state, metadata, search_req).await?;
         return Ok(DistributedDslSearchResult {
             all_hits: Vec::new(),
             total_hits: 0,

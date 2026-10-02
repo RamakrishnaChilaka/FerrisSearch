@@ -1,5 +1,8 @@
 use anyhow::{Context, Result, bail};
+use ferrissearch::cluster::ClusterManager;
+use ferrissearch::cluster::state::ClusterState;
 use ferrissearch::engine::{HotEngine, SearchEngine};
+use ferrissearch::transport::TransportClient;
 use ferrissearch::worker::WorkerPools;
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
@@ -354,6 +357,71 @@ async fn sql_bad_typed_predicates_return_400() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn residual_sql_bad_typed_predicates_return_400() -> Result<()> {
+    let mut cluster = Cluster::start(1, "residual_sql_bad_typed_predicates").await?;
+    cluster.seed().await?;
+    for field in ["n", "f", "d"] {
+        for endpoint in ["_sql", "_sql/stream"] {
+            let query =
+                format!("SELECT n FROM {INDEX} WHERE {field} >= 'abc' OR title LIKE '%document%'");
+            let (status, body) = cluster
+                .request(
+                    0,
+                    Method::POST,
+                    &format!("/{INDEX}/{endpoint}"),
+                    Some(json!({"query": query})),
+                )
+                .await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+            assert_eq!(body["error"]["type"], "query_shard_exception", "{body}");
+            assert_eq!(
+                body["error"]["caused_by"]["type"], "parse_exception",
+                "{body}"
+            );
+            assert!(
+                body["error"]["reason"].as_str().unwrap().contains("abc"),
+                "{body}"
+            );
+            cluster.normal_search(0).await?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn sql_null_literals_retain_three_valued_predicate_semantics() -> Result<()> {
+    let mut cluster = Cluster::start(1, "sql_null_literals").await?;
+    cluster.seed().await?;
+    for (predicate, expected) in [
+        ("n = NULL", vec![]),
+        ("n >= NULL", vec![]),
+        ("n BETWEEN NULL AND 3", vec![]),
+        ("n IN (NULL, 1)", vec![1]),
+        ("n = NULL OR n = 2", vec![2]),
+    ] {
+        let query = format!("SELECT n FROM {INDEX} WHERE {predicate} ORDER BY n");
+        let (status, body) = cluster
+            .request(
+                0,
+                Method::POST,
+                &format!("/{INDEX}/_sql"),
+                Some(json!({"query": query})),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{query}: {body}");
+        let values: Vec<_> = body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["n"].as_i64().unwrap())
+            .collect();
+        assert_eq!(values, expected, "{body}");
+        cluster.normal_search(0).await?;
+    }
+    Ok(())
+}
+
 async fn assert_huge_sql_limit(limit: &str, test_name: &str) -> Result<()> {
     let mut cluster = Cluster::start(1, test_name).await?;
     cluster.seed().await?;
@@ -374,6 +442,24 @@ async fn assert_huge_sql_limit(limit: &str, test_name: &str) -> Result<()> {
             .await?;
         assert_eq!(status, StatusCode::OK, "{query}: {body}");
         assert_eq!(body["rows"].as_array().map(Vec::len), Some(3), "{body}");
+        let column = if query.contains("SELECT _id") {
+            "_id"
+        } else {
+            "title"
+        };
+        let mut values: Vec<_> = body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row[column].as_str().unwrap())
+            .collect();
+        values.sort_unstable();
+        let expected = if column == "_id" {
+            vec!["1", "2", "3"]
+        } else {
+            vec!["document 1", "document 2", "document 3"]
+        };
+        assert_eq!(values, expected, "{body}");
         assert_eq!(body["truncated"], false, "{body}");
         cluster.normal_search(0).await?;
     }
@@ -468,6 +554,47 @@ async fn huge_search_windows_and_aggregation_sizes_do_not_crash() -> Result<()> 
     cluster.normal_search(0).await
 }
 
+#[tokio::test]
+async fn huge_sort_width_is_rejected_before_cursor_expansion() -> Result<()> {
+    let mut cluster = Cluster::start(1, "huge_sort_width").await?;
+    cluster.seed().await?;
+    for width in [64, 65] {
+        for cursor in [false, true] {
+            let mut request = json!({"sort": vec![json!({"n": "asc"}); width]});
+            if cursor {
+                request["search_after"] = json!(vec![0; width]);
+            }
+            let (status, body) = cluster
+                .request(0, Method::POST, &format!("/{INDEX}/_search"), Some(request))
+                .await?;
+            if width == 64 {
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body["hits"]["total"]["value"], 3, "{body}");
+                assert_eq!(body["hits"]["hits"].as_array().map(Vec::len), Some(3));
+            } else {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+                assert!(
+                    body["error"]["reason"].as_str().unwrap().contains("64"),
+                    "{body}"
+                );
+            }
+            cluster.normal_search(0).await?;
+        }
+    }
+    let order = vec!["n"; 65].join(", ");
+    let (status, body) = cluster
+        .request(
+            0,
+            Method::POST,
+            &format!("/{INDEX}/_sql"),
+            Some(json!({"query": format!("SELECT n FROM {INDEX} ORDER BY {order} LIMIT 1")})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"]["reason"].as_str().unwrap().contains("64"));
+    cluster.normal_search(0).await
+}
+
 async fn assert_huge_knn(filtered: bool, test_name: &str) -> Result<()> {
     let mut cluster = Cluster::start(1, test_name).await?;
     cluster.seed().await?;
@@ -520,18 +647,117 @@ async fn forwarded_bad_numeric_bound_returns_400_and_both_nodes_survive() -> Res
         .iter()
         .position(|node| node.name != primary)
         .context("no remote coordinator")?;
-    let (status, body) = cluster
-        .request(
-            coordinator,
-            Method::POST,
-            &format!("/{INDEX}/_search"),
-            Some(json!({"query": {"range": {"n": {"gte": "abc"}}}})),
-        )
-        .await?;
-    assert_bad_typed_value(status, &body, "n");
-    assert_eq!(body["error"]["failed_shards"][0]["node"], primary);
+    let snapshot: ClusterState = serde_json::from_value(state)?;
+    let target = snapshot.nodes[&primary].clone();
+    let manager = Arc::new(ClusterManager::new(snapshot.cluster_name.clone()));
+    manager.update_state(snapshot);
+    let transport = TransportClient::new().with_cluster_manager(manager);
+    let wide_req = serde_json::from_value(json!({"sort": vec![json!({"n": "asc"}); 65]}))?;
+    let error = transport
+        .forward_search_dsl_to_shard(&target, INDEX, 0, &wide_req)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<tonic::Status>().unwrap().code(),
+        tonic::Code::InvalidArgument,
+        "{error:#}"
+    );
+    for field in ["n", "f", "d"] {
+        for query in [
+            json!({"range": {field: {"gte": "abc"}}}),
+            json!({"term": {field: "abc"}}),
+            json!({"terms": {field: ["abc"]}}),
+        ] {
+            let (status, body) = cluster
+                .request(
+                    coordinator,
+                    Method::POST,
+                    &format!("/{INDEX}/_search"),
+                    Some(json!({"query": query})),
+                )
+                .await?;
+            assert_bad_typed_value(status, &body, field);
+            assert_eq!(body["error"]["failed_shards"][0]["node"], primary);
+
+            let req = serde_json::from_value(json!({"query": query, "size": usize::MAX}))?;
+            let columns = vec![field.to_string()];
+            let unary = transport
+                .forward_sql_batch_to_shard(&target, INDEX, 0, &req, &columns, false, false)
+                .await
+                .map(|_| ());
+            let streamed = transport
+                .open_sql_batch_stream_to_shard(&target, INDEX, 0, &req, &columns, false, false, 0)
+                .await
+                .map(|_| ());
+            for result in [unary, streamed] {
+                let error = result.unwrap_err();
+                let status = error
+                    .downcast_ref::<tonic::Status>()
+                    .context("query error lost its transport status")?;
+                assert_eq!(status.code(), tonic::Code::InvalidArgument, "{error:#}");
+                let reason: Value = serde_json::from_slice(status.details())?;
+                assert_eq!(reason["type"], "query_shard_exception", "{reason}");
+                assert_eq!(reason["caused_by"]["type"], "parse_exception", "{reason}");
+                let text = reason["reason"].as_str().unwrap();
+                assert!(text.contains(field) && text.contains("abc"), "{reason}");
+            }
+        }
+    }
     for node in 0..cluster.nodes.len() {
         cluster.normal_search(node).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn huge_sql_limit_streams_all_rows_through_a_remote_coordinator() -> Result<()> {
+    let mut cluster = Cluster::start(2, "huge_sql_stream").await?;
+    cluster.seed().await?;
+    let (_, state) = cluster
+        .request(0, Method::GET, "/_cluster/state", None)
+        .await?;
+    let primary = state["indices"][INDEX]["shard_routing"]["0"]["primary"]
+        .as_str()
+        .context("missing primary routing")?;
+    let coordinator = cluster
+        .nodes
+        .iter()
+        .position(|node| node.name != primary)
+        .unwrap();
+    for projection in ["title", "n"] {
+        let response = cluster.client
+            .post(format!("{}/{INDEX}/_sql/stream", cluster.nodes[coordinator].base_url))
+            .json(&json!({"query": format!("SELECT {projection} FROM {INDEX} ORDER BY n LIMIT 18446744073709551615")}))
+            .send().await?;
+        let status = response.status();
+        let text = response.text().await?;
+        cluster.ensure_running()?;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let frames = text
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<serde_json::Result<Vec<_>>>()?;
+        assert_eq!(frames[0]["type"], "meta", "{text}");
+        assert!(
+            !frames.iter().any(|frame| frame["type"] == "error"),
+            "{text}"
+        );
+        let rows: Vec<_> = frames
+            .iter()
+            .filter(|frame| frame["type"] == "rows")
+            .flat_map(|frame| frame["rows"].as_array().unwrap())
+            .collect();
+        assert_eq!(rows.len(), 3, "{text}");
+        for (position, row) in rows.iter().enumerate() {
+            if projection == "title" {
+                assert_eq!(row["title"], format!("document {}", position + 1));
+            } else {
+                assert_eq!(row["n"], position + 1);
+            }
+        }
+        for node in 0..cluster.nodes.len() {
+            cluster.normal_search(node).await?;
+        }
     }
     Ok(())
 }

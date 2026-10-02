@@ -1,7 +1,7 @@
 use super::SqlQueryResult;
 use super::merge::record_batches_to_json_rows;
 use super::planner::QueryPlan;
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::streaming::StreamingTable;
@@ -13,6 +13,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::PartitionStream;
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
+use std::borrow::Cow;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -145,6 +146,75 @@ pub fn normalize_sql_batch_for_schema(
     }
 }
 
+fn datafusion_execution_sql(plan: &QueryPlan) -> Result<Cow<'_, str>> {
+    use sqlparser::ast::{Expr, LimitClause, Statement, Value};
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    // DataFusion 53 casts window literals to i64 during optimization. Its
+    // TopK heap grows with actual rows, so keep the combined window in that
+    // domain rather than handing it an overflowing user count.
+    let max_window = i64::MAX as usize;
+    let offset = plan.offset.map(|offset| offset.min(max_window));
+    let limit = plan
+        .limit
+        .map(|limit| limit.min(max_window.saturating_sub(offset.unwrap_or(0))));
+    if offset == plan.offset && limit == plan.limit {
+        return Ok(Cow::Borrowed(&plan.rewritten_sql));
+    }
+
+    fn set_count(expr: &mut Expr, count: usize) -> Result<()> {
+        let Expr::Value(value) = expr else {
+            bail!("planned SQL window is not a literal");
+        };
+        let Value::Number(number, _) = &mut value.value else {
+            bail!("planned SQL window is not a numeric literal");
+        };
+        *number = count.to_string();
+        Ok(())
+    }
+
+    let mut statements = Parser::parse_sql(&GenericDialect, &plan.rewritten_sql)?;
+    let [Statement::Query(query)] = statements.as_mut_slice() else {
+        bail!("planned SQL must contain exactly one query");
+    };
+    match query
+        .limit_clause
+        .as_mut()
+        .context("planned SQL window is missing from rewritten SQL")?
+    {
+        LimitClause::LimitOffset {
+            limit: sql_limit,
+            offset: sql_offset,
+            ..
+        } => {
+            if let Some(limit) = limit {
+                set_count(
+                    sql_limit.as_mut().context("planned SQL LIMIT is missing")?,
+                    limit,
+                )?;
+            }
+            if let Some(offset) = offset {
+                set_count(
+                    &mut sql_offset
+                        .as_mut()
+                        .context("planned SQL OFFSET is missing")?
+                        .value,
+                    offset,
+                )?;
+            }
+        }
+        LimitClause::OffsetCommaLimit {
+            offset: sql_offset,
+            limit: sql_limit,
+        } => {
+            set_count(sql_offset, offset.context("planned SQL OFFSET is missing")?)?;
+            set_count(sql_limit, limit.context("planned SQL LIMIT is missing")?)?;
+        }
+    }
+    Ok(Cow::Owned(statements[0].to_string()))
+}
+
 pub async fn execute_sql_partition_streams(
     plan: &QueryPlan,
     schema: SchemaRef,
@@ -167,7 +237,8 @@ pub async fn execute_sql_partition_streams(
     let table = StreamingTable::try_new(schema, partitions)?;
     let ctx = SessionContext::new();
     ctx.register_table("matched_rows", Arc::new(table))?;
-    let dataframe = ctx.sql(&plan.rewritten_sql).await?;
+    let sql = datafusion_execution_sql(plan)?;
+    let dataframe = ctx.sql(sql.as_ref()).await?;
     let stream = dataframe.execute_stream().await?;
     let columns = stream
         .schema()
@@ -248,7 +319,8 @@ pub async fn execute_sql_batches_stream(
     let table = MemTable::try_new(final_schema, vec![normalized_batches])?;
     let ctx = SessionContext::new();
     ctx.register_table("matched_rows", Arc::new(table))?;
-    let dataframe = ctx.sql(&plan.rewritten_sql).await?;
+    let sql = datafusion_execution_sql(plan)?;
+    let dataframe = ctx.sql(sql.as_ref()).await?;
     let stream = dataframe.execute_stream().await?;
     let columns = stream
         .schema()
@@ -667,6 +739,27 @@ mod tests {
             "LIMIT 5 must return 5 rows, got {}",
             result.rows.len()
         );
+    }
+
+    #[tokio::test]
+    async fn datafusion_huge_limit_and_offset_preserve_result_rows() {
+        for (window, expected) in [
+            ("LIMIT 18446744073709551615", 3),
+            ("LIMIT 18446744073709551615 OFFSET 1", 2),
+            ("LIMIT 1 OFFSET 18446744073709551615", 0),
+            ("LIMIT 0", 0),
+        ] {
+            let sql = format!("SELECT name, price FROM test ORDER BY price, name {window}");
+            let plan = super::super::planner::plan_sql("test", &sql).unwrap();
+            let result = execute_sql_batches(&plan, vec![make_test_batch(3)])
+                .await
+                .unwrap();
+            assert_eq!(result.rows.len(), expected, "{sql}: {result:?}");
+            if expected == 2 {
+                assert_eq!(result.rows[0]["name"], "item-1");
+                assert_eq!(result.rows[1]["name"], "item-2");
+            }
+        }
     }
 
     #[tokio::test]

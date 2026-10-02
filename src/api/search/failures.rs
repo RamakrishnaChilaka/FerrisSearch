@@ -275,6 +275,33 @@ mod tests {
         assert!(all_shards_failed_response(0, &[]).is_none());
     }
 
+    #[tokio::test]
+    async fn contained_search_panic_preserves_shard_failure_and_transport_reason() {
+        let pools = crate::worker::WorkerPools::new(1, 1);
+        let error = pools
+            .spawn_search(|| panic!("injected shard search panic"))
+            .await
+            .unwrap_err();
+        let local = ShardFailure::from_error("index", 0, "local", &error);
+        let remote_error: anyhow::Error = search_error_status(error).into();
+        let remote = ShardFailure::from_error("index", 1, "remote", &remote_error);
+        let failures = [local, remote];
+        let (status, Json(body)) = all_shards_failed_response(0, &failures).unwrap();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(body["error"]["reason"], "all shards failed");
+        for failure in body["error"]["failed_shards"].as_array().unwrap() {
+            let reason = failure["reason"]["reason"].as_str().unwrap();
+            assert!(
+                reason.contains("search worker task panicked")
+                    && reason.contains("injected shard search panic"),
+                "{body}"
+            );
+        }
+        assert!(all_shards_failed_response(1, &failures).is_none());
+        assert_eq!(shard_stats(1, 2, &failures)["failed"], 2);
+        assert_eq!(pools.spawn_search(|| 42).await.unwrap(), 42);
+    }
+
     #[test]
     fn qsearch_all_validation_errors_return_400() {
         let local_error =

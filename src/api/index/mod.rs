@@ -1010,6 +1010,13 @@ pub(crate) async fn execute_distributed_dsl_search(
 ) -> Result<DistributedDslSearchResult, (StatusCode, Json<Value>)> {
     // IndexName is validated at extraction time
 
+    if let Err(error) = crate::search::validate_sort_width(search_req.sort.len()) {
+        return Err(crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            error,
+        ));
+    }
     if search_req.from.checked_add(search_req.size).is_none() {
         return Err(crate::api::error_response(
             StatusCode::BAD_REQUEST,
@@ -1064,7 +1071,22 @@ pub(crate) async fn execute_distributed_dsl_search(
             let pools = state.worker_pools.clone();
             async move {
                 let result = pools
-                    .spawn_search(move || engine.search_query(&search_req))
+                    .spawn_search(move || -> anyhow::Result<_> {
+                        let (hits, total, partial_aggs) = engine.search_query(&search_req)?;
+                        let knn_hits = if let Some(knn) = &search_req.knn
+                            && let Some((field, params)) = knn.fields.iter().next()
+                        {
+                            engine.search_knn_filtered(
+                                field,
+                                &params.vector,
+                                params.k,
+                                params.filter.as_ref(),
+                            )?
+                        } else {
+                            Vec::new()
+                        };
+                        Ok((hits, total, partial_aggs, knn_hits))
+                    })
                     .await;
                 (shard_id, result)
             }
@@ -1074,7 +1096,7 @@ pub(crate) async fn execute_distributed_dsl_search(
 
     for (shard_id, search_result) in search_results {
         match search_result {
-            Ok(Ok((hits, shard_total, partial_aggs))) => {
+            Ok(Ok((hits, shard_total, partial_aggs, shard_knn_hits))) => {
                 successful += 1;
                 total_hits += shard_total;
                 if !partial_aggs.is_empty() {
@@ -1094,6 +1116,17 @@ pub(crate) async fn execute_distributed_dsl_search(
                     shard_list.push(enriched);
                 }
                 shard_hit_lists.push(shard_list);
+                for hit in shard_knn_hits {
+                    knn_hits.push(serde_json::json!({
+                        "_index": index_name,
+                        "_shard": shard_id,
+                        "_id": hit.get("_id").and_then(|v| v.as_str()).unwrap_or(""),
+                        "_score": hit.get("_score"),
+                        "_source": hit.get("_source"),
+                        "_knn_field": hit.get("_knn_field"),
+                        "_knn_distance": hit.get("_knn_distance"),
+                    }));
+                }
             }
             Ok(Err(e)) | Err(e) => {
                 tracing::error!("Shard {}/{} search failed: {:#}", index_name, shard_id, e);
@@ -1104,55 +1137,6 @@ pub(crate) async fn execute_distributed_dsl_search(
                     &e,
                 ));
                 failed += 1;
-            }
-        }
-    }
-
-    if let Some(ref knn) = search_req.knn
-        && let Some((field_name, params)) = knn.fields.iter().next()
-    {
-        for (shard_id, engine) in &local_shards {
-            let engine = engine.clone();
-            let field_name = field_name.clone();
-            let vector = params.vector.clone();
-            let k = params.k;
-            let filter = params.filter.clone();
-            let shard_id = *shard_id;
-            let knn_result = state
-                .worker_pools
-                .spawn_search(move || {
-                    engine.search_knn_filtered(&field_name, &vector, k, filter.as_ref())
-                })
-                .await;
-            match knn_result {
-                Ok(Ok(hits)) => {
-                    for hit in hits {
-                        knn_hits.push(serde_json::json!({
-                            "_index": index_name,
-                            "_shard": shard_id,
-                            "_id": hit.get("_id").and_then(|v| v.as_str()).unwrap_or(""),
-                            "_score": hit.get("_score"),
-                            "_source": hit.get("_source"),
-                            "_knn_field": hit.get("_knn_field"),
-                            "_knn_distance": hit.get("_knn_distance"),
-                        }));
-                    }
-                }
-                Ok(Err(e)) | Err(e) => {
-                    tracing::error!(
-                        "Vector search on {}/shard_{} failed: {}",
-                        index_name,
-                        shard_id,
-                        e
-                    );
-                    shard_failures.push(ShardFailure::from_error(
-                        index_name,
-                        shard_id,
-                        &state.local_node_id,
-                        &e,
-                    ));
-                    failed += 1;
-                }
             }
         }
     }

@@ -294,6 +294,10 @@ impl VectorIndex {
                 query.len()
             ));
         }
+        let k = k.min(self.len());
+        if k == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
         let results = self
             .index
             .search(query, k)

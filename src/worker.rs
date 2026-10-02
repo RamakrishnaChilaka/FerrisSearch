@@ -9,7 +9,39 @@
 //! true physical isolation, not just semaphore-bounded concurrency on a
 //! shared pool.
 
+use std::any::Any;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
+
+#[derive(Debug, thiserror::Error)]
+#[error("search worker task panicked during {operation}: {message}")]
+pub(crate) struct SearchWorkerPanic {
+    operation: &'static str,
+    message: String,
+}
+
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        message
+    } else if let Some(message) = payload.downcast_ref::<&str>() {
+        message
+    } else {
+        "non-string panic payload"
+    }
+}
+
+fn abort_write_panic(operation: &str, payload: &(dyn Any + Send)) -> ! {
+    let message = panic_message(payload);
+    tracing::error!(
+        operation,
+        panic = message,
+        "write worker task panicked; aborting to avoid serving inconsistent shard state"
+    );
+    eprintln!(
+        "write worker task panicked during {operation}: {message}; aborting to avoid serving inconsistent shard state"
+    );
+    std::process::abort()
+}
 
 /// Run blocking engine maintenance on Tokio's blocking pool.
 ///
@@ -47,12 +79,20 @@ impl WorkerPools {
         let search_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(search_pool_size)
             .thread_name(|i| format!("search-{i}"))
+            .panic_handler(|payload| {
+                tracing::error!(
+                    operation = "search",
+                    panic = panic_message(payload.as_ref()),
+                    "unhandled search worker panic"
+                );
+            })
             .build()
             .expect("failed to create search thread pool");
 
         let write_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(write_pool_size)
             .thread_name(|i| format!("write-{i}"))
+            .panic_handler(|payload| abort_write_panic("unhandled write job", payload.as_ref()))
             .build()
             .expect("failed to create write thread pool");
 
@@ -79,35 +119,46 @@ impl WorkerPools {
     /// Run a blocking closure on the **search** thread pool.
     ///
     /// The closure executes on a dedicated OS thread owned by the search pool.
-    /// Returns a future that resolves when the closure completes.
+    /// Panics become operation errors without terminating the pool or process.
     pub async fn spawn_search<F, R>(&self, f: F) -> crate::common::Result<R>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
         let pool = self.search_pool.clone();
+        let operation = std::any::type_name::<F>();
         let (tx, rx) = tokio::sync::oneshot::channel();
         pool.spawn(move || {
-            let result = f();
+            let result = catch_unwind(AssertUnwindSafe(f)).map_err(|payload| {
+                anyhow::Error::new(SearchWorkerPanic {
+                    operation,
+                    message: panic_message(payload.as_ref()).to_string(),
+                })
+            });
             let _ = tx.send(result);
         });
         rx.await
-            .map_err(|_| anyhow::anyhow!("search task was cancelled"))
+            .map_err(|_| anyhow::anyhow!("search task was cancelled"))?
     }
 
     /// Run a blocking closure on the **write** thread pool.
     ///
     /// The closure executes on a dedicated OS thread owned by the write pool.
-    /// Returns a future that resolves when the closure completes.
+    /// A panic is logged and aborts the process: unwinding may leave shard
+    /// mutation state inconsistent, so returning an error alone is not safe.
     pub async fn spawn_write<F, R>(&self, f: F) -> crate::common::Result<R>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
         let pool = self.write_pool.clone();
+        let operation = std::any::type_name::<F>();
         let (tx, rx) = tokio::sync::oneshot::channel();
         pool.spawn(move || {
-            let result = f();
+            let result = match catch_unwind(AssertUnwindSafe(f)) {
+                Ok(result) => result,
+                Err(payload) => abort_write_panic(operation, payload.as_ref()),
+            };
             let _ = tx.send(result);
         });
         rx.await
