@@ -128,7 +128,9 @@ pub struct ShardManager {
 ### Applied Incarnation Retirement
 
 - Production Node and Raft-backed transport constructors bind one immutable
-  ClusterManager/local-node context to the manager. It reads the existing
+  applied-state/local-node context to the manager. A replacement ClusterManager
+  wrapper is allowed only when it shares the exact same state `Arc`, never an
+  equal copied snapshot. The context reads the existing
   shared applied Raft state; it is not another metadata publisher. Only
   local/no-Raft test helpers remain unbound.
 - Serving getters and final engine publication require the current applied

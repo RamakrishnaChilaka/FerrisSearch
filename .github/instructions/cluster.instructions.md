@@ -161,6 +161,9 @@ fn allocate_unassigned_replicas_for_shards(&mut self, data_nodes: &[String], eli
 pub struct ClusterManager { state: Arc<RwLock<ClusterState>> }
 ```
 - `new(cluster_name)` / `with_shared_state(state)` — Raft SM shares the same `Arc<RwLock<ClusterState>>`
+- Shard authority binding compares the shared state `Arc`, not the
+  ClusterManager wrapper. Reconstructing a transport wrapper around that exact
+  state is valid; an equal copied snapshot is not a replacement Raft authority.
 - `get_state() -> ClusterState` — cloned snapshot (read lock)
 - `version()` reads only the applied version under the shared read lock.
   `with_state()` extracts coherent forwarding context under that lock without

@@ -20,7 +20,9 @@ impl ShardManager {
                 local_node_id: local_node_id.clone(),
             });
         assert!(
-            Arc::ptr_eq(&authority.cluster_manager, &cluster_manager)
+            authority
+                .cluster_manager
+                .shares_state_with(&cluster_manager)
                 && authority.local_node_id == local_node_id,
             "a shard manager must keep one applied Raft authority"
         );
