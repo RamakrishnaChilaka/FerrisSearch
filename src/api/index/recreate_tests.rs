@@ -406,3 +406,43 @@ async fn issue_152_recreate_while_old_mapping_write_is_in_flight() {
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn issue_152_applied_delete_releases_idle_follower_engine_and_wal() {
+    let cluster = ForwardingCluster::start().await;
+    let index = "recreate-idle";
+    create_on(&cluster, 0, index).await;
+    let (status, body) = cluster
+        .request(
+            0,
+            reqwest::Method::PUT,
+            &format!("/{index}/_doc/old"),
+            Some(json!({"value": 1})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let manager = &cluster.nodes[1].state.shard_manager;
+    let old = manager.get_shard(index, 0).unwrap();
+    let weak = Arc::downgrade(&old);
+    drop(old);
+    let old_dir = manager.shard_data_dir(index, 0).unwrap();
+    let identity_path = old_dir.join(crate::shard::SHARD_COPY_IDENTITY_FILE);
+    let identity = read_file(identity_path.clone()).await;
+    let (status, body) = cluster
+        .request(0, reqwest::Method::DELETE, &format!("/{index}"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    wait_for_applied_metadata(&cluster).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while weak.upgrade().is_some()
+            || manager.index_uuid(index).is_some()
+            || manager.copy_identity(index, 0).is_some()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("applied deletion must drop the idle engine/WAL without a subsequent client request");
+    assert!(manager.get_index_shards(index).is_empty());
+    assert_eq!(read_file(identity_path).await, identity);
+}

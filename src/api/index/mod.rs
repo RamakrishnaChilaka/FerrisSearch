@@ -2273,8 +2273,9 @@ pub async fn delete_index(
     // Close local shard engines and delete data
     if let Err(e) = state
         .shard_manager
-        .close_index_shards_blocking_with_reason(
+        .close_index_shards_for_uuid_blocking_with_reason(
             index_name.to_string(),
+            index_metadata.uuid.to_string(),
             crate::shard::SHARD_DATA_REMOVE_REASON_API_DELETE_INDEX,
         )
         .await

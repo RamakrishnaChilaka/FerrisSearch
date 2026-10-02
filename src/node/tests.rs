@@ -239,6 +239,135 @@ async fn issue_152_reconciliation_replaces_uuid_without_deleting_other_data() {
     assert!(dir.path().join(&new_uuid).join("shard_0").is_dir());
 }
 
+#[tokio::test]
+async fn issue_152_replacement_preserves_foreign_allocation_and_fails_closed() {
+    tokio::task::spawn_blocking(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        let mut state = crate::cluster::state::ClusterState::new("recreate".into());
+        state.add_index(IndexMetadata::build_shard_routing(
+            "idx",
+            1,
+            0,
+            &["node-2".into()],
+        ));
+        let guarded = std::sync::Mutex::new(std::collections::HashSet::new());
+        assert!(open_local_assigned_shards(&state, "node-2", &manager, &guarded).is_empty());
+        let new = IndexMetadata::build_shard_routing("idx", 1, 0, &["node-2".into()]);
+        let new_uuid = new.uuid.clone();
+        state.add_index_with_allocation_id(new, 2).unwrap();
+        state
+            .shard_allocations
+            .get_mut("idx")
+            .unwrap()
+            .get_mut(&0)
+            .unwrap()
+            .primary_initialized = true;
+        let foreign = ShardManager::new(dir.path(), Duration::from_secs(60));
+        foreign
+            .initialize_copy_identity_for_test("idx", 0, &new_uuid, 999, 1)
+            .unwrap();
+        let foreign_dir = dir.path().join(&new_uuid).join("shard_0");
+        let identity_path = foreign_dir.join(crate::shard::SHARD_COPY_IDENTITY_FILE);
+        let before = std::fs::read(&identity_path).unwrap();
+        let evidence = foreign_dir.join("foreign-allocation-data");
+        std::fs::write(&evidence, b"must not be wiped").unwrap();
+
+        let failures = open_local_assigned_shards(&state, "node-2", &manager, &guarded);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].reason.contains("allocation"), "{failures:?}");
+        assert!(manager.get_shard("idx", 0).is_none());
+        assert_eq!(std::fs::read(identity_path).unwrap(), before);
+        assert_eq!(std::fs::read(evidence).unwrap(), b"must not be wiped");
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue_152_stale_reconciliation_snapshot_cannot_close_new_allocation() {
+    let (raft, state_handle) = crate::consensus::create_raft_instance_mem(1, "recreate".into())
+        .await
+        .unwrap();
+    crate::consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:0".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !raft.is_leader() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let cluster = Arc::new(ClusterManager::with_shared_state(state_handle));
+    let dir = tempfile::tempdir().unwrap();
+    let manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    manager.bind_applied_shard_authority(cluster.clone(), "node-2".into());
+    raft.client_write(ClusterCommand::CreateIndex {
+        metadata: IndexMetadata::build_shard_routing("idx", 1, 0, &["node-1".into()]),
+    })
+    .await
+    .unwrap()
+    .data
+    .into_result()
+    .unwrap();
+    let old_snapshot = cluster.get_state();
+    raft.client_write(ClusterCommand::DeleteIndex {
+        index_name: "idx".into(),
+    })
+    .await
+    .unwrap();
+    let new = IndexMetadata::build_shard_routing("idx", 1, 0, &["node-2".into()]);
+    let uuid = new.uuid.clone();
+    raft.client_write(ClusterCommand::CreateIndex { metadata: new })
+        .await
+        .unwrap()
+        .data
+        .into_result()
+        .unwrap();
+    let allocation_id = cluster
+        .get_state()
+        .shard_allocation_id("idx", 0, "node-2")
+        .unwrap();
+    let new_engine = manager
+        .open_primary_assigned_shard_with_settings_blocking(
+            "idx".into(),
+            0,
+            HashMap::new(),
+            IndexSettings::default(),
+            uuid.clone(),
+            crate::shard::AssignedShardOpen {
+                allocation_id,
+                primary_term: 1,
+                allow_empty_creation: true,
+            },
+        )
+        .await
+        .unwrap();
+    let checking = manager.clone();
+    tokio::task::spawn_blocking(move || {
+        assert!(
+            open_local_assigned_shards(
+                &old_snapshot,
+                "node-2",
+                &checking,
+                &std::sync::Mutex::new(std::collections::HashSet::new()),
+            )
+            .is_empty()
+        );
+    })
+    .await
+    .unwrap();
+    let serving = manager
+        .get_shard("idx", 0)
+        .expect("old unassigned routing must not retire the new incarnation's allocated engine");
+    assert!(Arc::ptr_eq(&serving, &new_engine));
+    let identity = manager.copy_identity("idx", 0).unwrap();
+    assert_eq!(identity.index_uuid, uuid.as_str());
+    assert_eq!(identity.allocation_id, allocation_id);
+    raft.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn collision_quarantine_keeps_lifecycle_failure_reportable_until_removal() {
     let (raft, state_handle) =
@@ -1535,7 +1664,7 @@ async fn corrupt_in_sync_replica_copy_is_reported_as_definitive() {
     assert!(manifest.exists());
     std::fs::write(&manifest, b"{not-a-manifest").unwrap();
 
-    let restarted = ShardManager::new(dir.path(), Duration::from_secs(60));
+    let restarted = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
     restarted.set_copy_retry_policy_for_test(3, Duration::ZERO, Duration::ZERO, Duration::ZERO);
     let mut reported = 0;
     for _ in 0..3 {
@@ -1674,7 +1803,7 @@ async fn corrupt_in_sync_replica_is_failed_and_replication_resumes() {
         b"{not-a-manifest",
     )
     .unwrap();
-    let restarted = ShardManager::new(dir.path(), Duration::from_secs(60));
+    let restarted = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
     restarted.set_copy_retry_policy_for_test(3, Duration::ZERO, Duration::ZERO, Duration::ZERO);
     let failure = open_local_assigned_shards(
         &state_handle.read().unwrap().clone(),
@@ -1841,7 +1970,7 @@ async fn corrupt_primary_with_in_sync_replica_is_promoted() {
         b"{not-a-manifest",
     )
     .unwrap();
-    let restarted = ShardManager::new(dir.path(), Duration::from_secs(60));
+    let restarted = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
     restarted.set_copy_retry_policy_for_test(3, Duration::ZERO, Duration::ZERO, Duration::ZERO);
     let failure = open_local_assigned_shards(
         &state_handle.read().unwrap().clone(),

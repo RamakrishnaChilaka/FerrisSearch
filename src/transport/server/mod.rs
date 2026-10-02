@@ -3769,8 +3769,9 @@ impl InternalTransport for TransportService {
         // Close local shard engines and delete data on this (leader) node
         if let Err(e) = self
             .shard_manager
-            .close_index_shards_blocking_with_reason(
+            .close_index_shards_for_uuid_blocking_with_reason(
                 index_name.clone(),
+                index_metadata.uuid.to_string(),
                 crate::shard::SHARD_DATA_REMOVE_REASON_TRANSPORT_DELETE_INDEX,
             )
             .await
@@ -4986,7 +4987,12 @@ impl TransportService {
             }
             if let Err(quarantine_error) = self
                 .shard_manager
-                .quarantine_shard_copy_blocking(index_name.to_string(), shard_id)
+                .quarantine_shard_copy_for_allocation_blocking(
+                    index_name.to_string(),
+                    shard_id,
+                    index_uuid.to_string(),
+                    allocation_id,
+                )
                 .await
             {
                 tracing::warn!(
@@ -6572,8 +6578,9 @@ impl TransportService {
             };
             if current_metadata.uuid != metadata.uuid {
                 self.shard_manager
-                    .close_index_shards_blocking_with_reason(
+                    .close_index_shards_for_uuid_blocking_with_reason(
                         index_name.to_string(),
+                        metadata.uuid.to_string(),
                         crate::shard::SHARD_DATA_REMOVE_REASON_STALE_UUID_REPLACEMENT,
                     )
                     .await
@@ -6775,6 +6782,7 @@ pub(crate) fn create_transport_service_with_raft_and_storage_handle(
     remote_store_resources: RemoteStoreTransportResources,
     local_node_id: String,
 ) -> (InternalTransportServer<TransportService>, TransportService) {
+    shard_manager.bind_applied_shard_authority(cluster_manager.clone(), local_node_id.clone());
     let transport_client = transport_client.with_cluster_manager(cluster_manager.clone());
     #[cfg(feature = "protocol-trace")]
     {
@@ -6798,6 +6806,7 @@ pub(crate) fn create_transport_service_with_raft_and_storage_handle(
         join_lock: new_join_lock(),
     };
     peer_recovery::start_peer_recovery_reaper(service.clone());
+    service.shard_manager.start_applied_index_reconciler();
     let handle = service.clone();
     (
         InternalTransportServer::new(service)

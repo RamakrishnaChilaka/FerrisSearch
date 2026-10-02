@@ -218,6 +218,16 @@ pub(super) async fn open_local_assigned_shards_blocking(
     shard_manager: Arc<ShardManager>,
     guarded_missing_startup_shards: GuardedStartupShards,
 ) -> Vec<ShardCopyFailure> {
+    if let Err(error) = shard_manager
+        .reconcile_index_incarnations_blocking(state.clone())
+        .await
+    {
+        tracing::error!(
+            error = %format!("{error:#}"),
+            "Unable to retire obsolete local indices; deferring assigned shard opens"
+        );
+        return Vec::new();
+    }
     match tokio::task::spawn_blocking(move || {
         open_local_assigned_shards(
             &state,
@@ -248,6 +258,13 @@ pub(super) fn open_local_assigned_shards(
     >,
 ) -> Vec<ShardCopyFailure> {
     let mut failures = Vec::new();
+    if let Err(error) = shard_manager.reconcile_index_incarnations(state) {
+        tracing::error!(
+            error = %format!("{error:#}"),
+            "Unable to retire obsolete local indices; deferring assigned shard opens"
+        );
+        return failures;
+    }
     let guard_set = guarded_missing_startup_shards
         .lock()
         .map(|g| g.clone())
@@ -260,9 +277,12 @@ pub(super) fn open_local_assigned_shards(
                     .iter()
                     .any(|node_id| node_id == local_node_id);
             if !assigned_here {
-                if shard_manager.get_shard(index_name, *shard_id).is_some() {
-                    shard_manager.quarantine_shard_copy(index_name, *shard_id);
-                }
+                shard_manager.retire_obsolete_shard_copy(
+                    index_name,
+                    *shard_id,
+                    state,
+                    local_node_id,
+                );
                 continue;
             }
             let authoritative_here =
@@ -271,7 +291,12 @@ pub(super) fn open_local_assigned_shards(
                 state.shard_allocation_id(index_name, *shard_id, local_node_id)
             else {
                 if authoritative_here {
-                    shard_manager.quarantine_shard_copy(index_name, *shard_id);
+                    shard_manager.retire_obsolete_shard_copy(
+                        index_name,
+                        *shard_id,
+                        state,
+                        local_node_id,
+                    );
                     let red_primary = routing.primary == local_node_id
                         && state.primary_initialized(index_name, *shard_id)
                         && state.primary_allocation_id(index_name, *shard_id).is_none();

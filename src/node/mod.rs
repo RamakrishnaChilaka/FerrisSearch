@@ -211,7 +211,7 @@ fn should_attempt_failed_copy_report(
 async fn report_failed_shard_copies(
     failures: Vec<ShardCopyFailure>,
     cluster_manager: &ClusterManager,
-    shard_manager: &ShardManager,
+    shard_manager: &Arc<ShardManager>,
     transport_client: &TransportClient,
     raft: &RaftInstance,
     recent_reports: &mut std::collections::HashMap<FailedCopyReportKey, Instant>,
@@ -255,8 +255,17 @@ async fn report_failed_shard_copies(
             );
             continue;
         }
-        if failure.quarantine {
-            shard_manager.quarantine_shard_copy(&failure.index_name, failure.shard_id);
+        if failure.quarantine
+            && let Err(error) = shard_manager
+                .quarantine_shard_copy_for_allocation_blocking(
+                    failure.index_name.clone(),
+                    failure.shard_id,
+                    failure.index_uuid.clone(),
+                    failure.allocation_id,
+                )
+                .await
+        {
+            tracing::warn!(error = %format!("{error:#}"), "Lifecycle shard-copy quarantine failed");
         }
         let promotion_candidate = if failure.promote_only {
             let metadata = &current.indices[&failure.index_name];
@@ -466,6 +475,8 @@ impl Node {
                 config.column_cache_populate_threshold,
             )),
         ));
+        shard_manager
+            .bind_applied_shard_authority(cluster_manager.clone(), config.node_name.clone());
         shard_manager.configure_copy_retry_policy(
             config.shard_io_failure_escalation_attempts,
             Duration::from_millis(config.shard_io_failure_escalation_window_ms),
@@ -739,7 +750,7 @@ impl Node {
             report_failed_shard_copies(
                 failures,
                 manager.as_ref(),
-                manager_clone.as_ref(),
+                &manager_clone,
                 &client,
                 raft.as_ref(),
                 &mut recent_failed_copy_reports,
@@ -775,7 +786,7 @@ impl Node {
                 report_failed_shard_copies(
                     failures,
                     manager.as_ref(),
-                    manager_clone.as_ref(),
+                    &manager_clone,
                     &client,
                     raft.as_ref(),
                     &mut recent_failed_copy_reports,
