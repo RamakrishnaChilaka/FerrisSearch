@@ -13,6 +13,9 @@ use std::time::Duration;
 #[path = "forwarding_review_tests.rs"]
 mod review;
 
+#[path = "recreate_tests.rs"]
+mod recreate;
+
 struct ForwardingNode {
     _data: tempfile::TempDir,
     state: AppState,

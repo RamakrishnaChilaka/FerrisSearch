@@ -4274,6 +4274,83 @@ mod tests {
         (dir, mgr)
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue_152_delayed_close_preserves_recreated_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+        let old = manager
+            .open_shard_with_settings_blocking(
+                "idx".into(),
+                0,
+                HashMap::new(),
+                IndexSettings::default(),
+                "old-uuid",
+            )
+            .await
+            .unwrap();
+        let old_lifecycle = manager.source_recovery_lifecycle_lock("old-uuid", 0);
+        let old_guard = old_lifecycle.lock_owned().await;
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+        manager.set_close_lifecycle_waiting_signal(waiting_tx);
+        let closing_manager = manager.clone();
+        let close = tokio::spawn(async move {
+            closing_manager
+                .close_index_shards_blocking_with_reason(
+                    "idx".into(),
+                    SHARD_DATA_REMOVE_REASON_API_DELETE_INDEX,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), waiting_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        manager
+            .quarantine_shard_copy_blocking("idx".into(), 0)
+            .await
+            .unwrap();
+        let new = manager
+            .open_shard_with_settings_blocking(
+                "idx".into(),
+                0,
+                HashMap::new(),
+                IndexSettings::default(),
+                "new-uuid",
+            )
+            .await
+            .unwrap();
+        let writer = new.clone();
+        tokio::task::spawn_blocking(move || {
+            writer.add_document("new", json!({"value": 2})).unwrap();
+            writer.flush().unwrap();
+        })
+        .await
+        .unwrap();
+        assert!(dir.path().join("old-uuid/shard_0").is_dir());
+        assert!(dir.path().join("new-uuid/shard_0").is_dir());
+        drop(old_guard);
+        close.await.unwrap().unwrap();
+
+        assert_eq!(manager.index_uuid("idx").as_deref(), Some("new-uuid"));
+        let serving = manager
+            .get_shard("idx", 0)
+            .expect("new engine must remain open");
+        assert!(Arc::ptr_eq(&serving, &new));
+        assert!(dir.path().join("new-uuid/shard_0").is_dir());
+        drop(old);
+        let reader = serving.clone();
+        let source = tokio::task::spawn_blocking(move || {
+            reader
+                .get_document_with_metadata("new", true)
+                .unwrap()
+                .unwrap()
+                .source
+        })
+        .await
+        .unwrap();
+        assert_eq!(source, json!({"value": 2}));
+    }
+
     fn apply_index(
         engine: &Arc<dyn SearchEngine>,
         doc_id: &str,

@@ -159,6 +159,86 @@ async fn reconciliation_closes_engine_after_local_allocation_is_removed() {
     assert!(dir.path().join("idx-uuid/shard_0").exists());
 }
 
+#[tokio::test]
+async fn issue_152_reconciliation_closes_deleted_index_and_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+    let mut state = crate::cluster::state::ClusterState::new("recreate".into());
+    let metadata = IndexMetadata::build_shard_routing("idx", 1, 0, &["node-2".into()]);
+    let old_uuid = metadata.uuid.clone();
+    state.add_index(metadata);
+    let guarded = std::sync::Mutex::new(std::collections::HashSet::new());
+    assert!(open_local_assigned_shards(&state, "node-2", &manager, &guarded).is_empty());
+    let old_engine = manager.get_shard("idx", 0).unwrap();
+    apply_index(&old_engine, "old", serde_json::json!({"value": 1}), 0, 1);
+    let weak = Arc::downgrade(&old_engine);
+    drop(old_engine);
+    state.indices.remove("idx");
+    state.shard_allocations.remove("idx");
+    state.version += 1;
+
+    assert!(open_local_assigned_shards(&state, "node-2", &manager, &guarded).is_empty());
+    assert!(
+        manager.get_shard("idx", 0).is_none(),
+        "applied deletion must retire an engine absent from metadata"
+    );
+    assert!(
+        weak.upgrade().is_none(),
+        "the manager must release the old engine and WAL"
+    );
+    assert!(manager.copy_identity("idx", 0).is_none());
+    assert!(dir.path().join(&old_uuid).join("shard_0").is_dir());
+}
+
+#[tokio::test]
+async fn issue_152_reconciliation_replaces_uuid_without_deleting_other_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+    let mut state = crate::cluster::state::ClusterState::new("recreate".into());
+    let old = IndexMetadata::build_shard_routing("idx", 1, 0, &["node-2".into()]);
+    let old_uuid = old.uuid.clone();
+    state.add_index(old);
+    let guarded = std::sync::Mutex::new(std::collections::HashSet::new());
+    assert!(open_local_assigned_shards(&state, "node-2", &manager, &guarded).is_empty());
+    let old_engine = manager.get_shard("idx", 0).unwrap();
+    apply_index(&old_engine, "old", serde_json::json!({"value": 1}), 0, 1);
+    drop(old_engine);
+    let old_identity_path = dir
+        .path()
+        .join(&old_uuid)
+        .join("shard_0")
+        .join(crate::shard::SHARD_COPY_IDENTITY_FILE);
+    let old_identity = std::fs::read(&old_identity_path).unwrap();
+    let new = IndexMetadata::build_shard_routing("idx", 1, 0, &["node-2".into()]);
+    let new_uuid = new.uuid.clone();
+    state.add_index_with_allocation_id(new, 2).unwrap();
+    state.version += 1;
+
+    let failures = open_local_assigned_shards(&state, "node-2", &manager, &guarded);
+    assert!(failures.is_empty(), "{failures:?}");
+    let identity = manager.copy_identity("idx", 0).unwrap();
+    assert_eq!(identity.index_uuid, new_uuid.as_str());
+    assert_eq!(identity.allocation_id, 2);
+    let engine = manager.get_shard("idx", 0).unwrap();
+    assert!(
+        engine
+            .get_document_with_metadata("old", true)
+            .unwrap()
+            .is_none()
+    );
+    apply_index(&engine, "new", serde_json::json!({"value": 2}), 0, 1);
+    assert_eq!(
+        engine
+            .get_document_with_metadata("new", true)
+            .unwrap()
+            .unwrap()
+            .source,
+        serde_json::json!({"value": 2})
+    );
+    assert_eq!(std::fs::read(old_identity_path).unwrap(), old_identity);
+    assert!(dir.path().join(&new_uuid).join("shard_0").is_dir());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn collision_quarantine_keeps_lifecycle_failure_reportable_until_removal() {
     let (raft, state_handle) =
