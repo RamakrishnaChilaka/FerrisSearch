@@ -1,6 +1,22 @@
 use super::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forwarding_ci158_deadline_arms_create_after_an_earlier_entry() {
+    let cluster = ForwardingCluster::start().await;
+    cluster.gate.pause();
+    cluster.nodes[0]
+        .state
+        .raft
+        .client_write(ClusterCommand::SetMaster {
+            node_id: "node-1".into(),
+        })
+        .await
+        .unwrap();
+    cluster.gate.wait_until_entered().await;
+    assert_forwarding_lag_deadline(&cluster).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn forwarding_ci158_preentered_gate_cannot_autocreate_on_master() {
     let cluster = ForwardingCluster::start().await;
     cluster.nodes[1]

@@ -400,12 +400,16 @@ async fn forwarding_lag_bulk_update_delete_and_get_wait_for_raft_apply() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn forwarding_lag_deadline_returns_retryable_503_with_cause() {
     let cluster = ForwardingCluster::start().await;
+    cluster.gate.pause();
+    assert_forwarding_lag_deadline(&cluster).await;
+}
+
+async fn assert_forwarding_lag_deadline(cluster: &ForwardingCluster) {
     cluster.nodes[1]
         .state
         .cluster_manager
         .forwarding_wait_millis
         .store(100, std::sync::atomic::Ordering::Relaxed);
-    cluster.gate.pause();
     let create = cluster
         .client
         .put(format!("{}/lag-timeout", cluster.nodes[0].url))
@@ -413,12 +417,22 @@ async fn forwarding_lag_deadline_returns_retryable_503_with_cause() {
         .send();
     tokio::pin!(create);
     tokio::select! {
+        biased;
+        () = cluster.gate.wait_until_entered() => {}
         response = &mut create => {
             assert_eq!(response.unwrap().status(), StatusCode::OK);
             cluster.gate.wait_until_entered().await;
         }
-        () = cluster.gate.wait_until_entered() => {}
     }
+    assert!(
+        cluster.nodes[0]
+            .state
+            .cluster_manager
+            .get_state()
+            .indices
+            .contains_key("lag-timeout"),
+        "a paused earlier entry must not substitute for explicit index creation"
+    );
     for (method, path, payload) in [
         (
             reqwest::Method::PUT,
