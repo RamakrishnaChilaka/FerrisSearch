@@ -272,11 +272,43 @@ resends too.
 
 ### D8. Visibility
 
-**Status (2026-10-01):** Implemented for `local_shards`: search remains
+**Status (2026-10-02):** Implemented for `local_shards`: search remains
 near-real-time, GET by ID is realtime by default, and `realtime=false` uses
-the search-visible reader. Remaining: all-copy `refresh=true`,
-`refresh=wait_for`, and acknowledgement-preserving refresh-failure reporting.
-Current post-write refresh dispatch remains coordinator-local.
+the search-visible reader. Explicit `refresh=true` (also an empty value or
+bare `?refresh`) now covers the primary and every copy in the write's captured
+Raft-authoritative in-sync set, including writes coordinated by shardless
+nodes or replicas and writes whose primary is a follower. Refresh failures
+are reported without changing the acknowledged write status or receipt.
+Remaining: sequence-covering `refresh=wait_for`, which is still rejected with
+400 rather than emulated with a forced refresh.
+
+Refresh intent travels with primary index/create/update/delete and bulk
+requests. After synchronous replication acknowledges, the primary refreshes
+itself and fans out `RefreshShardCopy` concurrently, retaining the shared
+recovery write guard. Targets validate the exact UUID, allocation, primary,
+term, durable fence, recovery gate, and served engine before and after
+blocking reader publication. Missing or replaced copies fail refresh; this
+path never creates or reopens shard storage.
+
+This follows OpenSearch's primary-owned post-write visibility model, but
+uses a separate replica maintenance RPC rather than attaching refresh to
+replica-apply acknowledgements. The extra round keeps replication failures
+as write failures and refresh-only errors as visibility failures. The
+coordinator does not select refresh targets from its own metadata.
+Homogeneous shard batches share one refresh report across acknowledged
+items. Ordered/mixed bulk preserves its existing action and update barriers,
+so a shard can be refreshed more than once. Detected no-op updates and empty
+bulk requests perform no write or post-write refresh.
+
+For explicit refresh, `_shards.total` counts the primary plus the captured
+in-sync replicas; `successful` and `failed` describe their refresh outcomes.
+Each failed copy has a `failures` entry with index, shard, node, allocation ID,
+primary role, and the underlying reason. `forced_refresh` is true when the
+primary publishes successfully, even if a replica refresh fails, and false
+when the primary refresh fails. Bulk refresh failures retain item status,
+result, sequence, and term and do not set `errors`; that field still depends
+only on item error objects. No refresh parameter or `refresh=false` adds no
+refresh RPCs or engine refreshes.
 
 HotEngine uses manual reader publication, not Tantivy's background commit
 watcher. A commit alone does not make documents searchable. FerrisSearch keeps
@@ -520,12 +552,11 @@ A write parameter that changes safety semantics and is not implemented returns
   any `op_type`.
 - **Refresh:** document and bulk URL parameters accept `true`, the empty
   value (including bare `?refresh`), and `false`. Reject `wait_for` and
-  every other value. Post-write refresh uses only engines on the
-  coordinating node: single writes refresh a local shard if available,
-  and bulk refreshes local shards for affected indices. It does not
-  refresh every in-sync copy or necessarily a remote primary, so it
-  cannot implement `wait_for` as a forced all-copy refresh. DELETE now
-  uses the same local refresh helper. Reject per-action bulk `refresh`
+  every other value. Explicit refresh is primary-owned and covers every
+  captured in-sync copy, with acknowledgement-preserving failure reporting
+  as described in D8. `wait_for` still needs sequence-covering refresh
+  listeners; do not emulate it with forced all-copy refresh.
+  Reject per-action bulk `refresh`
   and index-creation `refresh`, which have no implementation.
 - **Active copies:** accept `wait_for_active_shards` only when absent or
   exactly `1`; bulk metadata also accepts numeric `1`. Reject `all` even

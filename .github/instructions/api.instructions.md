@@ -420,12 +420,23 @@ keys through the shared `validate_write_parameter()` helper.
 Run validation before metadata writes, auto-creation, routing, or document
 mutation. Document and bulk URLs accept `refresh=true`, `refresh=false`,
 and an empty value, including bare `?refresh`; reject `wait_for` and every
-other value with `400 illegal_argument_exception`. Index, update, delete,
-and bulk refresh only engines on the coordinator. All-copy refresh remains
-unimplemented; do not accept `wait_for` until refresh covers the primary
-and every in-sync replica. Index creation does not implement `refresh`.
-Post-write refresh waits use Tokio's blocking pool; the document and replica
-write itself remains on the dedicated write pool.
+other value with `400 illegal_argument_exception`. Carry explicit refresh
+intent through index/create/update/delete and both bulk routes to the primary.
+The primary refreshes its captured Raft-authoritative acknowledgement set;
+never refresh coordinator-local engines or select targets from coordinator
+metadata. Refresh-only failures retain acknowledged status/result/sequence/
+term and appear in `_shards.failed` and `failures`. `forced_refresh` reflects
+successful primary publication, not success on every replica. Bulk refresh
+failures do not set `errors` or create item error objects.
+
+No refresh or `refresh=false` adds no refresh RPCs or engine maintenance.
+Detected no-op updates and empty bulk perform no post-write refresh.
+Index-only batches share refresh outcomes per shard run; mixed/conditional
+actions and coordinator-side update barriers retain their existing order.
+Keep `wait_for` rejected until sequence-covering refresh listeners exist;
+do not emulate it with forced refresh. Index creation does not implement
+`refresh`. Post-write refresh uses Tokio's blocking pool and the existing
+reader-publication path; mutations remain on the dedicated write pool.
 
 ### Unsupported Write Parameters
 `validate_write_parameter()` owns one explicit rejection list shared by
