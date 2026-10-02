@@ -16,6 +16,8 @@ mod review;
 #[path = "recreate_tests.rs"]
 mod recreate;
 
+const LOOP_INDEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
 struct ForwardingNode {
     _data: tempfile::TempDir,
     state: AppState,
@@ -232,11 +234,26 @@ impl ForwardingCluster {
         path: &str,
         body: Option<Value>,
     ) -> (StatusCode, Value) {
+        self.request_with_timeout(node, method, path, body, None)
+            .await
+    }
+
+    async fn request_with_timeout(
+        &self,
+        node: usize,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+        timeout: Option<Duration>,
+    ) -> (StatusCode, Value) {
         let mut request = self
             .client
             .request(method, format!("{}{path}", self.nodes[node].url));
         if let Some(body) = body {
             request = request.json(&body);
+        }
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
         }
         let response = request.send().await.unwrap();
         let status = response.status();
@@ -244,14 +261,24 @@ impl ForwardingCluster {
     }
 
     async fn create(&self, index: &str) -> (StatusCode, Value) {
-        self.request(
-            0,
+        self.create_with_timeout(0, index, None).await
+    }
+
+    async fn create_with_timeout(
+        &self,
+        node: usize,
+        index: &str,
+        timeout: Option<Duration>,
+    ) -> (StatusCode, Value) {
+        self.request_with_timeout(
+            node,
             reqwest::Method::PUT,
             &format!("/{index}"),
             Some(json!({
                 "settings": {"number_of_shards": 1, "number_of_replicas": 0},
                 "mappings": {"properties": {"value": {"type": "integer"}}}
             })),
+            timeout,
         )
         .await
     }
@@ -475,7 +502,9 @@ async fn forwarding_create_then_write_50_iterations_without_hook() {
     let mut failures = Vec::new();
     for iteration in 0..50 {
         let index = format!("forward-loop-{iteration}");
-        let (status, body) = cluster.create(&index).await;
+        let (status, body) = cluster
+            .create_with_timeout(0, &index, Some(LOOP_INDEX_REQUEST_TIMEOUT))
+            .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let (status, body) = cluster
             .request(

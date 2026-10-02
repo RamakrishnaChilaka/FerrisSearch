@@ -34,16 +34,17 @@ async fn use_leader_primary(cluster: &ForwardingCluster) {
 }
 
 async fn create_on(cluster: &ForwardingCluster, coordinator: usize, index: &str) -> Value {
+    create_on_with_timeout(cluster, coordinator, index, None).await
+}
+
+async fn create_on_with_timeout(
+    cluster: &ForwardingCluster,
+    coordinator: usize,
+    index: &str,
+    timeout: Option<Duration>,
+) -> Value {
     let (status, body) = cluster
-        .request(
-            coordinator,
-            reqwest::Method::PUT,
-            &format!("/{index}"),
-            Some(json!({
-                "settings": {"number_of_shards": 1, "number_of_replicas": 0},
-                "mappings": {"properties": {"value": {"type": "integer"}}}
-            })),
-        )
+        .create_with_timeout(coordinator, index, timeout)
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["acknowledged"], true, "{body}");
@@ -65,7 +66,13 @@ async fn assert_recreate_cycles(coordinator: usize, primary: usize) {
     let primary_node = &cluster.nodes[primary];
     let primary_id = &primary_node.state.local_node_id;
     let protected = "recreate-protected";
-    create_on(&cluster, coordinator, protected).await;
+    create_on_with_timeout(
+        &cluster,
+        coordinator,
+        protected,
+        Some(LOOP_INDEX_REQUEST_TIMEOUT),
+    )
+    .await;
     let protected_source = json!({"value": 987654});
     let (status, body) = cluster
         .request(
@@ -93,7 +100,13 @@ async fn assert_recreate_cycles(coordinator: usize, primary: usize) {
     let index = "recreate-cycle";
     let mut failures = Vec::new();
     for iteration in 0..CYCLES {
-        let first_create = create_on(&cluster, coordinator, index).await;
+        let first_create = create_on_with_timeout(
+            &cluster,
+            coordinator,
+            index,
+            Some(LOOP_INDEX_REQUEST_TIMEOUT),
+        )
+        .await;
         assert_eq!(first_create["shards_acknowledged"], true, "{first_create}");
         let old_state = cluster.nodes[0].state.cluster_manager.get_state();
         let old_metadata = &old_state.indices[index];
@@ -122,11 +135,23 @@ async fn assert_recreate_cycles(coordinator: usize, primary: usize) {
         assert_eq!(body["_source"], old_source, "{body}");
 
         let (status, body) = cluster
-            .request(0, reqwest::Method::DELETE, &format!("/{index}"), None)
+            .request_with_timeout(
+                0,
+                reqwest::Method::DELETE,
+                &format!("/{index}"),
+                None,
+                Some(LOOP_INDEX_REQUEST_TIMEOUT),
+            )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         wait_for_applied_metadata(&cluster).await;
-        let recreated = create_on(&cluster, coordinator, index).await;
+        let recreated = create_on_with_timeout(
+            &cluster,
+            coordinator,
+            index,
+            Some(LOOP_INDEX_REQUEST_TIMEOUT),
+        )
+        .await;
         let new_state = cluster.nodes[0].state.cluster_manager.get_state();
         let new_metadata = &new_state.indices[index];
         assert_ne!(new_metadata.uuid, old_uuid);
@@ -257,7 +282,13 @@ async fn assert_recreate_cycles(coordinator: usize, primary: usize) {
             .await
             .unwrap();
         let (status, body) = cluster
-            .request(0, reqwest::Method::DELETE, &format!("/{index}"), None)
+            .request_with_timeout(
+                0,
+                reqwest::Method::DELETE,
+                &format!("/{index}"),
+                None,
+                Some(LOOP_INDEX_REQUEST_TIMEOUT),
+            )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         wait_for_applied_metadata(&cluster).await;
