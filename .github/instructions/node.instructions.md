@@ -94,7 +94,9 @@ pub struct Node {
 1. Ping master node for liveness check
 2. Retire deleted/replaced index incarnations before reopening assigned shards.
    Iterating only current `state.indices` cannot discover a deleted index's
-   still-open engine.
+   still-open engine. Attempt every obsolete index even if another retirement
+   fails; report each index/UUID and cause, and defer only that name's assigned
+   opens.
 3. Retry `JoinCluster` whenever the authoritative cluster state does not contain the local node, even if local Raft state is already initialized from disk
 4. If the master ping is rejected because the target no longer recognizes this node in cluster state, immediately retry `JoinCluster` through the seed hosts so a removed or stale follower can re-register itself. Transient ping failures (timeouts, connection errors, missing local master info) should only log and retry on the next lifecycle tick — they must not trigger a rejoin by themselves. Repeated follower-side join retries should be rate-limited so a permanently rejected or partitioned node does not issue `JoinCluster` on every 5-second lifecycle tick.
 
@@ -108,11 +110,21 @@ pub struct Node {
   This reads the same shared Raft state, does not publish metadata or apply
   cluster-wide reactive settings, and preserves disk evidence. API/transport
   deletion uses the pre-deletion metadata UUID rather than a later name lookup.
+  Followers retain retired directories until authoritative startup cleanup;
+  collecting them after applied deletion is a separate follow-up.
+- Async assigned-open reconciliation performs source-session cleanup once,
+  then passes failed index names to the blocking open pass. Do not rerun an
+  unguarded synchronous retirement after an admission/settlement failure.
+  Unrelated indices must still retire and open.
 - Retirement, reopen, and recovery install use index-level lifecycle exclusion
   in addition to source-session and per-shard locks. Final publication and
   serving getters check the live UUID/allocation, so delayed startup/reopen work
   cannot publish an old incarnation. Reopen's first filesystem validation also
   runs on the blocking pool.
+- UUID registration is ordered under the same applied-state guard. Retirement
+  selects engines by cached UUID, retains another incarnation's settings/ISR,
+  and drops extracted engines only after releasing the node-wide serving-map
+  lock.
 - Recovered-node startup assignments must fail closed when durable
   UUID/allocation identity is missing, malformed, or mismatched. The sole
   exception is an uninitialized allocation created by CreateIndex, before any

@@ -72,8 +72,12 @@ the direct fast-field path derives its schema without a persisted mapping.
 - ShardManager's name-keyed serving map is not incarnation authority. Production
   managers bind the shared applied ClusterManager/local-node context, retire
   removed/replaced UUIDs, and gate serving/publication by exact UUID/allocation.
-  Retirement preserves old disk evidence; destructive cleanup captures the
-  deleted UUID and never follows a newer name-to-UUID mapping.
+  Production UUID registration is ordered inside that current-copy state guard.
+  Retirement selects engines by cached identity UUID, not the name registry,
+  and preserves another incarnation's engines/settings/ISR. It preserves old
+  disk evidence until authoritative startup cleanup; runtime collection after
+  applied deletion is future work. Destructive cleanup captures the deleted
+  UUID and never follows a newer name-to-UUID mapping.
 - `build_shard_routing()` auto-generates a UUID; `auto_create_index()` generates one explicitly
 
 ### Key ClusterState Methods

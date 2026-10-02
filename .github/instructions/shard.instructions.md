@@ -138,15 +138,33 @@ pub struct ShardManager {
   empty-copy permission again from the live G1 decision. Never weaken durable
   identity validation, adopt foreign allocation data, or reset schema to make
   recreation succeed.
+- Register production UUIDs inside the current-copy applied-state guard,
+  including ordinary open, recovery prepare/finalize, and pending-marker
+  restoration. Cache a successfully prepared assigned identity only at guarded
+  engine publication; an aborted old open must not poison a sibling's identity
+  or overwrite the current incarnation's registry.
 - The Raft-backed transport starts a weak-owned applied-version poller, every
   100 ms, so every node retires a deleted/replaced index even without another
   request or lifecycle tick. Async assigned opens also retire a replaced
   incarnation before opening its replacement. Cleanup errors are logged and
   retried; an unresolved source admission remains protected until settlement.
-- Retirement removes the old serving engines, copy identities, settings, ISR,
-  retry state, and matching recovery bookkeeping. It retains the old UUID
-  directory. Explicit deletion instead removes only the captured UUID's
-  directory; a later registered UUID must never retarget that deletion.
+- Retirement inventories both registered UUIDs and cached copy identities.
+  Remove only engines whose cached identity has the retiring UUID, regardless
+  of the name registry. Remove matching identities, ISR observations, retry
+  state, and recovery bookkeeping. Preserve name-keyed settings and other ISR
+  entries while another incarnation's engine remains; repair a retiring
+  registry entry only from a surviving currently applied copy.
+- Extract retired engine Arcs under the serving-map lock, then release that
+  lock before dropping engines and WAL handles on the blocking pool. Writer
+  teardown must not block unrelated serving-map lookups.
+- Retirement attempts all obsolete incarnations and returns every failed
+  index/UUID with its underlying cause. A source admission/settlement error
+  defers only that index's opens, not unrelated retirement or assigned opens.
+- Followers retain obsolete UUID directories until authoritative startup
+  cleanup. Runtime directory collection after observing applied deletion is a
+  follow-up, not implemented retirement behavior. Explicit deletion removes
+  only the captured UUID's directory; a later registered UUID must never
+  retarget that deletion.
 - Source recovery lifecycle locks precede the index read/write lifecycle lock,
   which precedes per-shard open locks. Parallel opens/reopen/install share the
   index lock; whole-incarnation retirement takes it exclusively. Acquire
