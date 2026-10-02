@@ -1064,6 +1064,97 @@ mod tests {
     }
 
     #[test]
+    fn atomic_create_index_rejects_duplicate_without_mutation() {
+        let machines = (0..3)
+            .map(|_| ClusterStateMachine::new("atomic-create".into()))
+            .collect::<Vec<_>>();
+        let first = IndexMetadata::build_shard_routing(
+            "atomic-index",
+            2,
+            1,
+            &["node-1".into(), "node-2".into()],
+        );
+        let duplicate =
+            IndexMetadata::build_shard_routing("atomic-index", 1, 0, &["node-3".into()]);
+        assert_ne!(first.uuid, duplicate.uuid);
+        let mut responses = Vec::new();
+        for machine in &machines {
+            assert_eq!(
+                machine.apply_command_at(
+                    &ClusterCommand::CreateIndex {
+                        metadata: first.clone(),
+                    },
+                    10,
+                ),
+                ClusterResponse::Ok,
+            );
+            let before = machine.state_handle().read().unwrap().clone();
+            let response = machine.apply_command_at(
+                &ClusterCommand::CreateIndex {
+                    metadata: duplicate.clone(),
+                },
+                20,
+            );
+            let after = machine.state_handle().read().unwrap().clone();
+            println!(
+                "ATOMIC_APPLY response={response:?} before_uuid={} after_uuid={} before_version={} after_version={}",
+                before.indices["atomic-index"].uuid,
+                after.indices["atomic-index"].uuid,
+                before.version,
+                after.version,
+            );
+            assert!(
+                response.clone().into_result().is_err(),
+                "duplicate CreateIndex must reject, not replace the first incarnation",
+            );
+            assert_eq!(after.version, before.version);
+            assert_eq!(after.indices["atomic-index"].uuid, first.uuid);
+            assert_eq!(
+                serde_json::to_value(&after.indices).unwrap(),
+                serde_json::to_value(&before.indices).unwrap(),
+            );
+            assert_eq!(after.shard_allocations, before.shard_allocations);
+            responses.push(response);
+        }
+        assert!(responses.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    #[test]
+    fn atomic_create_index_allows_recreate_after_applied_delete() {
+        let machine = ClusterStateMachine::new("atomic-create".into());
+        let first = make_index("atomic-recreate");
+        let mut second = first.clone();
+        second.uuid = crate::cluster::state::IndexUuid::new_random();
+        assert_eq!(
+            machine.apply_command_at(&ClusterCommand::CreateIndex { metadata: first }, 10),
+            ClusterResponse::Ok,
+        );
+        assert_eq!(
+            machine.apply_command_at(
+                &ClusterCommand::DeleteIndex {
+                    index_name: "atomic-recreate".into(),
+                },
+                20,
+            ),
+            ClusterResponse::Ok,
+        );
+        assert_eq!(
+            machine.apply_command_at(
+                &ClusterCommand::CreateIndex {
+                    metadata: second.clone(),
+                },
+                30,
+            ),
+            ClusterResponse::Ok,
+        );
+        let state = machine.state_handle().read().unwrap().clone();
+        assert_eq!(state.indices["atomic-recreate"].uuid, second.uuid);
+        assert_eq!(state.primary_allocation_id("atomic-recreate", 0), Some(30));
+        assert!(!state.primary_initialized("atomic-recreate", 0));
+        assert_eq!(state.version, 3);
+    }
+
+    #[test]
     fn apply_delete_index_command() {
         let sm = ClusterStateMachine::new("test".into());
         sm.apply_command(&ClusterCommand::CreateIndex {

@@ -24,6 +24,9 @@ mod recreate;
 #[path = "forwarding_ci_tests.rs"]
 mod ci_failure;
 
+#[path = "atomic_create_tests.rs"]
+mod atomic_create;
+
 const LOOP_INDEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct ForwardingNode {
@@ -41,12 +44,14 @@ struct ForwardingNode {
 struct ForwardingCluster {
     nodes: Vec<ForwardingNode>,
     gate: Arc<TestApplyGate>,
+    leader_gate: Arc<TestApplyGate>,
     client: reqwest::Client,
 }
 
 impl Drop for ForwardingCluster {
     fn drop(&mut self) {
         self.gate.resume();
+        self.leader_gate.resume();
         for node in &self.nodes {
             for task in &node.tasks {
                 task.abort();
@@ -62,6 +67,7 @@ impl ForwardingCluster {
 
     async fn start_with_roles(roles: &[Vec<NodeRole>]) -> Self {
         let gate = Arc::new(TestApplyGate::default());
+        let leader_gate = Arc::new(TestApplyGate::default());
         let mut nodes = Vec::new();
         let mut addresses = Vec::new();
         for id in 1..=roles.len() as u64 {
@@ -74,6 +80,8 @@ impl ForwardingCluster {
             let mut machine = ClusterStateMachine::new("forwarding-test".into());
             if id == 2 {
                 machine.set_apply_gate(gate.clone());
+            } else {
+                machine.set_apply_gate(leader_gate.clone());
             }
             let cluster_manager =
                 Arc::new(ClusterManager::with_shared_state(machine.state_handle()));
@@ -277,6 +285,7 @@ impl ForwardingCluster {
         Self {
             nodes,
             gate,
+            leader_gate,
             client,
         }
     }
