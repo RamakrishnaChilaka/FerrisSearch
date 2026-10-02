@@ -14256,11 +14256,15 @@ mod tests {
             aggs: HashMap::new(),
         };
 
-        let (hits, _, _) = engine.search_query(&req).unwrap();
+        let error = engine.search_query(&req).unwrap_err();
         assert!(
-            hits.is_empty(),
-            "integer fields must not reinterpret ISO date strings as epoch millis"
+            crate::search::query_string::query_error_is_client(&error),
+            "{error:#}"
         );
+        let reason = format!("{error:#}");
+        assert!(reason.contains("counter"), "{reason}");
+        assert!(reason.contains("2025-01-05T08:15:00Z"), "{reason}");
+        assert!(reason.contains("signed 64-bit integer"), "{reason}");
     }
 
     #[test]
