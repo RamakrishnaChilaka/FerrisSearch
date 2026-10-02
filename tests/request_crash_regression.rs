@@ -205,6 +205,10 @@ impl Cluster {
     }
 
     async fn seed(&mut self) -> Result<()> {
+        self.seed_values(&[1, 2, 3]).await
+    }
+
+    async fn seed_values(&mut self, values: &[i64]) -> Result<()> {
         let (status, body) = self
             .request(
                 0,
@@ -228,7 +232,7 @@ impl Cluster {
             )
             .await?;
         assert_eq!(status, StatusCode::OK, "{body}");
-        for n in 1..=3 {
+        for (position, &n) in values.iter().enumerate() {
             let (status, body) = self
                 .request(
                     0,
@@ -239,7 +243,7 @@ impl Cluster {
                         "tag": format!("tag-{n}"),
                         "n": n,
                         "f": n as f64 + 0.5,
-                        "d": format!("2026-01-0{n}T00:00:00Z"),
+                        "d": format!("2026-01-{:02}T00:00:00Z", position + 1),
                         "embedding": [n as f32, 1.0]
                     })),
                 )
@@ -250,10 +254,14 @@ impl Cluster {
             .request(0, Method::POST, &format!("/{INDEX}/_refresh"), None)
             .await?;
         assert_eq!(status, StatusCode::OK, "{body}");
-        self.normal_search(0).await
+        self.normal_search_count(0, values.len()).await
     }
 
     async fn normal_search(&mut self, node: usize) -> Result<()> {
+        self.normal_search_count(node, 3).await
+    }
+
+    async fn normal_search_count(&mut self, node: usize, count: usize) -> Result<()> {
         let (status, body) = self
             .request(
                 node,
@@ -263,8 +271,8 @@ impl Cluster {
             )
             .await?;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["hits"]["total"]["value"], 3, "{body}");
-        assert_eq!(body["hits"]["hits"].as_array().map(Vec::len), Some(3));
+        assert_eq!(body["hits"]["total"]["value"], count, "{body}");
+        assert_eq!(body["hits"]["hits"].as_array().map(Vec::len), Some(count));
         assert_eq!(body["_shards"]["failed"], 0, "{body}");
         Ok(())
     }
@@ -280,6 +288,84 @@ impl Cluster {
             .await?;
         assert_bad_typed_value(status, &body, field);
         self.normal_search(node).await
+    }
+
+    async fn assert_search_values(
+        &mut self,
+        node: usize,
+        query: Value,
+        expected: &[i64],
+    ) -> Result<()> {
+        let (status, body) = self
+            .request(
+                node,
+                Method::POST,
+                &format!("/{INDEX}/_search"),
+                Some(json!({"query": query, "sort": [{"n": "asc"}]})),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{query}: {body}");
+        assert_eq!(body["_shards"]["failed"], 0, "{body}");
+        assert_eq!(body["hits"]["total"]["value"], expected.len(), "{body}");
+        let values: Vec<_> = body["hits"]["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["_source"]["n"].as_i64().unwrap())
+            .collect();
+        assert_eq!(values, expected, "{query}: {body}");
+        Ok(())
+    }
+
+    async fn assert_sql_values(
+        &mut self,
+        node: usize,
+        predicate: &str,
+        expected: &[i64],
+    ) -> Result<()> {
+        let query = format!("SELECT n FROM {INDEX} WHERE {predicate} ORDER BY n");
+        for endpoint in ["_sql", "_sql/stream"] {
+            self.ensure_running()?;
+            let response = self
+                .client
+                .post(format!("{}/{INDEX}/{endpoint}", self.nodes[node].base_url))
+                .json(&json!({"query": query}))
+                .send()
+                .await?;
+            let status = response.status();
+            let text = response.text().await?;
+            self.ensure_running()?;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "coordinator {node}, {endpoint}, {query}: {text}"
+            );
+            let rows: Vec<Value> = if endpoint == "_sql" {
+                let body: Value = serde_json::from_str(&text)?;
+                body["rows"].as_array().unwrap().clone()
+            } else {
+                let frames = text
+                    .lines()
+                    .map(serde_json::from_str::<Value>)
+                    .collect::<serde_json::Result<Vec<_>>>()?;
+                assert_eq!(frames[0]["type"], "meta", "{text}");
+                assert!(
+                    !frames.iter().any(|frame| frame["type"] == "error"),
+                    "{text}"
+                );
+                frames
+                    .iter()
+                    .filter(|frame| frame["type"] == "rows")
+                    .flat_map(|frame| frame["rows"].as_array().unwrap().iter().cloned())
+                    .collect()
+            };
+            let values: Vec<_> = rows.iter().map(|row| row["n"].as_i64().unwrap()).collect();
+            assert_eq!(
+                values, expected,
+                "coordinator {node}, {endpoint}, {query}: {text}"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -387,6 +473,314 @@ async fn residual_sql_bad_typed_predicates_return_400() -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn assert_review_residual_sql(predicate: &str, expected: &[i64]) -> Result<()> {
+    let mut cluster = Cluster::start(2, predicate).await?;
+    cluster.seed_values(&[1, 2, 3, 4, 5]).await?;
+    for node in 0..cluster.nodes.len() {
+        cluster.assert_sql_values(node, predicate, expected).await?;
+        cluster.normal_search_count(node, 5).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn review_residual_sql_fractional_gte_keeps_datafusion_results() -> Result<()> {
+    assert_review_residual_sql("n >= 1.5 OR title LIKE '%zzz%'", &[2, 3, 4, 5]).await
+}
+
+#[tokio::test]
+async fn review_residual_sql_fractional_gt_keeps_datafusion_results() -> Result<()> {
+    assert_review_residual_sql("n > 1.5 OR title LIKE '%zzz%'", &[2, 3, 4, 5]).await
+}
+
+#[tokio::test]
+async fn review_residual_sql_timestamps_keep_datafusion_results() -> Result<()> {
+    for (predicate, expected) in [
+        (
+            "d >= '2026-01-03 00:00:00' OR title LIKE '%zzz%'",
+            vec![3, 4, 5],
+        ),
+        (
+            "d >= '2026-01-03 00:00:00.5' OR title LIKE '%zzz%'",
+            vec![4, 5],
+        ),
+    ] {
+        assert_review_residual_sql(predicate, &expected).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn review_residual_sql_unsigned_literal_keeps_datafusion_results() -> Result<()> {
+    assert_review_residual_sql(
+        "n < 18446744073709551615 OR title LIKE '%zzz%'",
+        &[1, 2, 3, 4, 5],
+    )
+    .await
+}
+
+#[tokio::test]
+async fn review_fractional_integer_terms_match_opensearch_results() -> Result<()> {
+    let mut cluster = Cluster::start(2, "review_fractional_terms").await?;
+    cluster.seed_values(&[1, 2, 3, 4, 5]).await?;
+    for node in 0..cluster.nodes.len() {
+        for value in [json!(1.5), json!(-1.5), json!("1.5"), json!("-1.5")] {
+            cluster
+                .assert_search_values(node, json!({"term": {"n": value}}), &[])
+                .await?;
+        }
+        for (query, expected) in [
+            (
+                json!({"terms": {"n": [1, 1.5, "2", "2.5", 3.0]}}),
+                vec![1, 2, 3],
+            ),
+            (json!({"terms": {"n": [1.5, -1.5]}}), vec![]),
+            (json!({"term": {"n": 2.0}}), vec![2]),
+        ] {
+            cluster.assert_search_values(node, query, &expected).await?;
+        }
+        cluster.normal_search_count(node, 5).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn review_fractional_integer_ranges_match_opensearch_results() -> Result<()> {
+    let values = [-3, -2, -1, 0, 1, 2, 3, 4, 5];
+    let mut cluster = Cluster::start(2, "review_fractional_ranges").await?;
+    cluster.seed_values(&values).await?;
+    for node in 0..cluster.nodes.len() {
+        for (bound, lower, upper) in [(1.5, 2, 1), (-1.5, -1, -2), (0.5, 1, 0), (-0.5, 0, -1)] {
+            for (operator, expected) in [
+                (
+                    "gte",
+                    values
+                        .into_iter()
+                        .filter(|n| *n >= lower)
+                        .collect::<Vec<_>>(),
+                ),
+                ("gt", values.into_iter().filter(|n| *n >= lower).collect()),
+                ("lte", values.into_iter().filter(|n| *n <= upper).collect()),
+                ("lt", values.into_iter().filter(|n| *n <= upper).collect()),
+            ] {
+                for value in [json!(bound), json!(bound.to_string())] {
+                    cluster
+                        .assert_search_values(
+                            node,
+                            json!({"range": {"n": {operator: value}}}),
+                            &expected,
+                        )
+                        .await?;
+                }
+            }
+        }
+        for (condition, expected) in [
+            (json!({"gte": 1.5, "lte": 3.5}), vec![2, 3]),
+            (json!({"gte": 3.5, "lte": 1.5}), vec![]),
+            (json!({"gt": 1.0, "lt": 3.0}), vec![2]),
+            (json!({"gt": -2.0, "lt": 0.0}), vec![-1]),
+        ] {
+            cluster
+                .assert_search_values(node, json!({"range": {"n": condition}}), &expected)
+                .await?;
+        }
+        cluster.normal_search_count(node, values.len()).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn review_fractional_sql_pushdown_and_residual_results_agree() -> Result<()> {
+    let mut cluster = Cluster::start(2, "review_fractional_sql").await?;
+    cluster.seed_values(&[-3, -2, -1, 0, 1, 2, 3, 4, 5]).await?;
+    for node in 0..cluster.nodes.len() {
+        for (predicate, expected) in [
+            ("n >= 1.5", vec![2, 3, 4, 5]),
+            ("n > 1.5", vec![2, 3, 4, 5]),
+            ("n <= -1.5", vec![-3, -2]),
+            ("n < -1.5", vec![-3, -2]),
+            ("n = 1.5", vec![]),
+            ("n = -1.5", vec![]),
+            ("n IN (1, 2.5)", vec![1]),
+            ("n IN (-1, -2.5)", vec![-1]),
+            ("n BETWEEN 1.5 AND 3.5", vec![2, 3]),
+            ("n BETWEEN -2.5 AND -0.5", vec![-2, -1]),
+        ] {
+            for predicate in [
+                predicate.to_string(),
+                format!("({predicate}) OR title LIKE '%zzz%'"),
+            ] {
+                cluster
+                    .assert_sql_values(node, &predicate, &expected)
+                    .await?;
+            }
+        }
+        cluster.normal_search_count(node, 9).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn review_fractional_date_epoch_millis_preserve_truncation() -> Result<()> {
+    let mut cluster = Cluster::start(2, "review_fractional_dates").await?;
+    cluster.seed_values(&[1, 2, 3, 4, 5]).await?;
+    for node in 0..cluster.nodes.len() {
+        for value in [json!(1_767_398_400_000.5), json!("1767398400000.5")] {
+            for (query, expected) in [
+                (json!({"term": {"d": value}}), vec![3]),
+                (json!({"terms": {"d": [value]}}), vec![3]),
+                (json!({"range": {"d": {"gte": value}}}), vec![3, 4, 5]),
+            ] {
+                cluster.assert_search_values(node, query, &expected).await?;
+            }
+        }
+        cluster.normal_search_count(node, 5).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn review_empty_range_is_a_client_error_locally_and_remotely() -> Result<()> {
+    let mut cluster = Cluster::start(2, "review_empty_range").await?;
+    cluster.seed().await?;
+    let (_, state) = cluster
+        .request(0, Method::GET, "/_cluster/state", None)
+        .await?;
+    let primary = state["indices"][INDEX]["shard_routing"]["0"]["primary"]
+        .as_str()
+        .context("missing primary routing")?;
+    for node in 0..cluster.nodes.len() {
+        let (status, body) = cluster
+            .request(
+                node,
+                Method::POST,
+                &format!("/{INDEX}/_search"),
+                Some(json!({"query": {"range": {"n": {}}}})),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["type"], "search_phase_execution_exception");
+        let failures = body["error"]["failed_shards"].as_array().unwrap();
+        assert_eq!(failures.len(), 1, "{body}");
+        assert_eq!(failures[0]["node"], primary, "{body}");
+        assert_eq!(
+            failures[0]["reason"]["type"], "query_shard_exception",
+            "{body}"
+        );
+        let reason = failures[0]["reason"]["reason"].as_str().unwrap();
+        assert!(reason.contains('n') && reason.contains("bound"), "{body}");
+        cluster.normal_search(node).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn review_invalid_knn_dimensions_are_client_errors_on_both_coordinators() -> Result<()> {
+    let mut cluster = Cluster::start(2, "review_knn_dimensions").await?;
+    cluster.seed().await?;
+    let (_, state) = cluster
+        .request(0, Method::GET, "/_cluster/state", None)
+        .await?;
+    let primary = state["indices"][INDEX]["shard_routing"]["0"]["primary"]
+        .as_str()
+        .context("missing primary routing")?;
+    for node in 0..cluster.nodes.len() {
+        for vector in [json!([1.0, 1.0, 1.0]), json!([])] {
+            for k in [0, 3, usize::MAX] {
+                let (status, body) = cluster
+                    .request(
+                        node,
+                        Method::POST,
+                        &format!("/{INDEX}/_search"),
+                        Some(json!({"knn": {"embedding": {"vector": vector, "k": k}}})),
+                    )
+                    .await?;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+                assert_eq!(body["error"]["type"], "search_phase_execution_exception");
+                let failures = body["error"]["failed_shards"].as_array().unwrap();
+                assert_eq!(failures.len(), 1, "{body}");
+                assert_eq!(failures[0]["node"], primary, "{body}");
+                let reason = failures[0]["reason"]["reason"].as_str().unwrap();
+                assert!(
+                    reason.contains("dimension") && reason.contains("expected 2"),
+                    "{body}"
+                );
+                cluster.normal_search(node).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn review_empty_remote_store_rejects_empty_ranges() -> Result<()> {
+    let mut cluster = Cluster::start(1, "review_empty_remote_range").await?;
+    cluster.seed().await?;
+    let (status, body) = cluster
+        .request(
+            0,
+            Method::PUT,
+            "/empty",
+            Some(json!({
+                "engine": "remote_store",
+                "mappings": {"properties": {"n": {"type": "integer"}}}
+            })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = cluster
+        .request(
+            0,
+            Method::POST,
+            "/empty/_search",
+            Some(json!({"query": {"range": {"n": {}}}})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["type"], "query_shard_exception", "{body}");
+    assert!(
+        body["error"]["reason"].as_str().unwrap().contains("bound"),
+        "{body}"
+    );
+    cluster.normal_search(0).await
+}
+
+#[tokio::test]
+async fn review_integer_extrema_and_json_precision_remain_exact() -> Result<()> {
+    let mut cluster = Cluster::start(1, "review_integer_precision").await?;
+    let values = [
+        i64::MIN,
+        0,
+        1,
+        9_007_199_254_740_992,
+        9_007_199_254_740_993,
+        i64::MAX,
+    ];
+    cluster.seed_values(&values).await?;
+    for n in values {
+        for value in [json!(n), json!(n.to_string())] {
+            cluster
+                .assert_search_values(0, json!({"term": {"n": value}}), &[n])
+                .await?;
+        }
+    }
+    for (condition, expected) in [
+        (json!({"gt": i64::MAX}), vec![]),
+        (json!({"lt": i64::MIN}), vec![]),
+        (json!({"gte": i64::MAX}), vec![i64::MAX]),
+        (json!({"lte": i64::MIN}), vec![i64::MIN]),
+        (
+            json!({"gt": 9_007_199_254_740_992i64, "lt": i64::MAX}),
+            vec![9_007_199_254_740_993],
+        ),
+    ] {
+        cluster
+            .assert_search_values(0, json!({"range": {"n": condition}}), &expected)
+            .await?;
+    }
+    cluster.normal_search_count(0, values.len()).await
 }
 
 #[tokio::test]
