@@ -83,6 +83,11 @@ applyTo: "src/hybrid/**,src/api/search/**,src/engine/tantivy.rs"
 - Multi-column ORDER BY cannot be pushed — falls back to DataFusion sorting.
 - `parse_limit_expr()` and `parse_offset_expr()` extract numeric values from `sqlparser::ast::LimitClause`.
 - When limit is pushed down, the Tantivy search collects only `limit + offset` docs instead of the default 100K.
+- Saturate LIMIT/OFFSET addition and approximate shard top-K multiplication,
+  then bound every hit collector by the shard's live docs. Bound grouped
+  selection/pagination by actual buckets; LIMIT 0 never selects index -1.
+- Apply the shared 64-field bound to explicit ORDER BY lists during shape
+  validation, before residual sort keys can amplify per-row memory.
 - The `limit_pushed_down` guard conditions are: `limit.is_some() && !has_residual_predicates && grouped_sql.is_none() && group_by_columns.is_empty() && (is_order_by_score_only || sort_pushdown.is_some())`.
 
 ## Distributed Fast-Field SQL
@@ -121,8 +126,22 @@ applyTo: "src/hybrid/**,src/api/search/**,src/engine/tantivy.rs"
 - The workaround uses `sqlparser` only for SELECT-list order. The set of required columns must come from the planner (`required_columns`, `needs_id`, `needs_score`), not from a second SQL AST walker, so CASE/HAVING/GROUP BY dependencies are preserved.
 - DataFusion still handles LIMIT/OFFSET execution — we do NOT strip LIMIT from the SQL or apply it manually. The workaround only prevents the specific optimizer misfire.
 - When DataFusion fixes this upstream, the workaround can be removed — the reordering is a no-op when projection already matches schema order.
+- Separately, DataFusion 53 casts LIMIT/OFFSET literals to i64. Its execution
+  SQL normalizes oversized literals and the combined window into that domain
+  without changing the original planner metadata or imposing an HTTP
+  `max_result_window` rejection. DataFusion's TopK heap grows with actual rows,
+  not the user count. Keep this normalization on both buffered and partition
+  stream entry points, and retain DataFusion's final LIMIT/OFFSET execution.
 
 ## Planning Rules
+- Validate direct field/literal comparisons inside residual WHERE clauses on
+  the search pool with the canonical schema and shared typed-term conversion.
+  Mixed OR/LIKE, negation, IN, or BETWEEN must not evade numeric/date validation
+  merely because the whole predicate cannot be pushed into Tantivy. This is
+  validation only; do not force those predicates into execution pushdown.
+- Leave SQL NULL comparisons, NULL-bearing IN lists, and NULL-bounded BETWEEN
+  residual so DataFusion retains three-valued semantics. SQL NULL is not an
+  invalid numeric term, and must never become a text term for a numeric field.
 - Split planning into two stages:
   1. search-aware planning in Tantivy
   2. residual SQL planning in DataFusion

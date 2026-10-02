@@ -242,14 +242,27 @@ to query-body `_count`. SQL paths that share distributed search also reject an
 all-failed shard set. Metadata-only `_count` and SQL `count(*)` reject an entirely
 unavailable shard set.
 `_count?q=...` and `_msearch` are not supported.
-Empty remote-store indices also validate query strings against the index mappings
+Invalid numeric/date range, term, terms, SQL predicate, kNN filter, and cursor
+values return HTTP 400 with the offending field/value and parse cause rather
+than silently matching nothing. Empty remote-store indices also validate
+query strings and typed values against the index mappings
 and return HTTP 400 with a parser cause instead of hiding invalid queries behind
 an empty result.
 
-Search clamps each shard's collector window to its live document count.
-Oversized `size` values cannot allocate more hit slots than the shard can return.
+Search and SQL clamp each shard's hit-collector limit to its live document
+count; kNN limits and candidate buffers are bounded by indexed vectors.
+Huge valid SQL LIMIT values return the available rows, including on sorted
+and materialized paths. This is not a `max_result_window` policy.
 If `from + size` overflows, URI and query-body search return HTTP 400 with a
 pagination reason before dispatching work.
+Sort lists (including explicit SQL ORDER BY lists) support up to 64 fields;
+wider lists return HTTP 400 before cursor expansion or sort-value allocation.
+
+Unwinding search-worker panics become diagnosable shard failures without
+terminating the node or its search pool. Write-worker panics remain explicitly
+fail-stop: the operation and panic are logged before abort, because a panic
+can leave partially mutated shard state. Allocator OOM aborts are not caught;
+these bounds are not a total query-memory or admission-control budget.
 
 ### 5. Analyze the matched set
 

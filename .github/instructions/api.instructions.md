@@ -338,6 +338,21 @@ query-string subset and all-shards-failed response contract are owned by
 [`search.instructions.md`](search.instructions.md). Preserve partial-failure
 HTTP 200 responses, parser causes across gRPC, and full hit counts before
 pagination. Do not turn all-shard failures into empty successful responses.
+Malformed numeric/date range, term, terms, SQL predicate, kNN filter, and cursor
+values return classified HTTP 400 query errors with the offending field/value
+and cause. Search-worker panics remain diagnosable server-side shard failures;
+local and remote vector errors must not be hidden by a successful text leg.
+Large valid SQL LIMITs and search/kNN/terms sizes retain their normal result
+semantics through data-bounded collectors, not a new result-window cap.
+Sort/explicit SQL ORDER BY lists wider than 64 fields return HTTP 400 before
+cursor expansion or per-hit sort annotation.
+Validate typed literal comparisons in residual SQL before DataFusion, including
+mixed OR/LIKE and negated predicates. Preserve SQL NULL semantics rather than
+submitting NULL to the strict numeric query-term helper.
+Direct SQL remains all-or-nothing for shard errors. A local or forwarded
+worker panic must retain its shard identity and return a server-side search
+failure, not enter the materialized/buffered capability fallback. Late streaming
+failures remain explicit NDJSON error frames.
 
 ### Global SQL Endpoint
 - `POST /_sql` handles SQL commands that don't require an index in the URL path.

@@ -146,6 +146,11 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   into untyped `success: false` responses. Remote-store leaf batches preserve
   the same parse classification so the root can return HTTP 400 when every
   split fails for a client query error.
+- `SqlRecordBatch` and `SqlRecordBatchStream` use that same structured query
+  status classification, including errors before opening a stream. A remote
+  kNN error propagates through `SearchShardDsl`; do not log it and return only
+  the successful text leg. Contained worker panics remain `INTERNAL` with the
+  operation and panic message intact.
 - Forwarded document, bulk, GET, search, SQL, index-scoped stats, remote-store
   leaf, and maintenance handlers validate local metadata before waiting.
   `x-ferris-cluster-state-version` is a routing hint, not an unconditional

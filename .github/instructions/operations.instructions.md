@@ -50,6 +50,18 @@ operator-facing fields.
   engine work. Document writes and replica applies stay on the write pool;
   maintenance waits must not consume it. Do not run Raft or network futures on
   rayon.
+- Catch unwinding panics inside search jobs and return an error naming the
+  closure operation and panic payload. Keep the pool usable, propagate the
+  failure through the shard/error boundary, and retain the search pool's
+  fallback panic handler; never turn a panic into an empty successful result.
+  Preserve the typed `SearchWorkerPanic` locally and its stable transport
+  message prefix so SQL capability fallback cannot mask a panicking shard.
+- Write-job panics remain explicitly fail-stop. Catch only to log the closure
+  operation and panic payload before aborting; the write pool's fallback
+  handler also aborts. WAL, version-map, or vector mutation may already have
+  occurred, and recovering a poisoned lock does not prove consistency.
+  Do not replace this with error-only containment without an atomic copy
+  quarantine/reopen protocol. Allocator OOM aborts are not unwindable.
 - Avoid nested rayon use. Grouped segment scans deliberately use scoped OS
   threads where nested pool use could deadlock.
 - Background maintenance is not automatically low priority just because it was
