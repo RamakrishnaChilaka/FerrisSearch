@@ -276,6 +276,9 @@ cargo test -- test_name                         # Single test by name
   delayed-prechecked-proposal regression after primary activation and an
   acknowledged write, concurrent explicit-create one-winner coverage, and
   intentionally lagging coordinator 400/503 coverage.
+  `ForwardingCluster::start_with_roles` also supports three-node refresh tests;
+  bind the atomic leader apply gate only to node-1, not every node other than
+  the gated node-2 follower. Other nodes must keep applying while it is paused.
 - `atomic_create_tests.rs` exercises concurrent first POST `_doc`, PUT `_doc`,
   `_create`, and global/index-scoped multi-index bulk in master-only and
   all-roles topologies through both coordinators. `FERRIS_ATOMIC_ROUNDS`

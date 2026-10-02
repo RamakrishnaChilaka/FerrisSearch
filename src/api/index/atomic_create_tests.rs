@@ -38,7 +38,7 @@ async fn catch_up(cluster: &ForwardingCluster) {
         }
     })
     .await
-    .expect("both real Raft state machines must apply the committed log");
+    .expect("all real Raft state machines must apply the committed log");
 }
 
 async fn all_roles(cluster: &ForwardingCluster) {
@@ -120,6 +120,49 @@ async fn bulk_request(
         .await
         .unwrap();
     (response.status(), response.json().await.unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn atomic_leader_apply_gate_does_not_pause_third_node() {
+    let cluster = ForwardingCluster::start_with_roles(&[
+        vec![NodeRole::Master],
+        vec![NodeRole::Data],
+        vec![NodeRole::Data],
+    ])
+    .await;
+    catch_up(&cluster).await;
+    let before = cluster.nodes[0].state.cluster_manager.version();
+    let raft = cluster.nodes[0].state.raft.clone();
+    cluster.leader_gate.pause();
+    let write = tokio::spawn(async move {
+        raft.client_write(ClusterCommand::SetMaster {
+            node_id: "node-1".into(),
+        })
+        .await
+        .unwrap()
+    });
+    tokio::time::timeout(TEST_WAIT, cluster.leader_gate.wait_until_entered())
+        .await
+        .unwrap();
+    tokio::time::timeout(TEST_WAIT, async {
+        while cluster.nodes[2].state.cluster_manager.version() < before + 1 {
+            assert_eq!(
+                cluster.nodes[0].state.cluster_manager.version(),
+                before,
+                "the leader gate must not be consumed by another node",
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the third node must apply while only leader application is paused");
+    assert_eq!(cluster.nodes[0].state.cluster_manager.version(), before);
+    assert!(!write.is_finished());
+    cluster.leader_gate.resume();
+    write.await.unwrap().data.into_result().unwrap();
+    catch_up(&cluster).await;
+    assert_eq!(cluster.nodes[0].state.cluster_manager.version(), before + 1);
+    assert_eq!(cluster.nodes[2].state.cluster_manager.version(), before + 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

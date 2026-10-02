@@ -80,7 +80,7 @@ impl ForwardingCluster {
             let mut machine = ClusterStateMachine::new("forwarding-test".into());
             if id == 2 {
                 machine.set_apply_gate(gate.clone());
-            } else {
+            } else if id == 1 {
                 machine.set_apply_gate(leader_gate.clone());
             }
             let cluster_manager =
