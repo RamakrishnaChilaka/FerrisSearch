@@ -31,6 +31,13 @@ type SourceRecoveryIdentity = (String, u32);
 type SourceRecoveryLock = Arc<tokio::sync::Mutex<()>>;
 type SourceRecoveryLockMap = HashMap<SourceRecoveryIdentity, SourceRecoveryLock>;
 
+#[cfg(test)]
+struct OpenValidationGate {
+    index_uuid: String,
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub(crate) struct DefinitiveShardCopyFailure {
@@ -858,6 +865,8 @@ pub struct ShardManager {
     #[cfg(test)]
     open_before_lock_release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     #[cfg(test)]
+    open_after_validation_gate: Mutex<Option<OpenValidationGate>>,
+    #[cfg(test)]
     reopen_after_cleanup_sender: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     #[cfg(test)]
     reopen_after_cleanup_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -930,6 +939,8 @@ impl ShardManager {
             open_before_lock_sender: Mutex::new(None),
             #[cfg(test)]
             open_before_lock_release: Mutex::new(None),
+            #[cfg(test)]
+            open_after_validation_gate: Mutex::new(None),
             #[cfg(test)]
             reopen_after_cleanup_sender: Mutex::new(None),
             #[cfg(test)]
@@ -2492,6 +2503,24 @@ impl ShardManager {
             assignment.map(|assignment| assignment.allocation_id),
             |_| Ok(()),
         )?;
+        #[cfg(test)]
+        {
+            let gate = {
+                let mut gate = self.open_after_validation_gate.lock().unwrap();
+                if gate
+                    .as_ref()
+                    .is_some_and(|gate| gate.index_uuid == index_uuid)
+                {
+                    gate.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(gate) = gate {
+                gate.entered.send(()).unwrap();
+                gate.release.recv_timeout(Duration::from_secs(30)).unwrap();
+            }
+        }
 
         // Re-check after acquiring the per-shard lock — a concurrent caller
         // may have finished opening this shard while we were waiting.

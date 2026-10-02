@@ -530,3 +530,7 @@ impl ShardManager {
 #[cfg(test)]
 #[path = "lifecycle/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "lifecycle/review_tests.rs"]
+mod review_tests;

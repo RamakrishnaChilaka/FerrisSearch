@@ -42,6 +42,164 @@ async fn node_rejects_excessive_peer_recovery_concurrency() {
     );
 }
 
+struct ReviewBlockedRetirement {
+    blocked: std::collections::HashSet<String>,
+    attempts: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl crate::shard::SourceRecoverySessionCleanup for ReviewBlockedRetirement {
+    fn abort_shard<'a>(
+        &'a self,
+        _index_uuid: &'a str,
+        _shard_id: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'a>>
+    {
+        Box::pin(async { panic!("the retirement regression only cleans whole indices") })
+    }
+
+    fn abort_index<'a>(
+        &'a self,
+        index_uuid: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<usize>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.attempts.lock().unwrap().insert(index_uuid.to_string());
+            if self.blocked.contains(index_uuid) {
+                anyhow::bail!(
+                    "cannot replace a primary engine while peer recovery admission is active"
+                );
+            }
+            Ok(0)
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_followup_n2_blocked_retirement_does_not_block_unrelated_assigned_open() {
+    let (raft, state_handle) = crate::consensus::create_raft_instance_mem(1, "review".into())
+        .await
+        .unwrap();
+    crate::consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:0".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !raft.is_leader() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let cluster = Arc::new(ClusterManager::with_shared_state(state_handle));
+    let dir = tempfile::tempdir().unwrap();
+    let manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    manager.bind_applied_shard_authority(cluster.clone(), "node-2".into());
+    let mut retired = Vec::new();
+    for name in ["blocked-a", "blocked-b"] {
+        let metadata = IndexMetadata::build_shard_routing(name, 1, 0, &["node-2".into()]);
+        let uuid = metadata.uuid.clone();
+        raft.client_write(ClusterCommand::CreateIndex { metadata })
+            .await
+            .unwrap()
+            .data
+            .into_result()
+            .unwrap();
+        let state = cluster.get_state();
+        manager
+            .open_primary_assigned_shard_with_settings_blocking(
+                name.into(),
+                0,
+                HashMap::new(),
+                IndexSettings::default(),
+                uuid.clone(),
+                crate::shard::AssignedShardOpen {
+                    allocation_id: state.shard_allocation_id(name, 0, "node-2").unwrap(),
+                    primary_term: 1,
+                    allow_empty_creation: true,
+                },
+            )
+            .await
+            .unwrap();
+        retired.push((name, uuid));
+    }
+    raft.client_write(ClusterCommand::CreateIndex {
+        metadata: IndexMetadata::build_shard_routing("unrelated", 1, 0, &["node-2".into()]),
+    })
+    .await
+    .unwrap()
+    .data
+    .into_result()
+    .unwrap();
+    let blocked = Arc::new(ReviewBlockedRetirement {
+        blocked: retired.iter().map(|(_, uuid)| uuid.to_string()).collect(),
+        attempts: Default::default(),
+    });
+    manager.register_source_recovery_cleanup(blocked.clone());
+    for (name, _) in &retired {
+        raft.client_write(ClusterCommand::DeleteIndex {
+            index_name: (*name).into(),
+        })
+        .await
+        .unwrap()
+        .data
+        .into_result()
+        .unwrap();
+    }
+    let state = cluster.get_state();
+    let failures = open_local_assigned_shards_blocking(
+        state.clone(),
+        "node-2".into(),
+        manager.clone(),
+        build_guarded_startup_shards(None, "node-2"),
+    )
+    .await;
+    assert!(failures.is_empty(), "{failures:?}");
+    println!(
+        "N2 attempted retirements={}, unrelated open={}",
+        blocked.attempts.lock().unwrap().len(),
+        manager.get_shard("unrelated", 0).is_some()
+    );
+    let engine = manager
+        .get_shard("unrelated", 0)
+        .expect("one blocked retired index must not defer an unrelated assigned open");
+    assert_eq!(
+        blocked.attempts.lock().unwrap().len(),
+        2,
+        "every retired index must be attempted"
+    );
+    let identity = manager.copy_identity("unrelated", 0).unwrap();
+    assert_eq!(
+        identity.index_uuid,
+        state.indices["unrelated"].uuid.as_str()
+    );
+    assert_eq!(
+        identity.allocation_id,
+        state.shard_allocation_id("unrelated", 0, "node-2").unwrap()
+    );
+    for (name, uuid) in &retired {
+        assert!(
+            manager.copy_identity(name, 0).is_some(),
+            "blocked retirement must not guess admission settlement"
+        );
+        assert_eq!(manager.index_uuid(name).as_deref(), Some(uuid.as_str()));
+    }
+    tokio::task::spawn_blocking(move || {
+        engine
+            .add_document_with_receipt_at_term("new", serde_json::json!({"value": 3}), 1)
+            .unwrap();
+        assert_eq!(
+            engine
+                .get_document_with_metadata("new", true)
+                .unwrap()
+                .unwrap()
+                .source,
+            serde_json::json!({"value": 3})
+        );
+    })
+    .await
+    .unwrap();
+    raft.shutdown().await.unwrap();
+}
+
 #[test]
 fn dead_node_removal_waits_for_routing_update_success() {
     assert!(dead_node_removal_allowed(false));
