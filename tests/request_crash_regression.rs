@@ -1,0 +1,935 @@
+use anyhow::{Context, Result, bail};
+use ferrissearch::engine::{HotEngine, SearchEngine};
+use ferrissearch::worker::WorkerPools;
+use reqwest::{Client, Method, StatusCode};
+use serde_json::{Value, json};
+use std::fs::{self, File};
+use std::net::TcpListener;
+use std::path::PathBuf;
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+use tempfile::TempDir;
+use tokio::sync::OwnedMutexGuard;
+
+const INDEX: &str = "crash";
+const READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+struct NodeProcess {
+    name: String,
+    base_url: String,
+    log_path: PathBuf,
+    child: Child,
+}
+
+impl NodeProcess {
+    fn ensure_running(&mut self) -> Result<()> {
+        if let Some(status) = self.child.try_wait()? {
+            bail!(
+                "{} (PID {}) exited with {status}\n{}",
+                self.name,
+                self.child.id(),
+                fs::read_to_string(&self.log_path)?
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Drop for NodeProcess {
+    fn drop(&mut self) {
+        match self.child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => {
+                if let Err(error) = self.child.kill() {
+                    eprintln!("failed to kill test node {}: {error}", self.child.id());
+                }
+                if let Err(error) = self.child.wait() {
+                    eprintln!("failed to reap test node {}: {error}", self.child.id());
+                }
+            }
+        }
+    }
+}
+
+struct Cluster {
+    nodes: Vec<NodeProcess>,
+    client: Client,
+    _directory: TempDir,
+    _guard: OwnedMutexGuard<()>,
+}
+
+fn process_test_lock() -> Arc<tokio::sync::Mutex<()>> {
+    static LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+    LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+impl Cluster {
+    async fn start(node_count: usize, test_name: &str) -> Result<Self> {
+        let guard = process_test_lock().lock_owned().await;
+        let directory = tempfile::tempdir()?;
+        let reservations = (0..node_count * 2)
+            .map(|_| TcpListener::bind("127.0.0.1:0"))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let ports = reservations
+            .iter()
+            .map(|listener| listener.local_addr().map(|address| address.port()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let seeds = (0..node_count)
+            .map(|i| format!("127.0.0.1:{}", ports[i * 2 + 1]))
+            .collect::<Vec<_>>()
+            .join(",");
+        let log_dir = match std::env::var_os("FERRIS_CRASH_TEST_LOG_DIR") {
+            Some(path) => PathBuf::from(path),
+            None => directory.path().to_path_buf(),
+        };
+        fs::create_dir_all(&log_dir)?;
+        drop(reservations);
+
+        let mut cluster = Self {
+            nodes: Vec::new(),
+            client: Client::builder().timeout(Duration::from_secs(10)).build()?,
+            _directory: directory,
+            _guard: guard,
+        };
+        for i in 0..node_count {
+            let name = format!("crash-node-{}", i + 1);
+            let log_path = log_dir.join(format!("{test_name}-{}-{name}.log", std::process::id()));
+            let stdout = File::create(&log_path)?;
+            let stderr = stdout.try_clone()?;
+            let mut command = Command::new(env!("CARGO_BIN_EXE_ferrissearch"));
+            for (key, _) in std::env::vars() {
+                if key.starts_with("FERRISSEARCH_") {
+                    command.env_remove(key);
+                }
+            }
+            let child = command
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .env("RUST_LOG", "info")
+                .env("FERRISSEARCH_NODE_NAME", &name)
+                .env("FERRISSEARCH_CLUSTER_NAME", "request-crash-regression")
+                .env("FERRISSEARCH_HTTP_PORT", ports[i * 2].to_string())
+                .env("FERRISSEARCH_TRANSPORT_PORT", ports[i * 2 + 1].to_string())
+                .env("FERRISSEARCH_RAFT_NODE_ID", (i + 1).to_string())
+                .env(
+                    "FERRISSEARCH_DATA_DIR",
+                    cluster._directory.path().join(&name),
+                )
+                .env("FERRISSEARCH_SEED_HOSTS", &seeds)
+                .env("FERRISSEARCH_COLUMN_CACHE_SIZE_PERCENT", "0")
+                .stdout(Stdio::from(stdout))
+                .stderr(Stdio::from(stderr))
+                .spawn()?;
+            eprintln!(
+                "started {name} PID {}, log {}",
+                child.id(),
+                log_path.display()
+            );
+            cluster.nodes.push(NodeProcess {
+                name,
+                base_url: format!("http://127.0.0.1:{}", ports[i * 2]),
+                log_path,
+                child,
+            });
+            cluster.wait_for_membership(i + 1).await?;
+        }
+        Ok(cluster)
+    }
+
+    async fn wait_for_membership(&mut self, count: usize) -> Result<()> {
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
+        tokio::time::timeout(READY_TIMEOUT, async {
+            loop {
+                interval.tick().await;
+                self.ensure_running()?;
+                let mut ready = true;
+                for node in &self.nodes {
+                    let response = self
+                        .client
+                        .get(format!("{}/_cluster/state", node.base_url))
+                        .send()
+                        .await;
+                    match response {
+                        Ok(response) if response.status() == StatusCode::OK => {
+                            let state: Value = response.json().await?;
+                            ready &= state["nodes"].as_object().map(|nodes| nodes.len())
+                                == Some(count)
+                                && state["master_node"].as_str().is_some();
+                        }
+                        _ => ready = false,
+                    }
+                }
+                if ready {
+                    return Ok(());
+                }
+            }
+        })
+        .await
+        .context("cluster membership readiness timed out")?
+    }
+
+    fn ensure_running(&mut self) -> Result<()> {
+        for node in &mut self.nodes {
+            node.ensure_running()?;
+        }
+        Ok(())
+    }
+
+    async fn request(
+        &mut self,
+        node: usize,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<(StatusCode, Value)> {
+        self.ensure_running()?;
+        let request = self
+            .client
+            .request(method, format!("{}{path}", self.nodes[node].base_url));
+        let request = match body {
+            Some(body) => request.json(&body),
+            None => request,
+        };
+        let response = request.send().await;
+        self.ensure_running()?;
+        let response = response.context("request to crash-regression node failed")?;
+        let status = response.status();
+        let text = response.text().await?;
+        self.ensure_running()?;
+        let value = serde_json::from_str(&text).with_context(|| format!("{status}: {text}"))?;
+        Ok((status, value))
+    }
+
+    async fn seed(&mut self) -> Result<()> {
+        let (status, body) = self
+            .request(
+                0,
+                Method::PUT,
+                &format!("/{INDEX}"),
+                Some(json!({
+                    "settings": {
+                        "number_of_shards": 1,
+                        "number_of_replicas": 0,
+                        "refresh_interval_ms": 60000
+                    },
+                    "mappings": {"properties": {
+                        "title": {"type": "text"},
+                        "tag": {"type": "keyword"},
+                        "n": {"type": "integer"},
+                        "f": {"type": "float"},
+                        "d": {"type": "date"},
+                        "embedding": {"type": "knn_vector", "dimension": 2}
+                    }}
+                })),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for n in 1..=3 {
+            let (status, body) = self
+                .request(
+                    0,
+                    Method::PUT,
+                    &format!("/{INDEX}/_doc/{n}"),
+                    Some(json!({
+                        "title": format!("document {n}"),
+                        "tag": format!("tag-{n}"),
+                        "n": n,
+                        "f": n as f64 + 0.5,
+                        "d": format!("2026-01-0{n}T00:00:00Z"),
+                        "embedding": [n as f32, 1.0]
+                    })),
+                )
+                .await?;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+        let (status, body) = self
+            .request(0, Method::POST, &format!("/{INDEX}/_refresh"), None)
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        self.normal_search(0).await
+    }
+
+    async fn normal_search(&mut self, node: usize) -> Result<()> {
+        let (status, body) = self
+            .request(
+                node,
+                Method::POST,
+                &format!("/{INDEX}/_search"),
+                Some(json!({"query": {"match_all": {}}})),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["hits"]["total"]["value"], 3, "{body}");
+        assert_eq!(body["hits"]["hits"].as_array().map(Vec::len), Some(3));
+        assert_eq!(body["_shards"]["failed"], 0, "{body}");
+        Ok(())
+    }
+
+    async fn assert_bad_query(&mut self, node: usize, query: Value, field: &str) -> Result<()> {
+        let (status, body) = self
+            .request(
+                node,
+                Method::POST,
+                &format!("/{INDEX}/_search"),
+                Some(json!({"query": query})),
+            )
+            .await?;
+        assert_bad_typed_value(status, &body, field);
+        self.normal_search(node).await
+    }
+}
+
+fn assert_bad_typed_value(status: StatusCode, body: &Value, field: &str) {
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["type"], "search_phase_execution_exception");
+    assert_eq!(body["error"]["reason"], "all shards failed");
+    let failures = body["error"]["failed_shards"].as_array().unwrap();
+    assert_eq!(failures.len(), 1, "{body}");
+    let reason = &failures[0]["reason"];
+    assert_eq!(reason["type"], "query_shard_exception", "{body}");
+    assert_eq!(reason["caused_by"]["type"], "parse_exception", "{body}");
+    let text = reason["reason"].as_str().unwrap();
+    assert!(text.contains(field) && text.contains("abc"), "{body}");
+    assert!(
+        reason["caused_by"]["reason"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty()),
+        "{body}"
+    );
+}
+
+macro_rules! bad_value_test {
+    ($name:ident, $field:literal, $kind:literal) => {
+        #[tokio::test]
+        async fn $name() -> Result<()> {
+            let mut cluster = Cluster::start(1, stringify!($name)).await?;
+            cluster.seed().await?;
+            let value = match $kind {
+                "range" => json!({"gte": "abc"}),
+                "terms" => json!(["abc"]),
+                _ => json!("abc"),
+            };
+            cluster
+                .assert_bad_query(0, json!({$kind: {$field: value}}), $field)
+                .await
+        }
+    };
+}
+
+bad_value_test!(integer_range_bad_value_returns_400, "n", "range");
+bad_value_test!(float_range_bad_value_returns_400, "f", "range");
+bad_value_test!(date_range_bad_value_returns_400, "d", "range");
+bad_value_test!(integer_term_bad_value_returns_400, "n", "term");
+bad_value_test!(float_term_bad_value_returns_400, "f", "term");
+bad_value_test!(date_term_bad_value_returns_400, "d", "term");
+bad_value_test!(integer_terms_bad_value_returns_400, "n", "terms");
+bad_value_test!(float_terms_bad_value_returns_400, "f", "terms");
+bad_value_test!(date_terms_bad_value_returns_400, "d", "terms");
+
+#[tokio::test]
+async fn sql_bad_typed_predicates_return_400() -> Result<()> {
+    let mut cluster = Cluster::start(1, "sql_bad_typed_predicates").await?;
+    cluster.seed().await?;
+    for field in ["n", "f", "d"] {
+        for predicate in [
+            format!("{field} >= 'abc'"),
+            format!("{field} = 'abc'"),
+            format!("{field} IN ('abc')"),
+        ] {
+            for endpoint in ["_sql", "_sql/stream"] {
+                let (status, body) = cluster
+                    .request(
+                        0,
+                        Method::POST,
+                        &format!("/{INDEX}/{endpoint}"),
+                        Some(json!({"query": format!("SELECT title FROM {INDEX} WHERE {predicate}")})),
+                    )
+                    .await?;
+                assert_bad_typed_value(status, &body, field);
+                cluster.normal_search(0).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn assert_huge_sql_limit(limit: &str, test_name: &str) -> Result<()> {
+    let mut cluster = Cluster::start(1, test_name).await?;
+    cluster.seed().await?;
+    for query in [
+        format!("SELECT title FROM {INDEX} LIMIT {limit}"),
+        format!("SELECT title FROM {INDEX} ORDER BY n LIMIT {limit}"),
+        format!("SELECT title FROM {INDEX} ORDER BY f DESC LIMIT {limit}"),
+        format!("SELECT _id, _score FROM {INDEX} LIMIT {limit}"),
+        format!("SELECT * FROM {INDEX} LIMIT {limit}"),
+    ] {
+        let (status, body) = cluster
+            .request(
+                0,
+                Method::POST,
+                &format!("/{INDEX}/_sql"),
+                Some(json!({"query": query})),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{query}: {body}");
+        assert_eq!(body["rows"].as_array().map(Vec::len), Some(3), "{body}");
+        assert_eq!(body["truncated"], false, "{body}");
+        cluster.normal_search(0).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn sql_capacity_overflow_limit_returns_all_rows() -> Result<()> {
+    assert_huge_sql_limit("4611686018427387904", "sql_capacity_overflow_limit").await
+}
+
+#[tokio::test]
+async fn sql_multiply_overflow_limit_returns_all_rows() -> Result<()> {
+    assert_huge_sql_limit("18446744073709551615", "sql_multiply_overflow_limit").await
+}
+
+#[tokio::test]
+async fn grouped_sql_huge_and_zero_windows_preserve_results() -> Result<()> {
+    let mut cluster = Cluster::start(1, "grouped_sql_windows").await?;
+    cluster.seed().await?;
+    for (suffix, expected) in [
+        ("LIMIT 18446744073709551615", 3),
+        ("LIMIT 18446744073709551615 OFFSET 1", 2),
+        ("LIMIT 1 OFFSET 18446744073709551615", 0),
+        ("LIMIT 0", 0),
+    ] {
+        let query =
+            format!("SELECT tag, count(*) AS c FROM {INDEX} GROUP BY tag ORDER BY c DESC {suffix}");
+        let (status, body) = cluster
+            .request(
+                0,
+                Method::POST,
+                &format!("/{INDEX}/_sql"),
+                Some(json!({"query": query})),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{query}: {body}");
+        assert_eq!(
+            body["rows"].as_array().map(Vec::len),
+            Some(expected),
+            "{body}"
+        );
+        cluster.normal_search(0).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn huge_search_windows_and_aggregation_sizes_do_not_crash() -> Result<()> {
+    let mut cluster = Cluster::start(1, "huge_search_windows").await?;
+    cluster.seed().await?;
+    for (from, size) in [(0, usize::MAX), (usize::MAX, 0), (usize::MAX, 1)] {
+        for sort in [json!([]), json!([{"n": "asc"}])] {
+            let (status, body) = cluster
+                .request(
+                    0,
+                    Method::POST,
+                    &format!("/{INDEX}/_search"),
+                    Some(json!({"from": from, "size": size, "sort": sort})),
+                )
+                .await?;
+            assert!(
+                matches!(status, StatusCode::OK | StatusCode::BAD_REQUEST),
+                "{body}"
+            );
+            if status == StatusCode::OK {
+                assert_eq!(body["hits"]["total"]["value"], 3, "{body}");
+                assert_eq!(
+                    body["hits"]["hits"].as_array().map(Vec::len),
+                    Some(if from == 0 { 3 } else { 0 }),
+                    "{body}"
+                );
+            }
+            cluster.normal_search(0).await?;
+        }
+    }
+    let (status, body) = cluster
+        .request(
+            0,
+            Method::POST,
+            &format!("/{INDEX}/_search"),
+            Some(json!({"size": 0, "aggs": {"tags": {"terms": {"field": "tag", "size": usize::MAX}}}})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["aggregations"]["tags"]["buckets"]
+            .as_array()
+            .map(Vec::len),
+        Some(3)
+    );
+    cluster.normal_search(0).await
+}
+
+async fn assert_huge_knn(filtered: bool, test_name: &str) -> Result<()> {
+    let mut cluster = Cluster::start(1, test_name).await?;
+    cluster.seed().await?;
+    let mut params = json!({"vector": [1.0, 1.0], "k": usize::MAX});
+    if filtered {
+        params["filter"] = json!({"range": {"n": {"gte": 1}}});
+    }
+    let (status, body) = cluster
+        .request(
+            0,
+            Method::POST,
+            &format!("/{INDEX}/_search"),
+            Some(json!({"size": 10, "knn": {"embedding": params}})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_shards"]["failed"], 0, "{body}");
+    let hits = body["hits"]["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 3, "{body}");
+    assert!(
+        hits.iter().any(|hit| hit["_knn_field"] == "embedding"),
+        "kNN must not silently fail and return only text hits: {body}"
+    );
+    cluster.normal_search(0).await
+}
+
+#[tokio::test]
+async fn huge_knn_k_returns_available_neighbors() -> Result<()> {
+    assert_huge_knn(false, "huge_knn_k").await
+}
+
+#[tokio::test]
+async fn huge_filtered_knn_k_returns_available_neighbors() -> Result<()> {
+    assert_huge_knn(true, "huge_filtered_knn_k").await
+}
+
+#[tokio::test]
+async fn forwarded_bad_numeric_bound_returns_400_and_both_nodes_survive() -> Result<()> {
+    let mut cluster = Cluster::start(2, "forwarded_bad_bound").await?;
+    cluster.seed().await?;
+    let (_, state) = cluster
+        .request(0, Method::GET, "/_cluster/state", None)
+        .await?;
+    let primary = state["indices"][INDEX]["shard_routing"]["0"]["primary"]
+        .as_str()
+        .context("missing primary routing")?
+        .to_string();
+    let coordinator = cluster
+        .nodes
+        .iter()
+        .position(|node| node.name != primary)
+        .context("no remote coordinator")?;
+    let (status, body) = cluster
+        .request(
+            coordinator,
+            Method::POST,
+            &format!("/{INDEX}/_search"),
+            Some(json!({"query": {"range": {"n": {"gte": "abc"}}}})),
+        )
+        .await?;
+    assert_bad_typed_value(status, &body, "n");
+    assert_eq!(body["error"]["failed_shards"][0]["node"], primary);
+    for node in 0..cluster.nodes.len() {
+        cluster.normal_search(node).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn additional_sql_limit_offset_arithmetic_preserves_rows() -> Result<()> {
+    let mut cluster = Cluster::start(1, "sql_limit_offset_arithmetic").await?;
+    cluster.seed().await?;
+    for (suffix, expected) in [
+        ("LIMIT 18446744073709551615 OFFSET 1", 2),
+        ("LIMIT 1 OFFSET 18446744073709551615", 0),
+        ("LIMIT 0", 0),
+    ] {
+        for projection in ["title", "*"] {
+            let query = format!("SELECT {projection} FROM {INDEX} {suffix}");
+            let (status, body) = cluster
+                .request(
+                    0,
+                    Method::POST,
+                    &format!("/{INDEX}/_sql"),
+                    Some(json!({"query": query})),
+                )
+                .await?;
+            assert_eq!(status, StatusCode::OK, "{query}: {body}");
+            assert_eq!(
+                body["rows"].as_array().map(Vec::len),
+                Some(expected),
+                "{body}"
+            );
+            cluster.normal_search(0).await?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn additional_bad_numeric_search_after_returns_400() -> Result<()> {
+    let mut cluster = Cluster::start(1, "bad_numeric_search_after").await?;
+    cluster.seed().await?;
+    for field in ["n", "f", "d"] {
+        let (status, body) = cluster
+            .request(
+                0,
+                Method::POST,
+                &format!("/{INDEX}/_search"),
+                Some(json!({"sort": [{field: "asc"}], "search_after": ["abc"]})),
+            )
+            .await?;
+        assert_bad_typed_value(status, &body, field);
+        cluster.normal_search(0).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn additional_bad_knn_filter_fails_the_shard_locally_and_remotely() -> Result<()> {
+    let mut cluster = Cluster::start(2, "bad_knn_filter").await?;
+    cluster.seed().await?;
+    for node in 0..cluster.nodes.len() {
+        let (status, body) = cluster
+            .request(
+                node,
+                Method::POST,
+                &format!("/{INDEX}/_search"),
+                Some(json!({
+                    "knn": {"embedding": {
+                        "vector": [1.0, 1.0],
+                        "k": 3,
+                        "filter": {"term": {"n": "abc"}}
+                    }}
+                })),
+            )
+            .await?;
+        assert_bad_typed_value(status, &body, "n");
+        cluster.normal_search(node).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn additional_empty_remote_store_validates_typed_values() -> Result<()> {
+    let mut cluster = Cluster::start(1, "empty_remote_store_typed_values").await?;
+    cluster.seed().await?;
+    let (status, body) = cluster
+        .request(
+            0,
+            Method::PUT,
+            "/empty",
+            Some(json!({
+                "engine": "remote_store",
+                "mappings": {"properties": {
+                    "n": {"type": "integer"},
+                    "f": {"type": "float"},
+                    "d": {"type": "date"}
+                }}
+            })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for field in ["n", "f", "d"] {
+        for query in [
+            json!({"range": {field: {"gte": "abc"}}}),
+            json!({"term": {field: "abc"}}),
+            json!({"terms": {field: ["abc"]}}),
+        ] {
+            let (status, body) = cluster
+                .request(
+                    0,
+                    Method::POST,
+                    "/empty/_search",
+                    Some(json!({"query": query})),
+                )
+                .await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+            assert_eq!(body["error"]["type"], "query_shard_exception", "{body}");
+            assert_eq!(body["error"]["caused_by"]["type"], "parse_exception");
+            let reason = body["error"]["reason"].as_str().unwrap();
+            assert!(reason.contains(field) && reason.contains("abc"), "{body}");
+            cluster.normal_search(0).await?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn additional_zero_grouped_collector_limit_returns_empty_buckets() -> Result<()> {
+    let mut cluster = Cluster::start(1, "zero_grouped_collector_limit").await?;
+    cluster.seed().await?;
+    for query in [
+        json!({"match_all": {}}),
+        json!({"range": {"n": {"gte": 1}}}),
+    ] {
+        let (status, body) = cluster
+            .request(
+                0,
+                Method::POST,
+                &format!("/{INDEX}/_search"),
+                Some(json!({
+                    "query": query,
+                    "size": 0,
+                    "aggs": {"groups": {"grouped_metrics": {
+                        "group_by": ["tag"],
+                        "metrics": [{"output_name": "c", "function": "count"}],
+                        "shard_top_k": {
+                            "limit": 0,
+                            "sort_by": "c",
+                            "sort_function": "count",
+                            "descending": true
+                        }
+                    }}}
+                })),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["hits"]["total"]["value"], 3);
+        assert_eq!(
+            body["aggregations"]["groups"]["buckets"]
+                .as_array()
+                .map(Vec::len),
+            Some(0),
+            "{body}"
+        );
+        cluster.normal_search(0).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn additional_invalid_numeric_representations_return_400() -> Result<()> {
+    let mut cluster = Cluster::start(1, "invalid_numeric_representations").await?;
+    cluster.seed().await?;
+    for (field, values) in [
+        (
+            "n",
+            vec![
+                json!(u64::MAX),
+                json!("9223372036854775808"),
+                json!(1.5),
+                json!(true),
+                json!([]),
+            ],
+        ),
+        (
+            "f",
+            vec![
+                json!("NaN"),
+                json!("inf"),
+                json!("1e999"),
+                json!(true),
+                json!({}),
+            ],
+        ),
+        (
+            "d",
+            vec![json!(u64::MAX), json!("not-a-date"), json!(true), json!([])],
+        ),
+    ] {
+        for value in values {
+            let (status, body) = cluster
+                .request(
+                    0,
+                    Method::POST,
+                    &format!("/{INDEX}/_search"),
+                    Some(json!({"query": {"term": {field: value}}})),
+                )
+                .await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {value}: {body}");
+            assert_eq!(
+                body["error"]["failed_shards"][0]["reason"]["type"],
+                "query_shard_exception"
+            );
+            let reason = body["error"]["failed_shards"][0]["reason"]["reason"]
+                .as_str()
+                .unwrap();
+            assert!(
+                reason.contains(field) && reason.contains(&value.to_string()),
+                "{body}"
+            );
+            cluster.normal_search(0).await?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn additional_valid_typed_terms_preserve_exact_integer_identity() -> Result<()> {
+    let mut cluster = Cluster::start(1, "valid_typed_terms").await?;
+    cluster.seed().await?;
+    for (query, id) in [
+        (json!({"term": {"n": "2"}}), "2"),
+        (json!({"terms": {"n": ["2"]}}), "2"),
+        (json!({"term": {"f": "2.5"}}), "2"),
+        (json!({"terms": {"f": ["2.5"]}}), "2"),
+        (json!({"term": {"d": "2026-01-02T00:00:00Z"}}), "2"),
+        (json!({"terms": {"d": ["2026-01-02T00:00:00Z"]}}), "2"),
+    ] {
+        let (status, body) = cluster
+            .request(
+                0,
+                Method::POST,
+                &format!("/{INDEX}/_search"),
+                Some(json!({"query": query})),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{query}: {body}");
+        assert_eq!(body["hits"]["total"]["value"], 1, "{body}");
+        assert_eq!(body["hits"]["hits"][0]["_id"], id);
+    }
+    for (id, n) in [
+        ("large-even", 9_007_199_254_740_992i64),
+        ("large-odd", 9_007_199_254_740_993i64),
+    ] {
+        let (status, body) = cluster
+            .request(
+                0,
+                Method::PUT,
+                &format!("/{INDEX}/_doc/{id}"),
+                Some(json!({"n": n})),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let (status, body) = cluster
+        .request(0, Method::POST, &format!("/{INDEX}/_refresh"), None)
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for value in [json!(9_007_199_254_740_993i64), json!("9007199254740993")] {
+        for query in [
+            json!({"term": {"n": value}}),
+            json!({"terms": {"n": [value]}}),
+            json!({"range": {"n": {"gte": value, "lte": value}}}),
+        ] {
+            let (status, body) = cluster
+                .request(
+                    0,
+                    Method::POST,
+                    &format!("/{INDEX}/_search"),
+                    Some(json!({"query": query})),
+                )
+                .await?;
+            assert_eq!(status, StatusCode::OK, "{query}: {body}");
+            assert_eq!(body["hits"]["total"]["value"], 1, "{body}");
+            assert_eq!(body["hits"]["hits"][0]["_id"], "large-odd");
+        }
+    }
+    Ok(())
+}
+
+fn worker_probe(kind: &str) -> Result<Output> {
+    Command::new(std::env::current_exe()?)
+        .args(["--exact", "worker_panic_probe", "--ignored", "--nocapture"])
+        .env("FERRIS_CRASH_WORKER_PROBE", kind)
+        .output()
+        .context("spawn crash-isolated worker probe")
+}
+
+#[test]
+fn search_worker_contains_panics_and_keeps_serving() -> Result<()> {
+    let output = worker_probe("search")?;
+    assert!(
+        output.status.success(),
+        "search worker probe exited with {}\n{}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+#[test]
+fn additional_huge_sql_stream_batch_size_is_bounded() -> Result<()> {
+    let output = worker_probe("batch")?;
+    assert!(
+        output.status.success(),
+        "SQL batch probe exited with {}\n{}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn write_worker_panic_is_explicit_and_fail_stop() -> Result<()> {
+    use std::os::unix::process::ExitStatusExt;
+
+    let output = worker_probe("write")?;
+    assert_eq!(output.status.signal(), Some(6), "{output:?}");
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("write worker task panicked") && stderr.contains("write panic marker"),
+        "write panic must identify the operation before aborting: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "subprocess-only panic probe; the parent observes any process abort"]
+fn worker_panic_probe() -> Result<()> {
+    let kind = std::env::var("FERRIS_CRASH_WORKER_PROBE")?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let pools = WorkerPools::new(2, 1);
+        if kind == "batch" {
+            let directory = tempfile::tempdir()?;
+            let engine = HotEngine::new(directory.path(), Duration::from_secs(60))?;
+            engine.add_document("one", json!({"body": "one"}))?;
+            engine.refresh()?;
+            let req = serde_json::from_value(json!({"size": usize::MAX}))?;
+            pools
+                .spawn_search(move || -> Result<()> {
+                    let mut handle =
+                        engine.sql_streaming_batch_handle(&req, &[], true, false, usize::MAX)?;
+                    assert_eq!(handle.next_batch()?.unwrap().num_rows(), 1);
+                    assert!(handle.next_batch()?.is_none());
+                    Ok(())
+                })
+                .await??;
+            return Ok(());
+        }
+        if kind == "write" {
+            pools.spawn_write(|| panic!("write panic marker")).await?;
+            bail!("a panicking write must fail-stop");
+        }
+        let error = pools
+            .spawn_search(|| panic!("search panic marker"))
+            .await
+            .unwrap_err();
+        let reason = error.to_string();
+        assert!(reason.contains("search") && reason.contains("search panic marker"));
+        let error = pools
+            .spawn_search(|| std::panic::panic_any(String::from("owned panic marker")))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("owned panic marker"));
+        let error = pools
+            .spawn_search(|| std::panic::panic_any(7u8))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("non-string panic payload"));
+        let results = futures::future::join_all((0..12).map(|n| {
+            pools.spawn_search(move || {
+                if n % 2 == 0 {
+                    panic!("concurrent panic {n}");
+                }
+                n
+            })
+        }))
+        .await;
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 6);
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 6);
+        for n in 0..12 {
+            assert_eq!(pools.spawn_search(move || n).await?, n);
+        }
+        assert_eq!(pools.spawn_write(|| 42).await?, 42);
+        Ok(())
+    })
+}
