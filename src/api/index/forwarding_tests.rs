@@ -4,7 +4,10 @@ use crate::cluster::state::{NodeInfo, NodeRole};
 use crate::consensus::state_machine::{ClusterStateMachine, TestApplyGate};
 use crate::consensus::types::{ClusterCommand, RaftInstance};
 use crate::transport::TransportClient;
-use crate::transport::server::create_transport_service_with_raft;
+use crate::transport::server::{
+    RemoteStoreTransportResources, TransportService,
+    create_transport_service_with_raft_and_storage_handle,
+};
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -21,8 +24,10 @@ struct ForwardingNode {
     url: String,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     refresh_requests: Arc<std::sync::atomic::AtomicUsize>,
+    bulk_refresh_requests: Arc<std::sync::atomic::AtomicUsize>,
     refresh_request_started: Arc<tokio::sync::Notify>,
     reject_refresh_requests: Arc<std::sync::atomic::AtomicBool>,
+    refresh_service: TransportService,
 }
 
 struct ForwardingCluster {
@@ -101,33 +106,46 @@ impl ForwardingCluster {
                 sql_group_by_scan_limit: 1_000_000,
                 sql_approximate_top_k: false,
             };
-            let service = create_transport_service_with_raft(
+            let (service, refresh_service) = create_transport_service_with_raft_and_storage_handle(
                 cluster_manager,
                 shard_manager,
                 transport_client,
                 raft,
                 task_manager,
+                RemoteStoreTransportResources {
+                    storage_manager: state.storage_manager.clone(),
+                    remote_store_reader_cache: state.remote_store_reader_cache.clone(),
+                },
                 state.local_node_id.clone(),
             );
             let refresh_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let bulk_refresh_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let refresh_request_started = Arc::new(tokio::sync::Notify::new());
             let reject_refresh_requests = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let requests = refresh_requests.clone();
+            let bulk_requests = bulk_refresh_requests.clone();
             let request_started = refresh_request_started.clone();
             let reject_requests = reject_refresh_requests.clone();
             let grpc_task = tokio::spawn(async move {
                 tonic::transport::Server::builder()
                     .layer(tower::util::MapRequestLayer::new(
                         move |mut request: axum::http::Request<tonic::body::Body>| {
-                            if request.uri().path().ends_with("/RefreshShardCopy") {
+                            let copy_refresh = request.uri().path().ends_with("/RefreshShardCopy");
+                            let bulk_refresh =
+                                request.uri().path().ends_with("/RefreshShardWrites");
+                            if copy_refresh {
                                 requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 request_started.notify_one();
-                                if reject_requests.load(std::sync::atomic::Ordering::Relaxed) {
-                                    *request.uri_mut() =
-                                        "/transport.InternalTransport/TestRejectedRefresh"
-                                            .parse()
-                                            .unwrap();
-                                }
+                            } else if bulk_refresh {
+                                bulk_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            if (copy_refresh || bulk_refresh)
+                                && reject_requests.load(std::sync::atomic::Ordering::Relaxed)
+                            {
+                                *request.uri_mut() =
+                                    "/transport.InternalTransport/TestRejectedRefresh"
+                                        .parse()
+                                        .unwrap();
                             }
                             request
                         },
@@ -147,8 +165,10 @@ impl ForwardingCluster {
                 url: format!("http://{http_addr}"),
                 tasks: vec![grpc_task, http_task],
                 refresh_requests,
+                bulk_refresh_requests,
                 refresh_request_started,
                 reject_refresh_requests,
+                refresh_service,
             });
         }
         let leader = &nodes[0].state.raft;

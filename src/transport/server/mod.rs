@@ -101,6 +101,8 @@ struct PrimaryActivationState {
     promotion_noop_bulk_requests_received: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     checkpoint_recording_hook: std::sync::Mutex<Option<CheckpointRecordingHook>>,
+    #[cfg(test)]
+    refresh_limit_for_test: std::sync::Mutex<Option<std::time::Duration>>,
 }
 
 impl PrimaryActivationState {
@@ -690,6 +692,11 @@ impl InternalTransport for TransportService {
         &self,
         request: Request<ShardDocRequest>,
     ) -> Result<Response<ShardDocResponse>, Status> {
+        let refresh_deadline = request
+            .get_ref()
+            .refresh
+            .then(|| crate::transport::refresh_deadline::RefreshDeadline::from_request(&request))
+            .transpose()?;
         self.wait_for_forwarded_state(
             &request,
             Some(&request.get_ref().index_name),
@@ -1024,13 +1031,14 @@ impl InternalTransport for TransportService {
                         }));
                     }
                 }
-                let write_refresh = if req.refresh {
+                let write_refresh = if let Some(deadline) = refresh_deadline {
                     Some(
                         self.refresh_acknowledged_write(
                             &write_state,
                             &req.index_name,
                             req.shard_id,
                             &activated_primary,
+                            deadline,
                         )
                         .await,
                     )
@@ -1130,6 +1138,11 @@ impl InternalTransport for TransportService {
         &self,
         request: Request<ShardBulkRequest>,
     ) -> Result<Response<ShardBulkResponse>, Status> {
+        let refresh_deadline = request
+            .get_ref()
+            .refresh
+            .then(|| crate::transport::refresh_deadline::RefreshDeadline::from_request(&request))
+            .transpose()?;
         self.wait_for_forwarded_state(
             &request,
             Some(&request.get_ref().index_name),
@@ -1156,7 +1169,7 @@ impl InternalTransport for TransportService {
             if req.operations.iter().any(|operation| {
                 operation.kind != ShardBulkOpKind::Index as i32 || operation.if_seq_no.is_some()
             }) {
-                return bulk_writes::execute_ordered_bulk(self, req).await;
+                return bulk_writes::execute_ordered_bulk(self, req, refresh_deadline).await;
             }
         }
 
@@ -1435,13 +1448,14 @@ impl InternalTransport for TransportService {
                         }));
                     }
                 }
-                if req.refresh {
+                if let Some(deadline) = refresh_deadline {
                     let refresh = self
                         .refresh_acknowledged_write(
                             &write_state,
                             &req.index_name,
                             req.shard_id,
                             &activated_primary,
+                            deadline,
                         )
                         .await;
                     for result in &mut results {
@@ -1527,6 +1541,11 @@ impl InternalTransport for TransportService {
         &self,
         request: Request<ShardDeleteRequest>,
     ) -> Result<Response<ShardDeleteResponse>, Status> {
+        let refresh_deadline = request
+            .get_ref()
+            .refresh
+            .then(|| crate::transport::refresh_deadline::RefreshDeadline::from_request(&request))
+            .transpose()?;
         self.wait_for_forwarded_state(
             &request,
             Some(&request.get_ref().index_name),
@@ -1752,13 +1771,14 @@ impl InternalTransport for TransportService {
                         }));
                     }
                 }
-                let write_refresh = if req.refresh {
+                let write_refresh = if let Some(deadline) = refresh_deadline {
                     Some(
                         self.refresh_acknowledged_write(
                             &write_state,
                             &req.index_name,
                             req.shard_id,
                             &activated_primary,
+                            deadline,
                         )
                         .await,
                     )
@@ -4166,6 +4186,7 @@ impl InternalTransport for TransportService {
         &self,
         request: Request<ShardCopyRefreshRequest>,
     ) -> Result<Response<ShardCopyRefreshResult>, Status> {
+        let deadline = crate::transport::refresh_deadline::RefreshDeadline::from_request(&request)?;
         crate::transport::write_refresh::validate_refresh_request(request.get_ref())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         self.wait_for_forwarded_state(
@@ -4176,7 +4197,31 @@ impl InternalTransport for TransportService {
         )
         .await?;
         Ok(Response::new(
-            self.refresh_local_copy(request.into_inner()).await,
+            self.refresh_local_copy(
+                request.into_inner(),
+                deadline.copy_budget(self.copy_refresh_limit()),
+            )
+            .await,
+        ))
+    }
+
+    async fn refresh_shard_writes(
+        &self,
+        request: Request<ShardCopyRefreshRequest>,
+    ) -> Result<Response<ShardWriteRefreshResult>, Status> {
+        let deadline = crate::transport::refresh_deadline::RefreshDeadline::from_request(&request)?;
+        crate::transport::write_refresh::validate_refresh_request(request.get_ref())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        self.wait_for_forwarded_state(
+            &request,
+            Some(&request.get_ref().index_name),
+            Some((request.get_ref().shard_id, true)),
+            Some(&request.get_ref().index_uuid),
+        )
+        .await?;
+        Ok(Response::new(
+            self.refresh_primary_shard_writes(request.into_inner(), deadline)
+                .await?,
         ))
     }
 

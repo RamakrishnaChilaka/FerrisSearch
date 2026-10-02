@@ -213,7 +213,7 @@ message ShardCopyRefreshRequest {
 
 message ShardCopyRefreshResult {
     string node_id = 1;
-    uint64 allocation_id = 2;
+    optional uint64 allocation_id = 2;
     bool primary = 3;
     oneof outcome {
         Empty refreshed = 4;
@@ -739,6 +739,7 @@ service InternalTransport {
     rpc BulkIndex(ShardBulkRequest) returns (ShardBulkResponse);
     rpc DeleteDoc(ShardDeleteRequest) returns (ShardDeleteResponse);
     rpc RefreshShardCopy(ShardCopyRefreshRequest) returns (ShardCopyRefreshResult);
+    rpc RefreshShardWrites(ShardCopyRefreshRequest) returns (ShardWriteRefreshResult);
     rpc GetDoc(ShardGetRequest) returns (ShardGetResponse);
 
     // Shard-level search

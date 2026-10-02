@@ -445,6 +445,16 @@ async fn bulk_visibility(global: bool, replica_coordinator: bool, mixed: bool) {
         6,
         "one refresh round for each touched shard, independent of bulk actions"
     );
+    assert_eq!(
+        harness
+            .cluster
+            .nodes
+            .iter()
+            .map(|node| node.bulk_refresh_requests.load(Ordering::Relaxed))
+            .sum::<usize>(),
+        3,
+        "one primary-owned bulk phase for each touched shard"
+    );
 }
 
 macro_rules! bulk_visibility_test {
@@ -699,7 +709,8 @@ async fn refresh_regression_false_and_absent_do_not_refresh_single_writes() {
             .cluster
             .nodes
             .iter()
-            .all(|node| node.refresh_requests.load(Ordering::Relaxed) == 0)
+            .all(|node| node.refresh_requests.load(Ordering::Relaxed) == 0
+                && node.bulk_refresh_requests.load(Ordering::Relaxed) == 0)
     );
 }
 
@@ -749,7 +760,8 @@ async fn refresh_regression_false_and_absent_do_not_refresh_bulk() {
             .cluster
             .nodes
             .iter()
-            .all(|node| node.refresh_requests.load(Ordering::Relaxed) == 0)
+            .all(|node| node.refresh_requests.load(Ordering::Relaxed) == 0
+                && node.bulk_refresh_requests.load(Ordering::Relaxed) == 0)
     );
 }
 

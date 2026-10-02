@@ -3,6 +3,7 @@
 
 pub mod client;
 pub(crate) mod primary_open;
+pub(crate) mod refresh_deadline;
 pub mod server;
 pub(crate) mod state_wait;
 pub(crate) mod write_refresh;

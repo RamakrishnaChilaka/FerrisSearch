@@ -327,7 +327,7 @@ async fn forward_bulk_batches(
                         if_seq_no,
                         if_primary_term,
                         retry_on_conflict: document.retry_on_conflict,
-                        refresh: refresh.then(|| "true".to_string()),
+                        refresh: None,
                         ..UpdateParams::default()
                     },
                 )
@@ -367,7 +367,7 @@ async fn forward_bulk_batches(
                 .collect::<Vec<_>>();
             match state
                 .transport_client
-                .forward_bulk_operations_to_shard(node, &key.0, key.2, &operations, refresh)
+                .forward_bulk_operations_to_shard(node, &key.0, key.2, &operations, false)
                 .await
             {
                 Ok(items) => results.extend(
@@ -391,11 +391,90 @@ async fn forward_bulk_batches(
                 }
             }
         }
+        if refresh && results.iter().any(is_acknowledged_mutation) {
+            let report = refresh_bulk_target(state, cluster_state, &key, &results).await;
+            for item in &mut results {
+                if item.get("error").is_none() {
+                    crate::transport::write_refresh::add_write_refresh_to_response(
+                        item, &key.0, key.2, &report,
+                    );
+                }
+            }
+        }
         (key, Ok(results))
     }))
     .await
     .into_iter()
     .collect()
+}
+
+fn is_acknowledged_mutation(item: &Value) -> bool {
+    item.get("error").is_none()
+        && item["result"] != "noop"
+        && item["_seq_no"].is_u64()
+        && item["_primary_term"].as_u64().is_some_and(|term| term > 0)
+}
+
+async fn refresh_bulk_target(
+    state: &AppState,
+    cluster_state: &crate::cluster::state::ClusterState,
+    key: &BulkTargetKey,
+    results: &[Value],
+) -> crate::transport::proto::ShardWriteRefreshResult {
+    let allocation = cluster_state
+        .shard_allocation_id(&key.0, key.2, &key.1)
+        .filter(|allocation| *allocation > 0);
+    let result = async {
+        let metadata = cluster_state
+            .indices
+            .get(&key.0)
+            .ok_or_else(|| anyhow::anyhow!("bulk refresh index metadata is missing"))?;
+        let node = cluster_state
+            .nodes
+            .get(&key.1)
+            .ok_or_else(|| anyhow::anyhow!("bulk refresh primary node [{}] is missing", key.1))?;
+        let term = results
+            .iter()
+            .rev()
+            .find(|item| is_acknowledged_mutation(item))
+            .and_then(|item| item["_primary_term"].as_u64())
+            .ok_or_else(|| anyhow::anyhow!("bulk refresh has no acknowledged primary term"))?;
+        let allocation = allocation
+            .ok_or_else(|| anyhow::anyhow!("bulk refresh primary allocation is missing"))?;
+        state
+            .transport_client
+            .refresh_shard_writes(
+                node,
+                crate::transport::proto::ShardCopyRefreshRequest {
+                    index_name: key.0.clone(),
+                    index_uuid: metadata.uuid.to_string(),
+                    shard_id: key.2,
+                    primary_node_id: key.1.clone(),
+                    primary_term: Some(term),
+                    target_allocation_id: Some(allocation),
+                },
+            )
+            .await
+    }
+    .await;
+    match result {
+        Ok(report) => report,
+        Err(error) => {
+            tracing::error!(
+                index = key.0, shard = key.2, node = key.1,
+                error = %format!("{error:#}"),
+                "Primary-owned bulk refresh failed after writes acknowledged"
+            );
+            crate::transport::proto::ShardWriteRefreshResult {
+                copies: vec![crate::transport::write_refresh::copy_refresh_failure(
+                    &key.1,
+                    allocation,
+                    true,
+                    format!("primary-owned bulk refresh failed: {error:#}"),
+                )],
+            }
+        }
+    }
 }
 
 pub(super) fn finalize_bulk_items(

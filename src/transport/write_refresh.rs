@@ -22,11 +22,11 @@ pub(crate) fn validate_refresh_request(request: &ShardCopyRefreshRequest) -> any
 }
 
 fn validate_copy_result(result: &ShardCopyRefreshResult) -> anyhow::Result<()> {
-    if result.node_id.is_empty() || result.allocation_id == 0 {
+    if result.node_id.is_empty() || result.allocation_id == Some(0) {
         anyhow::bail!("shard-copy refresh response is missing its copy identity");
     }
     match &result.outcome {
-        Some(Outcome::Refreshed(_)) => Ok(()),
+        Some(Outcome::Refreshed(_)) if result.allocation_id.is_some() => Ok(()),
         Some(Outcome::Error(error)) if !error.is_empty() => Ok(()),
         _ => anyhow::bail!("shard-copy refresh response is missing a valid outcome"),
     }
@@ -40,12 +40,26 @@ pub(crate) fn validate_refresh_copy_response(
 ) -> anyhow::Result<()> {
     validate_copy_result(result)?;
     if result.node_id != node_id
-        || result.allocation_id != allocation_id
+        || result.allocation_id != Some(allocation_id)
         || result.primary != primary
     {
         anyhow::bail!("shard-copy refresh response has inconsistent copy identity");
     }
     Ok(())
+}
+
+pub(crate) fn copy_refresh_failure(
+    node_id: &str,
+    allocation_id: Option<u64>,
+    primary: bool,
+    reason: impl Into<String>,
+) -> ShardCopyRefreshResult {
+    ShardCopyRefreshResult {
+        node_id: node_id.to_string(),
+        allocation_id,
+        primary,
+        outcome: Some(Outcome::Error(reason.into())),
+    }
 }
 
 pub(crate) fn validate_write_refresh_response(
@@ -97,14 +111,19 @@ pub(crate) fn add_write_refresh_to_response(
         .copies
         .iter()
         .filter_map(|copy| match &copy.outcome {
-            Some(Outcome::Error(error)) => Some(json!({
-                "index": index_name,
-                "shard": shard_id,
-                "node": copy.node_id,
-                "allocation_id": copy.allocation_id,
-                "primary": copy.primary,
-                "reason": {"type": "refresh_exception", "reason": error}
-            })),
+            Some(Outcome::Error(error)) => {
+                let mut failure = json!({
+                    "index": index_name,
+                    "shard": shard_id,
+                    "node": copy.node_id,
+                    "primary": copy.primary,
+                    "reason": {"type": "refresh_exception", "reason": error}
+                });
+                if let Some(allocation_id) = copy.allocation_id {
+                    failure["allocation_id"] = json!(allocation_id);
+                }
+                Some(failure)
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -116,12 +135,15 @@ pub(crate) fn add_write_refresh_to_response(
     if !failures.is_empty() {
         response["_shards"]["failures"] = json!(failures);
     }
-    response["forced_refresh"] = json!(
-        result
-            .copies
-            .iter()
-            .any(|copy| { copy.primary && matches!(copy.outcome, Some(Outcome::Refreshed(_))) })
-    );
+    if result
+        .copies
+        .iter()
+        .any(|copy| copy.primary && matches!(copy.outcome, Some(Outcome::Refreshed(_))))
+    {
+        response["forced_refresh"] = json!(true);
+    } else if let Some(object) = response.as_object_mut() {
+        object.remove("forced_refresh");
+    }
 }
 
 #[cfg(test)]
@@ -133,7 +155,7 @@ mod tests {
     fn copy(node: &str, primary: bool) -> ShardCopyRefreshResult {
         ShardCopyRefreshResult {
             node_id: node.into(),
-            allocation_id: 9,
+            allocation_id: Some(9),
             primary,
             outcome: Some(Outcome::Refreshed(Empty {})),
         }
@@ -149,7 +171,11 @@ mod tests {
                 ..valid.clone()
             },
             ShardCopyRefreshResult {
-                allocation_id: 0,
+                allocation_id: Some(0),
+                ..valid.clone()
+            },
+            ShardCopyRefreshResult {
+                allocation_id: None,
                 ..valid.clone()
             },
             ShardCopyRefreshResult {
@@ -169,7 +195,7 @@ mod tests {
                 ..valid.clone()
             },
             ShardCopyRefreshResult {
-                allocation_id: 10,
+                allocation_id: Some(10),
                 ..valid.clone()
             },
         ] {
@@ -321,5 +347,47 @@ mod tests {
         assert_eq!(response["_shards"]["failed"], 1);
         assert_eq!(response["_shards"]["failures"][0]["primary"], true);
         assert!(response.get("forced_refresh").is_none());
+    }
+
+    #[test]
+    fn refresh_wire_allows_unknown_allocation_only_for_explicit_invariant_failure() {
+        let failure =
+            copy_refresh_failure("replica", None, false, "captured allocation is missing");
+        let result = ShardWriteRefreshResult {
+            copies: vec![copy("primary", true), failure.clone()],
+        };
+        let decoded = ShardWriteRefreshResult::decode(result.encode_to_vec().as_slice()).unwrap();
+        validate_write_refresh_response(Some(&decoded), true, "primary").unwrap();
+        assert!(validate_refresh_copy_response(&failure, "replica", 9, false).is_err());
+        let mut response = json!({"status": 201, "_seq_no": 0});
+        add_write_refresh_to_response(&mut response, "idx", 0, &decoded);
+        assert_eq!(response["_shards"]["failed"], 1);
+        assert_eq!(response["_shards"]["failures"][0]["node"], "replica");
+        assert!(
+            response["_shards"]["failures"][0]
+                .get("allocation_id")
+                .is_none()
+        );
+        assert_eq!(response["status"], 201);
+        assert_eq!(response["_seq_no"], 0);
+        for invalid in [
+            ShardCopyRefreshResult {
+                outcome: Some(Outcome::Refreshed(Empty {})),
+                ..failure.clone()
+            },
+            ShardCopyRefreshResult {
+                outcome: Some(Outcome::Error(String::new())),
+                ..failure.clone()
+            },
+            ShardCopyRefreshResult {
+                allocation_id: Some(0),
+                ..failure.clone()
+            },
+        ] {
+            let invalid = ShardWriteRefreshResult {
+                copies: vec![copy("primary", true), invalid],
+            };
+            assert!(validate_write_refresh_response(Some(&invalid), true, "primary").is_err());
+        }
     }
 }

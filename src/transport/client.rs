@@ -145,7 +145,7 @@ impl Default for TransportClient {
 impl TransportClient {
     pub fn new() -> Self {
         Self {
-            timeout: Duration::from_secs(30),
+            timeout: super::refresh_deadline::DEFAULT_FORWARD_TIMEOUT,
             cluster_manager: None,
             acknowledged_versions: Arc::new(RwLock::new(HashMap::new())),
             channels: Arc::new(RwLock::new(HashMap::new())),
@@ -156,7 +156,7 @@ impl TransportClient {
     /// Create a transport client with a TLS connector for encrypted inter-node communication.
     pub fn with_tls_connector(connector: Arc<dyn TlsConnector>) -> Self {
         Self {
-            timeout: Duration::from_secs(30),
+            timeout: super::refresh_deadline::DEFAULT_FORWARD_TIMEOUT,
             cluster_manager: None,
             acknowledged_versions: Arc::new(RwLock::new(HashMap::new())),
             channels: Arc::new(RwLock::new(HashMap::new())),
@@ -463,10 +463,11 @@ impl TransportClient {
         let shard_id = request.shard_id;
         let doc_id = request.doc_id.clone();
         let refresh = request.refresh;
-        let response = client
-            .index_doc(self.forwarding_request(request, &index_name, Some((shard_id, &node.id))))
-            .await?
-            .into_inner();
+        let mut request = self.forwarding_request(request, &index_name, Some((shard_id, &node.id)));
+        if refresh {
+            request.set_timeout(self.timeout);
+        }
+        let response = client.index_doc(request).await?.into_inner();
         if response.success {
             super::write_refresh::validate_write_refresh_response(
                 response.write_refresh.as_ref(),
@@ -535,7 +536,7 @@ impl TransportClient {
     ) -> Result<serde_json::Value, anyhow::Error> {
         let mut client = self.connect(&node.host, node.transport_port).await?;
         let (if_seq_no, if_primary_term) = options.condition.expected_version();
-        let request = self.forwarding_request(
+        let mut request = self.forwarding_request(
             ShardDeleteRequest {
                 index_name: index_name.to_string(),
                 shard_id,
@@ -547,6 +548,9 @@ impl TransportClient {
             index_name,
             Some((shard_id, &node.id)),
         );
+        if options.refresh {
+            request.set_timeout(self.timeout);
+        }
         let response = client.delete_doc(request).await?.into_inner();
         if response.success {
             super::write_refresh::validate_write_refresh_response(
@@ -637,20 +641,21 @@ impl TransportClient {
             .iter()
             .map(|(doc_id, source, _)| encode_bulk_document(doc_id, source))
             .collect::<Result<Vec<_>, _>>()?;
-        let response = client
-            .bulk_index(self.forwarding_request(
-                ShardBulkRequest {
-                    index_name: index_name.to_string(),
-                    shard_id,
-                    documents_json,
-                    operations: docs.iter().map(|(_, _, operation)| *operation).collect(),
-                    refresh,
-                },
-                index_name,
-                Some((shard_id, &node.id)),
-            ))
-            .await?
-            .into_inner();
+        let mut request = self.forwarding_request(
+            ShardBulkRequest {
+                index_name: index_name.to_string(),
+                shard_id,
+                documents_json,
+                operations: docs.iter().map(|(_, _, operation)| *operation).collect(),
+                refresh,
+            },
+            index_name,
+            Some((shard_id, &node.id)),
+        );
+        if refresh {
+            request.set_timeout(self.timeout);
+        }
+        let response = client.bulk_index(request).await?.into_inner();
         if !response.success {
             anyhow::bail!("Shard bulk failed: {}", response.error);
         }
@@ -699,27 +704,72 @@ impl TransportClient {
         &self,
         node: &NodeInfo,
         request: ShardCopyRefreshRequest,
+        budget: Duration,
     ) -> anyhow::Result<ShardCopyRefreshResult> {
         super::write_refresh::validate_refresh_request(&request)?;
-        let index_name = request.index_name.clone();
-        let shard_id = request.shard_id;
         let allocation = request
             .target_allocation_id
-            .expect("validated refresh allocation");
+            .ok_or_else(|| anyhow::anyhow!("refresh request has no target allocation"))?;
         let primary = node.id == request.primary_node_id;
         let mut client = self.connect(&node.host, node.transport_port).await?;
-        let response = client
-            .refresh_shard_copy(self.forwarding_request(
-                request,
-                &index_name,
-                Some((shard_id, &node.id)),
-            ))
-            .await?
-            .into_inner();
+        let mut request = self.fenced_refresh_request(node, request)?;
+        request.set_timeout(budget);
+        let response = client.refresh_shard_copy(request).await?.into_inner();
         super::write_refresh::validate_refresh_copy_response(
             &response, &node.id, allocation, primary,
         )?;
         Ok(response)
+    }
+
+    pub(crate) async fn refresh_shard_writes(
+        &self,
+        node: &NodeInfo,
+        request: ShardCopyRefreshRequest,
+    ) -> anyhow::Result<ShardWriteRefreshResult> {
+        super::write_refresh::validate_refresh_request(&request)?;
+        let allocation = request
+            .target_allocation_id
+            .ok_or_else(|| anyhow::anyhow!("refresh request has no primary allocation"))?;
+        let mut client = self.connect(&node.host, node.transport_port).await?;
+        let mut request = self.fenced_refresh_request(node, request)?;
+        request.set_timeout(self.timeout);
+        let response = client.refresh_shard_writes(request).await?.into_inner();
+        super::write_refresh::validate_write_refresh_response(Some(&response), true, &node.id)?;
+        for primary in response
+            .copies
+            .iter()
+            .filter(|copy| copy.primary && copy.allocation_id.is_some())
+        {
+            super::write_refresh::validate_refresh_copy_response(
+                primary, &node.id, allocation, true,
+            )?;
+        }
+        Ok(response)
+    }
+
+    fn fenced_refresh_request(
+        &self,
+        node: &NodeInfo,
+        request: ShardCopyRefreshRequest,
+    ) -> anyhow::Result<tonic::Request<ShardCopyRefreshRequest>> {
+        use super::state_wait::{ALLOCATION_ID_HEADER, PRIMARY_TERM_HEADER};
+        super::write_refresh::validate_refresh_request(&request)?;
+        let index = request.index_name.clone();
+        let shard = request.shard_id;
+        let term = request
+            .primary_term
+            .ok_or_else(|| anyhow::anyhow!("refresh request has no primary term"))?;
+        let allocation = request
+            .target_allocation_id
+            .ok_or_else(|| anyhow::anyhow!("refresh request has no target allocation"))?;
+        let mut request = self.forwarding_request(request, &index, Some((shard, &node.id)));
+        request
+            .metadata_mut()
+            .insert(PRIMARY_TERM_HEADER, term.to_string().parse()?);
+        request
+            .metadata_mut()
+            .insert(ALLOCATION_ID_HEADER, allocation.to_string().parse()?);
+        Ok(request)
     }
 
     /// Forward a query-string search to a specific shard on a remote node
