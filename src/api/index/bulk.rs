@@ -90,7 +90,7 @@ fn bulk_error_item(
     serde_json::json!({(action): result})
 }
 
-fn wire_item_json(index: &str, item: ShardBulkItemResponse) -> Value {
+fn wire_item_json(index: &str, shard: u32, item: ShardBulkItemResponse) -> Value {
     let mut result =
         serde_json::json!({"_index": index, "_id": item.doc_id, "status": item.status});
     if item.error.is_empty() {
@@ -104,6 +104,14 @@ fn wire_item_json(index: &str, item: ShardBulkItemResponse) -> Value {
     }
     if let Some(term) = item.primary_term {
         result["_primary_term"] = serde_json::json!(term);
+    }
+    if let Some(refresh) = &item.write_refresh {
+        crate::transport::write_refresh::add_write_refresh_to_response(
+            &mut result,
+            index,
+            shard,
+            refresh,
+        );
     }
     result
 }
@@ -282,6 +290,7 @@ async fn forward_bulk_batches(
     state: &AppState,
     cluster_state: &crate::cluster::state::ClusterState,
     routed_docs: &mut [RoutedBulkDoc],
+    refresh: bool,
 ) -> BulkTargetResults {
     let mut batches: HashMap<BulkTargetKey, Vec<&mut RoutedBulkDoc>> = HashMap::new();
     for document in routed_docs {
@@ -358,12 +367,14 @@ async fn forward_bulk_batches(
                 .collect::<Vec<_>>();
             match state
                 .transport_client
-                .forward_bulk_operations_to_shard(node, &key.0, key.2, &operations)
+                .forward_bulk_operations_to_shard(node, &key.0, key.2, &operations, false)
                 .await
             {
-                Ok(items) => {
-                    results.extend(items.into_iter().map(|item| wire_item_json(&key.0, item)))
-                }
+                Ok(items) => results.extend(
+                    items
+                        .into_iter()
+                        .map(|item| wire_item_json(&key.0, key.2, item)),
+                ),
                 Err(error) => {
                     let failure = BulkTargetFailure::from_forward_error(error);
                     for document in run {
@@ -380,11 +391,90 @@ async fn forward_bulk_batches(
                 }
             }
         }
+        if refresh && results.iter().any(is_acknowledged_mutation) {
+            let report = refresh_bulk_target(state, cluster_state, &key, &results).await;
+            for item in &mut results {
+                if item.get("error").is_none() {
+                    crate::transport::write_refresh::add_write_refresh_to_response(
+                        item, &key.0, key.2, &report,
+                    );
+                }
+            }
+        }
         (key, Ok(results))
     }))
     .await
     .into_iter()
     .collect()
+}
+
+fn is_acknowledged_mutation(item: &Value) -> bool {
+    item.get("error").is_none()
+        && item["result"] != "noop"
+        && item["_seq_no"].is_u64()
+        && item["_primary_term"].as_u64().is_some_and(|term| term > 0)
+}
+
+async fn refresh_bulk_target(
+    state: &AppState,
+    cluster_state: &crate::cluster::state::ClusterState,
+    key: &BulkTargetKey,
+    results: &[Value],
+) -> crate::transport::proto::ShardWriteRefreshResult {
+    let allocation = cluster_state
+        .shard_allocation_id(&key.0, key.2, &key.1)
+        .filter(|allocation| *allocation > 0);
+    let result = async {
+        let metadata = cluster_state
+            .indices
+            .get(&key.0)
+            .ok_or_else(|| anyhow::anyhow!("bulk refresh index metadata is missing"))?;
+        let node = cluster_state
+            .nodes
+            .get(&key.1)
+            .ok_or_else(|| anyhow::anyhow!("bulk refresh primary node [{}] is missing", key.1))?;
+        let term = results
+            .iter()
+            .rev()
+            .find(|item| is_acknowledged_mutation(item))
+            .and_then(|item| item["_primary_term"].as_u64())
+            .ok_or_else(|| anyhow::anyhow!("bulk refresh has no acknowledged primary term"))?;
+        let allocation = allocation
+            .ok_or_else(|| anyhow::anyhow!("bulk refresh primary allocation is missing"))?;
+        state
+            .transport_client
+            .refresh_shard_writes(
+                node,
+                crate::transport::proto::ShardCopyRefreshRequest {
+                    index_name: key.0.clone(),
+                    index_uuid: metadata.uuid.to_string(),
+                    shard_id: key.2,
+                    primary_node_id: key.1.clone(),
+                    primary_term: Some(term),
+                    target_allocation_id: Some(allocation),
+                },
+            )
+            .await
+    }
+    .await;
+    match result {
+        Ok(report) => report,
+        Err(error) => {
+            tracing::error!(
+                index = key.0, shard = key.2, node = key.1,
+                error = %format!("{error:#}"),
+                "Primary-owned bulk refresh failed after writes acknowledged"
+            );
+            crate::transport::proto::ShardWriteRefreshResult {
+                copies: vec![crate::transport::write_refresh::copy_refresh_failure(
+                    &key.1,
+                    allocation,
+                    true,
+                    format!("primary-owned bulk refresh failed: {error:#}"),
+                )],
+            }
+        }
+    }
 }
 
 pub(super) fn finalize_bulk_items(
@@ -615,20 +705,8 @@ async fn execute_bulk(
             }
         }
     }
-    let outcomes = forward_bulk_batches(state, &cluster_state, &mut routed).await;
-    if refresh.should_refresh() {
-        let indices = routed
-            .iter()
-            .map(|document| &document.index_name)
-            .collect::<std::collections::HashSet<_>>();
-        for index in indices {
-            for (shard_id, engine) in state.shard_manager.get_index_shards(index) {
-                if let Err(error) = refresh_engine_after_write(engine).await {
-                    tracing::error!("Post-bulk refresh failed for {index}/{shard_id}: {error}");
-                }
-            }
-        }
-    }
+    let outcomes =
+        forward_bulk_batches(state, &cluster_state, &mut routed, refresh.should_refresh()).await;
     let items = finalize_bulk_items(items, routed, &outcomes);
     let errors = items.iter().any(|item| {
         item.as_object()

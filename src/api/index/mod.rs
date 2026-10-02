@@ -604,12 +604,6 @@ impl UpdateParams {
     }
 }
 
-async fn refresh_engine_after_write(
-    engine: Arc<dyn crate::engine::SearchEngine>,
-) -> crate::common::Result<()> {
-    crate::worker::spawn_engine_maintenance("post-write refresh", move || engine.refresh()).await
-}
-
 /// HEAD /{index} — Check if an index exists.
 pub async fn index_exists(
     State(state): State<AppState>,
@@ -850,37 +844,27 @@ pub async fn index_document(
 
     match state
         .transport_client
-        .forward_index_with_condition_to_shard(
+        .forward_index_with_options_to_shard(
             &target_node,
             &index_name,
             shard_id,
             &doc_id,
             &payload,
-            condition,
+            crate::transport::WriteOptions {
+                condition,
+                refresh: refresh_param.should_refresh(),
+            },
         )
         .await
     {
-        Ok(res) => {
-            if refresh_param.should_refresh()
-                && let Some(engine) = state.shard_manager.get_shard(&index_name, shard_id)
-                && let Err(error) = refresh_engine_after_write(engine).await
-            {
-                tracing::error!(
-                    "Post-write refresh failed for {}/{}: {}",
-                    index_name,
-                    shard_id,
-                    error
-                );
-            }
-            (
-                if res["result"] == "created" {
-                    StatusCode::CREATED
-                } else {
-                    StatusCode::OK
-                },
-                Json(res),
-            )
-        }
+        Ok(res) => (
+            if res["result"] == "created" {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            },
+            Json(res),
+        ),
         Err(e) => document_write_error_response("Forward", e),
     }
 }
@@ -951,37 +935,27 @@ pub async fn index_document_with_id(
 
     match state
         .transport_client
-        .forward_index_with_condition_to_shard(
+        .forward_index_with_options_to_shard(
             &target_node,
             &index_name,
             shard_id,
             &doc_id,
             &payload,
-            condition,
+            crate::transport::WriteOptions {
+                condition,
+                refresh: refresh_param.should_refresh(),
+            },
         )
         .await
     {
-        Ok(res) => {
-            if refresh_param.should_refresh()
-                && let Some(engine) = state.shard_manager.get_shard(&index_name, shard_id)
-                && let Err(error) = refresh_engine_after_write(engine).await
-            {
-                tracing::error!(
-                    "Post-write refresh failed for {}/{}: {}",
-                    index_name,
-                    shard_id,
-                    error
-                );
-            }
-            (
-                if res["result"] == "created" {
-                    StatusCode::CREATED
-                } else {
-                    StatusCode::OK
-                },
-                Json(res),
-            )
-        }
+        Ok(res) => (
+            if res["result"] == "created" {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            },
+            Json(res),
+        ),
         Err(e) => document_write_error_response("Forward", e),
     }
 }
@@ -1769,6 +1743,7 @@ async fn execute_update(
             if_primary_term,
             create_only: condition == crate::engine::WriteCondition::Create,
             index_uuid: Some(index_uuid.clone()),
+            refresh: matches!(params.refresh.as_deref(), Some("true") | Some("")),
         };
         match state
             .transport_client
@@ -1776,14 +1751,6 @@ async fn execute_update(
             .await
         {
             Ok(response) => {
-                if matches!(params.refresh.as_deref(), Some("true") | Some(""))
-                    && let Some(engine) = state.shard_manager.get_shard(index_name, shard_id)
-                    && let Err(error) = refresh_engine_after_write(engine).await
-                {
-                    tracing::error!(
-                        "Post-update refresh failed for {index_name}/{shard_id}: {error}"
-                    );
-                }
                 return (
                     if response["result"] == "created" {
                         StatusCode::CREATED
@@ -1865,36 +1832,26 @@ pub async fn delete_document(
 
     match state
         .transport_client
-        .forward_delete_with_condition_to_shard(
+        .forward_delete_with_options_to_shard(
             &target_node,
             &index_name,
             shard_id,
             &doc_id,
-            condition,
+            crate::transport::WriteOptions {
+                condition,
+                refresh: params.should_refresh(),
+            },
         )
         .await
     {
-        Ok(res) => {
-            if params.should_refresh()
-                && let Some(engine) = state.shard_manager.get_shard(&index_name, shard_id)
-                && let Err(error) = refresh_engine_after_write(engine).await
-            {
-                tracing::error!(
-                    "Post-delete refresh failed for {}/{}: {}",
-                    index_name,
-                    shard_id,
-                    error
-                );
-            }
-            (
-                if res["result"] == "not_found" {
-                    StatusCode::NOT_FOUND
-                } else {
-                    StatusCode::OK
-                },
-                Json(res),
-            )
-        }
+        Ok(res) => (
+            if res["result"] == "not_found" {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::OK
+            },
+            Json(res),
+        ),
         Err(e) => document_write_error_response("Delete", e),
     }
 }

@@ -420,12 +420,34 @@ keys through the shared `validate_write_parameter()` helper.
 Run validation before metadata writes, auto-creation, routing, or document
 mutation. Document and bulk URLs accept `refresh=true`, `refresh=false`,
 and an empty value, including bare `?refresh`; reject `wait_for` and every
-other value with `400 illegal_argument_exception`. Index, update, delete,
-and bulk refresh only engines on the coordinator. All-copy refresh remains
-unimplemented; do not accept `wait_for` until refresh covers the primary
-and every in-sync replica. Index creation does not implement `refresh`.
-Post-write refresh waits use Tokio's blocking pool; the document and replica
-write itself remains on the dedicated write pool.
+other value with `400 illegal_argument_exception`. Carry explicit refresh
+intent through single index/create/update/delete requests to the primary.
+For both REST bulk routes, run every shard unit and update CAS attempt with
+refresh off. After all units finish, request one fenced `RefreshShardWrites`
+round per mutated shard and attach the report to its acknowledged items.
+The primary captures its current Raft-authoritative in-sync set for that
+round; single writes use their captured acknowledgement set. Never refresh
+coordinator-local engines or select replicas from coordinator metadata.
+Bounded refresh-only failures retain acknowledged status/result/sequence/
+term and appear in `_shards.failed` and `failures`; a bulk phase dispatch
+failure reports the known primary, not invented replica results. Emit
+`forced_refresh` only as true on successful primary publication, not on
+success of every replica. Refresh failures do not set bulk `errors` or
+create item error objects. Pre-acknowledgement transport ambiguity remains.
+
+No refresh or `refresh=false` adds no refresh RPCs or engine maintenance.
+Detected single-update no-ops and empty, all-error, or no-op-only bulk perform
+no post-write refresh. A no-op on a bulk shard with a real mutation shares
+that shard's report. Mixed/conditional actions and coordinator-side update
+barriers retain their existing order; none refresh per item or run.
+Keep `wait_for` rejected until sequence-covering refresh listeners exist;
+do not emulate it with forced refresh. Index creation does not implement
+`refresh`. Post-write refresh uses Tokio's blocking pool and the existing
+reader-publication path; mutations remain on the dedicated write pool.
+Copy waits are capped at five seconds and below the forwarded request's
+remaining deadline. A timeout reports incomplete visibility while a blocking
+refresh may finish later. See ADR D8 for the deliberate differences from
+OpenSearch's primary/replica refresh failure policy.
 
 ### Unsupported Write Parameters
 `validate_write_parameter()` owns one explicit rejection list shared by

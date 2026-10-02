@@ -18,6 +18,8 @@ Ping(PingRequest) → Empty
 IndexDoc(ShardDocRequest) → ShardDocResponse
 BulkIndex(ShardBulkRequest) → ShardBulkResponse
 DeleteDoc(ShardDeleteRequest) → ShardDeleteResponse
+RefreshShardCopy(ShardCopyRefreshRequest) → ShardCopyRefreshResult
+RefreshShardWrites(ShardCopyRefreshRequest) → ShardWriteRefreshResult
 GetDoc(ShardGetRequest) → ShardGetResponse
 
 // Search (scatter to remote shards)
@@ -83,6 +85,37 @@ term. An empty bulk omits its start. New clients fail closed on missing or incon
 receipt metadata. FerrisSearch is pre-1.0: successful responses require these
 receipts, and metadata-free success responses from older peers fail. Do not add
 compatibility fallbacks or rollout machinery for this protocol change.
+
+Primary document/delete/bulk requests carry `refresh`. Acknowledged
+document/delete responses and acknowledged bulk items require `write_refresh`
+when requested, and omit it otherwise. Direct homogeneous and ordered bulk
+handlers coalesce one report across their acknowledged items. REST bulk sends
+all mutation units with refresh off, then calls `RefreshShardWrites` once per
+mutated shard. That fenced phase activates before taking the shared recovery
+guard and captures the primary's current authoritative in-sync set. Forward
+its explicit term/allocation, not stale coordinator routing-header values.
+The report has one result for the primary and each captured in-sync replica.
+Require unique node IDs, exactly one correctly identified primary, and an
+explicit `refreshed`/non-empty `error` oneof. Successful results require a
+positive allocation ID; only explicit invariant failures may omit it.
+Ordinary fenced copy responses must match the requested positive allocation,
+including errors. A known primary allocation in the bulk-phase response must
+also match its request. Missing outcomes, zero/inconsistent allocations,
+duplicate or unrequested results fail decoding; never substitute defaults.
+
+Requested-refresh handlers capture `grpc-timeout` before metadata waits or
+write work. Decode the standard timeout units strictly and cap the enclosing
+budget at the default 30 seconds. Each copy waits at most five seconds and
+the remaining budget minus a reply margin (250 ms or one quarter of a smaller
+remaining duration). Bound local blocking-pool waits and remote connection/RPC
+waits with `tokio::time::timeout`, and set the copy RPC timeout explicitly.
+Timeout is a per-copy visibility failure, not a failed acknowledged write;
+blocking work may finish later without retaining the primary recovery guard.
+The primary bulk phase also bounds activation and guard acquisition. Its
+coordinator already owns receipts, so phase RPC failure becomes a known-primary
+refresh failure without inventing replica results or changing item statuses.
+No-refresh requests add no timeout parsing or refresh RPCs. This is not FS-029
+or a guarantee against data-phase timeouts and disconnects.
 
 `ClusterState.format_version` is required and must equal the one current wire
 version. Missing/unknown versions are rejected with recreate guidance.
@@ -227,6 +260,20 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   `success: false` if replication fails** — write is only acknowledged after all
   in-sync replicas confirm (synchronous replication contract). Assigned
   out-of-sync replicas receive no live writes and cannot fail the request.
+- **Post-write refresh**: after synchronous replication acknowledges, explicit
+  refresh concurrently publishes the primary and its captured in-sync set,
+  while retaining the shared recovery write guard. Do not consult coordinator
+  metadata or replace the captured acknowledgement set with a newer one.
+  Refresh-only failures preserve acknowledged status/receipt and become
+  `_shards` copy failures; `forced_refresh` reflects primary publication.
+  No refresh/false adds no RPCs or engine refreshes.
+- **refresh_shard_copy**: require index name/UUID, primary identity, positive
+  term, and target allocation ID. Revalidate current authoritative assignment,
+  durable copy identity/fence, recovery gate, and served engine before and
+  after blocking refresh. Use only the already-open acknowledged copy; missing
+  or replaced engines are failures, not reopen/create opportunities. Run
+  refresh on Tokio's blocking maintenance pool through the existing public
+  engine refresh/reader-reload path, never on Tokio workers or the write pool.
 - **replicate_doc / replicate_bulk**: Require index UUID, sender primary term,
   and target allocation ID. Revalidate the current local assignment inside the
   write worker; then validate durable identity, recovery gate, and term fence

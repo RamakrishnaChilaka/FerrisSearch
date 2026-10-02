@@ -31,6 +31,12 @@ pub struct ShardDocumentRead {
     pub document: Option<crate::engine::DocumentRead>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct WriteOptions {
+    pub condition: crate::engine::WriteCondition,
+    pub refresh: bool,
+}
+
 #[derive(Clone)]
 pub struct TransportClient {
     timeout: Duration,
@@ -139,7 +145,7 @@ impl Default for TransportClient {
 impl TransportClient {
     pub fn new() -> Self {
         Self {
-            timeout: Duration::from_secs(30),
+            timeout: super::refresh_deadline::DEFAULT_FORWARD_TIMEOUT,
             cluster_manager: None,
             acknowledged_versions: Arc::new(RwLock::new(HashMap::new())),
             channels: Arc::new(RwLock::new(HashMap::new())),
@@ -150,7 +156,7 @@ impl TransportClient {
     /// Create a transport client with a TLS connector for encrypted inter-node communication.
     pub fn with_tls_connector(connector: Arc<dyn TlsConnector>) -> Self {
         Self {
-            timeout: Duration::from_secs(30),
+            timeout: super::refresh_deadline::DEFAULT_FORWARD_TIMEOUT,
             cluster_manager: None,
             acknowledged_versions: Arc::new(RwLock::new(HashMap::new())),
             channels: Arc::new(RwLock::new(HashMap::new())),
@@ -409,27 +415,30 @@ impl TransportClient {
         doc_id: &str,
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, anyhow::Error> {
-        self.forward_index_with_condition_to_shard(
+        self.forward_index_with_options_to_shard(
             node,
             index_name,
             shard_id,
             doc_id,
             payload,
-            crate::engine::WriteCondition::Unconditional,
+            WriteOptions {
+                condition: crate::engine::WriteCondition::Unconditional,
+                refresh: false,
+            },
         )
         .await
     }
 
-    pub async fn forward_index_with_condition_to_shard(
+    pub async fn forward_index_with_options_to_shard(
         &self,
         node: &NodeInfo,
         index_name: &str,
         shard_id: u32,
         doc_id: &str,
         payload: &serde_json::Value,
-        condition: crate::engine::WriteCondition,
+        options: WriteOptions,
     ) -> Result<serde_json::Value, anyhow::Error> {
-        let (if_seq_no, if_primary_term) = condition.expected_version();
+        let (if_seq_no, if_primary_term) = options.condition.expected_version();
         let request = ShardDocRequest {
             index_name: index_name.to_string(),
             shard_id,
@@ -437,8 +446,9 @@ impl TransportClient {
             doc_id: doc_id.to_string(),
             if_seq_no,
             if_primary_term,
-            create_only: condition == crate::engine::WriteCondition::Create,
+            create_only: options.condition == crate::engine::WriteCondition::Create,
             index_uuid: None,
+            refresh: options.refresh,
         };
         self.forward_index_request_to_shard(node, request).await
     }
@@ -452,10 +462,19 @@ impl TransportClient {
         let index_name = request.index_name.clone();
         let shard_id = request.shard_id;
         let doc_id = request.doc_id.clone();
-        let response = client
-            .index_doc(self.forwarding_request(request, &index_name, Some((shard_id, &node.id))))
-            .await?
-            .into_inner();
+        let refresh = request.refresh;
+        let mut request = self.forwarding_request(request, &index_name, Some((shard_id, &node.id)));
+        if refresh {
+            request.set_timeout(self.timeout);
+        }
+        let response = client.index_doc(request).await?.into_inner();
+        if response.success {
+            super::write_refresh::validate_write_refresh_response(
+                response.write_refresh.as_ref(),
+                refresh,
+                &node.id,
+            )?;
+        }
         decode_shard_doc_response(&index_name, shard_id, &doc_id, response)
     }
 
@@ -494,38 +513,52 @@ impl TransportClient {
         shard_id: u32,
         doc_id: &str,
     ) -> Result<serde_json::Value, anyhow::Error> {
-        self.forward_delete_with_condition_to_shard(
+        self.forward_delete_with_options_to_shard(
             node,
             index_name,
             shard_id,
             doc_id,
-            crate::engine::WriteCondition::Unconditional,
+            WriteOptions {
+                condition: crate::engine::WriteCondition::Unconditional,
+                refresh: false,
+            },
         )
         .await
     }
 
-    pub async fn forward_delete_with_condition_to_shard(
+    pub async fn forward_delete_with_options_to_shard(
         &self,
         node: &NodeInfo,
         index_name: &str,
         shard_id: u32,
         doc_id: &str,
-        condition: crate::engine::WriteCondition,
+        options: WriteOptions,
     ) -> Result<serde_json::Value, anyhow::Error> {
         let mut client = self.connect(&node.host, node.transport_port).await?;
-        let (if_seq_no, if_primary_term) = condition.expected_version();
-        let request = self.forwarding_request(
+        let (if_seq_no, if_primary_term) = options.condition.expected_version();
+        let mut request = self.forwarding_request(
             ShardDeleteRequest {
                 index_name: index_name.to_string(),
                 shard_id,
                 doc_id: doc_id.to_string(),
                 if_seq_no,
                 if_primary_term,
+                refresh: options.refresh,
             },
             index_name,
             Some((shard_id, &node.id)),
         );
+        if options.refresh {
+            request.set_timeout(self.timeout);
+        }
         let response = client.delete_doc(request).await?.into_inner();
+        if response.success {
+            super::write_refresh::validate_write_refresh_response(
+                response.write_refresh.as_ref(),
+                options.refresh,
+                &node.id,
+            )?;
+        }
         decode_shard_delete_response(index_name, shard_id, doc_id, response)
     }
 
@@ -601,25 +634,28 @@ impl TransportClient {
         index_name: &str,
         shard_id: u32,
         docs: &[(String, serde_json::Value, ShardBulkOperation)],
+        refresh: bool,
     ) -> Result<Vec<ShardBulkItemResponse>, anyhow::Error> {
         let mut client = self.connect(&node.host, node.transport_port).await?;
         let documents_json = docs
             .iter()
             .map(|(doc_id, source, _)| encode_bulk_document(doc_id, source))
             .collect::<Result<Vec<_>, _>>()?;
-        let response = client
-            .bulk_index(self.forwarding_request(
-                ShardBulkRequest {
-                    index_name: index_name.to_string(),
-                    shard_id,
-                    documents_json,
-                    operations: docs.iter().map(|(_, _, operation)| *operation).collect(),
-                },
-                index_name,
-                Some((shard_id, &node.id)),
-            ))
-            .await?
-            .into_inner();
+        let mut request = self.forwarding_request(
+            ShardBulkRequest {
+                index_name: index_name.to_string(),
+                shard_id,
+                documents_json,
+                operations: docs.iter().map(|(_, _, operation)| *operation).collect(),
+                refresh,
+            },
+            index_name,
+            Some((shard_id, &node.id)),
+        );
+        if refresh {
+            request.set_timeout(self.timeout);
+        }
+        let response = client.bulk_index(request).await?.into_inner();
         if !response.success {
             anyhow::bail!("Shard bulk failed: {}", response.error);
         }
@@ -650,11 +686,90 @@ impl TransportClient {
                         "shard bulk success has invalid result or missing operation identity"
                     );
                 }
+                super::write_refresh::validate_write_refresh_response(
+                    item.write_refresh.as_ref(),
+                    refresh,
+                    &node.id,
+                )?;
             } else if item.status < 400 || item.error_type.is_empty() {
                 anyhow::bail!("shard bulk error has invalid status or missing error type");
+            } else if item.write_refresh.is_some() {
+                anyhow::bail!("failed bulk item contains acknowledged refresh results");
             }
         }
         Ok(response.results)
+    }
+
+    pub(crate) async fn refresh_shard_copy(
+        &self,
+        node: &NodeInfo,
+        request: ShardCopyRefreshRequest,
+        budget: Duration,
+    ) -> anyhow::Result<ShardCopyRefreshResult> {
+        super::write_refresh::validate_refresh_request(&request)?;
+        let allocation = request
+            .target_allocation_id
+            .ok_or_else(|| anyhow::anyhow!("refresh request has no target allocation"))?;
+        let primary = node.id == request.primary_node_id;
+        let mut client = self.connect(&node.host, node.transport_port).await?;
+        let mut request = self.fenced_refresh_request(node, request)?;
+        request.set_timeout(budget);
+        let response = client.refresh_shard_copy(request).await?.into_inner();
+        super::write_refresh::validate_refresh_copy_response(
+            &response, &node.id, allocation, primary,
+        )?;
+        Ok(response)
+    }
+
+    pub(crate) async fn refresh_shard_writes(
+        &self,
+        node: &NodeInfo,
+        request: ShardCopyRefreshRequest,
+    ) -> anyhow::Result<ShardWriteRefreshResult> {
+        super::write_refresh::validate_refresh_request(&request)?;
+        let allocation = request
+            .target_allocation_id
+            .ok_or_else(|| anyhow::anyhow!("refresh request has no primary allocation"))?;
+        let mut client = self.connect(&node.host, node.transport_port).await?;
+        let mut request = self.fenced_refresh_request(node, request)?;
+        request.set_timeout(self.timeout);
+        let response = client.refresh_shard_writes(request).await?.into_inner();
+        super::write_refresh::validate_write_refresh_response(Some(&response), true, &node.id)?;
+        for primary in response
+            .copies
+            .iter()
+            .filter(|copy| copy.primary && copy.allocation_id.is_some())
+        {
+            super::write_refresh::validate_refresh_copy_response(
+                primary, &node.id, allocation, true,
+            )?;
+        }
+        Ok(response)
+    }
+
+    fn fenced_refresh_request(
+        &self,
+        node: &NodeInfo,
+        request: ShardCopyRefreshRequest,
+    ) -> anyhow::Result<tonic::Request<ShardCopyRefreshRequest>> {
+        use super::state_wait::{ALLOCATION_ID_HEADER, PRIMARY_TERM_HEADER};
+        super::write_refresh::validate_refresh_request(&request)?;
+        let index = request.index_name.clone();
+        let shard = request.shard_id;
+        let term = request
+            .primary_term
+            .ok_or_else(|| anyhow::anyhow!("refresh request has no primary term"))?;
+        let allocation = request
+            .target_allocation_id
+            .ok_or_else(|| anyhow::anyhow!("refresh request has no target allocation"))?;
+        let mut request = self.forwarding_request(request, &index, Some((shard, &node.id)));
+        request
+            .metadata_mut()
+            .insert(PRIMARY_TERM_HEADER, term.to_string().parse()?);
+        request
+            .metadata_mut()
+            .insert(ALLOCATION_ID_HEADER, allocation.to_string().parse()?);
+        Ok(request)
     }
 
     /// Forward a query-string search to a specific shard on a remote node
@@ -1769,14 +1884,23 @@ fn decode_shard_doc_response(
         .ok_or_else(|| {
             anyhow::anyhow!("successful shard index response is missing its primary term")
         })?;
-    Ok(serde_json::json!({
+    let mut result = serde_json::json!({
         "_index": index_name,
         "_id": response.doc_id,
         "_shard": shard_id,
         "_seq_no": seq_no,
         "_primary_term": primary_term,
         "result": if response.created { "created" } else { "updated" }
-    }))
+    });
+    if let Some(refresh) = &response.write_refresh {
+        super::write_refresh::add_write_refresh_to_response(
+            &mut result,
+            index_name,
+            shard_id,
+            refresh,
+        );
+    }
+    Ok(result)
 }
 
 fn decode_shard_bulk_response(
@@ -1817,6 +1941,7 @@ fn decode_shard_bulk_response(
             .and_then(|start| start.checked_add(offset as u64));
         if item.doc_id != *doc_id
             || !item.error.is_empty()
+            || item.write_refresh.is_some()
             || item.seq_no != expected_seq
             || item.primary_term != Some(receipt.primary_term)
             || !matches!(
@@ -1848,14 +1973,23 @@ fn decode_shard_delete_response(
         .ok_or_else(|| {
             anyhow::anyhow!("successful shard delete response is missing its primary term")
         })?;
-    Ok(serde_json::json!({
+    let mut result = serde_json::json!({
         "_index": index_name,
         "_id": doc_id,
         "_shard": shard_id,
         "_seq_no": seq_no,
         "_primary_term": primary_term,
         "result": if response.deleted > 0 { "deleted" } else { "not_found" }
-    }))
+    });
+    if let Some(refresh) = &response.write_refresh {
+        super::write_refresh::add_write_refresh_to_response(
+            &mut result,
+            index_name,
+            shard_id,
+            refresh,
+        );
+    }
+    Ok(result)
 }
 
 struct ReplicaApplyResponseFields<'a> {
@@ -2227,6 +2361,7 @@ mod tests {
                 error: String::new(),
                 seq_no: Some(0),
                 primary_term: Some(7),
+                write_refresh: None,
             },
         )
         .unwrap();
@@ -2243,6 +2378,7 @@ mod tests {
                     error: String::new(),
                     seq_no: None,
                     primary_term: Some(7),
+                    write_refresh: None,
                 },
             )
             .is_err()

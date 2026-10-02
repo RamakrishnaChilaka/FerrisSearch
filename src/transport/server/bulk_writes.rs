@@ -55,7 +55,18 @@ fn failed_item(doc_id: String, error: Status) -> ShardBulkItemResponse {
 pub(super) async fn execute_ordered_bulk(
     service: &TransportService,
     request: ShardBulkRequest,
+    refresh_deadline: Option<crate::transport::refresh_deadline::RefreshDeadline>,
 ) -> Result<Response<ShardBulkResponse>, Status> {
+    let index_uuid = if refresh_deadline.is_some() {
+        service
+            .cluster_manager
+            .get_state()
+            .indices
+            .get(&request.index_name)
+            .map(|metadata| metadata.uuid.to_string())
+    } else {
+        None
+    };
     let mut results = Vec::with_capacity(request.documents_json.len());
     for (document_json, operation) in request.documents_json.into_iter().zip(request.operations) {
         let document: serde_json::Value = match serde_json::from_slice(&document_json) {
@@ -87,6 +98,7 @@ pub(super) async fn execute_ordered_bulk(
                         doc_id: doc_id.clone(),
                         if_seq_no: operation.if_seq_no,
                         if_primary_term: operation.if_primary_term,
+                        refresh: false,
                     },
                     &request.index_name,
                     Some((request.shard_id, &service.local_node_id)),
@@ -107,6 +119,7 @@ pub(super) async fn execute_ordered_bulk(
                             .to_string(),
                             seq_no: response.seq_no,
                             primary_term: response.primary_term,
+                            write_refresh: response.write_refresh,
                             ..Default::default()
                         }
                     } else {
@@ -136,6 +149,7 @@ pub(super) async fn execute_ordered_bulk(
                         if_primary_term: operation.if_primary_term,
                         create_only: kind == ShardBulkOpKind::Create,
                         index_uuid: None,
+                        refresh: false,
                     },
                     &request.index_name,
                     Some((request.shard_id, &service.local_node_id)),
@@ -156,6 +170,7 @@ pub(super) async fn execute_ordered_bulk(
                             .to_string(),
                             seq_no: response.seq_no,
                             primary_term: response.primary_term,
+                            write_refresh: response.write_refresh,
                             ..Default::default()
                         }
                     } else {
@@ -166,6 +181,67 @@ pub(super) async fn execute_ordered_bulk(
             }
         };
         results.push(item);
+    }
+    if let Some(deadline) = refresh_deadline
+        && let Some(term) = results
+            .iter()
+            .rev()
+            .find(|item| item.error.is_empty() && item.seq_no.is_some())
+            .and_then(|item| item.primary_term)
+    {
+        let current = service.cluster_manager.get_state();
+        let allocation = current
+            .shard_allocation_id(
+                &request.index_name,
+                request.shard_id,
+                &service.local_node_id,
+            )
+            .filter(|allocation| *allocation > 0);
+        let refresh = async {
+            let uuid = index_uuid.ok_or_else(|| {
+                Status::failed_precondition("ordered bulk refresh UUID is missing")
+            })?;
+            let allocation = allocation.ok_or_else(|| {
+                Status::failed_precondition("ordered bulk refresh allocation is missing")
+            })?;
+            service
+                .refresh_primary_shard_writes(
+                    ShardCopyRefreshRequest {
+                        index_name: request.index_name.clone(),
+                        index_uuid: uuid,
+                        shard_id: request.shard_id,
+                        primary_node_id: service.local_node_id.clone(),
+                        primary_term: Some(term),
+                        target_allocation_id: Some(allocation),
+                    },
+                    deadline,
+                )
+                .await
+        }
+        .await;
+        let report = match refresh {
+            Ok(report) => report,
+            Err(error) => {
+                tracing::error!(
+                    index = request.index_name, shard = request.shard_id,
+                    error = %error,
+                    "Ordered bulk refresh failed after writes acknowledged"
+                );
+                ShardWriteRefreshResult {
+                    copies: vec![crate::transport::write_refresh::copy_refresh_failure(
+                        &service.local_node_id,
+                        allocation,
+                        true,
+                        error.to_string(),
+                    )],
+                }
+            }
+        };
+        for item in &mut results {
+            if item.error.is_empty() {
+                item.write_refresh = Some(report.clone());
+            }
+        }
     }
     crate::metrics::BULK_DOCS_TOTAL
         .inc_by(results.iter().filter(|item| item.error.is_empty()).count() as u64);

@@ -4,12 +4,17 @@ use crate::cluster::state::{NodeInfo, NodeRole};
 use crate::consensus::state_machine::{ClusterStateMachine, TestApplyGate};
 use crate::consensus::types::{ClusterCommand, RaftInstance};
 use crate::transport::TransportClient;
-use crate::transport::server::create_transport_service_with_raft;
+use crate::transport::server::{
+    RemoteStoreTransportResources, TransportService,
+    create_transport_service_with_raft_and_storage_handle,
+};
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[path = "refresh_tests.rs"]
+mod refresh;
 #[path = "forwarding_review_tests.rs"]
 mod review;
 
@@ -18,6 +23,11 @@ struct ForwardingNode {
     state: AppState,
     url: String,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    refresh_requests: Arc<std::sync::atomic::AtomicUsize>,
+    bulk_refresh_requests: Arc<std::sync::atomic::AtomicUsize>,
+    refresh_request_started: Arc<tokio::sync::Notify>,
+    reject_refresh_requests: Arc<std::sync::atomic::AtomicBool>,
+    refresh_service: TransportService,
 }
 
 struct ForwardingCluster {
@@ -39,10 +49,14 @@ impl Drop for ForwardingCluster {
 
 impl ForwardingCluster {
     async fn start() -> Self {
+        Self::start_with_roles(&[vec![NodeRole::Master], vec![NodeRole::Data]]).await
+    }
+
+    async fn start_with_roles(roles: &[Vec<NodeRole>]) -> Self {
         let gate = Arc::new(TestApplyGate::default());
         let mut nodes = Vec::new();
         let mut addresses = Vec::new();
-        for id in 1..=2 {
+        for id in 1..=roles.len() as u64 {
             let data = tempfile::tempdir().unwrap();
             let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let grpc = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -92,16 +106,50 @@ impl ForwardingCluster {
                 sql_group_by_scan_limit: 1_000_000,
                 sql_approximate_top_k: false,
             };
-            let service = create_transport_service_with_raft(
+            let (service, refresh_service) = create_transport_service_with_raft_and_storage_handle(
                 cluster_manager,
                 shard_manager,
                 transport_client,
                 raft,
                 task_manager,
+                RemoteStoreTransportResources {
+                    storage_manager: state.storage_manager.clone(),
+                    remote_store_reader_cache: state.remote_store_reader_cache.clone(),
+                },
                 state.local_node_id.clone(),
             );
+            let refresh_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let bulk_refresh_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let refresh_request_started = Arc::new(tokio::sync::Notify::new());
+            let reject_refresh_requests = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let requests = refresh_requests.clone();
+            let bulk_requests = bulk_refresh_requests.clone();
+            let request_started = refresh_request_started.clone();
+            let reject_requests = reject_refresh_requests.clone();
             let grpc_task = tokio::spawn(async move {
                 tonic::transport::Server::builder()
+                    .layer(tower::util::MapRequestLayer::new(
+                        move |mut request: axum::http::Request<tonic::body::Body>| {
+                            let copy_refresh = request.uri().path().ends_with("/RefreshShardCopy");
+                            let bulk_refresh =
+                                request.uri().path().ends_with("/RefreshShardWrites");
+                            if copy_refresh {
+                                requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                request_started.notify_one();
+                            } else if bulk_refresh {
+                                bulk_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            if (copy_refresh || bulk_refresh)
+                                && reject_requests.load(std::sync::atomic::Ordering::Relaxed)
+                            {
+                                *request.uri_mut() =
+                                    "/transport.InternalTransport/TestRejectedRefresh"
+                                        .parse()
+                                        .unwrap();
+                            }
+                            request
+                        },
+                    ))
                     .add_service(service)
                     .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(grpc))
                     .await
@@ -116,6 +164,11 @@ impl ForwardingCluster {
                 state,
                 url: format!("http://{http_addr}"),
                 tasks: vec![grpc_task, http_task],
+                refresh_requests,
+                bulk_refresh_requests,
+                refresh_request_started,
+                reject_refresh_requests,
+                refresh_service,
             });
         }
         let leader = &nodes[0].state.raft;
@@ -135,16 +188,18 @@ impl ForwardingCluster {
             })
             .await
             .unwrap();
-        leader
-            .add_learner(
-                2,
-                openraft::BasicNode {
-                    addr: addresses[1].to_string(),
-                },
-                true,
-            )
-            .await
-            .unwrap();
+        for (offset, address) in addresses.iter().enumerate().skip(1) {
+            leader
+                .add_learner(
+                    offset as u64 + 1,
+                    openraft::BasicNode {
+                        addr: address.to_string(),
+                    },
+                    true,
+                )
+                .await
+                .unwrap();
+        }
         leader
             .client_write(ClusterCommand::SetMaster {
                 node_id: "node-1".into(),
@@ -161,11 +216,7 @@ impl ForwardingCluster {
                         host: "127.0.0.1".into(),
                         transport_port: addresses[offset].port(),
                         http_port: node.url.rsplit(':').next().unwrap().parse().unwrap(),
-                        roles: if offset == 0 {
-                            vec![NodeRole::Master]
-                        } else {
-                            vec![NodeRole::Data]
-                        },
+                        roles: roles[offset].clone(),
                         raft_node_id: offset as u64 + 1,
                     },
                 })
@@ -179,14 +230,14 @@ impl ForwardingCluster {
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while nodes[1]
-                .state
-                .cluster_manager
-                .get_state()
-                .master_node
-                .as_deref()
-                != Some("node-1")
-            {
+            while nodes.iter().skip(1).any(|node| {
+                node.state
+                    .cluster_manager
+                    .get_state()
+                    .master_node
+                    .as_deref()
+                    != Some("node-1")
+            }) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })

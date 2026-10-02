@@ -113,6 +113,7 @@ message ShardDocRequest {
     optional uint64 if_primary_term = 6;
     bool create_only = 7;
     optional string index_uuid = 8; // pins a read/CAS operation to one index incarnation
+    bool refresh = 9;
 }
 
 message ShardDocResponse {
@@ -122,6 +123,7 @@ message ShardDocResponse {
     optional uint64 seq_no = 4;
     optional uint64 primary_term = 5;
     bool created = 6;
+    ShardWriteRefreshResult write_refresh = 7;
 }
 
 message ShardDeleteRequest {
@@ -130,6 +132,7 @@ message ShardDeleteRequest {
     string doc_id = 3;
     optional uint64 if_seq_no = 4;
     optional uint64 if_primary_term = 5;
+    bool refresh = 6;
 }
 
 message ShardDeleteResponse {
@@ -138,6 +141,7 @@ message ShardDeleteResponse {
     string error = 3;
     optional uint64 seq_no = 4;
     optional uint64 primary_term = 5;
+    ShardWriteRefreshResult write_refresh = 6;
 }
 
 message ShardGetRequest {
@@ -176,6 +180,7 @@ message ShardBulkItemResponse {
     string error_type = 5;
     optional uint64 seq_no = 6;
     optional uint64 primary_term = 7;
+    ShardWriteRefreshResult write_refresh = 8;
 }
 
 message ShardBulkRequest {
@@ -185,6 +190,7 @@ message ShardBulkRequest {
     // Empty operations means a homogeneous unconditional index batch.
     // Otherwise one operation must accompany each document, in the same order.
     repeated ShardBulkOperation operations = 4;
+    bool refresh = 5;
 }
 
 message ShardBulkResponse {
@@ -194,6 +200,29 @@ message ShardBulkResponse {
     optional uint64 start_seq_no = 4; // absent for an empty batch
     optional uint64 primary_term = 5;
     repeated ShardBulkItemResponse results = 6;
+}
+
+message ShardCopyRefreshRequest {
+    string index_name = 1;
+    string index_uuid = 2;
+    uint32 shard_id = 3;
+    string primary_node_id = 4;
+    optional uint64 primary_term = 5;
+    optional uint64 target_allocation_id = 6;
+}
+
+message ShardCopyRefreshResult {
+    string node_id = 1;
+    optional uint64 allocation_id = 2;
+    bool primary = 3;
+    oneof outcome {
+        Empty refreshed = 4;
+        string error = 5;
+    }
+}
+
+message ShardWriteRefreshResult {
+    repeated ShardCopyRefreshResult copies = 1;
 }
 
 message ShardSearchRequest {
@@ -709,6 +738,8 @@ service InternalTransport {
     rpc IndexDoc(ShardDocRequest) returns (ShardDocResponse);
     rpc BulkIndex(ShardBulkRequest) returns (ShardBulkResponse);
     rpc DeleteDoc(ShardDeleteRequest) returns (ShardDeleteResponse);
+    rpc RefreshShardCopy(ShardCopyRefreshRequest) returns (ShardCopyRefreshResult);
+    rpc RefreshShardWrites(ShardCopyRefreshRequest) returns (ShardWriteRefreshResult);
     rpc GetDoc(ShardGetRequest) returns (ShardGetResponse);
 
     // Shard-level search

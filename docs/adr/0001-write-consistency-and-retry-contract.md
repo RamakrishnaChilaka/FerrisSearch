@@ -272,11 +272,76 @@ resends too.
 
 ### D8. Visibility
 
-**Status (2026-10-01):** Implemented for `local_shards`: search remains
+**Status (2026-10-02):** Implemented for `local_shards`: search remains
 near-real-time, GET by ID is realtime by default, and `realtime=false` uses
-the search-visible reader. Remaining: all-copy `refresh=true`,
-`refresh=wait_for`, and acknowledgement-preserving refresh-failure reporting.
-Current post-write refresh dispatch remains coordinator-local.
+the search-visible reader. Explicit `refresh=true` (also an empty value or
+bare `?refresh`) covers the primary and every Raft-authoritative in-sync copy,
+including writes coordinated by shardless nodes or replicas and writes whose
+primary is a follower. Bulk performs one refresh round per touched shard,
+not per item or update attempt. Bounded refresh failures are reported without
+changing a returned acknowledged write status or receipt.
+Remaining: sequence-covering `refresh=wait_for`, which is still rejected with
+400 rather than emulated with a forced refresh.
+
+Single-document index/create/update/delete requests carry refresh intent to
+the primary. After synchronous replication acknowledges, the primary refreshes
+itself and fans out `RefreshShardCopy` concurrently to the same captured
+acknowledgement set, retaining the shared recovery write guard.
+REST bulk runs every mutation unit with refresh off, including ordered runs
+and update CAS attempts. After all units for a shard finish, one fenced
+`RefreshShardWrites` call asks the primary to activate, take the shared guard,
+and capture its **current** authoritative in-sync set. Activation precedes the
+shared guard because it may need the exclusive barrier. One report is attached
+to every acknowledged item on that shard, including a no-op alongside actual
+mutations; failed items retain their errors. Direct homogeneous and ordered
+bulk RPCs also refresh at most once. Empty, all-error, and no-op-only bulks,
+and detected single-update no-ops, add no post-write refresh.
+
+Targets validate the exact UUID, allocation, primary, term, durable fence,
+recovery gate, and served engine before and after blocking reader publication.
+Missing or replaced copies fail refresh; this path never creates or reopens
+shard storage. Coordinators do not choose replica targets from their own view.
+
+Copy refresh waits are capped at five seconds and the enclosing gRPC request's
+remaining deadline, reserving 250 ms for reply (or one quarter of a smaller
+remaining duration). The deadline is captured before metadata waits and data
+work; copy RPCs carry their budget explicitly. Expiry produces a per-copy
+refresh failure and releases the primary's shared guard. Blocking maintenance
+already running can finish later; timeout does not cancel disk work. The bulk
+phase also bounds activation and guard acquisition below its caller deadline.
+If the phase cannot return its authoritative set, the coordinator reports a
+known-primary phase failure instead of inventing replica results. Data-phase
+timeouts and transport disconnects can still leave the write outcome
+indeterminate (D4); this is not a general request-deadline or retry protocol.
+
+The primary-owned, once-per-shard bulk round follows
+[OpenSearch's shard bulk action](https://github.com/opensearch-project/OpenSearch/blob/main/server/src/main/java/org/opensearch/action/bulk/TransportShardBulkAction.java).
+FerrisSearch uses separate replica maintenance RPCs rather than embedding
+refresh in replica-apply acknowledgements. Two deliberate failure-policy
+deviations from
+[OpenSearch's replication operation](https://github.com/opensearch-project/OpenSearch/blob/main/server/src/main/java/org/opensearch/action/support/replication/ReplicationOperation.java)
+are part of D8: OpenSearch fails the whole request when primary post-write
+refresh fails (`finishAsFailed`), and treats replica refresh failure as replica
+failure (`failShardIfNeeded`). FerrisSearch instead preserves the already
+acknowledged mutation and reports visibility failure, without removing a copy
+solely for refresh failure. Reader publication is separate from the successful
+data acknowledgement; turning its failure into a failed write invites retries
+of an operation already applied, including create conflicts. Actual mutation
+or synchronous replication failures remain write failures.
+
+For a completed explicit refresh phase, `_shards.total` counts the primary
+plus its captured in-sync replicas; `successful` and `failed` describe refresh,
+not replication outcomes. Each failed copy has a `failures` entry with index,
+shard, node, allocation ID, primary role, and the underlying reason. An
+invariant failure with no allocation ID reports the cause and omits that ID,
+never fabricating one. `forced_refresh` is emitted only as `true` when the
+primary publishes successfully, even if a replica refresh fails; it is omitted
+otherwise, as in
+[OpenSearch's document response](https://github.com/opensearch-project/OpenSearch/blob/main/server/src/main/java/org/opensearch/action/DocWriteResponse.java).
+Bulk refresh failures retain item status,
+result, sequence, and term and do not set `errors`; that field still depends
+only on item error objects. No refresh parameter or `refresh=false` adds no
+refresh RPCs or engine refreshes.
 
 HotEngine uses manual reader publication, not Tantivy's background commit
 watcher. A commit alone does not make documents searchable. FerrisSearch keeps
@@ -290,9 +355,10 @@ Protocol-trace snapshot capture also uses an unpublished reader.
 
 - **Search:** an acknowledgement does not imply search visibility. Search sees
   a write after the next refresh.
-- **`refresh=true`:** refreshes the primary and every in-sync copy before the
-  response.
-- **`refresh=wait_for`:** returns once a refresh covers the operation's `seq_no`.
+- **`refresh=true`:** attempts bounded refresh of the primary and every in-sync
+  copy before the response; inspect `_shards.failed` for incomplete visibility.
+- **`refresh=wait_for`:** proposed: return once a refresh covers the operation's
+  `seq_no`. Currently rejected with 400.
 - **Refresh failure:** a refresh that fails after an acknowledged write keeps
   the acknowledged status. It is reported as a shard failure entry in the
   response, not as a failed write.
@@ -472,7 +538,9 @@ line boundaries, all four actions, ordered per-shard execution, and per-item
 outcomes. `_index` overrides on index-scoped bulk requests are honored and
 authorized. Updates use D9; consecutive other actions use one shard RPC.
 Unconditional index-only runs retain the existing engine batch path; mixed
-or conditional runs execute sequential single-write handlers.
+or conditional runs execute sequential single-write handlers. Explicit bulk
+refresh is deferred until all shard units finish, with one primary-owned
+round per touched shard (D8), rather than refreshing each item.
 
 Remaining: FS-014's bounded streaming parser, backpressure, cancellation,
 and resource accounting. Request parsing and shard grouping still materialize
@@ -520,12 +588,12 @@ A write parameter that changes safety semantics and is not implemented returns
   any `op_type`.
 - **Refresh:** document and bulk URL parameters accept `true`, the empty
   value (including bare `?refresh`), and `false`. Reject `wait_for` and
-  every other value. Post-write refresh uses only engines on the
-  coordinating node: single writes refresh a local shard if available,
-  and bulk refreshes local shards for affected indices. It does not
-  refresh every in-sync copy or necessarily a remote primary, so it
-  cannot implement `wait_for` as a forced all-copy refresh. DELETE now
-  uses the same local refresh helper. Reject per-action bulk `refresh`
+  every other value. Explicit refresh uses primary-owned, deadline-bounded
+  all-copy rounds and acknowledgement-preserving visibility failure reporting
+  as described in D8. Bulk pays one round per touched shard.
+  `wait_for` still needs sequence-covering refresh
+  listeners; do not emulate it with forced all-copy refresh.
+  Reject per-action bulk `refresh`
   and index-creation `refresh`, which have no implementation.
 - **Active copies:** accept `wait_for_active_shards` only when absent or
   exactly `1`; bulk metadata also accepts numeric `1`. Reject `all` even
