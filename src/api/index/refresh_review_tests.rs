@@ -140,6 +140,11 @@ async fn refresh_review_update_bulk_100_is_acknowledged_with_one_round() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refresh_review_slow_replica_uses_remaining_deadline_and_preserves_ack() {
     let harness = RefreshCluster::start(1).await;
+    // Keep both primary and replica waits deadline-limited, not production-cap-limited.
+    for node in &harness.cluster.nodes {
+        node.refresh_service
+            .set_copy_refresh_limit_for_test(Duration::from_secs(20));
+    }
     let replica = harness.replica(0);
     let (committed_tx, committed_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -167,7 +172,7 @@ async fn refresh_review_slow_replica_uses_remaining_deadline_and_preserves_ack()
         },
         state.version,
     );
-    request.set_timeout(Duration::from_secs(2));
+    request.set_timeout(Duration::from_secs(10));
     let started = std::time::Instant::now();
     let response = tokio::spawn(async move { client.index_doc(request).await });
     let paused =
