@@ -320,6 +320,6 @@ mod tests {
         assert_eq!(response["result"], "deleted");
         assert_eq!(response["_shards"]["failed"], 1);
         assert_eq!(response["_shards"]["failures"][0]["primary"], true);
-        assert_eq!(response["forced_refresh"], false);
+        assert!(response.get("forced_refresh").is_none());
     }
 }

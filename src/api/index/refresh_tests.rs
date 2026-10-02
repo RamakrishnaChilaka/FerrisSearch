@@ -7,6 +7,9 @@ use std::sync::atomic::Ordering;
 
 const INDEX: &str = "refresh-copies";
 
+#[path = "refresh_review_tests.rs"]
+mod review;
+
 struct RefreshCluster {
     cluster: ForwardingCluster,
     engines: HashMap<(usize, u32), Arc<CompositeEngine>>,
@@ -229,22 +232,34 @@ impl RefreshCluster {
     }
 
     async fn bulk(&self, node: usize, global: bool, refresh: &str, body: String) -> Value {
+        self.bulk_measured(node, global, refresh, body).await.0
+    }
+
+    async fn bulk_measured(
+        &self,
+        node: usize,
+        global: bool,
+        refresh: &str,
+        body: String,
+    ) -> (Value, Duration) {
         let route = if global {
             "/_bulk".to_string()
         } else {
             format!("/{INDEX}/_bulk")
         };
+        let started = std::time::Instant::now();
         let response = self
             .cluster
             .client
             .post(format!("{}{route}{refresh}", self.cluster.nodes[node].url))
+            .timeout(Duration::from_secs(90))
             .header("content-type", "application/x-ndjson")
             .body(body)
             .send()
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        response.json().await.unwrap()
+        (response.json().await.unwrap(), started.elapsed())
     }
 }
 
@@ -427,8 +442,8 @@ async fn bulk_visibility(global: bool, replica_coordinator: bool, mixed: bool) {
             .iter()
             .map(|node| node.refresh_requests.load(Ordering::Relaxed))
             .sum::<usize>(),
-        if mixed { 24 } else { 6 },
-        "refresh only written shards and preserve existing batch/update barriers"
+        6,
+        "one refresh round for each touched shard, independent of bulk actions"
     );
 }
 
@@ -581,7 +596,7 @@ async fn refresh_regression_primary_failure_preserves_acknowledgement() {
     assert_eq!(body["result"], "created", "{body}");
     assert!(body.get("error").is_none(), "{body}");
     assert_copy_failure(&body, primary_id, 0, true);
-    assert_ne!(body["forced_refresh"], true, "{body}");
+    assert!(body.get("forced_refresh").is_none(), "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -991,7 +1006,7 @@ async fn refresh_regression_reports_every_failed_copy_without_unacknowledging() 
         nodes,
         std::collections::HashSet::from(["node-2", "node-3", "node-4"])
     );
-    assert_eq!(body["forced_refresh"], false);
+    assert!(body.get("forced_refresh").is_none(), "{body}");
     assert!(body.get("error").is_none(), "{body}");
 }
 
