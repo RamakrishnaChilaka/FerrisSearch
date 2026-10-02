@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 
 mod lifecycle;
 
+pub(crate) use lifecycle::IndexIncarnationRetirementErrors;
+
 pub const SHARD_DATA_REMOVE_REASON_API_DELETE_INDEX: &str = "api_delete_index";
 pub const SHARD_DATA_REMOVE_REASON_TRANSPORT_DELETE_INDEX: &str = "transport_delete_index_rpc";
 pub const SHARD_DATA_REMOVE_REASON_ORPHAN_CLEANUP: &str = "orphan_cleanup_unknown_uuid";
@@ -1570,7 +1572,6 @@ impl ShardManager {
                 Err(error) => return Err(error.into()),
             }
         }
-        self.cache_copy_identity(key, identity.clone());
         Ok(identity)
     }
 
@@ -2575,7 +2576,15 @@ impl ShardManager {
             None
         };
 
-        self.register_index_uuid(index, index_uuid);
+        self.with_current_copy(
+            &key,
+            index_uuid,
+            assignment.map(|assignment| assignment.allocation_id),
+            |_| {
+                self.register_index_uuid(index, index_uuid);
+                Ok(())
+            },
+        )?;
 
         // Ensure a settings manager exists for this index
         let settings_mgr = self.ensure_settings_manager(index, settings);
@@ -2601,7 +2610,7 @@ impl ShardManager {
             mappings,
             open_mode,
         )?;
-        if let Some(identity) = prepared_identity {
+        if let Some(identity) = &prepared_identity {
             engine
                 .reconcile_term_sequence_state(identity.replica_fence, identity.fence_max_seq_no)?;
         }
@@ -2641,6 +2650,9 @@ impl ShardManager {
             index_uuid,
             assignment.map(|assignment| assignment.allocation_id),
             |_| {
+                if let Some(identity) = prepared_identity {
+                    self.cache_copy_identity(&key, identity);
+                }
                 self.shards
                     .write()
                     .unwrap_or_else(|error| error.into_inner())
@@ -2981,6 +2993,8 @@ impl ShardManager {
         );
         self.ensure_copy_io_attempt_allowed(&retry_key)?;
         let key = ShardKey::new(index, shard_id);
+        let index_lock = self.index_lifecycle_lock(index);
+        let index_guard = index_lock.read().unwrap_or_else(|error| error.into_inner());
         let per_shard_lock = self.shard_open_lock(&key);
         let guard = per_shard_lock
             .lock()
@@ -3001,7 +3015,11 @@ impl ShardManager {
             }
             Err(error) => return Err(self.record_copy_io_failure(retry_key, error)),
         };
-        {
+        let restored = self.with_current_copy(
+            &key,
+            index_uuid,
+            Some(assignment.allocation_id),
+            |_| {
             let mut targets = self
                 .peer_recovery_targets
                 .write()
@@ -3017,13 +3035,20 @@ impl ShardManager {
                 }
                 None => {
                     targets.insert(
-                        key,
+                        key.clone(),
                         PeerRecoveryTargetState::FinalizedAwaitingMembership(pending),
                     );
                 }
             }
+            self.register_index_uuid(index, index_uuid);
+            Ok(true)
+        },
+        )?;
+        if !restored {
+            return Ok(false);
         }
         drop(guard);
+        drop(index_guard);
         self.clear_copy_io_failure(&retry_key);
         self.open_assigned_shard_with_settings(
             index,
@@ -3366,18 +3391,12 @@ impl ShardManager {
             {
                 anyhow::bail!("peer recovery target is already finalized and awaiting membership");
             }
-            shard_manager
-                .shards
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&key);
-            shard_manager
-                .copy_identities
-                .write()
-                .unwrap_or_else(|error| error.into_inner())
-                .remove(&key);
-            shard_manager.isr_tracker.remove_shard(&index, shard_id);
-            shard_manager.register_index_uuid(&index, &index_uuid);
+            let removed =
+                shard_manager.with_current_copy(&key, &index_uuid, Some(allocation_id), |_| {
+                    shard_manager.register_index_uuid(&index, &index_uuid);
+                    Ok(shard_manager.remove_serving_shard_copy(&key))
+                })?;
+            drop(removed);
 
             if shard_dir.try_exists()? {
                 Self::remove_dir_all_with_retry(&shard_dir)?;
@@ -3509,7 +3528,10 @@ impl ShardManager {
             committed_boundary.persist(&committed_path)?;
             std::fs::File::open(shard_dir.join("index"))?.sync_all()?;
 
-            shard_manager.register_index_uuid(&index, &index_uuid);
+            shard_manager.with_current_copy(&key, &index_uuid, Some(allocation_id), |_| {
+                shard_manager.register_index_uuid(&index, &index_uuid);
+                Ok(())
+            })?;
             let settings_manager = shard_manager.ensure_settings_manager(&index, &settings);
             let refresh_interval = settings_manager.refresh_interval();
             let refresh_rx = settings_manager.watch_refresh_interval();
@@ -3558,8 +3580,8 @@ impl ShardManager {
                 flush_threshold_rx,
             );
             let dynamic_engine: Arc<dyn SearchEngine> = engine;
-            shard_manager.cache_copy_identity(&key, identity);
             shard_manager.with_current_copy(&key, &index_uuid, Some(allocation_id), |_| {
+                shard_manager.cache_copy_identity(&key, identity);
                 shard_manager
                     .shards
                     .write()
@@ -4011,7 +4033,7 @@ impl ShardManager {
             .join(index_uuid)
             .join(format!("shard_{shard_id}"));
         std::fs::create_dir_all(&shard_dir)?;
-        self.prepare_assigned_copy_identity(
+        let identity = self.prepare_assigned_copy_identity(
             &key,
             &shard_dir,
             index_uuid,
@@ -4021,6 +4043,7 @@ impl ShardManager {
                 allow_empty_creation: true,
             },
         )?;
+        self.cache_copy_identity(&key, identity);
         self.register_index_uuid(index, index_uuid);
         Ok(())
     }

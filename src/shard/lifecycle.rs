@@ -7,6 +7,44 @@ pub(super) struct AppliedShardAuthority {
     pub(super) local_node_id: String,
 }
 
+#[derive(Debug)]
+pub(crate) struct IndexIncarnationRetirementFailure {
+    pub(crate) index: String,
+    pub(crate) index_uuid: String,
+    pub(crate) error: anyhow::Error,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct IndexIncarnationRetirementErrors {
+    pub(crate) failures: Vec<IndexIncarnationRetirementFailure>,
+}
+
+impl std::fmt::Display for IndexIncarnationRetirementErrors {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "index incarnation retirement failed")?;
+        for failure in &self.failures {
+            write!(
+                formatter,
+                "; [{}] UUID [{}]: {:#}",
+                failure.index, failure.index_uuid, failure.error
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for IndexIncarnationRetirementErrors {}
+
+impl IndexIncarnationRetirementErrors {
+    fn into_result(self) -> Result<(), Self> {
+        if self.failures.is_empty() {
+            Ok(())
+        } else {
+            Err(self)
+        }
+    }
+}
+
 impl ShardManager {
     pub(crate) fn bind_applied_shard_authority(
         &self,
@@ -104,13 +142,23 @@ impl ShardManager {
         }
     }
 
-    fn registered_index_incarnations(&self) -> Vec<(String, String)> {
-        self.index_uuids
+    fn local_index_incarnations(&self) -> Vec<(String, String)> {
+        let mut incarnations = self
+            .index_uuids
             .read()
             .unwrap_or_else(|error| error.into_inner())
             .iter()
             .map(|(index, uuid)| (index.clone(), uuid.clone()))
-            .collect()
+            .collect::<std::collections::BTreeSet<_>>();
+        // A name registry cannot represent overlapping local incarnations.
+        incarnations.extend(
+            self.copy_identities
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .iter()
+                .map(|(key, identity)| (key.index.clone(), identity.index_uuid.clone())),
+        );
+        incarnations.into_iter().collect()
     }
 
     fn incarnation_is_obsolete(&self, state: &ClusterState, index: &str, index_uuid: &str) -> bool {
@@ -123,19 +171,30 @@ impl ShardManager {
         })
     }
 
-    pub(crate) fn reconcile_index_incarnations(&self, state: &ClusterState) -> Result<()> {
-        for (index, uuid) in self.registered_index_incarnations() {
-            if self.incarnation_is_obsolete(state, &index, &uuid) {
-                self.close_index_incarnation(
+    #[cfg(test)]
+    pub(crate) fn reconcile_index_incarnations(
+        &self,
+        state: &ClusterState,
+    ) -> Result<(), IndexIncarnationRetirementErrors> {
+        let mut errors = IndexIncarnationRetirementErrors::default();
+        for (index, uuid) in self.local_index_incarnations() {
+            if self.incarnation_is_obsolete(state, &index, &uuid)
+                && let Err(error) = self.close_index_incarnation(
                     &index,
                     &uuid,
                     "applied_index_incarnation_retired",
                     false,
                     Some(state),
-                )?;
+                )
+            {
+                errors.failures.push(IndexIncarnationRetirementFailure {
+                    index,
+                    index_uuid: uuid,
+                    error,
+                });
             }
         }
-        Ok(())
+        errors.into_result()
     }
 
     pub(crate) fn retire_obsolete_shard_copy(
@@ -244,20 +303,28 @@ impl ShardManager {
     pub(crate) async fn reconcile_index_incarnations_blocking(
         self: &Arc<Self>,
         state: ClusterState,
-    ) -> Result<()> {
-        for (index, uuid) in self.registered_index_incarnations() {
-            if self.incarnation_is_obsolete(&state, &index, &uuid) {
-                self.close_index_incarnation_blocking(
+    ) -> Result<(), IndexIncarnationRetirementErrors> {
+        let mut errors = IndexIncarnationRetirementErrors::default();
+        for (index, uuid) in self.local_index_incarnations() {
+            if self.incarnation_is_obsolete(&state, &index, &uuid)
+                && let Err(error) = self
+                    .close_index_incarnation_blocking(
+                        index.clone(),
+                        uuid.clone(),
+                        "applied_index_incarnation_retired",
+                        false,
+                        Some(state.clone()),
+                    )
+                    .await
+            {
+                errors.failures.push(IndexIncarnationRetirementFailure {
                     index,
-                    uuid,
-                    "applied_index_incarnation_retired",
-                    false,
-                    Some(state.clone()),
-                )
-                .await?;
+                    index_uuid: uuid,
+                    error,
+                });
             }
         }
-        Ok(())
+        errors.into_result()
     }
 
     pub(super) async fn retire_replaced_index_blocking(
@@ -405,31 +472,77 @@ impl ShardManager {
             .iter()
             .map(|(_, lock)| lock.lock().unwrap_or_else(|error| error.into_inner()))
             .collect::<Vec<_>>();
-        if self.index_uuid(index).as_deref() == Some(index_uuid) {
-            self.shards
+        let copy_uuids = self
+            .copy_identities
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .filter(|(key, _)| key.index == index)
+            .map(|(key, identity)| (key.clone(), identity.index_uuid.clone()))
+            .collect::<HashMap<_, _>>();
+        let (retired_engines, remaining_keys) = {
+            let mut shards = self
+                .shards
                 .write()
-                .unwrap_or_else(|error| error.into_inner())
-                .retain(|key, _| key.index != index);
-            self.copy_identities
-                .write()
-                .unwrap_or_else(|error| error.into_inner())
-                .retain(|key, identity| key.index != index || identity.index_uuid != index_uuid);
+                .unwrap_or_else(|error| error.into_inner());
+            let retired_engines = copy_uuids
+                .iter()
+                .filter(|(_, uuid)| uuid.as_str() == index_uuid)
+                .filter_map(|(key, _)| shards.remove(key))
+                .collect::<Vec<_>>();
+            let remaining_keys = shards
+                .keys()
+                .filter(|key| key.index == index)
+                .cloned()
+                .collect::<Vec<_>>();
+            (retired_engines, remaining_keys)
+        };
+        self.copy_identities
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|key, identity| key.index != index || identity.index_uuid != index_uuid);
+        for (key, uuid) in &copy_uuids {
+            if uuid == index_uuid {
+                self.isr_tracker.remove_shard(index, key.shard_id);
+            }
+        }
+        if remaining_keys.is_empty() {
             self.isr_tracker.remove_index(index);
             self.settings_managers
                 .write()
                 .unwrap_or_else(|error| error.into_inner())
                 .remove(index);
-            self.index_uuids
-                .write()
-                .unwrap_or_else(|error| error.into_inner())
-                .remove(index);
-            tracing::info!(
-                index,
-                uuid = index_uuid,
-                reason,
-                "Retired local index incarnation"
-            );
         }
+        self.with_applied_state(|state| {
+            let remaining_uuid = remaining_keys.iter().find_map(|key| {
+                if state.is_some_and(|state| !self.copy_is_current(state, key)) {
+                    None
+                } else {
+                    copy_uuids.get(key).cloned()
+                }
+            });
+            let mut uuids = self
+                .index_uuids
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
+            if uuids.get(index).is_some_and(|uuid| uuid == index_uuid) {
+                match remaining_uuid {
+                    Some(uuid) => {
+                        uuids.insert(index.to_string(), uuid);
+                    }
+                    None => {
+                        uuids.remove(index);
+                    }
+                }
+            }
+        });
+        drop(retired_engines);
+        tracing::info!(
+            index,
+            uuid = index_uuid,
+            reason,
+            "Retired local index incarnation"
+        );
         self.peer_recovery_targets
             .write()
             .unwrap_or_else(|error| error.into_inner())

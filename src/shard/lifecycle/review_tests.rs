@@ -131,6 +131,10 @@ async fn review_followup_b1_delayed_old_registration_preserves_current_engine() 
     .await
     .unwrap();
     println!("B1 current reopen validation: {reopen_validation:?}");
+    assert!(
+        manager.copy_identity("idx", 0).is_none(),
+        "an aborted old open must not cache a foreign identity before retirement"
+    );
     manager
         .reconcile_index_incarnations_blocking(cluster.get_state())
         .await
@@ -206,86 +210,88 @@ async fn review_followup_b1_delayed_old_registration_preserves_current_engine() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_followup_b1_retirement_preserves_other_uuid_engine_settings_and_isr() {
-    let dir = tempfile::tempdir().unwrap();
-    let manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
-    let preparing = manager.clone();
-    let (old, current, settings) = tokio::task::spawn_blocking(move || {
-        let old = preparing
-            .open_shard_with_settings(
+    for registered_uuid in ["old-uuid", "new-uuid"] {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+        let preparing = manager.clone();
+        let (old, current, settings) = tokio::task::spawn_blocking(move || {
+            let old = preparing
+                .open_shard_with_settings(
+                    "idx",
+                    0,
+                    &HashMap::new(),
+                    &IndexSettings::default(),
+                    "old-uuid",
+                )
+                .unwrap();
+            let current = preparing
+                .open_shard_with_settings(
+                    "idx",
+                    1,
+                    &HashMap::new(),
+                    &IndexSettings::default(),
+                    "new-uuid",
+                )
+                .unwrap();
+            current
+                .add_document_with_receipt_at_term("new", json!({"value": 2}), 1)
+                .unwrap();
+            preparing.isr_tracker.update_replica_checkpoint(
                 "idx",
-                0,
-                &HashMap::new(),
-                &IndexSettings::default(),
-                "old-uuid",
-            )
-            .unwrap();
-        let current = preparing
-            .open_shard_with_settings(
-                "idx",
-                1,
-                &HashMap::new(),
-                &IndexSettings::default(),
                 "new-uuid",
-            )
-            .unwrap();
-        current
-            .add_document_with_receipt_at_term("new", json!({"value": 2}), 1)
-            .unwrap();
-        preparing.isr_tracker.update_replica_checkpoint(
-            "idx",
-            "new-uuid",
-            1,
-            1,
-            Some(0),
-            ReplicaCheckpointUpdate {
-                node_id: "replica".into(),
-                allocation_id: 9,
-                processed_checkpoint: Some(0),
-                persisted_checkpoint: Some(0),
-            },
-        );
-        let settings = preparing.get_settings_manager("idx").unwrap();
-        preparing.register_index_uuid("idx", "old-uuid");
-        (old, current, settings)
-    })
-    .await
-    .unwrap();
-    let closing = manager.clone();
-    tokio::task::spawn_blocking(move || {
-        closing
-            .close_index_incarnation("idx", "old-uuid", "review_uuid_retirement", false, None)
-            .unwrap();
-    })
-    .await
-    .unwrap();
-    assert!(manager.get_shard("idx", 0).is_none());
-    let serving = manager
-        .get_shard("idx", 1)
-        .expect("current UUID must remain served");
-    assert!(Arc::ptr_eq(&serving, &current));
-    assert!(Arc::ptr_eq(
-        &manager.get_settings_manager("idx").unwrap(),
-        &settings
-    ));
-    assert_eq!(
-        manager.isr_tracker.replica_checkpoints("idx", 1),
-        vec![("replica".into(), 0)]
-    );
-    assert_eq!(manager.index_uuid("idx").as_deref(), Some("new-uuid"));
-    tokio::task::spawn_blocking(move || {
+                1,
+                1,
+                Some(0),
+                ReplicaCheckpointUpdate {
+                    node_id: "replica".into(),
+                    allocation_id: 9,
+                    processed_checkpoint: Some(0),
+                    persisted_checkpoint: Some(0),
+                },
+            );
+            let settings = preparing.get_settings_manager("idx").unwrap();
+            preparing.register_index_uuid("idx", registered_uuid);
+            (old, current, settings)
+        })
+        .await
+        .unwrap();
+        let closing = manager.clone();
+        tokio::task::spawn_blocking(move || {
+            closing
+                .close_index_incarnation("idx", "old-uuid", "review_uuid_retirement", false, None)
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        assert!(manager.get_shard("idx", 0).is_none());
+        let serving = manager
+            .get_shard("idx", 1)
+            .expect("current UUID must remain served");
+        assert!(Arc::ptr_eq(&serving, &current));
+        assert!(Arc::ptr_eq(
+            &manager.get_settings_manager("idx").unwrap(),
+            &settings
+        ));
         assert_eq!(
-            serving
-                .get_document_with_metadata("new", true)
-                .unwrap()
-                .unwrap()
-                .source,
-            json!({"value": 2})
+            manager.isr_tracker.replica_checkpoints("idx", 1),
+            vec![("replica".into(), 0)]
         );
-        drop(old);
-        drop(current);
-    })
-    .await
-    .unwrap();
+        assert_eq!(manager.index_uuid("idx").as_deref(), Some("new-uuid"));
+        tokio::task::spawn_blocking(move || {
+            assert_eq!(
+                serving
+                    .get_document_with_metadata("new", true)
+                    .unwrap()
+                    .unwrap()
+                    .source,
+                json!({"value": 2})
+            );
+            drop(old);
+            drop(current);
+        })
+        .await
+        .unwrap();
+    }
 }
 
 struct DropGateEngine {

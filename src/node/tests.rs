@@ -94,7 +94,7 @@ async fn review_followup_n2_blocked_retirement_does_not_block_unrelated_assigned
     let manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
     manager.bind_applied_shard_authority(cluster.clone(), "node-2".into());
     let mut retired = Vec::new();
-    for name in ["blocked-a", "blocked-b"] {
+    for name in ["blocked-a", "blocked-b", "retire-c"] {
         let metadata = IndexMetadata::build_shard_routing(name, 1, 0, &["node-2".into()]);
         let uuid = metadata.uuid.clone();
         raft.client_write(ClusterCommand::CreateIndex { metadata })
@@ -130,7 +130,11 @@ async fn review_followup_n2_blocked_retirement_does_not_block_unrelated_assigned
     .into_result()
     .unwrap();
     let blocked = Arc::new(ReviewBlockedRetirement {
-        blocked: retired.iter().map(|(_, uuid)| uuid.to_string()).collect(),
+        blocked: retired
+            .iter()
+            .filter(|(name, _)| name.starts_with("blocked-"))
+            .map(|(_, uuid)| uuid.to_string())
+            .collect(),
         attempts: Default::default(),
     });
     manager.register_source_recovery_cleanup(blocked.clone());
@@ -144,6 +148,14 @@ async fn review_followup_n2_blocked_retirement_does_not_block_unrelated_assigned
         .into_result()
         .unwrap();
     }
+    raft.client_write(ClusterCommand::CreateIndex {
+        metadata: IndexMetadata::build_shard_routing("blocked-a", 1, 0, &["node-2".into()]),
+    })
+    .await
+    .unwrap()
+    .data
+    .into_result()
+    .unwrap();
     let state = cluster.get_state();
     let failures = open_local_assigned_shards_blocking(
         state.clone(),
@@ -163,7 +175,7 @@ async fn review_followup_n2_blocked_retirement_does_not_block_unrelated_assigned
         .expect("one blocked retired index must not defer an unrelated assigned open");
     assert_eq!(
         blocked.attempts.lock().unwrap().len(),
-        2,
+        3,
         "every retired index must be attempted"
     );
     let identity = manager.copy_identity("unrelated", 0).unwrap();
@@ -176,11 +188,30 @@ async fn review_followup_n2_blocked_retirement_does_not_block_unrelated_assigned
         state.shard_allocation_id("unrelated", 0, "node-2").unwrap()
     );
     for (name, uuid) in &retired {
+        if !name.starts_with("blocked-") {
+            assert!(manager.copy_identity(name, 0).is_none());
+            assert!(manager.index_uuid(name).is_none());
+            continue;
+        }
         assert!(
             manager.copy_identity(name, 0).is_some(),
             "blocked retirement must not guess admission settlement"
         );
         assert_eq!(manager.index_uuid(name).as_deref(), Some(uuid.as_str()));
+    }
+    assert!(
+        manager.get_shard("blocked-a", 0).is_none(),
+        "the blocked index's new allocation must remain deferred"
+    );
+    let errors = manager
+        .reconcile_index_incarnations_blocking(cluster.get_state())
+        .await
+        .unwrap_err();
+    assert_eq!(errors.failures.len(), 2);
+    for failure in errors.failures {
+        assert!(failure.index.starts_with("blocked-"));
+        assert!(blocked.blocked.contains(&failure.index_uuid));
+        assert!(format!("{:#}", failure.error).contains("peer recovery admission is active"));
     }
     tokio::task::spawn_blocking(move || {
         engine
