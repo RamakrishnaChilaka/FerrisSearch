@@ -143,6 +143,8 @@ pub struct ShardManager {
   restoration. Cache a successfully prepared assigned identity only at guarded
   engine publication; an aborted old open must not poison a sibling's identity
   or overwrite the current incarnation's registry.
+- Protocol-trace constructor replay uses the validated prepared identity
+  explicitly, without publishing it early into the serving identity cache.
 - The Raft-backed transport starts a weak-owned applied-version poller, every
   100 ms, so every node retires a deleted/replaced index even without another
   request or lifecycle tick. Async assigned opens also retire a replaced

@@ -985,15 +985,24 @@ impl ShardManager {
         index: &str,
         shard_id: u32,
     ) -> Option<crate::protocol_trace::TraceCopy> {
+        let identity = self.copy_identity(index, shard_id)?;
+        self.protocol_trace_copy_for_identity(shard_id, &identity)
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_copy_for_identity(
+        &self,
+        shard_id: u32,
+        identity: &ShardCopyIdentity,
+    ) -> Option<crate::protocol_trace::TraceCopy> {
         let node = self
             .protocol_trace_node
             .read()
             .unwrap_or_else(|error| error.into_inner())
             .clone()?;
-        let identity = self.copy_identity(index, shard_id)?;
         Some(crate::protocol_trace::TraceCopy {
             node,
-            index_uuid: identity.index_uuid,
+            index_uuid: identity.index_uuid.clone(),
             shard: shard_id,
             allocation: identity.allocation_id,
         })
@@ -2602,14 +2611,26 @@ impl ShardManager {
             Self::remove_dir_all_with_retry(&stale_snapshot_dir)?;
         }
 
-        let engine = self.open_composite_engine(
-            index,
-            shard_id,
-            &shard_dir,
-            refresh_interval,
-            mappings,
-            open_mode,
-        )?;
+        let open = || {
+            self.open_composite_engine(
+                index,
+                shard_id,
+                &shard_dir,
+                refresh_interval,
+                mappings,
+                open_mode,
+            )
+        };
+        #[cfg(feature = "protocol-trace")]
+        let engine = match prepared_identity
+            .as_ref()
+            .and_then(|identity| self.protocol_trace_copy_for_identity(shard_id, identity))
+        {
+            Some(copy) => crate::protocol_trace::with_open_copy(copy, open),
+            None => open(),
+        }?;
+        #[cfg(not(feature = "protocol-trace"))]
+        let engine = open()?;
         if let Some(identity) = &prepared_identity {
             engine
                 .reconcile_term_sequence_state(identity.replica_fence, identity.fence_max_seq_no)?;
