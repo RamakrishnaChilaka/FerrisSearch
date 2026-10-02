@@ -42,6 +42,195 @@ async fn node_rejects_excessive_peer_recovery_concurrency() {
     );
 }
 
+struct ReviewBlockedRetirement {
+    blocked: std::collections::HashSet<String>,
+    attempts: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl crate::shard::SourceRecoverySessionCleanup for ReviewBlockedRetirement {
+    fn abort_shard<'a>(
+        &'a self,
+        _index_uuid: &'a str,
+        _shard_id: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'a>>
+    {
+        Box::pin(async { panic!("the retirement regression only cleans whole indices") })
+    }
+
+    fn abort_index<'a>(
+        &'a self,
+        index_uuid: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<usize>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.attempts.lock().unwrap().insert(index_uuid.to_string());
+            if self.blocked.contains(index_uuid) {
+                anyhow::bail!(
+                    "cannot replace a primary engine while peer recovery admission is active"
+                );
+            }
+            Ok(0)
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_followup_n2_blocked_retirement_does_not_block_unrelated_assigned_open() {
+    let (raft, state_handle) = crate::consensus::create_raft_instance_mem(1, "review".into())
+        .await
+        .unwrap();
+    crate::consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:0".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !raft.is_leader() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let cluster = Arc::new(ClusterManager::with_shared_state(state_handle));
+    let dir = tempfile::tempdir().unwrap();
+    let manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    manager.bind_applied_shard_authority(cluster.clone(), "node-2".into());
+    let mut retired = Vec::new();
+    for name in ["blocked-a", "blocked-b", "retire-c"] {
+        let metadata = IndexMetadata::build_shard_routing(name, 1, 0, &["node-2".into()]);
+        let uuid = metadata.uuid.clone();
+        raft.client_write(ClusterCommand::CreateIndex { metadata })
+            .await
+            .unwrap()
+            .data
+            .into_result()
+            .unwrap();
+        let state = cluster.get_state();
+        manager
+            .open_primary_assigned_shard_with_settings_blocking(
+                name.into(),
+                0,
+                HashMap::new(),
+                IndexSettings::default(),
+                uuid.clone(),
+                crate::shard::AssignedShardOpen {
+                    allocation_id: state.shard_allocation_id(name, 0, "node-2").unwrap(),
+                    primary_term: 1,
+                    allow_empty_creation: true,
+                },
+            )
+            .await
+            .unwrap();
+        retired.push((name, uuid));
+    }
+    raft.client_write(ClusterCommand::CreateIndex {
+        metadata: IndexMetadata::build_shard_routing("unrelated", 1, 0, &["node-2".into()]),
+    })
+    .await
+    .unwrap()
+    .data
+    .into_result()
+    .unwrap();
+    let blocked = Arc::new(ReviewBlockedRetirement {
+        blocked: retired
+            .iter()
+            .filter(|(name, _)| name.starts_with("blocked-"))
+            .map(|(_, uuid)| uuid.to_string())
+            .collect(),
+        attempts: Default::default(),
+    });
+    manager.register_source_recovery_cleanup(blocked.clone());
+    for (name, _) in &retired {
+        raft.client_write(ClusterCommand::DeleteIndex {
+            index_name: (*name).into(),
+        })
+        .await
+        .unwrap()
+        .data
+        .into_result()
+        .unwrap();
+    }
+    raft.client_write(ClusterCommand::CreateIndex {
+        metadata: IndexMetadata::build_shard_routing("blocked-a", 1, 0, &["node-2".into()]),
+    })
+    .await
+    .unwrap()
+    .data
+    .into_result()
+    .unwrap();
+    let state = cluster.get_state();
+    let failures = open_local_assigned_shards_blocking(
+        state.clone(),
+        "node-2".into(),
+        manager.clone(),
+        build_guarded_startup_shards(None, "node-2"),
+    )
+    .await;
+    assert!(failures.is_empty(), "{failures:?}");
+    println!(
+        "N2 attempted retirements={}, unrelated open={}",
+        blocked.attempts.lock().unwrap().len(),
+        manager.get_shard("unrelated", 0).is_some()
+    );
+    let engine = manager
+        .get_shard("unrelated", 0)
+        .expect("one blocked retired index must not defer an unrelated assigned open");
+    assert_eq!(
+        blocked.attempts.lock().unwrap().len(),
+        3,
+        "every retired index must be attempted"
+    );
+    let identity = manager.copy_identity("unrelated", 0).unwrap();
+    assert_eq!(
+        identity.index_uuid,
+        state.indices["unrelated"].uuid.as_str()
+    );
+    assert_eq!(
+        identity.allocation_id,
+        state.shard_allocation_id("unrelated", 0, "node-2").unwrap()
+    );
+    for (name, uuid) in &retired {
+        if !name.starts_with("blocked-") {
+            assert!(manager.copy_identity(name, 0).is_none());
+            assert!(manager.index_uuid(name).is_none());
+            continue;
+        }
+        assert!(
+            manager.copy_identity(name, 0).is_some(),
+            "blocked retirement must not guess admission settlement"
+        );
+        assert_eq!(manager.index_uuid(name).as_deref(), Some(uuid.as_str()));
+    }
+    assert!(
+        manager.get_shard("blocked-a", 0).is_none(),
+        "the blocked index's new allocation must remain deferred"
+    );
+    let errors = manager
+        .reconcile_index_incarnations_blocking(cluster.get_state())
+        .await
+        .unwrap_err();
+    assert_eq!(errors.failures.len(), 2);
+    for failure in errors.failures {
+        assert!(failure.index.starts_with("blocked-"));
+        assert!(blocked.blocked.contains(&failure.index_uuid));
+        assert!(format!("{:#}", failure.error).contains("peer recovery admission is active"));
+    }
+    tokio::task::spawn_blocking(move || {
+        engine
+            .add_document_with_receipt_at_term("new", serde_json::json!({"value": 3}), 1)
+            .unwrap();
+        assert_eq!(
+            engine
+                .get_document_with_metadata("new", true)
+                .unwrap()
+                .unwrap()
+                .source,
+            serde_json::json!({"value": 3})
+        );
+    })
+    .await
+    .unwrap();
+    raft.shutdown().await.unwrap();
+}
+
 #[test]
 fn dead_node_removal_waits_for_routing_update_success() {
     assert!(dead_node_removal_allowed(false));
@@ -157,6 +346,215 @@ async fn reconciliation_closes_engine_after_local_allocation_is_removed() {
     );
     assert!(shard_manager.get_shard("idx", 0).is_none());
     assert!(dir.path().join("idx-uuid/shard_0").exists());
+}
+
+#[tokio::test]
+async fn issue_152_reconciliation_closes_deleted_index_and_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+    let mut state = crate::cluster::state::ClusterState::new("recreate".into());
+    let metadata = IndexMetadata::build_shard_routing("idx", 1, 0, &["node-2".into()]);
+    let old_uuid = metadata.uuid.clone();
+    state.add_index(metadata);
+    let guarded = std::sync::Mutex::new(std::collections::HashSet::new());
+    assert!(open_local_assigned_shards(&state, "node-2", &manager, &guarded).is_empty());
+    let old_engine = manager.get_shard("idx", 0).unwrap();
+    apply_index(&old_engine, "old", serde_json::json!({"value": 1}), 0, 1);
+    let weak = Arc::downgrade(&old_engine);
+    drop(old_engine);
+    state.indices.remove("idx");
+    state.shard_allocations.remove("idx");
+    state.version += 1;
+
+    assert!(open_local_assigned_shards(&state, "node-2", &manager, &guarded).is_empty());
+    assert!(
+        manager.get_shard("idx", 0).is_none(),
+        "applied deletion must retire an engine absent from metadata"
+    );
+    assert!(
+        weak.upgrade().is_none(),
+        "the manager must release the old engine and WAL"
+    );
+    assert!(manager.copy_identity("idx", 0).is_none());
+    assert!(dir.path().join(&old_uuid).join("shard_0").is_dir());
+}
+
+#[tokio::test]
+async fn issue_152_reconciliation_replaces_uuid_without_deleting_other_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+    let mut state = crate::cluster::state::ClusterState::new("recreate".into());
+    let old = IndexMetadata::build_shard_routing("idx", 1, 0, &["node-2".into()]);
+    let old_uuid = old.uuid.clone();
+    state.add_index(old);
+    let guarded = std::sync::Mutex::new(std::collections::HashSet::new());
+    assert!(open_local_assigned_shards(&state, "node-2", &manager, &guarded).is_empty());
+    let old_engine = manager.get_shard("idx", 0).unwrap();
+    apply_index(&old_engine, "old", serde_json::json!({"value": 1}), 0, 1);
+    drop(old_engine);
+    let old_identity_path = dir
+        .path()
+        .join(&old_uuid)
+        .join("shard_0")
+        .join(crate::shard::SHARD_COPY_IDENTITY_FILE);
+    let old_identity = std::fs::read(&old_identity_path).unwrap();
+    let new = IndexMetadata::build_shard_routing("idx", 1, 0, &["node-2".into()]);
+    let new_uuid = new.uuid.clone();
+    state.add_index_with_allocation_id(new, 2).unwrap();
+    state.version += 1;
+
+    let failures = open_local_assigned_shards(&state, "node-2", &manager, &guarded);
+    assert!(failures.is_empty(), "{failures:?}");
+    let identity = manager.copy_identity("idx", 0).unwrap();
+    assert_eq!(identity.index_uuid, new_uuid.as_str());
+    assert_eq!(identity.allocation_id, 2);
+    let engine = manager.get_shard("idx", 0).unwrap();
+    assert!(
+        engine
+            .get_document_with_metadata("old", true)
+            .unwrap()
+            .is_none()
+    );
+    apply_index(&engine, "new", serde_json::json!({"value": 2}), 0, 1);
+    assert_eq!(
+        engine
+            .get_document_with_metadata("new", true)
+            .unwrap()
+            .unwrap()
+            .source,
+        serde_json::json!({"value": 2})
+    );
+    assert_eq!(std::fs::read(old_identity_path).unwrap(), old_identity);
+    assert!(dir.path().join(&new_uuid).join("shard_0").is_dir());
+}
+
+#[tokio::test]
+async fn issue_152_replacement_preserves_foreign_allocation_and_fails_closed() {
+    tokio::task::spawn_blocking(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = ShardManager::new(dir.path(), Duration::from_secs(60));
+        let mut state = crate::cluster::state::ClusterState::new("recreate".into());
+        state.add_index(IndexMetadata::build_shard_routing(
+            "idx",
+            1,
+            0,
+            &["node-2".into()],
+        ));
+        let guarded = std::sync::Mutex::new(std::collections::HashSet::new());
+        assert!(open_local_assigned_shards(&state, "node-2", &manager, &guarded).is_empty());
+        let new = IndexMetadata::build_shard_routing("idx", 1, 0, &["node-2".into()]);
+        let new_uuid = new.uuid.clone();
+        state.add_index_with_allocation_id(new, 2).unwrap();
+        state
+            .shard_allocations
+            .get_mut("idx")
+            .unwrap()
+            .get_mut(&0)
+            .unwrap()
+            .primary_initialized = true;
+        let foreign = ShardManager::new(dir.path(), Duration::from_secs(60));
+        foreign
+            .initialize_copy_identity_for_test("idx", 0, &new_uuid, 999, 1)
+            .unwrap();
+        let foreign_dir = dir.path().join(&new_uuid).join("shard_0");
+        let identity_path = foreign_dir.join(crate::shard::SHARD_COPY_IDENTITY_FILE);
+        let before = std::fs::read(&identity_path).unwrap();
+        let evidence = foreign_dir.join("foreign-allocation-data");
+        std::fs::write(&evidence, b"must not be wiped").unwrap();
+
+        let failures = open_local_assigned_shards(&state, "node-2", &manager, &guarded);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].reason.contains("allocation"), "{failures:?}");
+        assert!(manager.get_shard("idx", 0).is_none());
+        assert_eq!(std::fs::read(identity_path).unwrap(), before);
+        assert_eq!(std::fs::read(evidence).unwrap(), b"must not be wiped");
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue_152_stale_reconciliation_snapshot_cannot_close_new_allocation() {
+    let (raft, state_handle) = crate::consensus::create_raft_instance_mem(1, "recreate".into())
+        .await
+        .unwrap();
+    crate::consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:0".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !raft.is_leader() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let cluster = Arc::new(ClusterManager::with_shared_state(state_handle));
+    let dir = tempfile::tempdir().unwrap();
+    let manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+    manager.bind_applied_shard_authority(cluster.clone(), "node-2".into());
+    raft.client_write(ClusterCommand::CreateIndex {
+        metadata: IndexMetadata::build_shard_routing("idx", 1, 0, &["node-1".into()]),
+    })
+    .await
+    .unwrap()
+    .data
+    .into_result()
+    .unwrap();
+    let old_snapshot = cluster.get_state();
+    raft.client_write(ClusterCommand::DeleteIndex {
+        index_name: "idx".into(),
+    })
+    .await
+    .unwrap();
+    let new = IndexMetadata::build_shard_routing("idx", 1, 0, &["node-2".into()]);
+    let uuid = new.uuid.clone();
+    raft.client_write(ClusterCommand::CreateIndex { metadata: new })
+        .await
+        .unwrap()
+        .data
+        .into_result()
+        .unwrap();
+    let allocation_id = cluster
+        .get_state()
+        .shard_allocation_id("idx", 0, "node-2")
+        .unwrap();
+    let new_engine = manager
+        .open_primary_assigned_shard_with_settings_blocking(
+            "idx".into(),
+            0,
+            HashMap::new(),
+            IndexSettings::default(),
+            uuid.clone(),
+            crate::shard::AssignedShardOpen {
+                allocation_id,
+                primary_term: 1,
+                allow_empty_creation: true,
+            },
+        )
+        .await
+        .unwrap();
+    let checking = manager.clone();
+    tokio::task::spawn_blocking(move || {
+        assert!(
+            open_local_assigned_shards(
+                &old_snapshot,
+                "node-2",
+                &checking,
+                &std::sync::Mutex::new(std::collections::HashSet::new()),
+            )
+            .is_empty()
+        );
+    })
+    .await
+    .unwrap();
+    let serving = manager
+        .get_shard("idx", 0)
+        .expect("old unassigned routing must not retire the new incarnation's allocated engine");
+    assert!(Arc::ptr_eq(&serving, &new_engine));
+    let identity = manager.copy_identity("idx", 0).unwrap();
+    assert_eq!(identity.index_uuid, uuid.as_str());
+    assert_eq!(identity.allocation_id, allocation_id);
+    raft.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1455,7 +1853,7 @@ async fn corrupt_in_sync_replica_copy_is_reported_as_definitive() {
     assert!(manifest.exists());
     std::fs::write(&manifest, b"{not-a-manifest").unwrap();
 
-    let restarted = ShardManager::new(dir.path(), Duration::from_secs(60));
+    let restarted = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
     restarted.set_copy_retry_policy_for_test(3, Duration::ZERO, Duration::ZERO, Duration::ZERO);
     let mut reported = 0;
     for _ in 0..3 {
@@ -1594,7 +1992,7 @@ async fn corrupt_in_sync_replica_is_failed_and_replication_resumes() {
         b"{not-a-manifest",
     )
     .unwrap();
-    let restarted = ShardManager::new(dir.path(), Duration::from_secs(60));
+    let restarted = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
     restarted.set_copy_retry_policy_for_test(3, Duration::ZERO, Duration::ZERO, Duration::ZERO);
     let failure = open_local_assigned_shards(
         &state_handle.read().unwrap().clone(),
@@ -1761,7 +2159,7 @@ async fn corrupt_primary_with_in_sync_replica_is_promoted() {
         b"{not-a-manifest",
     )
     .unwrap();
-    let restarted = ShardManager::new(dir.path(), Duration::from_secs(60));
+    let restarted = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
     restarted.set_copy_retry_policy_for_test(3, Duration::ZERO, Duration::ZERO, Duration::ZERO);
     let failure = open_local_assigned_shards(
         &state_handle.read().unwrap().clone(),

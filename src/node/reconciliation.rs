@@ -1,6 +1,7 @@
 //! Shard reconciliation: open local assigned shards, orphan cleanup, UUID directory management.
 
-use crate::shard::ShardManager;
+use crate::shard::{IndexIncarnationRetirementErrors, ShardManager};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -218,12 +219,18 @@ pub(super) async fn open_local_assigned_shards_blocking(
     shard_manager: Arc<ShardManager>,
     guarded_missing_startup_shards: GuardedStartupShards,
 ) -> Vec<ShardCopyFailure> {
+    let deferred_indices = deferred_index_opens(
+        shard_manager
+            .reconcile_index_incarnations_blocking(state.clone())
+            .await,
+    );
     match tokio::task::spawn_blocking(move || {
-        open_local_assigned_shards(
+        open_local_assigned_shards_after_retirement(
             &state,
             &local_node_id,
             shard_manager.as_ref(),
             guarded_missing_startup_shards.as_ref(),
+            &deferred_indices,
         )
     })
     .await
@@ -239,6 +246,28 @@ pub(super) async fn open_local_assigned_shards_blocking(
     }
 }
 
+fn deferred_index_opens(
+    retirement: Result<(), IndexIncarnationRetirementErrors>,
+) -> HashSet<String> {
+    match retirement {
+        Ok(()) => HashSet::new(),
+        Err(errors) => errors
+            .failures
+            .into_iter()
+            .map(|failure| {
+                tracing::error!(
+                    index = failure.index,
+                    uuid = failure.index_uuid,
+                    error = %format!("{:#}", failure.error),
+                    "Unable to retire obsolete local index; deferring only its assigned shard opens"
+                );
+                failure.index
+            })
+            .collect(),
+    }
+}
+
+#[cfg(test)]
 pub(super) fn open_local_assigned_shards(
     state: &crate::cluster::state::ClusterState,
     local_node_id: &str,
@@ -247,12 +276,32 @@ pub(super) fn open_local_assigned_shards(
         std::collections::HashSet<(String, u32, String)>,
     >,
 ) -> Vec<ShardCopyFailure> {
+    let deferred_indices = deferred_index_opens(shard_manager.reconcile_index_incarnations(state));
+    open_local_assigned_shards_after_retirement(
+        state,
+        local_node_id,
+        shard_manager,
+        guarded_missing_startup_shards,
+        &deferred_indices,
+    )
+}
+
+fn open_local_assigned_shards_after_retirement(
+    state: &crate::cluster::state::ClusterState,
+    local_node_id: &str,
+    shard_manager: &ShardManager,
+    guarded_missing_startup_shards: &std::sync::Mutex<HashSet<(String, u32, String)>>,
+    deferred_indices: &HashSet<String>,
+) -> Vec<ShardCopyFailure> {
     let mut failures = Vec::new();
     let guard_set = guarded_missing_startup_shards
         .lock()
         .map(|g| g.clone())
         .unwrap_or_default();
     for (index_name, metadata) in &state.indices {
+        if deferred_indices.contains(index_name) {
+            continue;
+        }
         for (shard_id, routing) in &metadata.shard_routing {
             let assigned_here = routing.primary == local_node_id
                 || routing
@@ -260,9 +309,12 @@ pub(super) fn open_local_assigned_shards(
                     .iter()
                     .any(|node_id| node_id == local_node_id);
             if !assigned_here {
-                if shard_manager.get_shard(index_name, *shard_id).is_some() {
-                    shard_manager.quarantine_shard_copy(index_name, *shard_id);
-                }
+                shard_manager.retire_obsolete_shard_copy(
+                    index_name,
+                    *shard_id,
+                    state,
+                    local_node_id,
+                );
                 continue;
             }
             let authoritative_here =
@@ -271,7 +323,12 @@ pub(super) fn open_local_assigned_shards(
                 state.shard_allocation_id(index_name, *shard_id, local_node_id)
             else {
                 if authoritative_here {
-                    shard_manager.quarantine_shard_copy(index_name, *shard_id);
+                    shard_manager.retire_obsolete_shard_copy(
+                        index_name,
+                        *shard_id,
+                        state,
+                        local_node_id,
+                    );
                     let red_primary = routing.primary == local_node_id
                         && state.primary_initialized(index_name, *shard_id)
                         && state.primary_allocation_id(index_name, *shard_id).is_none();

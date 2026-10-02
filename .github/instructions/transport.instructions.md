@@ -223,6 +223,15 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   its own application wait expires. Only marked pre-execution metadata waits
   map to safe document 503s; generic `UNAVAILABLE` is not a retryable create
   error.
+- Raft-backed constructors bind ShardManager to the same applied
+  ClusterManager/local-node context and start its incarnation retirement
+  poller. A recreated name retires the old serving UUID before assigned
+  primary open; durable UUID/allocation and initial-empty-copy checks remain
+  fail closed. DeleteIndex and delayed dynamic-mapping cleanup use the
+  captured metadata UUID, never a later name-based directory lookup.
+- Delayed copy-failure quarantine is exact-UUID/allocation scoped under the
+  shard lock and offloaded to the blocking pool. A report for an older
+  incarnation or allocation cannot evict the current engine.
 - Do not add these waits to Raft, replication, or recovery RPCs. Their
   authority, allocation, term-fence, and recovery-barrier contracts are
   unchanged.
@@ -344,6 +353,11 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - `StartPeerRecovery` is an asynchronous start/status RPC. `preparing=true`
   means the client should poll the same request/session reservation; snapshot
   commit/link/hash work is not performed in the RPC future.
+- The source reaper also initiates settlement when ordered local metadata
+  removes/replaces a session's index UUID, even before its finalize deadline.
+  Settlement observes that admission is impossible before releasing a submitted
+  admission barrier and retained WAL pin; a still-pending admission remains
+  protected from ordinary cleanup.
 - Snapshot preparation failures are retained and returned once on the next
   poll, so the target enters normal recovery backoff instead of relaunching
   setup in a tight loop.

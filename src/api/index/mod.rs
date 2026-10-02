@@ -351,12 +351,12 @@ async fn auto_create_index(
         "Index '{}' not found, auto-creating with 1 shard",
         index_name
     );
+    let body = serde_json::json!({
+        "settings": { "number_of_shards": 1, "number_of_replicas": 0 },
+        "mappings": { "dynamic": true }
+    });
     if let Some(master) = resolve_leader_or_master(state, "auto-create index")? {
         // Forward auto-create to the leader via gRPC
-        let body = serde_json::json!({
-            "settings": { "number_of_shards": 1, "number_of_replicas": 0 },
-            "mappings": { "dynamic": true }
-        });
         let body_bytes = serde_json::to_vec(&body).map_err(|error| {
             crate::api::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -393,27 +393,21 @@ async fn auto_create_index(
             }
         };
     }
-    let mut shard_routing = HashMap::new();
-    shard_routing.insert(
-        0,
-        crate::cluster::state::ShardRoutingEntry {
-            primary: state.local_node_id.clone(),
-            primary_term: 1,
-            replicas: vec![],
-            in_sync_replicas: vec![],
-            unassigned_replicas: 0,
-        },
-    );
-    let metadata = IndexMetadata {
-        name: index_name.to_string(),
-        uuid: crate::cluster::state::IndexUuid::new_random(),
-        number_of_shards: 1,
-        number_of_replicas: 0,
-        shard_routing,
-        mappings: HashMap::new(),
-        dynamic: crate::cluster::state::DynamicMapping::True,
-        settings: crate::cluster::state::IndexSettings::default(),
-    };
+    let cluster_state = state.cluster_manager.get_state();
+    let mut data_nodes = cluster_state
+        .nodes
+        .values()
+        .filter(|node| node.roles.contains(&crate::cluster::state::NodeRole::Data))
+        .map(|node| node.id.clone())
+        .collect::<Vec<_>>();
+    if let Some(local) = data_nodes
+        .iter()
+        .position(|node| node == &state.local_node_id)
+    {
+        data_nodes.swap(0, local);
+    }
+    let metadata = IndexMetadata::from_create_request_body(index_name, &body, &data_nodes)
+        .map_err(create_index_error_response)?;
     raft_write(
         state,
         crate::consensus::types::ClusterCommand::CreateIndex { metadata },
@@ -2230,8 +2224,9 @@ pub async fn delete_index(
     // Close local shard engines and delete data
     if let Err(e) = state
         .shard_manager
-        .close_index_shards_blocking_with_reason(
+        .close_index_shards_for_uuid_blocking_with_reason(
             index_name.to_string(),
+            index_metadata.uuid.to_string(),
             crate::shard::SHARD_DATA_REMOVE_REASON_API_DELETE_INDEX,
         )
         .await

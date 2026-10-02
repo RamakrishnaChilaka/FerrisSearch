@@ -18,6 +18,14 @@ mod refresh;
 #[path = "forwarding_review_tests.rs"]
 mod review;
 
+#[path = "recreate_tests.rs"]
+mod recreate;
+
+#[path = "forwarding_ci_tests.rs"]
+mod ci_failure;
+
+const LOOP_INDEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
 struct ForwardingNode {
     _data: tempfile::TempDir,
     state: AppState,
@@ -280,11 +288,26 @@ impl ForwardingCluster {
         path: &str,
         body: Option<Value>,
     ) -> (StatusCode, Value) {
+        self.request_with_timeout(node, method, path, body, None)
+            .await
+    }
+
+    async fn request_with_timeout(
+        &self,
+        node: usize,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+        timeout: Option<Duration>,
+    ) -> (StatusCode, Value) {
         let mut request = self
             .client
             .request(method, format!("{}{path}", self.nodes[node].url));
         if let Some(body) = body {
             request = request.json(&body);
+        }
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
         }
         let response = request.send().await.unwrap();
         let status = response.status();
@@ -292,14 +315,24 @@ impl ForwardingCluster {
     }
 
     async fn create(&self, index: &str) -> (StatusCode, Value) {
-        self.request(
-            0,
+        self.create_with_timeout(0, index, None).await
+    }
+
+    async fn create_with_timeout(
+        &self,
+        node: usize,
+        index: &str,
+        timeout: Option<Duration>,
+    ) -> (StatusCode, Value) {
+        self.request_with_timeout(
+            node,
             reqwest::Method::PUT,
             &format!("/{index}"),
             Some(json!({
                 "settings": {"number_of_shards": 1, "number_of_replicas": 0},
                 "mappings": {"properties": {"value": {"type": "integer"}}}
             })),
+            timeout,
         )
         .await
     }
@@ -418,25 +451,51 @@ async fn forwarding_lag_bulk_update_delete_and_get_wait_for_raft_apply() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn forwarding_lag_deadline_returns_retryable_503_with_cause() {
     let cluster = ForwardingCluster::start().await;
+    cluster.gate.pause();
+    assert_forwarding_lag_deadline(&cluster).await;
+}
+
+async fn assert_forwarding_lag_deadline(cluster: &ForwardingCluster) {
     cluster.nodes[1]
         .state
         .cluster_manager
         .forwarding_wait_millis
         .store(100, std::sync::atomic::Ordering::Relaxed);
-    cluster.gate.pause();
     let create = cluster
         .client
         .put(format!("{}/lag-timeout", cluster.nodes[0].url))
-        .json(&json!({"settings": {"number_of_replicas": 0}}))
-        .send();
-    tokio::pin!(create);
-    tokio::select! {
-        response = &mut create => {
-            assert_eq!(response.unwrap().status(), StatusCode::OK);
-            cluster.gate.wait_until_entered().await;
+        .json(&json!({"settings": {"number_of_replicas": 0}}));
+    let create = tokio::spawn(async move { create.send().await.unwrap() });
+    tokio::time::timeout(Duration::from_secs(5), cluster.gate.wait_until_entered())
+        .await
+        .expect("follower must pause application");
+    let metadata = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(metadata) = cluster.nodes[0]
+                .state
+                .cluster_manager
+                .get_state()
+                .indices
+                .get("lag-timeout")
+                .cloned()
+            {
+                break metadata;
+            }
+            tokio::task::yield_now().await;
         }
-        () = cluster.gate.wait_until_entered() => {}
-    }
+    })
+    .await
+    .expect("a paused earlier entry must not substitute for explicit index creation");
+    assert_eq!(metadata.primary_node(0).map(String::as_str), Some("node-2"));
+    assert_eq!(metadata.shard_routing[&0].primary_term, 1);
+    assert!(
+        !cluster.nodes[1]
+            .state
+            .cluster_manager
+            .get_state()
+            .indices
+            .contains_key("lag-timeout")
+    );
     for (method, path, payload) in [
         (
             reqwest::Method::PUT,
@@ -515,6 +574,18 @@ async fn forwarding_lag_deadline_returns_retryable_503_with_cause() {
             .get_shard("lag-timeout", 0)
             .is_none()
     );
+    assert!(
+        cluster.nodes[0]
+            .state
+            .shard_manager
+            .get_shard("lag-timeout", 0)
+            .is_none()
+    );
+    let response = create.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["acknowledged"], true, "{body}");
+    assert_eq!(body["shards_acknowledged"], false, "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -523,7 +594,9 @@ async fn forwarding_create_then_write_50_iterations_without_hook() {
     let mut failures = Vec::new();
     for iteration in 0..50 {
         let index = format!("forward-loop-{iteration}");
-        let (status, body) = cluster.create(&index).await;
+        let (status, body) = cluster
+            .create_with_timeout(0, &index, Some(LOOP_INDEX_REQUEST_TIMEOUT))
+            .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let (status, body) = cluster
             .request(

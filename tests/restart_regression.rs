@@ -1122,6 +1122,90 @@ async fn three_node_flush_restart_preserves_uuid_dirs_and_document_count() -> Re
 }
 
 #[tokio::test]
+async fn issue_152_recreated_follower_primary_restarts_with_only_new_data() -> Result<()> {
+    let mut harness = RestartClusterHarness::start().await?;
+    let old_uuid = harness.create_index(0).await?;
+    harness.bulk_index_documents(3).await?;
+    let before = harness.wait_for_cluster_state(3, Some(INDEX_NAME)).await?;
+    let master = before["master_node"].as_str().context("missing master")?;
+    let old_routing = routing_snapshot(&before, INDEX_NAME)?;
+    let follower = old_routing
+        .values()
+        .find(|routing| routing.primary != master)
+        .context("expected a follower primary")?
+        .primary
+        .clone();
+    let follower_config = harness
+        .nodes
+        .iter()
+        .find(|node| node.config.name == follower)
+        .context("missing follower process")?
+        .config
+        .clone();
+    let leader_url = harness
+        .nodes
+        .iter()
+        .find(|node| node.config.name == master)
+        .context("missing master process")?
+        .config
+        .base_url();
+    let response = harness
+        .client
+        .delete(format!("{leader_url}/{INDEX_NAME}"))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.json::<Value>().await?["acknowledged"], true);
+    let new_uuid = harness.create_index(0).await?;
+    assert_ne!(old_uuid, new_uuid);
+    let current = harness.wait_for_cluster_state(3, Some(INDEX_NAME)).await?;
+    let new_routing = routing_snapshot(&current, INDEX_NAME)?;
+    let shard_id = *new_routing
+        .iter()
+        .find(|(_, routing)| routing.primary == follower)
+        .context("recreated index must have a primary on the same follower")?
+        .0;
+    let doc_id = document_id_for_shard("only-new", shard_id);
+    let source =
+        json!({"title": "recreated", "author": "new", "payload": "new incarnation", "n": 152});
+    let receipt = harness.put_document(&doc_id, source.clone()).await?;
+    harness.flush_index().await?;
+    let old_dir = follower_config.data_dir.join(&old_uuid);
+    let new_dir = follower_config.data_dir.join(&new_uuid);
+    tokio::task::spawn_blocking(move || {
+        assert!(
+            old_dir.is_dir(),
+            "follower retirement must retain obsolete disk evidence"
+        );
+        assert!(
+            new_dir.is_dir(),
+            "the new UUID must have its own data directory"
+        );
+    })
+    .await?;
+    let stopped = harness.stop_node(&follower)?;
+    harness.restart_node(stopped).await?;
+    harness
+        .wait_for_index_shards(INDEX_NAME, 3, 0, READY_TIMEOUT)
+        .await?;
+    let after = harness.wait_for_cluster_state(3, Some(INDEX_NAME)).await?;
+    assert_eq!(after["indices"][INDEX_NAME]["uuid"], new_uuid);
+    harness.assert_expected_shard_dirs_exist(&after, &new_uuid)?;
+    let (status, body) = harness.get_document(&doc_id).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_source"], source, "{body}");
+    assert_eq!(body["_seq_no"], receipt["_seq_no"], "{body}");
+    assert_eq!(body["_primary_term"], receipt["_primary_term"], "{body}");
+    for old_id in 0..3 {
+        let (status, body) = harness.get_document(&format!("doc-{old_id}")).await?;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["found"], false, "{body}");
+    }
+    harness.wait_for_count(1).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn added_replica_recovers_files_and_survives_primary_loss() -> Result<()> {
     let mut harness = RestartClusterHarness::start().await?;
     harness.create_index_with_shards(1, 0).await?;

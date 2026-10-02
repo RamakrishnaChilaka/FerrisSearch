@@ -115,6 +115,10 @@ impl ClusterManager {
         read(&self.state.read().unwrap_or_else(|error| error.into_inner()))
     }
 
+    pub(crate) fn shares_state_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
     pub fn version(&self) -> u64 {
         self.state.read().unwrap_or_else(|e| e.into_inner()).version
     }
@@ -223,6 +227,17 @@ mod tests {
     use super::*;
     use crate::cluster::state::{ClusterState, NodeRole};
     use std::sync::Arc;
+
+    #[test]
+    fn applied_authority_compares_shared_state_not_manager_wrappers() {
+        let state = Arc::new(RwLock::new(ClusterState::new("authority".into())));
+        let first = ClusterManager::with_shared_state(state.clone());
+        let restarted = ClusterManager::with_shared_state(state.clone());
+        let copied =
+            ClusterManager::with_shared_state(Arc::new(RwLock::new(state.read().unwrap().clone())));
+        assert!(first.shares_state_with(&restarted));
+        assert!(!first.shares_state_with(&copied));
+    }
 
     #[tokio::test]
     async fn forwarding_wait_observes_applied_version_and_has_a_bounded_deadline() {

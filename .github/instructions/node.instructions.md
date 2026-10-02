@@ -49,7 +49,10 @@ pub struct Node {
 2. Sends `JoinCluster` gRPC to seed hosts (includes `raft_node_id`)
 3. Leader handles: validate node identity → `add_learner()` for non-voters → `AddNode` Raft command → `change_membership()`; if promotion fails, roll back the `AddNode`
 4. Raft log replication propagates state (joiner does NOT call `update_state`)
-5. `JoinCluster` returns an authoritative cluster-state snapshot; use it for initial local shard reopen and orphan-cleanup decisions before Raft catch-up finishes
+5. `JoinCluster` returns an authoritative cluster-state snapshot for initial
+   reopen inventory and orphan-cleanup decisions. Assigned engine open/publication
+   additionally requires the matching locally applied UUID/allocation; do not
+   install the snapshot into ClusterManager as a catch-up fallback.
 
 ### Leader Duties (every 5s tick)
 1. `SetMaster` if not already set
@@ -83,10 +86,17 @@ pub struct Node {
 7. When applied routing removes a local shard copy, remove its engine from the
    serving map without deleting its on-disk evidence. This closes copies removed
    after Apply-level escalation instead of retaining an unreachable open engine.
+   Recheck live UUID/allocation under the shard lock; an older routing snapshot
+   must not remove a newly allocated/recreated copy. Failure quarantine is also
+   exact-allocation scoped and runs on the blocking pool.
 
 ### Follower Duties (every 5s tick)
 1. Ping master node for liveness check
-2. Reopen any locally assigned shards that are still not open
+2. Retire deleted/replaced index incarnations before reopening assigned shards.
+   Iterating only current `state.indices` cannot discover a deleted index's
+   still-open engine. Attempt every obsolete index even if another retirement
+   fails; report each index/UUID and cause, and defer only that name's assigned
+   opens.
 3. Retry `JoinCluster` whenever the authoritative cluster state does not contain the local node, even if local Raft state is already initialized from disk
 4. If the master ping is rejected because the target no longer recognizes this node in cluster state, immediately retry `JoinCluster` through the seed hosts so a removed or stale follower can re-register itself. Transient ping failures (timeouts, connection errors, missing local master info) should only log and retry on the next lifecycle tick — they must not trigger a rejoin by themselves. Repeated follower-side join retries should be rate-limited so a permanently rejected or partitioned node does not issue `JoinCluster` on every 5-second lifecycle tick.
 
@@ -94,6 +104,27 @@ pub struct Node {
 - The lifecycle loop itself stays on Tokio because it coordinates Raft/control-plane work, but shard reopen and orphan cleanup perform blocking filesystem/Tantivy recovery work.
 - On Tokio call sites, use `open_local_assigned_shards_blocking()` and `cleanup_orphaned_data_if_authoritative_blocking()` so the actual shard-manager work runs on Tokio's blocking pool.
 - Do NOT move Raft heartbeats or master pings onto rayon; keep control-plane futures on Tokio and offload only the blocking shard work.
+- Raft-backed transport also starts ShardManager's weak-owned 100 ms
+  applied-version reconciliation task. It retires obsolete UUIDs on every
+  node, independently of the five-second lifecycle loop and client traffic.
+  This reads the same shared Raft state, does not publish metadata or apply
+  cluster-wide reactive settings, and preserves disk evidence. API/transport
+  deletion uses the pre-deletion metadata UUID rather than a later name lookup.
+  Followers retain retired directories until authoritative startup cleanup;
+  collecting them after applied deletion is a separate follow-up.
+- Async assigned-open reconciliation performs source-session cleanup once,
+  then passes failed index names to the blocking open pass. Do not rerun an
+  unguarded synchronous retirement after an admission/settlement failure.
+  Unrelated indices must still retire and open.
+- Retirement, reopen, and recovery install use index-level lifecycle exclusion
+  in addition to source-session and per-shard locks. Final publication and
+  serving getters check the live UUID/allocation, so delayed startup/reopen work
+  cannot publish an old incarnation. Reopen's first filesystem validation also
+  runs on the blocking pool.
+- UUID registration is ordered under the same applied-state guard. Retirement
+  selects engines by cached UUID, retains another incarnation's settings/ISR,
+  and drops extracted engines only after releasing the node-wide serving-map
+  lock.
 - Recovered-node startup assignments must fail closed when durable
   UUID/allocation identity is missing, malformed, or mismatched. The sole
   exception is an uninitialized allocation created by CreateIndex, before any
@@ -148,6 +179,10 @@ pub struct Node {
   `ActivatePrimary` term bump. If no admission command was submitted, release
   the barrier first and bump asynchronously; after submission, keep the barrier
   until admission or the newer term is observed.
+- Applied deletion/replacement of a source index UUID makes its admission
+  impossible. The source reaper starts the existing settlement path immediately
+  on that observation rather than waiting for the finalize deadline. Ordinary
+  cleanup must still never release a pending admission barrier by guessing.
 - Recovery start, source session, install, pending marker, admission, and target
   observation retain one exact allocation ID. Same-node remove/re-add is a
   definitive mismatch rather than an ABA-ambiguous `Unknown`.

@@ -217,7 +217,10 @@ values return `400 illegal_argument_exception` without enqueueing work.
   helper and existing blocking wrappers, UUID/allocation guards, and
   initial-empty-copy rule. Replicas do not participate. Primary activation
   remains on the existing first-write and lifecycle paths.
-- Auto-create retains leader-local placement for a leader coordinator.
+- Auto-create allocates only to applied nodes with the Data role, using the
+  shared create-index metadata builder. A data-capable leader retains local
+  preference; a master-only leader must select a data node, and no data nodes
+  yields `no_data_nodes_exception` before any Raft metadata/storage mutation.
   Follower coordinators use the leader's existing create-index allocator.
   Both paths set `dynamic: true`. Do not repeat primary opening after a
   forwarded create; the receiving write uses the existing lazy-open path.
@@ -496,6 +499,8 @@ Document and bulk handlers auto-create missing indices via `auto_create_index()`
 - Checks `raft.is_leader()` before writing
 - If NOT leader → forwards `CreateIndex` to master via `forward_create_index()` gRPC
 - If leader → commits directly via `raft.client_write(CreateIndex)`
+- Leader-local auto-create must filter authoritative Data-role candidates;
+  never assign a shard merely because the coordinator is the Raft leader.
 - NEVER calls `raft.client_write()` from a follower node
 
 ## Bulk Error Reporting

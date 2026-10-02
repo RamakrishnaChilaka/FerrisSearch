@@ -34,6 +34,10 @@ pub struct ShardManager {
 - `close_index_shards_with_reason(index, reason)` — same as above, but emits the delete reason in logs for destructive paths
 - `close_index_shards_blocking(index)` — async-safe Tokio wrapper for shard shutdown + directory deletion
 - `close_index_shards_blocking_with_reason(index, reason)` — async-safe Tokio wrapper for reason-tagged destructive delete paths
+- `close_index_shards_for_uuid_blocking_with_reason(index, uuid, reason)` —
+  production delete path bound to the metadata UUID captured before deletion
+- `reconcile_index_incarnations_blocking(state)` — retire serving copies for
+  deleted/replaced UUIDs without deleting their disk evidence
 - `apply_settings(index, new_settings)` — push to SettingsManager watch channels
 - `register_index_uuid(index, uuid)` — store the UUID mapping for an index
 - `index_uuid(index) -> Option<String>` — get registered UUID
@@ -43,6 +47,8 @@ pub struct ShardManager {
 - `raise_copy_fence_blocking(...)` — atomically persist a monotonic replica fence
 - `apply_replica_operation(...)` — serialize identity/gate/fence validation with replica mutation
 - `quarantine_shard_copy_blocking(...)` — stop serving an invalid copy without deleting evidence
+- `quarantine_shard_copy_for_allocation_blocking(...)` — production quarantine
+  scoped to the exact UUID/allocation, rechecked under the shard lock
 - `restore_peer_recovery_awaiting_membership(...)` — validate an exact durable
   pending marker, restore its in-memory gate, and reopen the finalized existing
   copy before recovery scheduling
@@ -118,6 +124,62 @@ pub struct ShardManager {
 - `cleanup_orphaned_data(known_uuids)` is called on startup only after authoritative index UUIDs are available; empty pre-catch-up state or missing expected UUID directories must skip cleanup to avoid deleting live shard data
 - Destructive delete paths must log an explicit reason so operators can distinguish API delete-index, transport delete-index, and orphan-cleanup removals in logs
 - **NEVER** construct shard paths using the index name — always go through UUID
+
+### Applied Incarnation Retirement
+
+- Production Node and Raft-backed transport constructors bind one immutable
+  applied-state/local-node context to the manager. A replacement ClusterManager
+  wrapper is allowed only when it shares the exact same state `Arc`, never an
+  equal copied snapshot. The context reads the existing
+  shared applied Raft state; it is not another metadata publisher. Only
+  local/no-Raft test helpers remain unbound.
+- Serving getters and final engine publication require the current applied
+  UUID/allocation. Revalidate delayed opens after lock waits, and narrow initial
+  empty-copy permission again from the live G1 decision. Never weaken durable
+  identity validation, adopt foreign allocation data, or reset schema to make
+  recreation succeed.
+- Register production UUIDs inside the current-copy applied-state guard,
+  including ordinary open, recovery prepare/finalize, and pending-marker
+  restoration. Cache a successfully prepared assigned identity only at guarded
+  engine publication; an aborted old open must not poison a sibling's identity
+  or overwrite the current incarnation's registry.
+- Protocol-trace constructor replay uses the validated prepared identity
+  explicitly, without publishing it early into the serving identity cache.
+- The Raft-backed transport starts a weak-owned applied-version poller, every
+  100 ms, so every node retires a deleted/replaced index even without another
+  request or lifecycle tick. Async assigned opens also retire a replaced
+  incarnation before opening its replacement. Cleanup errors are logged and
+  retried; an unresolved source admission remains protected until settlement.
+- Retirement inventories both registered UUIDs and cached copy identities.
+  Remove only engines whose cached identity has the retiring UUID, regardless
+  of the name registry. Remove matching identities, ISR observations, retry
+  state, and recovery bookkeeping. Preserve name-keyed settings and other ISR
+  entries while another incarnation's engine remains; repair a retiring
+  registry entry only from a surviving currently applied copy.
+- Extract retired engine Arcs under the serving-map lock, then release that
+  lock before dropping engines and WAL handles on the blocking pool. Writer
+  teardown must not block unrelated serving-map lookups.
+- Retirement attempts all obsolete incarnations and returns every failed
+  index/UUID with its underlying cause. A source admission/settlement error
+  defers only that index's opens, not unrelated retirement or assigned opens.
+- Followers retain obsolete UUID directories until authoritative startup
+  cleanup. Runtime directory collection after observing applied deletion is a
+  follow-up, not implemented retirement behavior. Explicit deletion removes
+  only the captured UUID's directory; a later registered UUID must never
+  retarget that deletion.
+- Source recovery lifecycle locks precede the index read/write lifecycle lock,
+  which precedes per-shard open locks. Parallel opens/reopen/install share the
+  index lock; whole-incarnation retirement takes it exclusively. Acquire
+  blocking locks and drop engines/WAL handles on the blocking pool. Keep the
+  applied-state read lock only around in-memory validation/publication, not
+  engine construction.
+- Stale routing snapshots and failure reports cannot evict a newer copy:
+  obsolete-copy retirement reads live authority, while production quarantine
+  compares the exact UUID/allocation under the shard lock. Existing request
+  handles may drain against the old incarnation, never the new directory.
+- Startup orphan cleanup and recovered-assignment guards remain separate.
+  Retirement is not a new garbage collector or permission to delete unknown
+  UUID data before startup authority is established.
 
 ### Shard Opening Sequence
 1. Register UUID mapping via `register_index_uuid()` or `get_or_generate_uuid()`

@@ -711,15 +711,22 @@ impl TransportService {
         for (session_id, session) in sessions {
             let should_settle = {
                 let mut session = session.lock().await;
-                let expired = session
+                let deadline_expired = session
                     .finalize_deadline
-                    .is_some_and(|deadline| now >= deadline)
+                    .is_some_and(|deadline| now >= deadline);
+                let incarnation_retired = self.cluster_manager.with_state(|state| {
+                    state
+                        .indices
+                        .get(&session.index_name)
+                        .is_none_or(|metadata| metadata.uuid.as_str() != session.index_uuid)
+                });
+                let settle = (deadline_expired || incarnation_retired)
                     && session.barrier_guard.is_some()
                     && !session.settlement_running;
-                if expired {
+                if settle {
                     session.settlement_running = true;
                 }
-                expired
+                settle
             };
             if should_settle {
                 let service = self.clone();
@@ -2836,6 +2843,149 @@ mod tests {
             "only settlement may release an unresolved admission barrier"
         );
         assert!(state.registry.lock().await.sessions.contains_key("session"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue_152_retired_incarnation_settles_recovery_and_releases_wal_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut service, shards, fixture) = review_service(dir.path());
+        let old_metadata = fixture.get_state().indices["idx"].clone();
+        let (raft, state_handle) = crate::consensus::create_raft_instance_mem(1, "recreate".into())
+            .await
+            .unwrap();
+        crate::consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:0".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !raft.is_leader() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let cluster = Arc::new(ClusterManager::with_shared_state(state_handle));
+        service.cluster_manager = cluster.clone();
+        service.transport_client = TransportClient::new().with_cluster_manager(cluster.clone());
+        service.raft = Some(raft.clone());
+        shards.bind_applied_shard_authority(cluster.clone(), "primary".into());
+        shards.register_source_recovery_cleanup(service.peer_recovery_state.clone());
+        raft.client_write(ClusterCommand::CreateIndex {
+            metadata: old_metadata.clone(),
+        })
+        .await
+        .unwrap()
+        .data
+        .into_result()
+        .unwrap();
+        let activated = service.ensure_primary_activated("idx", 0).await.unwrap();
+        let engine = shards.get_shard("idx", 0).unwrap();
+        let weak = Arc::downgrade(&engine);
+        let snapshot_dir = dir.path().join("uuid-1/shard_0/peer-recovery/old-session");
+        let writer = engine.clone();
+        let preparation_dir = snapshot_dir.clone();
+        let snapshot = tokio::task::spawn_blocking(move || {
+            writer
+                .add_document_with_receipt_at_term(
+                    "old",
+                    serde_json::json!({"value": 1}),
+                    activated.primary_term,
+                )
+                .unwrap();
+            prepared_test_snapshot(&writer, &preparation_dir)
+        })
+        .await
+        .unwrap();
+        let allocation_id = cluster
+            .get_state()
+            .shard_allocation_id("idx", 0, "replica")
+            .unwrap();
+        let key = ("uuid-1".to_string(), 0);
+        let barrier = service.peer_recovery_state.barrier(key.clone()).await;
+        let barrier_guard = barrier.clone().write_owned().await;
+        let session = Arc::new(Mutex::new(SourceSession {
+            index_name: "idx".into(),
+            index_uuid: key.0.clone(),
+            shard_id: 0,
+            target_node_id: "replica".into(),
+            target_allocation_id: allocation_id,
+            primary_node_id: "primary".into(),
+            primary_term: activated.primary_term,
+            snapshot_cursor: snapshot.snapshot_cursor,
+            snapshot_boundary: snapshot.committed_boundary.clone(),
+            snapshot_dir,
+            files: HashMap::new(),
+            retention_pin: Some(snapshot.retention_pin),
+            last_activity: Instant::now(),
+            barrier: Some(test_barrier(
+                snapshot.snapshot_cursor,
+                &snapshot.committed_boundary,
+            )),
+            barrier_guard: Some(barrier_guard),
+            finalize_deadline: Some(Instant::now() + Duration::from_secs(60)),
+            finalize_preparing: Arc::new(AtomicBool::new(false)),
+            mark_submitted: true,
+            settlement_running: false,
+        }));
+        {
+            let mut registry = service.peer_recovery_state.registry.lock().await;
+            registry.active_shards.insert(key, "old-session".into());
+            registry.sessions.insert("old-session".into(), session);
+        }
+        drop(engine);
+        service.reap_peer_recovery_sessions().await;
+        assert!(
+            barrier.try_write().is_err(),
+            "a still-pending admission must remain barriered"
+        );
+        raft.client_write(ClusterCommand::DeleteIndex {
+            index_name: "idx".into(),
+        })
+        .await
+        .unwrap();
+        let mut new_metadata = old_metadata;
+        new_metadata.uuid = IndexUuid::new("uuid-new");
+        raft.client_write(ClusterCommand::CreateIndex {
+            metadata: new_metadata,
+        })
+        .await
+        .unwrap()
+        .data
+        .into_result()
+        .unwrap();
+        assert!(
+            shards
+                .reconcile_index_incarnations_blocking(cluster.get_state())
+                .await
+                .is_err(),
+            "ordinary cleanup must not guess settlement or release an admission barrier"
+        );
+        service.reap_peer_recovery_sessions().await;
+        let settled = tokio::time::timeout(Duration::from_secs(5), barrier.write_owned())
+            .await
+            .expect("applied UUID replacement must settle without waiting for the deadline");
+        drop(settled);
+        shards
+            .reconcile_index_incarnations_blocking(cluster.get_state())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retirement must release the old engine and retained WAL pin");
+        assert!(
+            !service
+                .peer_recovery_state
+                .registry
+                .lock()
+                .await
+                .sessions
+                .contains_key("old-session")
+        );
+        assert!(shards.copy_identity("idx", 0).is_none());
+        raft.shutdown().await.unwrap();
     }
 
     #[tokio::test]

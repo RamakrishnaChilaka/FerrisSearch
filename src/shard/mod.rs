@@ -17,6 +17,10 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+mod lifecycle;
+
+pub(crate) use lifecycle::IndexIncarnationRetirementErrors;
+
 pub const SHARD_DATA_REMOVE_REASON_API_DELETE_INDEX: &str = "api_delete_index";
 pub const SHARD_DATA_REMOVE_REASON_TRANSPORT_DELETE_INDEX: &str = "transport_delete_index_rpc";
 pub const SHARD_DATA_REMOVE_REASON_ORPHAN_CLEANUP: &str = "orphan_cleanup_unknown_uuid";
@@ -28,6 +32,13 @@ const SHARD_COPY_IDENTITY_VERSION: u32 = 3;
 type SourceRecoveryIdentity = (String, u32);
 type SourceRecoveryLock = Arc<tokio::sync::Mutex<()>>;
 type SourceRecoveryLockMap = HashMap<SourceRecoveryIdentity, SourceRecoveryLock>;
+
+#[cfg(test)]
+struct OpenValidationGate {
+    index_uuid: String,
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
@@ -844,11 +855,19 @@ pub struct ShardManager {
     /// Serializes concurrent open attempts for the same shard key so only
     /// one thread performs the expensive CompositeEngine creation at a time.
     open_locks: Mutex<HashMap<ShardKey, Arc<Mutex<()>>>>,
+    /// Parallel shard opens share the lock; incarnation retirement excludes every open/reopen.
+    index_locks: Mutex<HashMap<String, Arc<RwLock<()>>>>,
+    applied_authority: std::sync::OnceLock<lifecycle::AppliedShardAuthority>,
+    applied_reconciler_started: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    index_close_before_lock_sender: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     source_recovery_locks: Mutex<SourceRecoveryLockMap>,
     #[cfg(test)]
     open_before_lock_sender: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     #[cfg(test)]
     open_before_lock_release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    #[cfg(test)]
+    open_after_validation_gate: Mutex<Option<OpenValidationGate>>,
     #[cfg(test)]
     reopen_after_cleanup_sender: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     #[cfg(test)]
@@ -912,11 +931,18 @@ impl ShardManager {
             copy_io_attempt_locks: Mutex::new(HashMap::new()),
             copy_retry_policy: RwLock::new(ShardCopyRetryPolicy::default()),
             open_locks: Mutex::new(HashMap::new()),
+            index_locks: Mutex::new(HashMap::new()),
+            applied_authority: std::sync::OnceLock::new(),
+            applied_reconciler_started: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            index_close_before_lock_sender: Mutex::new(None),
             source_recovery_locks: Mutex::new(HashMap::new()),
             #[cfg(test)]
             open_before_lock_sender: Mutex::new(None),
             #[cfg(test)]
             open_before_lock_release: Mutex::new(None),
+            #[cfg(test)]
+            open_after_validation_gate: Mutex::new(None),
             #[cfg(test)]
             reopen_after_cleanup_sender: Mutex::new(None),
             #[cfg(test)]
@@ -959,15 +985,24 @@ impl ShardManager {
         index: &str,
         shard_id: u32,
     ) -> Option<crate::protocol_trace::TraceCopy> {
+        let identity = self.copy_identity(index, shard_id)?;
+        self.protocol_trace_copy_for_identity(shard_id, &identity)
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    fn protocol_trace_copy_for_identity(
+        &self,
+        shard_id: u32,
+        identity: &ShardCopyIdentity,
+    ) -> Option<crate::protocol_trace::TraceCopy> {
         let node = self
             .protocol_trace_node
             .read()
             .unwrap_or_else(|error| error.into_inner())
             .clone()?;
-        let identity = self.copy_identity(index, shard_id)?;
         Some(crate::protocol_trace::TraceCopy {
             node,
-            index_uuid: identity.index_uuid,
+            index_uuid: identity.index_uuid.clone(),
             shard: shard_id,
             allocation: identity.allocation_id,
         })
@@ -1546,7 +1581,6 @@ impl ShardManager {
                 Err(error) => return Err(error.into()),
             }
         }
-        self.cache_copy_identity(key, identity.clone());
         Ok(identity)
     }
 
@@ -1832,15 +1866,7 @@ impl ShardManager {
         let _guard = per_shard_lock
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        self.shards
-            .write()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(&key);
-        self.copy_identities
-            .write()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(&key);
-        self.isr_tracker.remove_shard(index, shard_id);
+        drop(self.remove_serving_shard_copy(&key));
     }
 
     pub(crate) fn quarantine_sequence_collision(
@@ -2046,6 +2072,12 @@ impl ShardManager {
         expected_uuid: &str,
         expected_allocation_id: AllocationId,
     ) -> Result<()> {
+        self.with_current_copy(
+            &ShardKey::new(index, shard_id),
+            expected_uuid,
+            Some(expected_allocation_id),
+            |_| Ok(()),
+        )?;
         let registered_uuid = self.index_uuid(index);
         if registered_uuid.as_deref() != Some(expected_uuid) {
             return Err(ShardReopenAborted {
@@ -2332,6 +2364,7 @@ impl ShardManager {
             ShardCopyIoOperation::PendingMarker,
         );
         let key = ShardKey::new(index, shard_id);
+        self.with_current_copy(&key, index_uuid, Some(assignment.allocation_id), |_| Ok(()))?;
         let attempt_lock = self.copy_io_attempt_lock(&retry_key);
         let _attempt_guard = attempt_lock
             .lock()
@@ -2381,6 +2414,35 @@ impl ShardManager {
         index_uuid: &str,
         authority: ShardOpenAuthority,
     ) -> Result<Arc<dyn SearchEngine>> {
+        let key = ShardKey::new(index, shard_id);
+        let index_lock = self.index_lifecycle_lock(index);
+        let _index_guard = index_lock.read().unwrap_or_else(|error| error.into_inner());
+        let authority = match authority {
+            ShardOpenAuthority::Assigned { mut assignment } => {
+                self.with_current_copy(
+                    &key,
+                    index_uuid,
+                    Some(assignment.allocation_id),
+                    |state| {
+                        if let Some(state) = state
+                            && let Some(authority) = self.applied_authority.get()
+                        {
+                            assignment.allow_empty_creation &= state.may_create_initial_empty_copy(
+                                index,
+                                shard_id,
+                                &authority.local_node_id,
+                            );
+                        }
+                        Ok(())
+                    },
+                )?;
+                ShardOpenAuthority::Assigned { assignment }
+            }
+            local => {
+                self.with_current_copy(&key, index_uuid, None, |_| Ok(()))?;
+                local
+            }
+        };
         let (assignment, open_mode) = match authority {
             ShardOpenAuthority::Local { allow_schema_reset } => {
                 (None, CompositeOpenMode::CreateOrOpen { allow_schema_reset })
@@ -2396,7 +2458,6 @@ impl ShardManager {
                 (Some(assignment), open_mode)
             }
         };
-        let key = ShardKey::new(index, shard_id);
         let shard_dir = self
             .data_dir
             .join(index_uuid)
@@ -2446,6 +2507,30 @@ impl ShardManager {
         }
         let per_shard_lock = self.shard_open_lock(&key);
         let _guard = per_shard_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.with_current_copy(
+            &key,
+            index_uuid,
+            assignment.map(|assignment| assignment.allocation_id),
+            |_| Ok(()),
+        )?;
+        #[cfg(test)]
+        {
+            let gate = {
+                let mut gate = self.open_after_validation_gate.lock().unwrap();
+                if gate
+                    .as_ref()
+                    .is_some_and(|gate| gate.index_uuid == index_uuid)
+                {
+                    gate.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(gate) = gate {
+                gate.entered.send(()).unwrap();
+                gate.release.recv_timeout(Duration::from_secs(30)).unwrap();
+            }
+        }
 
         // Re-check after acquiring the per-shard lock — a concurrent caller
         // may have finished opening this shard while we were waiting.
@@ -2500,7 +2585,15 @@ impl ShardManager {
             None
         };
 
-        self.register_index_uuid(index, index_uuid);
+        self.with_current_copy(
+            &key,
+            index_uuid,
+            assignment.map(|assignment| assignment.allocation_id),
+            |_| {
+                self.register_index_uuid(index, index_uuid);
+                Ok(())
+            },
+        )?;
 
         // Ensure a settings manager exists for this index
         let settings_mgr = self.ensure_settings_manager(index, settings);
@@ -2518,15 +2611,27 @@ impl ShardManager {
             Self::remove_dir_all_with_retry(&stale_snapshot_dir)?;
         }
 
-        let engine = self.open_composite_engine(
-            index,
-            shard_id,
-            &shard_dir,
-            refresh_interval,
-            mappings,
-            open_mode,
-        )?;
-        if let Some(identity) = prepared_identity {
+        let open = || {
+            self.open_composite_engine(
+                index,
+                shard_id,
+                &shard_dir,
+                refresh_interval,
+                mappings,
+                open_mode,
+            )
+        };
+        #[cfg(feature = "protocol-trace")]
+        let engine = match prepared_identity
+            .as_ref()
+            .and_then(|identity| self.protocol_trace_copy_for_identity(shard_id, identity))
+        {
+            Some(copy) => crate::protocol_trace::with_open_copy(copy, open),
+            None => open(),
+        }?;
+        #[cfg(not(feature = "protocol-trace"))]
+        let engine = open()?;
+        if let Some(identity) = &prepared_identity {
             engine
                 .reconcile_term_sequence_state(identity.replica_fence, identity.fence_max_seq_no)?;
         }
@@ -2561,19 +2666,30 @@ impl ShardManager {
         );
 
         let dyn_engine: Arc<dyn SearchEngine> = engine;
-        let mut shards = self.shards.write().unwrap_or_else(|e| e.into_inner());
-        shards.insert(key.clone(), dyn_engine.clone());
-        drop(shards);
-        if let Some(pending) = awaiting_membership {
-            self.peer_recovery_targets
-                .write()
-                .unwrap_or_else(|error| error.into_inner())
-                .insert(
-                    key,
-                    PeerRecoveryTargetState::FinalizedAwaitingMembership(pending),
-                );
-        }
-        Ok(dyn_engine)
+        self.with_current_copy(
+            &key,
+            index_uuid,
+            assignment.map(|assignment| assignment.allocation_id),
+            |_| {
+                if let Some(identity) = prepared_identity {
+                    self.cache_copy_identity(&key, identity);
+                }
+                self.shards
+                    .write()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .insert(key.clone(), dyn_engine.clone());
+                if let Some(pending) = awaiting_membership {
+                    self.peer_recovery_targets
+                        .write()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .insert(
+                            key.clone(),
+                            PeerRecoveryTargetState::FinalizedAwaitingMembership(pending),
+                        );
+                }
+                Ok(dyn_engine)
+            },
+        )
     }
 
     /// Async wrapper for shard open/create on Tokio call sites.
@@ -2588,6 +2704,8 @@ impl ShardManager {
     ) -> Result<Arc<dyn SearchEngine>> {
         let shard_manager = self.clone();
         let uuid_str = index_uuid.into();
+        self.retire_replaced_index_blocking(&index, &uuid_str)
+            .await?;
         tokio::task::spawn_blocking(move || {
             shard_manager
                 .open_shard_with_settings(&index, shard_id, &mappings, &settings, &uuid_str)
@@ -2607,6 +2725,8 @@ impl ShardManager {
     ) -> Result<Arc<dyn SearchEngine>> {
         let shard_manager = self.clone();
         let uuid_str = index_uuid.into();
+        self.retire_replaced_index_blocking(&index, &uuid_str)
+            .await?;
         tokio::task::spawn_blocking(move || {
             shard_manager.open_assigned_shard_with_settings(
                 &index, shard_id, &mappings, &settings, &uuid_str, assignment,
@@ -2627,6 +2747,8 @@ impl ShardManager {
     ) -> Result<Arc<dyn SearchEngine>> {
         let shard_manager = self.clone();
         let uuid_str = index_uuid.into();
+        self.retire_replaced_index_blocking(&index, &uuid_str)
+            .await?;
         tokio::task::spawn_blocking(move || {
             shard_manager.open_primary_assigned_shard_with_settings(
                 &index, shard_id, &mappings, &settings, &uuid_str, assignment,
@@ -2758,6 +2880,9 @@ impl ShardManager {
         let shard_manager = self.clone();
         tokio::task::spawn_blocking(move || {
             let key = ShardKey::new(&index, shard_id);
+            let index_lock = shard_manager.index_lifecycle_lock(&index);
+            let _index_guard = index_lock.read().unwrap_or_else(|error| error.into_inner());
+            shard_manager.with_current_copy(&key, &index_uuid, Some(allocation_id), |_| Ok(()))?;
             let per_shard_lock = shard_manager.shard_open_lock(&key);
             let _guard = per_shard_lock
                 .lock()
@@ -2828,6 +2953,9 @@ impl ShardManager {
         let shard_manager = self.clone();
         tokio::task::spawn_blocking(move || {
             let key = ShardKey::new(&index, shard_id);
+            let index_lock = shard_manager.index_lifecycle_lock(&index);
+            let _index_guard = index_lock.read().unwrap_or_else(|error| error.into_inner());
+            shard_manager.with_current_copy(&key, &index_uuid, Some(allocation_id), |_| Ok(()))?;
             let per_shard_lock = shard_manager.shard_open_lock(&key);
             let _guard = per_shard_lock
                 .lock()
@@ -2886,6 +3014,8 @@ impl ShardManager {
         );
         self.ensure_copy_io_attempt_allowed(&retry_key)?;
         let key = ShardKey::new(index, shard_id);
+        let index_lock = self.index_lifecycle_lock(index);
+        let index_guard = index_lock.read().unwrap_or_else(|error| error.into_inner());
         let per_shard_lock = self.shard_open_lock(&key);
         let guard = per_shard_lock
             .lock()
@@ -2906,7 +3036,11 @@ impl ShardManager {
             }
             Err(error) => return Err(self.record_copy_io_failure(retry_key, error)),
         };
-        {
+        let restored = self.with_current_copy(
+            &key,
+            index_uuid,
+            Some(assignment.allocation_id),
+            |_| {
             let mut targets = self
                 .peer_recovery_targets
                 .write()
@@ -2922,13 +3056,20 @@ impl ShardManager {
                 }
                 None => {
                     targets.insert(
-                        key,
+                        key.clone(),
                         PeerRecoveryTargetState::FinalizedAwaitingMembership(pending),
                     );
                 }
             }
+            self.register_index_uuid(index, index_uuid);
+            Ok(true)
+        },
+        )?;
+        if !restored {
+            return Ok(false);
         }
         drop(guard);
+        drop(index_guard);
         self.clear_copy_io_failure(&retry_key);
         self.open_assigned_shard_with_settings(
             index,
@@ -3245,12 +3386,17 @@ impl ShardManager {
     where
         F: FnOnce() + Send + 'static,
     {
+        self.retire_replaced_index_blocking(&index, &index_uuid)
+            .await?;
         let shard_manager = self.clone();
         tokio::task::spawn_blocking(move || {
             if allocation_id == 0 {
                 anyhow::bail!("peer recovery target has a zero allocation ID");
             }
             let key = ShardKey::new(&index, shard_id);
+            let index_lock = shard_manager.index_lifecycle_lock(&index);
+            let _index_guard = index_lock.read().unwrap_or_else(|error| error.into_inner());
+            shard_manager.with_current_copy(&key, &index_uuid, Some(allocation_id), |_| Ok(()))?;
             let per_shard_lock = shard_manager.shard_open_lock(&key);
             let _guard = per_shard_lock.lock().unwrap_or_else(|e| e.into_inner());
             let shard_dir = shard_manager
@@ -3266,18 +3412,12 @@ impl ShardManager {
             {
                 anyhow::bail!("peer recovery target is already finalized and awaiting membership");
             }
-            shard_manager
-                .shards
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&key);
-            shard_manager
-                .copy_identities
-                .write()
-                .unwrap_or_else(|error| error.into_inner())
-                .remove(&key);
-            shard_manager.isr_tracker.remove_shard(&index, shard_id);
-            shard_manager.register_index_uuid(&index, &index_uuid);
+            let removed =
+                shard_manager.with_current_copy(&key, &index_uuid, Some(allocation_id), |_| {
+                    shard_manager.register_index_uuid(&index, &index_uuid);
+                    Ok(shard_manager.remove_serving_shard_copy(&key))
+                })?;
+            drop(removed);
 
             if shard_dir.try_exists()? {
                 Self::remove_dir_all_with_retry(&shard_dir)?;
@@ -3359,6 +3499,9 @@ impl ShardManager {
                 mut expected_files,
             } = install;
             let key = ShardKey::new(&index, shard_id);
+            let index_lock = shard_manager.index_lifecycle_lock(&index);
+            let _index_guard = index_lock.read().unwrap_or_else(|error| error.into_inner());
+            shard_manager.with_current_copy(&key, &index_uuid, Some(allocation_id), |_| Ok(()))?;
             let per_shard_lock = {
                 let mut locks = shard_manager
                     .open_locks
@@ -3406,7 +3549,10 @@ impl ShardManager {
             committed_boundary.persist(&committed_path)?;
             std::fs::File::open(shard_dir.join("index"))?.sync_all()?;
 
-            shard_manager.register_index_uuid(&index, &index_uuid);
+            shard_manager.with_current_copy(&key, &index_uuid, Some(allocation_id), |_| {
+                shard_manager.register_index_uuid(&index, &index_uuid);
+                Ok(())
+            })?;
             let settings_manager = shard_manager.ensure_settings_manager(&index, &settings);
             let refresh_interval = settings_manager.refresh_interval();
             let refresh_rx = settings_manager.watch_refresh_interval();
@@ -3455,14 +3601,16 @@ impl ShardManager {
                 flush_threshold_rx,
             );
             let dynamic_engine: Arc<dyn SearchEngine> = engine;
-            shard_manager.cache_copy_identity(&key, identity);
-            shard_manager
-                .shards
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(key, dynamic_engine.clone());
-            observer();
-            Ok(dynamic_engine)
+            shard_manager.with_current_copy(&key, &index_uuid, Some(allocation_id), |_| {
+                shard_manager.cache_copy_identity(&key, identity);
+                shard_manager
+                    .shards
+                    .write()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .insert(key.clone(), dynamic_engine.clone());
+                observer();
+                Ok(dynamic_engine)
+            })
         })
         .await
         .map_err(|e| anyhow::anyhow!("blocking peer recovery target finalization failed: {e}"))?
@@ -3703,7 +3851,21 @@ impl ShardManager {
             let source_recovery_lock =
                 shard_manager.source_recovery_lifecycle_lock(&index_uuid, shard_id);
             let _source_recovery_guard = source_recovery_lock.lock_owned().await;
-            shard_manager.ensure_reopen_target(&index, shard_id, &index_uuid, allocation_id)?;
+            let validation_manager = shard_manager.clone();
+            let validation_index = index.clone();
+            let validation_uuid = index_uuid.clone();
+            tokio::task::spawn_blocking(move || {
+                validation_manager.ensure_reopen_target(
+                    &validation_index,
+                    shard_id,
+                    &validation_uuid,
+                    allocation_id,
+                )
+            })
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("blocking shard reopen validation failed: {error}")
+            })??;
             shard_manager
                 .abort_source_recovery_for_shard(&index_uuid, shard_id)
                 .await?;
@@ -3736,6 +3898,8 @@ impl ShardManager {
             };
             let blocking_manager = shard_manager.clone();
             tokio::task::spawn_blocking(move || {
+                let index_lock = blocking_manager.index_lifecycle_lock(&index);
+                let _index_guard = index_lock.read().unwrap_or_else(|error| error.into_inner());
                 let _guard = per_shard_lock.lock().unwrap_or_else(|e| e.into_inner());
                 blocking_manager.ensure_reopen_target(
                     &index,
@@ -3840,12 +4004,14 @@ impl ShardManager {
                     shard_dir
                 );
                 let dyn_engine: Arc<dyn SearchEngine> = engine;
-                blocking_manager
-                    .shards
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(key, dyn_engine.clone());
-                Ok(dyn_engine)
+                blocking_manager.with_current_copy(&key, &index_uuid, Some(allocation_id), |_| {
+                    blocking_manager
+                        .shards
+                        .write()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .insert(key.clone(), dyn_engine.clone());
+                    Ok(dyn_engine)
+                })
             })
             .await
             .map_err(|e| anyhow::anyhow!("blocking shard reopen task failed: {e}"))?
@@ -3857,11 +4023,16 @@ impl ShardManager {
     /// Get an already-open shard engine.
     pub fn get_shard(&self, index: &str, shard_id: u32) -> Option<Arc<dyn SearchEngine>> {
         let key = ShardKey::new(index, shard_id);
-        self.shards
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-            .cloned()
+        self.with_applied_state(|state| {
+            if state.is_some_and(|state| !self.copy_is_current(state, &key)) {
+                return None;
+            }
+            self.shards
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+                .cloned()
+        })
     }
 
     #[cfg(test)]
@@ -3883,7 +4054,7 @@ impl ShardManager {
             .join(index_uuid)
             .join(format!("shard_{shard_id}"));
         std::fs::create_dir_all(&shard_dir)?;
-        self.prepare_assigned_copy_identity(
+        let identity = self.prepare_assigned_copy_identity(
             &key,
             &shard_dir,
             index_uuid,
@@ -3893,6 +4064,7 @@ impl ShardManager {
                 allow_empty_creation: true,
             },
         )?;
+        self.cache_copy_identity(&key, identity);
         self.register_index_uuid(index, index_uuid);
         Ok(())
     }
@@ -3921,23 +4093,30 @@ impl ShardManager {
 
     /// Return all local shard engines for a given index.
     pub fn get_index_shards(&self, index: &str) -> Vec<(u32, Arc<dyn SearchEngine>)> {
-        self.shards
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|(k, _)| k.index == index)
-            .map(|(k, e)| (k.shard_id, e.clone()))
-            .collect()
+        self.with_applied_state(|state| {
+            self.shards
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .iter()
+                .filter(|(key, _)| {
+                    key.index == index && state.is_none_or(|state| self.copy_is_current(state, key))
+                })
+                .map(|(key, engine)| (key.shard_id, engine.clone()))
+                .collect()
+        })
     }
 
     /// Return all local shard engines across all indices.
     pub fn all_shards(&self) -> Vec<(ShardKey, Arc<dyn SearchEngine>)> {
-        self.shards
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .map(|(k, e)| (k.clone(), e.clone()))
-            .collect()
+        self.with_applied_state(|state| {
+            self.shards
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|(key, _)| state.is_none_or(|state| self.copy_is_current(state, key)))
+                .map(|(key, engine)| (key.clone(), engine.clone()))
+                .collect()
+        })
     }
 
     #[cfg(feature = "protocol-trace")]
@@ -4004,68 +4183,10 @@ impl ShardManager {
     /// `reason` is logged with any on-disk removal so destructive paths can be
     /// distinguished in restart diagnostics.
     pub fn close_index_shards_with_reason(&self, index: &str, reason: &'static str) -> Result<()> {
-        let mut shards = self.shards.write().unwrap_or_else(|e| e.into_inner());
-        let keys_to_remove: Vec<ShardKey> = shards
-            .keys()
-            .filter(|k| k.index == index)
-            .cloned()
-            .collect();
-        for key in &keys_to_remove {
-            shards.remove(key);
+        match self.index_uuid(index) {
+            Some(uuid) => self.close_index_incarnation(index, &uuid, reason, true, None),
+            None => self.close_unregistered_index_bookkeeping(index),
         }
-        drop(shards);
-        self.copy_identities
-            .write()
-            .unwrap_or_else(|error| error.into_inner())
-            .retain(|key, _| key.index != index);
-
-        // Clean ISR tracking for this index
-        self.isr_tracker.remove_index(index);
-
-        // Clean settings manager for this index
-        {
-            let mut managers = self
-                .settings_managers
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
-            managers.remove(index);
-        }
-
-        // Look up UUID for this index and delete the UUID-based directory
-        let uuid = {
-            let mut uuids = self.index_uuids.write().unwrap_or_else(|e| e.into_inner());
-            uuids.remove(index)
-        };
-
-        if let Some(uuid) = uuid {
-            self.copy_io_retries
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .retain(|key, _| key.index_uuid != uuid);
-            self.copy_io_attempt_locks
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .retain(|key, _| key.index_uuid != uuid);
-            let index_dir = self.data_dir.join(&uuid);
-            if index_dir.exists() {
-                tracing::warn!(
-                    reason = reason,
-                    index = index,
-                    uuid = uuid.as_str(),
-                    path = ?index_dir,
-                    "Removing shard data directory"
-                );
-                Self::remove_dir_all_with_retry(&index_dir)?;
-                tracing::info!(
-                    reason = reason,
-                    index = index,
-                    uuid = uuid.as_str(),
-                    path = ?index_dir,
-                    "Removed shard data directory"
-                );
-            }
-        }
-        Ok(())
     }
 
     /// Async wrapper for shard shutdown + directory deletion on Tokio call sites.
@@ -4080,58 +4201,22 @@ impl ShardManager {
         index: String,
         reason: &'static str,
     ) -> Result<()> {
-        let mut source_recovery_guards = Vec::new();
-        if let Some(index_uuid) = self.index_uuid(&index) {
-            let mut lifecycle_locks = self
-                .source_recovery_locks
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .iter()
-                .filter(|((uuid, _), _)| uuid == &index_uuid)
-                .map(|((_, shard_id), lock)| (*shard_id, lock.clone()))
-                .collect::<Vec<_>>();
-            lifecycle_locks.sort_unstable_by_key(|(shard_id, _)| *shard_id);
-            for (_, lock) in lifecycle_locks {
-                let guard = match lock.clone().try_lock_owned() {
-                    Ok(guard) => guard,
-                    Err(_) => {
-                        #[cfg(test)]
-                        if let Some(sender) = self
-                            .close_lifecycle_waiting_sender
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .take()
-                        {
-                            let _ = sender.send(());
-                        }
-                        lock.lock_owned().await
-                    }
-                };
-                source_recovery_guards.push(guard);
+        match self.index_uuid(&index) {
+            Some(uuid) => {
+                self.close_index_shards_for_uuid_blocking_with_reason(index, uuid, reason)
+                    .await
             }
-            self.abort_source_recoveries_for_index(&index_uuid).await?;
+            None => {
+                let manager = self.clone();
+                tokio::task::spawn_blocking(move || {
+                    manager.close_unregistered_index_bookkeeping(&index)
+                })
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("blocking index bookkeeping close failed: {error}")
+                })?
+            }
         }
-        let mut open_locks = self
-            .open_locks
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .iter()
-            .filter(|(key, _)| key.index == index)
-            .map(|(key, lock)| (key.shard_id, lock.clone()))
-            .collect::<Vec<_>>();
-        open_locks.sort_unstable_by_key(|(shard_id, _)| *shard_id);
-        let shard_manager = self.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let _open_guards = open_locks
-                .iter()
-                .map(|(_, lock)| lock.lock().unwrap_or_else(|error| error.into_inner()))
-                .collect::<Vec<_>>();
-            shard_manager.close_index_shards_with_reason(&index, reason)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("blocking shard close task failed: {e}"))?;
-        drop(source_recovery_guards);
-        result
     }
 
     fn remove_dir_all_with_retry(path: &std::path::Path) -> Result<()> {
@@ -4272,6 +4357,83 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mgr = ShardManager::new(dir.path(), Duration::from_secs(60));
         (dir, mgr)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue_152_delayed_close_preserves_recreated_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+        let old = manager
+            .open_shard_with_settings_blocking(
+                "idx".into(),
+                0,
+                HashMap::new(),
+                IndexSettings::default(),
+                "old-uuid",
+            )
+            .await
+            .unwrap();
+        let old_lifecycle = manager.source_recovery_lifecycle_lock("old-uuid", 0);
+        let old_guard = old_lifecycle.lock_owned().await;
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+        manager.set_close_lifecycle_waiting_signal(waiting_tx);
+        let closing_manager = manager.clone();
+        let close = tokio::spawn(async move {
+            closing_manager
+                .close_index_shards_blocking_with_reason(
+                    "idx".into(),
+                    SHARD_DATA_REMOVE_REASON_API_DELETE_INDEX,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), waiting_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        manager
+            .quarantine_shard_copy_blocking("idx".into(), 0)
+            .await
+            .unwrap();
+        let new = manager
+            .open_shard_with_settings_blocking(
+                "idx".into(),
+                0,
+                HashMap::new(),
+                IndexSettings::default(),
+                "new-uuid",
+            )
+            .await
+            .unwrap();
+        let writer = new.clone();
+        tokio::task::spawn_blocking(move || {
+            writer.add_document("new", json!({"value": 2})).unwrap();
+            writer.flush().unwrap();
+        })
+        .await
+        .unwrap();
+        assert!(dir.path().join("old-uuid/shard_0").is_dir());
+        assert!(dir.path().join("new-uuid/shard_0").is_dir());
+        drop(old_guard);
+        close.await.unwrap().unwrap();
+
+        assert_eq!(manager.index_uuid("idx").as_deref(), Some("new-uuid"));
+        let serving = manager
+            .get_shard("idx", 0)
+            .expect("new engine must remain open");
+        assert!(Arc::ptr_eq(&serving, &new));
+        assert!(dir.path().join("new-uuid/shard_0").is_dir());
+        drop(old);
+        let reader = serving.clone();
+        let source = tokio::task::spawn_blocking(move || {
+            reader
+                .get_document_with_metadata("new", true)
+                .unwrap()
+                .unwrap()
+                .source
+        })
+        .await
+        .unwrap();
+        assert_eq!(source, json!({"value": 2}));
     }
 
     fn apply_index(
