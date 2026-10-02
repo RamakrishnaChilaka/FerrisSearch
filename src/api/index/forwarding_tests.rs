@@ -10,6 +10,8 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[path = "refresh_tests.rs"]
+mod refresh;
 #[path = "forwarding_review_tests.rs"]
 mod review;
 
@@ -18,6 +20,7 @@ struct ForwardingNode {
     state: AppState,
     url: String,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    refresh_requests: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 struct ForwardingCluster {
@@ -39,10 +42,14 @@ impl Drop for ForwardingCluster {
 
 impl ForwardingCluster {
     async fn start() -> Self {
+        Self::start_with_roles(&[vec![NodeRole::Master], vec![NodeRole::Data]]).await
+    }
+
+    async fn start_with_roles(roles: &[Vec<NodeRole>]) -> Self {
         let gate = Arc::new(TestApplyGate::default());
         let mut nodes = Vec::new();
         let mut addresses = Vec::new();
-        for id in 1..=2 {
+        for id in 1..=roles.len() as u64 {
             let data = tempfile::tempdir().unwrap();
             let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let grpc = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -100,8 +107,18 @@ impl ForwardingCluster {
                 task_manager,
                 state.local_node_id.clone(),
             );
+            let refresh_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let requests = refresh_requests.clone();
             let grpc_task = tokio::spawn(async move {
                 tonic::transport::Server::builder()
+                    .layer(tower::util::MapRequestLayer::new(
+                        move |request: axum::http::Request<tonic::body::Body>| {
+                            if request.uri().path().ends_with("/RefreshShardCopy") {
+                                requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            request
+                        },
+                    ))
                     .add_service(service)
                     .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(grpc))
                     .await
@@ -116,6 +133,7 @@ impl ForwardingCluster {
                 state,
                 url: format!("http://{http_addr}"),
                 tasks: vec![grpc_task, http_task],
+                refresh_requests,
             });
         }
         let leader = &nodes[0].state.raft;
@@ -135,16 +153,18 @@ impl ForwardingCluster {
             })
             .await
             .unwrap();
-        leader
-            .add_learner(
-                2,
-                openraft::BasicNode {
-                    addr: addresses[1].to_string(),
-                },
-                true,
-            )
-            .await
-            .unwrap();
+        for (offset, address) in addresses.iter().enumerate().skip(1) {
+            leader
+                .add_learner(
+                    offset as u64 + 1,
+                    openraft::BasicNode {
+                        addr: address.to_string(),
+                    },
+                    true,
+                )
+                .await
+                .unwrap();
+        }
         leader
             .client_write(ClusterCommand::SetMaster {
                 node_id: "node-1".into(),
@@ -161,11 +181,7 @@ impl ForwardingCluster {
                         host: "127.0.0.1".into(),
                         transport_port: addresses[offset].port(),
                         http_port: node.url.rsplit(':').next().unwrap().parse().unwrap(),
-                        roles: if offset == 0 {
-                            vec![NodeRole::Master]
-                        } else {
-                            vec![NodeRole::Data]
-                        },
+                        roles: roles[offset].clone(),
                         raft_node_id: offset as u64 + 1,
                     },
                 })
@@ -179,14 +195,14 @@ impl ForwardingCluster {
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while nodes[1]
-                .state
-                .cluster_manager
-                .get_state()
-                .master_node
-                .as_deref()
-                != Some("node-1")
-            {
+            while nodes.iter().skip(1).any(|node| {
+                node.state
+                    .cluster_manager
+                    .get_state()
+                    .master_node
+                    .as_deref()
+                    != Some("node-1")
+            }) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
