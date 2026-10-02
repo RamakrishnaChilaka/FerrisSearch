@@ -16,6 +16,9 @@ mod review;
 #[path = "recreate_tests.rs"]
 mod recreate;
 
+#[path = "forwarding_ci_tests.rs"]
+mod ci_failure;
+
 const LOOP_INDEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct ForwardingNode {
