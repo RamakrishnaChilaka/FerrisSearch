@@ -224,6 +224,18 @@ values return `400 illegal_argument_exception` without enqueueing work.
   Follower coordinators use the leader's existing create-index allocator.
   Both paths set `dynamic: true`. Do not repeat primary opening after a
   forwarded create; the receiving write uses the existing lazy-open path.
+- Name creation is atomic at Raft apply, not at HTTP/gRPC pre-checks. Explicit
+  `PUT /{index}` race losers return 400 `resource_already_exists_exception`
+  through both local and forwarded paths, even on a lagging coordinator.
+  Followers forward before building shard allocations; their node-role view
+  may lag as well as their index metadata and must not mask the leader's
+  already-exists rejection with a local no-data-nodes error.
+  Auto-create treats local pre-check existence and typed
+  `IndexAlreadyExistsError` from either path as success, then uses
+  `wait_for_index_metadata` and its existing deadline/503 behavior. Route/open
+  only the locally applied winning metadata, never the candidate that lost.
+  All other create failures remain errors; bulk retains independent per-index
+  metadata results for both routes.
 - Forwarded create, settings, and mapping acknowledgements carry an applied
   version. Settings wait locally before reporting success; create preserves
   its committed acknowledgement when local catch-up expires.
@@ -523,6 +535,14 @@ Document and bulk handlers auto-create missing indices via `auto_create_index()`
 - Leader-local auto-create must filter authoritative Data-role candidates;
   never assign a shard merely because the coordinator is the Raft leader.
 - NEVER calls `raft.client_write()` from a follower node
+- Treats only typed already-exists as a successful race outcome and rereads
+  committed local metadata for POST `_doc`, PUT `_doc`/`_create`, and both bulk
+  routes. No candidate UUID is returned or opened after rejection.
+
+The classification of stale writes already in flight across an explicit delete
+and recreate is unchanged: `ShardReopenAborted` / "applied shard assignment
+changed" can still surface as a non-retryable 500 on forwarded write paths.
+Other commands that can replace metadata are outside this atomic-create fix.
 
 ## Bulk Error Reporting
 - `bulk_index()` and `bulk_index_global()` must preserve the underlying shard forwarding error string in failed item responses. Do not collapse intermittent write or replication failures into a generic "Failed to index to shard" reason, because the ingest clients need the original message to diagnose flaky bulk errors.

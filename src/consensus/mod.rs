@@ -125,11 +125,8 @@ pub async fn bootstrap_single_node(
 pub async fn client_write_checked(
     raft: &RaftInstance,
     command: ClusterCommand,
-) -> Result<(), String> {
-    let response = raft
-        .client_write(command)
-        .await
-        .map_err(|error| error.to_string())?;
+) -> anyhow::Result<()> {
+    let response = raft.client_write(command).await?;
     response.data.into_result()
 }
 

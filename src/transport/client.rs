@@ -1434,6 +1434,23 @@ impl TransportClient {
             .create_index(request)
             .await
             .context("CreateIndex RPC")?;
+        let error_code = CreateIndexErrorCode::try_from(resp.get_ref().error_code)
+            .context("invalid CreateIndex response error code")?;
+        if error_code == CreateIndexErrorCode::AlreadyExists {
+            if resp.get_ref().acknowledged
+                || resp.get_ref().error.is_empty()
+                || !resp.get_ref().response_json.is_empty()
+            {
+                anyhow::bail!(
+                    "invalid already-exists CreateIndex response for index [{index_name}]"
+                );
+            }
+            self.observe_response_state(&resp, "CreateIndex", index_name)?;
+            return Err(crate::consensus::types::IndexAlreadyExistsError {
+                index_name: index_name.to_string(),
+            }
+            .into());
+        }
         if !resp.get_ref().error.is_empty() {
             return Err(anyhow::anyhow!("{}", resp.get_ref().error));
         }

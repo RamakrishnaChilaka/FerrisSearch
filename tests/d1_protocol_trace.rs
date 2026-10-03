@@ -222,10 +222,9 @@ async fn wait_for_primary_sequence(shard_manager: &ShardManager, expected: u64) 
 }
 
 fn assert_command_ok(response: ClusterResponse, action: &str) -> Result<()> {
-    match response {
-        ClusterResponse::Ok => Ok(()),
-        ClusterResponse::Error(error) => anyhow::bail!("{action} failed: {error}"),
-    }
+    response
+        .into_result()
+        .with_context(|| format!("{action} failed"))
 }
 
 fn current_authoritative_state(

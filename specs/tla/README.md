@@ -94,6 +94,12 @@ Applied index-incarnation retirement, stale routing/quarantine cleanup, and
 source settlement triggered by UUID removal/replacement are also Rust
 regression boundaries, outside this fixed-UUID model. The bounded matrix checks
 the unchanged allocation/fencing/admission protocol, not index-name recreation.
+G1 represents the initial committed CreateIndex allocation, not concurrent
+duplicate-name proposals. Atomic duplicate rejection and preservation of
+already-acknowledged documents are checked by the Rust state-machine and
+real-Raft/gRPC `atomic_create_tests.rs` regressions. Duplicate rejection does
+not replace allocations; successful creation still derives them from its
+committed log position.
 
 The Rust trace evidence currently scopes out periodic refresh, automatic or
 API-driven flush, force merge, and their WAL truncation. The harness sets a

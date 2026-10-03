@@ -145,14 +145,28 @@ pub(crate) async fn raft_write(
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     crate::consensus::client_write_checked(&state.raft, cmd)
         .await
-        .map_err(|e| {
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "raft_write_exception",
-                format!("Raft write failed: {e}"),
-            )
-        })?;
+        .map_err(raft_write_error_response)?;
     Ok(())
+}
+
+pub(crate) fn raft_write_error_response(
+    error: anyhow::Error,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if error
+        .downcast_ref::<crate::consensus::types::IndexAlreadyExistsError>()
+        .is_some()
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "resource_already_exists_exception",
+            error,
+        );
+    }
+    error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "raft_write_exception",
+        format!("Raft write failed: {error:#}"),
+    )
 }
 
 /// Middleware that pretty-prints JSON responses when `?pretty` is in the query string.

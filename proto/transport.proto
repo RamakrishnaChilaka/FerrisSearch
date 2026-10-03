@@ -558,10 +558,16 @@ message CreateIndexRequest {
     bytes body_json = 2;      // JSON-encoded create index body (settings + mappings)
 }
 
+enum CreateIndexErrorCode {
+    CREATE_INDEX_ERROR_CODE_NONE = 0;
+    CREATE_INDEX_ERROR_CODE_ALREADY_EXISTS = 1;
+}
+
 message CreateIndexResponse {
     bool acknowledged = 1;
     string error = 2;         // non-empty on failure
     bytes response_json = 3;  // JSON-encoded response body
+    CreateIndexErrorCode error_code = 4;
 }
 
 message DeleteIndexRequest {

@@ -269,6 +269,23 @@ cargo test -- test_name                         # Single test by name
   the real quorum. Keep a short deadline test, exact document results, and
   the two-node 50-iteration no-hook loop. Do not lengthen client timeouts or
   weaken assertions to hide a forwarding race.
+- Atomic-create regressions gate leader apply while real Raft proposals and
+  quorum replication continue. Queue both leader-local and follower-forwarded
+  creates, assert one UUID/allocation survives with no rejection version bump,
+  and prove writes/GET sources/counts use that incarnation. Preserve the
+  delayed-prechecked-proposal regression after primary activation and an
+  acknowledged write, concurrent explicit-create one-winner coverage, and
+  intentionally lagging coordinator 400/503 coverage.
+  `ForwardingCluster::start_with_roles` also supports three-node refresh tests;
+  bind the atomic leader apply gate only to node-1, not every node other than
+  the gated node-2 follower. Other nodes must keep applying while it is paused.
+- `atomic_create_tests.rs` exercises concurrent first POST `_doc`, PUT `_doc`,
+  `_create`, and global/index-scoped multi-index bulk in master-only and
+  all-roles topologies through both coordinators. `FERRIS_ATOMIC_ROUNDS`
+  increases the repeat count for loaded runs. Healthy runs require all 201s,
+  exact acknowledged counts/sources, one UUID, and one create/activation
+  mutation per index. Use ample watchdogs, not new tight wall-clock assertions;
+  leave existing deadline assertions unchanged.
 - A gate entering does not prove the intended CreateIndex committed: it may
   have paused an earlier bootstrap Normal entry. Deadline regressions must
   keep the explicit create request independently polled and observe the

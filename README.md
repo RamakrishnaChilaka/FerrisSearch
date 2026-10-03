@@ -444,6 +444,17 @@ incompatible indices and reindex their source data. For incompatible Raft logs
 or snapshots, wipe the node data directories and recreate the cluster. There is
 no rolling mixed-version compatibility path.
 
+Index creation is atomic by name at Raft apply: duplicate creates do not
+replace an existing UUID, routing, allocations, or documents. Explicit create
+race losers return 400 `resource_already_exists_exception`; document and bulk
+auto-create use the winning committed metadata. Delete then create still
+permits a new incarnation. Older Raft logs containing duplicate CreateIndex
+commands can replay differently under this rule; wipe the node data
+directories and recreate the cluster rather than replaying old-version logs.
+This does not change the possible forwarded 500 classification of writes
+already in flight across an explicit delete/recreate, or other metadata
+replacement commands.
+
 For `local_shards`, each encoded WAL operation is limited to 32 MiB, including
 the frame header and internal `_doc_id` / `_source` wrapper. The maximum usable
 JSON document body is therefore slightly smaller and varies with the document
