@@ -213,6 +213,19 @@ pub async fn replicate_write_with_durability(
         )]);
     }
 
+    #[cfg(feature = "protocol-trace")]
+    transport_client
+        .wait_at_primary_replication_for_test(&crate::protocol_trace::OperationKey::new(
+            &index_uuid,
+            shard_id,
+            primary_term,
+            seq_no,
+        ))
+        .await
+        .map_err(|error| {
+            trace_replication_failure(routing.primary.clone(), None, format!("{error:#}"))
+        })?;
+
     let replica_node_ids = metadata.in_sync_replica_nodes(shard_id);
     #[cfg(feature = "protocol-trace")]
     let trace_operation = crate::engine::SequencedOperation {
@@ -499,6 +512,20 @@ pub async fn replicate_bulk_with_durability(
     else {
         return Ok(Vec::new());
     };
+    #[cfg(feature = "protocol-trace")]
+    if !docs.is_empty() {
+        transport_client
+            .wait_at_primary_replication_for_test(&crate::protocol_trace::OperationKey::new(
+                &route.index_uuid,
+                shard_id,
+                primary_term,
+                start_seq_no,
+            ))
+            .await
+            .map_err(|error| {
+                trace_replication_failure(route.primary_node.clone(), None, format!("{error:#}"))
+            })?;
+    }
     if route.replica_node_ids.is_empty() {
         #[cfg(feature = "protocol-trace")]
         {

@@ -491,6 +491,14 @@ pub struct TransportClient {
 ```
 - **Connection pooling**: reuses gRPC channels per node address
 - `connect(host, port)` — lazy connection establishment (public, used by server for join forwarding)
+- Under the test-only `protocol-trace` feature,
+  `arm_primary_replication_pause_for_test` installs one observable
+  `primary_before_replication` pause for an exact UUID/shard/term/sequence
+  (the start sequence for a homogeneous bulk).
+  It is shared only by clones of that client, consumed once, and waits after
+  primary WAL/apply but before single/delete or homogeneous-bulk fan-out.
+  The pause releases its lock before awaiting. Cancellation is a replication
+  error, never permission to acknowledge the write.
 
 ### Forwarding Methods
 | Method | Purpose |

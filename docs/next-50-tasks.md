@@ -6,7 +6,7 @@
 >
 > **Current-behavior authority:** source and tests.
 >
-> **Last source audit:** 2026-09-27 for FS-001, FS-007, FS-012, FS-013,
+> **Last source audit:** 2026-10-04 for FS-007 and FS-012; 2026-09-27 for FS-001, FS-013,
 > FS-014, FS-019, and FS-022 through FS-026, after PRs #142-#144. Other tasks
 > were last audited on 2026-07-10.
 
@@ -94,7 +94,19 @@ supported API response to durable internal state.
 
 **Class:** Release blocker | **Gate:** 0 | **Depends on:** none
 
-**Status (2026-09-27):** Not started as a framework. PRs #141 and #143 added
+**Status (2026-10-04):** Partial. The `protocol-trace` feature records ordered
+schema-v4 Rust executions and checks seeded real-gRPC runs against the bounded
+D1 model. `tests/stale_primary_failover.rs` adds the named, client-scoped
+`primary_before_replication` pause and a real three-voter metadata partition.
+It holds index/delete/bulk after WAL/apply, promotes through committed Raft
+commands, establishes newer-term fences, and releases the still-live old
+primary's requests. Its result-level assertions cover failed responses,
+unchanged canonical WAL/documents/checkpoints, replica engine reopen, and
+fresh-allocation peer recovery. The named boundary ledger is separate from
+schema-v4 witness traces. A general cross-process failpoint framework and
+publication/hydration/compaction crash boundaries remain open.
+
+**Historical status (2026-09-27):** Not started as a framework. PRs #141 and #143 added
 in-process pause hooks: force-merge and refresh barriers, snapshot and setup
 release channels, and WAL-append and scan barriers. PR #144 added test-only
 failure hooks for WAL writes, engine apply, writer replacement, and
@@ -268,12 +280,24 @@ new sequence/version state, including timeout-after-commit and failover cases.
 
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-007, FS-009, FS-010
 
+**Status (2026-10-04):** Partial. The live stale-primary criterion now has
+deterministic real-Raft/gRPC coverage in `tests/stale_primary_failover.rs`.
+An old primary remains reachable with its stale applied view while the other
+two voters elect a leader and commit promotion. Delayed index/delete/bulk
+requests fail after the targets persist higher-term fences, without changing
+their canonical WAL, documents, or checkpoints. A surviving replica's
+file-backed engine reopens, and the old primary returns only through
+fresh-allocation peer recovery. This closes that bounded evidence gap, not
+the entire FS-007 framework, D5 self-fencing policy, D10 history convergence,
+or every restart/failover concurrency criterion.
+
 **Status (2026-09-30):** Partial. ADR 0001 D1 is implemented: replicas and
 replay apply by per-document `seq_no` and primary term, with gap-aware
 checkpoints, ignored redelivery, term-collision quarantine, and promotion NoOp
 gap fill. Evidence: the `d1_*_regression` suites, the D1 TLA+ model, and TLA+
-validation of traces captured from seeded three-node Rust fault runs. The
-stale-primary criterion below is still unmet, because it needs FS-007.
+validation of traces captured from seeded three-node Rust fault runs. At this
+date, the live stale-primary criterion was still unmet; the October 4 status
+records the newer coverage.
 
 **Status (2026-09-27):** Partial.
 - **Fencing is implemented** (PRs #143-#144), ahead of the listed dependencies:

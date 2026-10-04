@@ -13,10 +13,10 @@ cargo build
 echo "=== 4/7 Run tests ==="
 cargo test
 
-echo "=== 5/7 Build D1 protocol trace harness ==="
-cargo test --features protocol-trace --test d1_protocol_trace --no-run
+echo "=== 5/7 Build write fault-test harnesses ==="
+cargo test --features protocol-trace --lib --test d1_protocol_trace --test stale_primary_failover --no-run
 
-echo "=== 6/7 Validate seeded D1 protocol traces ==="
+echo "=== 6/7 Validate write fault evidence ==="
 ./scripts/tla/test_d1_protocol_trace_ci.sh
 
 echo "=== 7/7 Run bounded TLA+ checks ==="

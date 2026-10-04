@@ -323,6 +323,30 @@ RP-3/RP-5 acceptance matrix.
 The B5 acknowledged-write loss and B6 startup delete resurrection were both
 present at the `8f17172` main baseline.
 
+### Live Stale-Primary Evidence (October 4, 2026)
+
+`tests/stale_primary_failover.rs`, enabled by `protocol-trace`, adds a bounded
+F02 implementation regression with three real OpenRaft voters and production
+gRPC handlers. It pauses index/delete/homogeneous-bulk requests after the old
+primary's WAL/apply, blocks only metadata RPCs involving that voter, and keeps
+its data-plane server reachable. The surviving quorum elects a leader and
+commits exact-allocation promotion; new writes establish durable newer-term
+fences before the paused old requests resume.
+
+The assertions require all old requests to fail, every canonical document and
+its term/sequence identity to remain correct, both targets' physical WALs and
+checkpoints to remain unchanged by the delayed requests, and a surviving
+replica's file-backed engine to reopen with the same durable identity. Healing
+the metadata partition does not readmit the old primary: a committed fresh
+allocation and production peer recovery replace its divergent, unacknowledged
+tail before admission.
+
+`STALE_PRIMARY_EVIDENCE_OUTPUT` saves the observable boundary ledger using
+`ferrissearch.live-stale-primary-evidence/v1`. This ledger is not a schema-v4
+D1 witness and is not checked by TLC. The unchanged C2/fence configurations
+provide separate bounded-model evidence. This test neither covers a full
+process restart nor implements D5's proposed self-fencing or D10 resync.
+
 ### Modeled Requirements For The Rust Fencing Work
 
 These requirements are implemented for the bounded allocation/fencing slice;
