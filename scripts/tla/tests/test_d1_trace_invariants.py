@@ -30,6 +30,43 @@ class D1TraceInvariantTests(unittest.TestCase):
         result[-1]["records_before_end"] = len(result) - 1
         return result
 
+    @classmethod
+    def recovery_trace_with_delayed_ack(
+        cls, *, catch_up: bool
+    ) -> list[dict[str, object]]:
+        events = checker.load_trace(FIXTURES / "valid-recovery-snapshot-barrier.jsonl")
+        ack = next(
+            event
+            for event in events
+            if event["event"] == "client_result" and event["request_id"] == "w2"
+        )
+        events.remove(ack)
+        membership = next(
+            event for event in events if event["event"] == "recovery_membership"
+        )
+        events.insert(events.index(membership) + 1, ack)
+        if not catch_up:
+            events = [
+                event
+                for event in events
+                if not (
+                    event.get("node") == "t"
+                    and event.get("origin") == "recovery"
+                    and event["event"] in {"wal_appended", "operation_processed"}
+                )
+            ]
+            target_state = next(
+                event
+                for event in events
+                if event["event"] == "copy_state" and event["node"] == "t"
+            )
+            target_state["documents"] = [
+                document
+                for document in target_state["documents"]
+                if document["doc"] != "c"
+            ]
+        return cls.insert_before_end(events, [])
+
     def test_response_checkpoint_may_lag_current_replica_checkpoint(self) -> None:
         events = checker.load_trace(
             FIXTURES / "b1-bulk-batch-final-response-checkpoint.jsonl"
@@ -109,6 +146,80 @@ class D1TraceInvariantTests(unittest.TestCase):
             checker.check_trace(mutated)
         self.assertEqual(caught.exception.event, "wal_appended")
         self.assertIn("below the durable fence", str(caught.exception))
+
+    def test_processing_before_durable_fence_raise_is_rejected(self) -> None:
+        for fixture, node, origin in [
+            ("valid-promotion-noop-applied.jsonl", "r", "live_replication"),
+            ("valid-r6-promotion-physical-fill.jsonl", "q", "primary"),
+        ]:
+            with self.subTest(fixture=fixture, origin=origin):
+                events = checker.load_trace(FIXTURES / fixture)
+                checker.check_trace(events)
+                mutated = self.insert_before_end(
+                    [
+                        event
+                        for event in events
+                        if not (
+                            event["event"] == "fence_persisted"
+                            and event["node"] == node
+                            and event["term"] == 3
+                        )
+                    ],
+                    [],
+                )
+                self.assertEqual(len(mutated), len(events) - 1)
+                processed = next(
+                    event
+                    for event in mutated
+                    if event["event"] == "operation_processed"
+                    and event["node"] == node
+                    and event["origin"] == origin
+                    and event["term"] == 3
+                )
+                with self.assertRaises(checker.InvariantViolation) as caught:
+                    checker.check_trace(mutated)
+                self.assertEqual(caught.exception.step, processed["step"])
+                self.assertEqual(caught.exception.event, "operation_processed")
+                self.assertIn("above the durable fence", str(caught.exception))
+
+    def test_ack_accepts_recovered_in_sync_copy_after_catch_up(self) -> None:
+        checker.check_trace(self.recovery_trace_with_delayed_ack(catch_up=True))
+
+    def test_ack_without_recovered_in_sync_operation_is_rejected(self) -> None:
+        events = self.recovery_trace_with_delayed_ack(catch_up=False)
+        ack = next(
+            event
+            for event in events
+            if event["event"] == "client_result" and event["request_id"] == "w2"
+        )
+        with self.assertRaises(checker.InvariantViolation) as caught:
+            checker.check_trace(events)
+        self.assertEqual(caught.exception.step, ack["step"])
+        self.assertEqual(caught.exception.event, "client_result")
+        self.assertIn("in-sync copy t processed seq_no 2", str(caught.exception))
+
+    def test_rejected_recovery_does_not_make_target_authoritative(self) -> None:
+        events = self.recovery_trace_with_delayed_ack(catch_up=False)
+        membership = next(
+            event for event in events if event["event"] == "recovery_membership"
+        )
+        membership["outcome"] = "rejected"
+        checker.check_trace(events)
+
+    def test_recovered_in_sync_copy_requires_final_state(self) -> None:
+        events = checker.load_trace(FIXTURES / "valid-recovery-snapshot-barrier.jsonl")
+        mutated = self.insert_before_end(
+            [
+                event
+                for event in events
+                if not (event["event"] == "copy_state" and event["node"] == "t")
+            ],
+            [],
+        )
+        with self.assertRaises(checker.InvariantViolation) as caught:
+            checker.check_trace(mutated)
+        self.assertEqual(caught.exception.event, "trace_end")
+        self.assertIn("node t has no final copy_state", str(caught.exception))
 
     def test_applied_content_mismatch_is_rejected(self) -> None:
         events = copy.deepcopy(

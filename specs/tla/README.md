@@ -73,6 +73,9 @@ scenario behind the `protocol-trace` Cargo feature. It captures a correct
 schema-v4 trace plus the `arrival-order` and `seq-only-redelivery` mutations.
 The independent invariant checker and TLC accept the 158-event correct trace
 and reject the mutations at `operation_processed` steps 27 and 117.
+The wrapper also checks a promotion-NoOp retry trace: dropped and successful
+transport attempts must preserve one local WAL append and use distinct message
+IDs.
 
 The wrapper also captures `conditional_and_mixed_bulk_write_protocol_trace`:
 three copies, conditional index, create conflicts, ordered delete/create, and
@@ -105,7 +108,9 @@ The Rust trace evidence currently scopes out periodic refresh, automatic or
 API-driven flush, force merge, and their WAL truncation. The harness sets a
 long refresh interval and disables automatic flush because those background
 maintenance callbacks do not yet carry an engine-owned trace copy identity.
-Replay, activation, recovery, and final-state capture commits remain covered.
+Replay, activation, peer-recovery target installation, and final-state capture
+commits are traced. The source-side peer-recovery snapshot commit is not traced;
+see the supported envelope in [`trace/SCHEMA.md`](trace/SCHEMA.md#what-validation-means).
 Do not use these traces as evidence for maintenance/flush interleavings until
 that follow-up instrumentation and randomized scheduling are implemented.
 
@@ -570,8 +575,9 @@ replayable WAL entry after a later crash.
 The suite also retains expected-invalid arrival-order, seq-only collision,
 highest-commit, and replay-stage boundary traces. Converter tests reject
 versions 1 through 3, unknown fields/events, non-consecutive steps, and
-invented copy state. Rust instrumentation is not yet connected, so this is
-validator evidence from checked-in traces, not a captured Rust execution.
+invented copy state. These checked-in fixtures provide validator evidence,
+separate from the Rust capture and mutation checks described under
+[Run the model](#run-the-model).
 
 Two property formulations were retired:
 
