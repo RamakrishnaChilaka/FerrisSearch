@@ -55,6 +55,15 @@ TLA+-only rejections. Use `--fixture` only for hand-written fixtures that omit
 final copy-state observations; it skips that one completeness requirement.
 Rust harness traces always require the strict mode and actual-state sidecar.
 
+`cargo test --features protocol-trace --test stale_primary_failover` separately
+checks a still-live old primary across a real three-voter metadata partition,
+Raft promotion, higher-term fencing, and release of paused index/delete/bulk.
+It verifies canonical identities and WAL/checkpoints, replica engine reopen,
+and fresh-allocation peer recovery. Its named boundary ledger uses
+`ferrissearch.live-stale-primary-evidence/v1`, not schema v4; TLC does not consume
+that ledger. The C2 and durable-fence configurations remain separate bounded
+model evidence, not a witness for this Rust execution.
+
 `validate_trace.sh` defaults to 120 seconds and a 4 GiB Java heap per TLC run.
 Exit code `0` means accepted, `1` means rejected, and `3` with an
 `INCONCLUSIVE` label means TLC timed out, exhausted memory, or failed before

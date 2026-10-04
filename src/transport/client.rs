@@ -42,6 +42,8 @@ pub struct TransportClient {
     timeout: Duration,
     cluster_manager: Option<Arc<crate::cluster::ClusterManager>>,
     acknowledged_versions: Arc<RwLock<HashMap<String, u64>>>,
+    #[cfg(feature = "protocol-trace")]
+    primary_replication_pause: Arc<std::sync::Mutex<Option<PendingPrimaryReplicationPause>>>,
     /// Cached gRPC channels keyed by "host:port".
     /// Uses RwLock for concurrent reads (cache hits) — only blocks on writes (cache misses).
     /// Tonic channels handle HTTP/2 multiplexing and reconnection internally.
@@ -49,6 +51,34 @@ pub struct TransportClient {
     /// Optional TLS endpoint configurator. When set, `connect()` uses https and
     /// applies TLS settings. Populated by `with_tls()` (transport-tls feature only).
     tls_connector: Option<Arc<dyn TlsConnector>>,
+}
+
+#[cfg(feature = "protocol-trace")]
+struct PendingPrimaryReplicationPause {
+    operation: crate::protocol_trace::OperationKey,
+    reached: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(feature = "protocol-trace")]
+pub struct PrimaryReplicationPause {
+    reached: tokio::sync::oneshot::Receiver<()>,
+    release: tokio::sync::oneshot::Sender<()>,
+}
+
+#[cfg(feature = "protocol-trace")]
+impl PrimaryReplicationPause {
+    pub async fn wait_until_reached(&mut self) -> anyhow::Result<()> {
+        (&mut self.reached)
+            .await
+            .context("primary_before_replication ended before reaching the pause")
+    }
+
+    pub fn release(self) -> anyhow::Result<()> {
+        self.release
+            .send(())
+            .map_err(|_| anyhow::anyhow!("primary_before_replication waiter ended before release"))
+    }
 }
 
 /// Trait to abstract TLS configuration behind the feature flag.
@@ -148,6 +178,8 @@ impl TransportClient {
             timeout: super::refresh_deadline::DEFAULT_FORWARD_TIMEOUT,
             cluster_manager: None,
             acknowledged_versions: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(feature = "protocol-trace")]
+            primary_replication_pause: Arc::new(std::sync::Mutex::new(None)),
             channels: Arc::new(RwLock::new(HashMap::new())),
             tls_connector: None,
         }
@@ -159,6 +191,8 @@ impl TransportClient {
             timeout: super::refresh_deadline::DEFAULT_FORWARD_TIMEOUT,
             cluster_manager: None,
             acknowledged_versions: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(feature = "protocol-trace")]
+            primary_replication_pause: Arc::new(std::sync::Mutex::new(None)),
             channels: Arc::new(RwLock::new(HashMap::new())),
             tls_connector: Some(connector),
         }
@@ -170,6 +204,62 @@ impl TransportClient {
     ) -> Self {
         self.cluster_manager = Some(cluster_manager);
         self
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    pub fn arm_primary_replication_pause_for_test(
+        &self,
+        operation: crate::protocol_trace::OperationKey,
+    ) -> anyhow::Result<PrimaryReplicationPause> {
+        let mut pending = self
+            .primary_replication_pause
+            .lock()
+            .map_err(|_| anyhow::anyhow!("primary_before_replication pause lock is poisoned"))?;
+        anyhow::ensure!(
+            pending.is_none(),
+            "primary_before_replication already has an armed pause"
+        );
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *pending = Some(PendingPrimaryReplicationPause {
+            operation,
+            reached: reached_tx,
+            release: release_rx,
+        });
+        Ok(PrimaryReplicationPause {
+            reached: reached_rx,
+            release: release_tx,
+        })
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    pub(crate) async fn wait_at_primary_replication_for_test(
+        &self,
+        operation: &crate::protocol_trace::OperationKey,
+    ) -> anyhow::Result<()> {
+        let pause = {
+            let mut pending = self.primary_replication_pause.lock().map_err(|_| {
+                anyhow::anyhow!("primary_before_replication pause lock is poisoned")
+            })?;
+            if pending
+                .as_ref()
+                .is_some_and(|pause| pause.operation == *operation)
+            {
+                pending.take()
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            pause.reached.send(()).map_err(|_| {
+                anyhow::anyhow!("primary_before_replication observer ended before the pause")
+            })?;
+            pause
+                .release
+                .await
+                .context("primary_before_replication release was cancelled")?;
+        }
+        Ok(())
     }
 
     pub(crate) fn forwarding_request<T>(
@@ -2128,6 +2218,91 @@ mod tests {
     use datafusion::arrow::array::Int64Array;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
+
+    #[cfg(feature = "protocol-trace")]
+    #[tokio::test]
+    async fn primary_replication_pause_is_exact_shared_and_one_shot() {
+        use crate::protocol_trace::OperationKey;
+
+        let client = TransportClient::new();
+        let operation = OperationKey::new("uuid", 2, 7, 11);
+        let mut pause = client
+            .arm_primary_replication_pause_for_test(operation.clone())
+            .unwrap();
+        assert!(
+            client
+                .arm_primary_replication_pause_for_test(operation.clone())
+                .is_err()
+        );
+        for other in [
+            OperationKey::new("other-uuid", 2, 7, 11),
+            OperationKey::new("uuid", 3, 7, 11),
+            OperationKey::new("uuid", 2, 8, 11),
+            OperationKey::new("uuid", 2, 7, 12),
+        ] {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                client.wait_at_primary_replication_for_test(&other),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+        TransportClient::new()
+            .wait_at_primary_replication_for_test(&operation)
+            .await
+            .unwrap();
+        let writer = {
+            let client = client.clone();
+            let operation = operation.clone();
+            tokio::spawn(async move {
+                client
+                    .wait_at_primary_replication_for_test(&operation)
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), pause.wait_until_reached())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!writer.is_finished());
+        pause.release().unwrap();
+        writer.await.unwrap().unwrap();
+        client
+            .wait_at_primary_replication_for_test(&operation)
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "protocol-trace")]
+    #[tokio::test]
+    async fn primary_replication_pause_cancellation_is_an_error() {
+        use crate::protocol_trace::OperationKey;
+
+        let client = TransportClient::new();
+        let operation = OperationKey::new("uuid", 0, 1, 0);
+        let mut pause = client
+            .arm_primary_replication_pause_for_test(operation.clone())
+            .unwrap();
+        let writer = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .wait_at_primary_replication_for_test(&operation)
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), pause.wait_until_reached())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(pause);
+        let error = writer.await.unwrap().unwrap_err();
+        assert!(format!("{error:#}").contains("primary_before_replication release was cancelled"));
+        client
+            .arm_primary_replication_pause_for_test(OperationKey::new("uuid", 0, 1, 1))
+            .unwrap();
+    }
 
     #[test]
     fn decode_sql_batch_response_round_trips_arrow_ipc() {

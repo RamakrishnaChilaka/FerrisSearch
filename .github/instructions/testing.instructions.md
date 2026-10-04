@@ -32,6 +32,7 @@ cargo test --test replication_integration       # Replication tests
 cargo test --test replication_integration --features transport-tls  # Replication tests with encrypted gRPC transport
 cargo test --test rest_api_integration          # REST API integration tests
 cargo test --test restart_regression            # Real restart/rejoin regression
+cargo test --features protocol-trace --test stale_primary_failover  # Live old-primary partition
 cargo test -- test_name                         # Single test by name
 ./scripts/tla/check.sh                           # Fast bounded TLA+ matrix
 ./scripts/tla/check.sh c1-aba-fixed c2-fixed l2  # Selected fixed-design checks
@@ -221,6 +222,16 @@ cargo test -- test_name                         # Single test by name
   `arrival-order` and `seq-only-redelivery` at the causal
   `operation_processed` event in both the independent invariant checker and
   TLC. Keep the seed in failure output so the run is reproducible.
+- Keep the real three-voter `stale_primary_failover` regression separate from
+  the schema-v4 D1 witness harness. Its client-scoped one-shot pause must
+  observe primary WAL/apply before metadata isolation; the still-live primary
+  retains its old applied view while a surviving Raft quorum promotes a copy.
+  Establish durable newer-term fences before releasing index/delete/bulk.
+  Check failed old responses, unchanged target WAL/document identities and
+  checkpoints, a file-backed replica engine close/reopen, and fresh-allocation
+  peer recovery of the old primary. This is not a full process restart or D10.
+  `STALE_PRIMARY_EVIDENCE_OUTPUT` retains the named boundary ledger, not a
+  schema-v4 trace accepted by TLC. CI must exercise this feature-gated target.
 - Pending-target liveness must cover the settlement deadline, source-primary
   restart/reactivation, promotion of a different replica, and target restart
   with durable marker restoration. `RecoveryConverges` means one attempt

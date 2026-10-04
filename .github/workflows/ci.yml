@@ -55,10 +55,10 @@ jobs:
       - name: Run tests
         run: cargo test
 
-      - name: Build D1 protocol trace harness
-        run: cargo test --features protocol-trace --test d1_protocol_trace --no-run
+      - name: Build write fault-test harnesses
+        run: cargo test --features protocol-trace --lib --test d1_protocol_trace --test stale_primary_failover --no-run
 
-      - name: Validate seeded D1 protocol traces
+      - name: Validate write fault evidence
         timeout-minutes: 5
         run: ./scripts/tla/test_d1_protocol_trace_ci.sh
 
