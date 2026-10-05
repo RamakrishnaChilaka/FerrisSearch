@@ -6,7 +6,8 @@
 >
 > **Current-behavior authority:** source and tests.
 >
-> **Last source audit:** 2026-10-04 for FS-007 and FS-012; 2026-09-27 for FS-001, FS-013,
+> **Last source audit:** 2026-10-05 for FS-001 and FS-013; 2026-10-04 for FS-007
+> and FS-012; 2026-09-27 for
 > FS-014, FS-019, and FS-022 through FS-026, after PRs #142-#144. Other tasks
 > were last audited on 2026-07-10.
 
@@ -74,13 +75,23 @@ The rest of the order is unchanged.
 
 **Class:** Release blocker | **Gate:** 0 | **Depends on:** none
 
+**Status (2026-10-05):** Partial. ADR 0001 now selects operation-based durable
+acknowledgement, committed term/allocation-conditioned exclusion, sticky
+authority-scoped exclusion debt, indeterminate post-mutation outcomes, and local
+permit revocation as design targets. The future minimum is one by default with
+an explicit floor of two. The stricter-prefix recovery prose and I02, W02, W08,
+and F09 acceptance cases are reconciled with D1 and the selected target.
+`MC_D2_WriteAck.tla` provides bounded
+proposed/current/unsafe controls, not runtime implementation or completion of
+the entire ADR's retry, promotion, storage-format, and response criteria.
+
 **Status (2026-09-27):** Proposed decision record drafted in
 [`adr/0001-write-consistency-and-retry-contract.md`](adr/0001-write-consistency-and-retry-contract.md);
 not yet accepted.
 
-**Evidence:** `src/transport/server/mod.rs`, `src/replication/mod.rs`, and
-`src/api/index/` can return failure after a primary mutation; client-visible
-version/sequence metadata is incomplete.
+**Historical evidence (2026-09-27):** `src/transport/server/mod.rs`,
+`src/replication/mod.rs`, and `src/api/index/` can return failure after a primary
+mutation; client-visible version/sequence metadata is incomplete.
 
 **Outcome:** An accepted ADR defines operation identity, sequence number,
 primary epoch, acknowledged durability, retry behavior, refresh visibility,
@@ -342,6 +353,14 @@ restart.
 
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-001, FS-011, FS-012
 
+**Status (2026-10-05):** Design/model slice only. The selected D2/D4/D5/D14
+targets and copy-floor choice have bounded safety, rejection, and progress
+checks in `specs/tla/MC_D2_WriteAck.tla`. Production still fails any required
+replica error. No minimum-copy setting, success-after-exclusion, uniform
+indeterminate response type, restart exclusion-debt reconstruction, or D14
+immediate fail-stop policy has shipped. Those require an approved runtime
+slice and result-level transport/restart tests before this task can close.
+
 **Status (2026-09-27):** Evidence changed.
 - Writes now wait only for the Raft-owned in-sync replica set.
 - Any replica failure fails the request, even though the primary already
@@ -355,7 +374,7 @@ restart.
   timeout. The failure detector removes only nodes that stop pinging the Raft
   leader.
 
-**Evidence:** writes wait for all configured replicas, global checkpoint
+**Evidence:** writes wait for the Raft-authoritative in-sync replicas, global checkpoint
 progress is tied to the slowest replica, and failure after local mutation is
 ambiguous.
 

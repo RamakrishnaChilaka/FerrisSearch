@@ -2,7 +2,7 @@
 
 > **Status: Partially implemented.**
 >
-> **Updated:** September 29, 2026.
+> **Updated:** October 5, 2026; the acknowledgement design is reconciled with D1.
 >
 > **Historical design baseline:** `e805f70ff5dba0be9077b9bc32fcd488e837e6d1`
 > (PR #141).
@@ -363,11 +363,13 @@ no later data.
 Differences must remain explicit:
 
 - This design does not copy Lucene's file formats or Elasticsearch's internal RPCs.
-- The first implementation keeps an affected request failed/indeterminate after
-  a replication failure. Later exclusion does not retroactively turn that response
-  into success. A safe, identity-preserving retry is a separate operation attempt.
-  This differs from Elasticsearch's replication action, which can acknowledge
-  the original write after the master confirms the failed copy's exclusion.
+- Current Rust fails an affected request after a required replica error.
+  Later exclusion does not retroactively turn that response into success.
+  The selected D2 target instead allows the original request to succeed after
+  observed committed exclusion, before its response deadline, with all
+  remaining proofs and the minimum-copy floor. This follows the replication
+  action's membership-confirmation rule. A returned indeterminate outcome
+  remains indeterminate; retry is a separate attempt.
 - Universal exactly-once client requests, multi-shard transactions, linearizable
   search, and cross-engine point-in-time reads are not provided by recovery.
 - Comparable recovery performance requires separate equivalent-workload
@@ -402,25 +404,34 @@ multiple machines are configured.
 
 ### Proposed acknowledgement policy
 
+**Selected target, not implemented:** this section follows
+[ADR 0001 D2](adr/0001-write-consistency-and-retry-contract.md#d2-what-an-acknowledgement-means).
+Current Rust still fails required-replica errors after a possible primary
+mutation. A model-only exclusion policy does not change that behavior.
+
 For an active term/configuration, let `I` be its authoritative in-sync allocation
 set, including the primary. A successful write requires:
 
 1. A valid local primary permit for that shard, history, term, and configuration.
-2. Every member of `I` returns an acknowledgement bound to the operation,
-   history, authority term, and configuration, with
-   `durable_applied_prefix > operation.seq_no`.
-3. The acknowledged operation itself is below each returned contiguous durable
-   boundary. A gap-free prefix below the operation is not sufficient.
+2. Every member of the captured `I` has applied and durably stored the exact
+   operation, or has been removed by an observed accepted Raft commit conditioned
+   on its allocation and the issuing primary's authority.
+3. Each remaining copy's proof binds the operation identity/digest, history,
+   allocation, authority term, and configuration. A durable-applied prefix above
+   the operation can supply proof; a lower prefix is not proof that an
+   individually verified operation is absent. Do not require a prefix above
+   the operation when its above-gap applied/durable identity is already verified.
 4. The configured minimum durable-copy requirement.
 5. No concurrent authority transition invalidating that operation's permit.
 
-Proposed setting: `minimum_durable_copies`, default `1` for the existing
+Selected future setting: `minimum_durable_copies`, default `1` for the existing
 single-node profile. A value of `2` blocks writes when fewer than two durable
 copies are eligible. The setting is a minimum, not permission to skip another
 member of `I`; all in-sync copies must respond. Reject impossible combinations
 at configuration time and validate changes through Raft.
 
-This default is a design recommendation, not an approved implementation change.
+This default preserves the single-node profile; neither the setting nor D2's
+success-after-exclusion path exists in current Rust.
 With one surviving eligible copy and a minimum of one, writes can continue after
 safe reconfiguration, but losing that last copy can lose data. With a minimum of
 two, availability is deliberately sacrificed until redundancy is restored.
@@ -482,6 +493,12 @@ Keep bounded gap bookkeeping, or backpressure senders until missing positions
 arrive. Pending out-of-order work must not monopolize the worker needed to fill
 the gap. Validate overflow before reservation or WAL mutation.
 
+This does not prevent operation 9 from acknowledging once every required copy
+has verified its applied/durable identity. Record above-gap completion
+separately, retain the WAL needed to reconstruct it, and advance prefixes only
+when all earlier positions are resolved. A global prefix may lag operations
+that are already acknowledged.
+
 Persist enough metadata to reconstruct prefixes from a verified snapshot and
 checksummed WAL on restart. Never reset an existing copy to a manufactured zero
 and infer that it is a fresh replica. Global progress may be conservatively
@@ -516,13 +533,15 @@ error, and make the allocation unavailable pending verified repair. Removal
 from authoritative eligibility still requires a conditional Raft transition.
 
 The durable format must distinguish a committed durability frontier from an
-unsealed trailing attempt. For the initial design, acknowledgement requires:
+unsealed trailing attempt. For the selected design, acknowledgement requires:
 
-1. Complete, checksummed WAL records through the acknowledged prefix are fsynced.
+1. The operation's complete, checksummed WAL record is fsynced at its physical
+   generation/offset. This may cover a logical position above a sequence gap.
 2. A checksummed durability descriptor identifying generation, physical end,
-   prefix, and history digest is atomically published and durably synced,
-   including its directory entry.
-3. The engine has applied that same contiguous prefix.
+   contiguous prefix, verified above-gap positions, and history digest is
+   atomically published and durably synced, including its directory entry.
+3. The engine has applied the exact operation. The descriptor proves its
+   protected physical range even when the contiguous prefix is lower.
 
 Descriptor writes may be group-committed, but their durability cannot trail a
 successful response. An implementation can propose a different proven framing
@@ -530,12 +549,17 @@ scheme in FS-005; it cannot omit the frontier distinction to obtain throughput.
 
 On restart, discard a torn final unsealed attempt only when a valid durability
 descriptor proves it lies wholly beyond the last acknowledged durability
-frontier. A checksum/length mismatch within that frontier, mid-log corruption,
-or an ambiguous/corrupt descriptor makes the copy ineligible and requires
-verified peer/snapshot repair. Never scan past an invalid interior record or
-silently truncate from it while retaining later successes. Complete records
-beyond the frontier are unacknowledged evidence for canonical reconciliation,
-not permission to resume the old writer.
+physical frontier. A checksum/length mismatch within that frontier, mid-log
+corruption, or an ambiguous/corrupt descriptor makes the copy ineligible and
+requires verified peer/snapshot repair. Never scan past an invalid interior
+record or silently truncate from it while retaining later successes. Complete
+records beyond the protected physical frontier are unacknowledged evidence
+for canonical reconciliation, not permission to resume the old writer.
+Do not classify a record as unacknowledged merely because its logical sequence
+is above a lagging contiguous/global prefix. Sparse acknowledged records inside
+the protected physical range must remain recoverable. FS-005 still owns the
+unimplemented descriptor/framing format; this is a design requirement, not a
+claim about current on-disk bytes.
 
 Do not rely solely on persisting a local `FAILED` flag to the same failing disk.
 Every restart must revalidate authority and storage; a former primary requires
@@ -557,12 +581,15 @@ alone cannot restore eligibility: the copy needs normal recovery/readmission.
 3. It sequences and journals the mutation, applies it, and establishes its own
    durable frontier before replicating the same identity to the required
    copies. Version 1 does not overlap replica dispatch with the primary's own
-   uncertain fsync. Replica acknowledgements carry durable-applied prefixes,
-   not receipt into a queue.
+   uncertain fsync. Replica acknowledgements prove the exact operation's
+   applied/durable identity and also report gap-aware prefixes; queue receipt
+   or a prefix below the operation is not sufficient proof.
 4. Replicas enforce committed source authority, term, and history. A replica
    never allocates a replacement sequence.
-5. The primary gathers the required proof before success. On failure it reports
-   the error/indeterminate outcome and schedules repair or exclusion.
+5. The primary gathers the required proof before success. A failed required
+   copy may settle through the conditional exclusion below. Without the proof
+   before the response deadline, report the error/indeterminate outcome and
+   schedule repair or exclusion.
 
 Term permits coordinate the entire operation with configuration changes, without
 holding a Tantivy writer lock across network I/O. Promotion on a candidate drains
@@ -577,8 +604,14 @@ acknowledged operation and then promote an unproven copy. Excluded copies become
 stale/recovering and lose promotion eligibility.
 
 Changing the set requires a per-shard admission barrier and a unique transition
-ID. Drain in-flight operations and keep new admission closed until the
-transition is definitively settled. At any point admitting writes, the
+ID. Failed-copy exclusion closes new admission and blocks later responses until
+the transition is definitively settled. It must not wait for the affected
+request to obtain the failed target's ACK before committing its exclusion:
+that would deadlock the very response D2 is trying to settle. Already admitted
+requests retain their captured set and can complete only with exact operation
+proof from every remaining target plus observed committed exclusion.
+Membership growth, primary replacement, and destructive copy transitions still
+drain/cancel the relevant in-flight permits. At any point admitting writes, the
 primary's required-ack set must contain the committed in-sync set.
 
 A linearizable read still showing the old generation does **not** cancel an
@@ -596,9 +629,11 @@ right to resume with guessed membership. Persist/reconstruct the unresolved
 transition state; if authority remains unavailable, leave the shard unavailable
 for new writes without holding a worker or an unbounded queue.
 
-An affected write that already failed remains failed/indeterminate. Subsequent
-writes use the committed set and minimum-copy policy. A retry must identify the
-original operation, not allocate a new position just because a response was lost.
+An affected write whose indeterminate response has already returned remains
+indeterminate. Before that deadline, committed exclusion can allow success if
+all remaining copy and minimum requirements hold. Subsequent writes use the
+committed set and minimum-copy policy. A retry must identify the original
+operation, not allocate a new position just because a response was lost.
 
 ### A deduplication hit is not an acknowledgement
 
@@ -610,9 +645,10 @@ To return success for a retained operation at position `s`, the current ACTIVE
 primary must acquire a current permit, verify that the same operation/digest is
 in canonical history, and satisfy all five acknowledgement conditions in
 Section 4 under its current committed configuration. In particular, every
-required copy must attest to a durable-applied prefix above `s`. It may reuse
-validated current-term progress evidence, or repair/wait for missing progress;
-the stored local result alone is never sufficient.
+remaining required copy must attest to that exact applied/durable operation,
+whether through an individually verified above-gap record or a same-history
+prefix that covers `s`. It may reuse validated current-term proof, or repair/wait
+for missing evidence; the stored local result alone is never sufficient.
 
 Otherwise return pending/indeterminate or wait on the original attempt within
 the request budget. An obsolete primary cannot manufacture success from its
@@ -635,16 +671,18 @@ while establishing fresh acknowledgement proof under the new authority.
    the recovering process temporarily has an older local Raft view.
    An unavailable report is not invented as an empty history.
 3. **Establish canonical history:** recover the candidate's durable records,
-   preserve at least its own verified durable-applied prefix, and resolve its
-   old-term tail and gaps. Never trim to a lagging global-prefix observation.
+   preserve its own verified durable-applied prefix and protected above-gap
+   operations, and resolve its old-term tail and gaps. Never trim to a lagging
+   global-prefix observation.
    Previously acknowledged operations must exist on this candidate by the
    in-sync invariant. Unacknowledged operations may survive; failure responses
    did not promise rollback. Version 1 also adopts non-conflicting verified
    same-history records from the frozen peer reports. Do not no-op a reservation
    for which a reachable eligible peer has a matching valid record. If the
    candidate has no valid record at a position and frozen peers disagree on
-   its contents, that position was not acknowledged under the required-prefix
-   rule. The fixed version-1 rule is a new-term no-op, with the disagreeing
+   its contents, and no verified snapshot/protected record covers it, that
+   position was not acknowledged under the all-copy operation-proof rule.
+   The fixed version-1 rule is a new-term no-op, with the disagreeing
    copies excluded for post-activation repair. This explicit conflict case
    is the exception to adopting the peers' otherwise matching record. Reconstruct
    canonical state in sequence order and set `next_seq_no` beyond every

@@ -3,6 +3,8 @@
 > **Status: Proposed protocol acceptance; limited RP-1, in-sync tracking, primary-term, and bounded file-recovery coverage is recorded below.**
 >
 > **Date:** September 24, 2026.
+> **Acknowledgement design revision:** October 5, 2026; I02, W02, W08, and
+> F09 follow the selected operation-proof contract, not a shipped D2 policy.
 >
 > Contract: [Shard replication and recovery](recovery-protocol.md).
 > Source baseline: `8f17172` (merged PR #143).
@@ -101,7 +103,7 @@ acknowledgement policy, or production parity.
 | ID | Boundary or scenario | Required result | Layer |
 |---|---|---|---|
 | I01 | Empty copy and a copy containing only sequence zero. | Their prefixes are 0 and 1 respectively; full recovery includes sequence zero. | U, T, P |
-| I02 | Deliver sequences 0, 2, then 1, including an index/delete pair for the same document. | Prefix stops at 1 until sequence 1 is resolved; no success for position 2 before prefix 3; exact values/deletes match the oracle, not arrival order. | U, T |
+| I02 | Deliver sequences 0, 2, then 1, including an index/delete pair for the same document. | Prefix stops at 1 until sequence 1 is resolved. Position 2 may acknowledge with exact applied/durable proof on every required copy; only resolution of sequence 1 advances the prefix to 3. Exact values/deletes match the oracle, not arrival order. | U, T |
 | I03 | Duplicate a valid operation/chunk and then reuse its identity with different content. | Duplicate returns its original outcome without a new sequence; conflicting reuse fails before mutation. | U, T |
 | I04 | Recreate an index with the same name; deliver old requests. | Index UUID/history/allocation mismatch rejects them without affecting new data. | T, P |
 | I05 | Replace a node's data directory while retaining its node name. | New storage has a new allocation and cannot inherit old in-sync/promotion eligibility. | P |
@@ -114,13 +116,13 @@ acknowledgement policy, or production parity.
 | ID | Boundary or scenario | Required result | Layer |
 |---|---|---|---|
 | W01 | Concurrent single/bulk/update/delete calls through different coordinators. | Each operation keeps its own term/sequence/ID and result on primary and replicas. | T, P |
-| W02 | Primary durable mutation followed by replica timeout/error. | Affected request is failed/indeterminate with the actual cause, never a false success or guaranteed rollback. | T, P |
+| W02 | Primary durable mutation followed by replica timeout/error. | Success requires observed committed conditional exclusion, exact proof from every remaining copy, and the minimum-copy floor before the response deadline. Otherwise return indeterminate with the actual cause, never false success or guaranteed rollback. An already returned indeterminate result stays indeterminate. | T, P |
 | W03 | Drop the primary's response to the coordinator after required copies persist the operation; retry the same internal envelope within its retained epoch. | Original mutation identity/result is reused without another sequence, but success requires current authority and required-copy proof. A fresh external request without that identity is not assumed deduplicated. | T, P |
 | W04 | Retry after the supported retention window. | Explicit expired/unknown outcome; the internal retry is not silently accepted as a new write. | U, T |
 | W05 | Conditional update/delete races with the same expected term/sequence. | Exactly one conflicting mutation wins; restart/promotion does not reset the version contract. | T, P |
 | W06 | Validate malformed bulk items and interrupt a partially completed bulk. | Per-item receipts/errors remain attributable; successful items survive, failed/indeterminate items are not relabelled successful. | T, P |
 | W07 | Skew clocks, flush/truncate the WAL within a retained epoch, promote a primary, install a snapshot, and retire the epoch. | Supported result/digest records survive flush, truncation, promotion, and install until committed retirement; an expired envelope is rejected, not reapplied, regardless of local clock readings. | U, T, P |
-| W08 | Retry while a required replica lacks the operation, after exclusion commits, on an obsolete primary, and on the new primary after adoption. | A local dedup hit cannot create success. Only current ACTIVE authority plus required-copy durable-prefix proof can confirm the original mutation without reallocation. | T, P |
+| W08 | Retry while a required replica lacks the operation, after exclusion commits, on an obsolete primary, and on the new primary after adoption. | A local dedup hit cannot create success. Only current ACTIVE authority plus exact required-copy applied/durable operation proof can confirm the original mutation without reallocation; an individually verified above-gap record does not require a covering contiguous prefix. | T, P |
 
 ## D. Durable Storage Boundaries
 
@@ -145,7 +147,7 @@ acknowledgement policy, or production parity.
 | F06 | A late response for an operation already copied to the candidate arrives after promotion. | The operation is retained; delayed response delivery is not mistaken for proof that a stale new mutation was accepted. | T, P |
 | F07 | No current in-sync copy survives, but a stale copy is reachable. | Automatic recovery remains unavailable; no acknowledged-loss promotion. Explicit data-loss recovery, if later supported, creates a new history. | P |
 | F08 | Isolate metadata quorum, including losing one voter from a two-voter metadata configuration. | Reconfiguration follows actual Raft quorum rules; data-copy count is never treated as metadata authority. No minority promotion. | P |
-| F09 | Delay sequence s, deliver s+1, lag global-prefix propagation, then crash the primary at each ack boundary. | No success above an unresolved gap; promotion preserves the candidate's own durable acknowledged history even when the known global prefix is lower. | T, P |
+| F09 | Delay sequence s, deliver s+1, lag global-prefix propagation, then crash the primary at each ack boundary. | Success for s+1 requires exact applied/durable proof on every required copy despite a lower prefix. No prefix skips s; retained WAL and promotion preserve protected acknowledged history above the lagging global prefix. | T, P |
 | F10 | Give an old eligible replica a conflicting tail and an older snapshot; crash/supersede promotion during reconciliation, including conflicting peer records where the candidate lacks a position. | No authoritative copy is destructively rolled back before committed exclusion/activation. Missing-candidate conflicts use the declared no-op/exclusion rule; every later eligible promotion preserves acknowledged history. | F, P |
 | F11 | Crash a primary with non-conflicting in-flight records spread across survivors; restart a reporting peer and deliver old-term work; after promotion, lose the new primary's shard storage while retaining metadata quorum. Also exercise genuine conflicts separately. | Durable peer fences reject delayed old-term work; new incarnation requires a fresh report. Normal tails preserve redundancy by append-only resync. Genuine-conflict fallback enforces the selected minimum and reports unavailable after loss of the only eligible copy. | T, F, P |
 
