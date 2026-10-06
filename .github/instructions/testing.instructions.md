@@ -42,6 +42,12 @@ cargo test -- test_name                         # Single test by name
 ./scripts/tla/check.sh storage-replica storage-primary storage-primary-no-replica
 ./scripts/tla/check.sh storage-apply-replica storage-apply-primary storage-apply-primary-no-replica
 ./scripts/tla/check.sh s1-combined-replica s1-combined-primary s1-combined-liveness
+./scripts/tla/check.sh d2-current d2-smoke-one d2-smoke-two
+./scripts/tla/check.sh d2-proposed-one d2-proposed-two  # Exhaustive two-write local checks
+./scripts/tla/check.sh d2-early-exclusion d2-no-sticky d2-minimum-bypass
+./scripts/tla/check.sh d2-stale-self-fence d2-no-self-fence d2-gap-operation d2-gap-prefix d2-debt-liveness
+./scripts/tla/check.sh d2-quorum-loss-witness d2-exclusion-witness d2-fail-stop-witness
+./scripts/tla/check.sh d2-quorum-loss-witness d2-quorum-loss-negative
 ./scripts/tla/check.sh trace-validator          # Converter and trace acceptance/rejection
 ./scripts/tla/validate_trace.sh path/to/trace.jsonl
 ./scripts/tla/check_d1_trace_invariants.py path/to/trace.jsonl
@@ -82,6 +88,21 @@ cargo test -- test_name                         # Single test by name
   `d1-promotion-replay-noop`, `d1-trace-actions`, `trace-validator`,
   `two-shard`, `fixed-crash`, and
   `fixed-partition` are expected-pass configurations.
+- D2 policy checks are selected design targets, not Rust fixes. Keep
+  `d2-current`, both `d2-smoke-*` and local-only `d2-proposed-*` floors,
+  `d2-stale-self-fence`, `d2-gap-operation`, and `d2-debt-liveness` green.
+  Preserve the named unsafe controls for uncommitted exclusion, forgotten
+  debt, minimum bypass, and ignored self-fencing; `d2-gap-prefix` retains the
+  rejected prefix-gating temporal stutter. The three `d2-*-witness` checks
+  deliberately violate negated reachability targets while keeping the safety
+  invariants: healthy all-copy ACK without metadata quorum, one-copy ACK after
+  committed exclusions, and no-WAL rejection after local post-WAL fencing.
+  The quorum-loss witness must use ACK-time certificate state.
+  `d2-quorum-loss-negative` forbids ACK during an outage and must keep that
+  negated witness invariant: a later outage cannot prove an earlier ACK.
+  Document fixed operation shapes, replica symmetry, fairness, and the
+  abstract post-WAL permit failure. Do not infer byte-level I/O, restart-debt,
+  dynamic configuration, ABA, or D10 proof from these bounds.
 - An expected-pass failure stops the modeling task. Preserve the raw trace,
   decide whether the model or implementation is wrong, and do not weaken an
   invariant or transition merely to obtain green output.

@@ -3,6 +3,8 @@
 - **Status:** Partially implemented. D1, D13, and the marked parts of D8, D9, D11,
   and D12 are implemented; the remaining decisions are proposed.
 - **Date:** 2026-09-27
+- **Design revision:** 2026-10-05; acknowledgement/failure targets selected for
+  bounded modeling, not implemented in production.
 - **Backlog:** [FS-001](../next-50-tasks.md#fs-001--decide-the-write-consistency-and-retry-contract)
 - **Roadmap:** Gate 0 deliverable "accepted write acknowledgement, retry, OCC,
   and version semantics"; invariants 6.1.1-6.1.6 in
@@ -78,6 +80,9 @@ source and the Elasticsearch 7.10 reference, the fork point.
   every replica before the acknowledgement; `async` can lose acknowledged
   writes. Durability is a dynamic per-index setting
   ([translog](https://github.com/elastic/elasticsearch/blob/v7.10.2/docs/reference/index-modules/translog.asciidoc#L25-L63)).
+  The write action syncs its operation's physical translog location, not a
+  contiguous logical sequence prefix
+  ([TransportWriteAction](https://github.com/opensearch-project/OpenSearch/blob/3.8.0/server/src/main/java/org/opensearch/action/support/replication/TransportWriteAction.java#L442-L513)).
 - **Sequence numbers:** each operation is identified by (term, seq_no). The
   global checkpoint is the minimum persisted local checkpoint over in-sync
   copies. On promotion, the new primary fills gaps with no-ops and resyncs
@@ -167,6 +172,11 @@ Known limitations of the implementation:
 
 ### D2. What an acknowledgement means
 
+**Status (2026-10-05):** Selected design target; not implemented. Rust still
+fails a request when any required synchronous replica fails, including after
+the primary has mutated. This revision reconciles D2 with D1's implemented
+operation-based acknowledgement; it does not change that runtime policy.
+
 A 2xx write response means all of the following hold:
 
 1. The primary validated its activation, exact allocation, and term before the
@@ -178,26 +188,64 @@ A 2xx write response means all of the following hold:
    guard that peer-recovery admission takes exclusively. The command is
    conditional on the copy's exact allocation ID and the operation's primary
    term.
+4. The remaining eligible copies satisfy `minimum_durable_copies`. Its future
+   default is **1**, preserving the single-node profile; **2** is an explicit
+   redundancy requirement. The primary counts as one copy. This is a lower
+   bound, not permission to ignore another in-sync allocation. Reject values
+   greater than the configured primary-plus-replica capacity.
+5. The primary's permit has not been locally revoked, and no unresolved
+   exclusion in that authority epoch remains acknowledgement-blocking.
 
-A failed replica is therefore removed, as in OpenSearch, instead of failing the
-client request.
+**Durability is operation-based, not prefix-gated.** Each remaining required
+copy must prove that this exact term/sequence operation is applied and durable.
+An exclusive durable prefix above the sequence can supply that proof only when
+bound to the same history and allocation. A lower prefix cannot disprove
+durability of an individually verified operation above a gap. Do not wait for
+an unrelated earlier position merely to acknowledge this operation.
+Contiguous local/global prefixes still govern WAL retention, safe truncation,
+recovery boundaries, and prefix reconstruction. They must never jump a gap.
+This preserves the implemented D1 rule and the existing above-gap witnesses.
+
+With the default of one, losing the last remaining durable copy can lose data;
+metadata quorum does not replace document copies. With two, writes remain
+unavailable until enough eligible copies exist. `request` durability is the
+scope of these guarantees; asynchronous fsync retains D3's weaker contract.
+
+A replica failure need not fail the original request when observed committed
+exclusion leaves enough eligible durable copies and every condition above holds.
 
 - **Retries before removal:** the primary may retry transient replica errors
-  within the request deadline, but only after D1 makes replica apply idempotent
-  and order-independent.
+  within the request deadline using the same D1 operation identity. An internal
+  retry never allocates another sequence; this is not durable external-client
+  deduplication, which remains FS-011.
 - **Reporting:** `_shards.total`, `_shards.successful`, and `_shards.failed`
   report what happened.
 - **Removal that cannot commit:** if the removal cannot commit before the
   deadline, for example because there is no Raft leader, the response is
   indeterminate (D4).
 - **Pending removals stick:** a pending removal stays pending after an
-  indeterminate response. No later acknowledgement on that shard may complete
-  until the removal commits, so a copy can never stay in sync with a hole.
+  indeterminate response. It is bound to the index UUID, primary allocation,
+  primary term, failed allocation, and transition identity. Close new write
+  admission in that authority epoch and block acknowledgement of already
+  admitted later requests until the exclusion is definitively settled.
+  A proposal, transport timeout, or stale view is not a committed removal.
+  Observe the accepted committed result or the applied removal. A definitive
+  stale-authority rejection revokes the old local permit instead of authorizing
+  continued writes. Reconstruct unresolved state before activation after a
+  process restart; that cross-restart work remains a runtime prerequisite.
+- **A deadline is not rollback:** if the primary WAL may have changed, report
+  D4's indeterminate outcome. A failed request may appear later through replay
+  or recovery. An observed accepted exclusion can allow the original request
+  to succeed only before its response budget expires and only if every other
+  condition above holds. An already returned indeterminate result is not
+  retroactively converted to success.
 
-This replaces the global rule that synchronous replication failures are request
-failures. It also amends items 11 and 19 of the "Required Rust contract"
-section in `specs/tla/README.md`; item 19's bounded transport timeout stays.
-The model's acknowledgement rule must change before FS-013 implements D2.
+Implementing D2 would replace the global rule that synchronous replication
+failures are request failures and amend items 11 and 19 of the "Required Rust
+contract" in `specs/tla/README.md`; item 19's bounded transport timeout stays.
+The [separate D2 model](../../specs/tla/README.md#proposed-write-acknowledgement-and-failure-contract)
+checks the selected target. The current shared model and Rust contract remain
+unchanged until FS-013 implements it.
 
 ### D3. Durability modes
 
@@ -210,6 +258,11 @@ The model's acknowledgement rule must change before FS-013 implements D2.
   shard.
 
 ### D4. Outcome classes
+
+**Status (2026-10-05):** Selected target response contract; not implemented as
+a uniform HTTP/transport error classification. Preserve underlying causes and
+operation-owned term/sequence metadata when known; never infer a receipt from
+a later shared checkpoint.
 
 Every write response is in exactly one class:
 
@@ -231,6 +284,9 @@ Every write response is in exactly one class:
 
 ### D5. Stale primaries and missing leaders
 
+**Status (2026-10-05):** Existing replica fences are implemented; local
+self-fencing after a rejected old-primary exclusion remains a selected target.
+
 - **Existing fences stay:** primary validation at admission; replica checks of
   UUID, allocation, and term against the durable fence; and conditional
   promotion.
@@ -238,8 +294,15 @@ Every write response is in exactly one class:
   operation's term, so a stale primary's removal is rejected. The stale primary
   then answers indeterminate and stops accepting writes for that allocation.
 - **No Raft leader:** a primary that sees no leader may still acknowledge a
-  write, but only when every in-sync replica applied it, because D2 removal
-  needs a leader. Otherwise the response is indeterminate.
+  write, but only when every required in-sync allocation applied it durably,
+  the minimum-copy floor holds, and no unresolved exclusion or revoked permit
+  exists. Data copies are not a metadata quorum. D2 exclusion needs a
+  committed Raft decision; otherwise the affected post-mutation response is
+  indeterminate.
+- **Late responses:** delivery of a success already established for a retained
+  canonical operation can occur after promotion. It is not permission to
+  admit another old-term mutation or to acknowledge from an obsolete dedup
+  table without fresh authority/copy proof.
 
 ### D6. Retry semantics
 
@@ -504,11 +567,15 @@ In-sync copies must not keep divergent operations after a failover:
    restart, the primary fills gaps and resyncs operations above the global
    checkpoint. The restart case matters because a sticky pending removal (D2)
    lives only in the old process.
-4. **Replica rollback:** a replica rolls back operations above the global
-   checkpoint that belong to an older term. Trimming the WAL cannot undo
-   operations Tantivy already committed, so rollback either replays from a safe
-   commit at or below the global checkpoint, or re-recovers the copy through
-   peer recovery.
+4. **Replica reconciliation:** compare older-term suffixes with the promoted
+   canonical history. A lagging global checkpoint or an older term alone is
+   not permission to discard an acknowledged above-gap operation. Preserve
+   protected history and remove a conflicting copy from authoritative
+   eligibility before repair. Trimming the WAL cannot undo operations Tantivy
+   already committed, so repair either replays from a verified safe commit or
+   re-recovers the copy through peer recovery. The
+   [promotion protocol](../recovery-protocol.md#promotion-protocol) owns this
+   unimplemented reconciliation.
 
 ### D11. Concurrency control
 
@@ -620,6 +687,10 @@ remain unimplemented.
 
 ### D14. Engine and WAL failures on the write path
 
+**Status (2026-10-05):** Selected target; not implemented by the current
+bounded apply-I/O escalation policy. The model treats local permit invalidation
+abstractly and does not prove byte-level WAL/fsync failure detection.
+
 - **Primary engine failure:** a post-WAL engine failure makes the operation
   indeterminate and fails the copy. The copy is promote-only when an in-sync
   candidate exists, or marked unavailable otherwise.
@@ -632,6 +703,11 @@ remain unimplemented.
 - **Replica failure:** any replica apply failure removes the copy through D2. The
   primary validates documents before the WAL append, so a replica-side
   validation failure means divergence, not a user error.
+- **Local action precedes metadata settlement:** revoke the affected copy's
+  write/durability-ack permit immediately. A missing metadata quorum cannot
+  authorize another mutation or a retry that treats a later successful fsync
+  as proof of the failed attempt. Reporting and removal/promotion still use
+  conditional Raft commands, never follower-local metadata mutation.
 
 ## 3. Failure scenarios
 
@@ -640,7 +716,7 @@ remain unimplemented.
 | Client timeout after the primary committed | The coordinator returns 500 `write_outcome_unknown`, with term and `seq_no` if known. A retry follows D6. |
 | Primary crashes after the WAL append, before the response | Indeterminate. If a replica is promoted, D10 decides whether the operation survives on every copy. |
 | Concurrent writes reach a replica out of order | The replica applies by per-document `seq_no` (D1), and its final state matches the primary's. |
-| One replica fails to apply | It is removed through D2, then the write is acknowledged with `_shards.failed = 1`. It rejoins through peer recovery. |
+| One replica fails to apply | It is committed out through D2; acknowledgement then requires all remaining copies and the configured minimum, with `_shards.failed = 1`. Below the minimum or without settled exclusion, the post-mutation result is indeterminate. It rejoins through peer recovery. |
 | Replica removal cannot commit (no leader) | Indeterminate. The removal stays pending, and later acknowledgements wait for it (D2). |
 | Stale primary after promotion | Replica applies are rejected by term. The stale primary answers indeterminate and fences itself, and the client retries on the new primary. |
 | Duplicate client retry | Follows D6 for each operation type. Exactly-once needs FS-011. |
@@ -676,11 +752,14 @@ remain unimplemented.
 
 ## 5. Consequences
 
-- A replica fault no longer blocks writes, at the cost of a peer recovery of
-  that copy. Transient faults can cause recovery churn. The in-request retry
-  budget bounds it. An allocation retry limit, which is deferred work, would
-  bound repeated failures.
-- The write path waits for a Raft commit only when it removes a replica.
+- The selected D2 target can restore writes after committed failed-copy
+  exclusion and peer recovery, but only while the configured minimum holds.
+  Unresolved exclusions remain unavailable. Transient faults can cause
+  recovery churn; the in-request retry budget bounds an attempt, not repeated
+  failed allocations. A separate allocation retry limit remains deferred.
+- The target write path waits for Raft only when eligibility must change; an
+  all-copy durable response without pending exclusion needs no new metadata
+  commit. Current Rust retains its fail-request behavior.
 - Clients get distinct classes for "not executed" and "indeterminate", and real
   metadata for concurrency control.
 - The live version map adds memory proportional to writes per refresh interval,

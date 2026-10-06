@@ -180,6 +180,15 @@ historical order/replay counterexamples, fixed concurrent/replay variants, and
 no-durable-tombstone check in that matrix. Also retain the D1 term-collision
 historical/fixed pair, restart restoration pair, primary-gap detector pair,
 bounded gap-resolution check, and promotion replay/NoOp check.
+The separate D2 acknowledgement controls are proposed policy evidence only.
+The fast matrix uses one-write safety profiles for both minimum-copy floors,
+two-write concurrent/progress controls, and focused reachability witnesses.
+The exhaustive two-write `d2-proposed-one` and `d2-proposed-two` profiles are
+local-only, isolated with a 2 GiB heap and parallel GC; smaller checks retain
+bounded single-worker batching. Preserve current fail-request behavior and
+every legacy verdict. A failed child must still write its batch status and
+print its log, and batch-local loop variables must not overwrite the outer
+selected configuration; otherwise an isolated check can be silently skipped.
 
 GitHub Actions installs the moving stable Rust toolchain. When CI reports a
 compiler-specific lint failure, reproduce the exact runner version with

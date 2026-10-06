@@ -133,6 +133,21 @@ default_configs=(
     d1-trace-actions
     d1-failover-actions
     d1-noop-collision-actions
+    d2-current
+    d2-smoke-one
+    d2-smoke-two
+    d2-early-exclusion
+    d2-no-sticky
+    d2-minimum-bypass
+    d2-stale-self-fence
+    d2-no-self-fence
+    d2-gap-operation
+    d2-gap-prefix
+    d2-debt-liveness
+    d2-quorum-loss-witness
+    d2-quorum-loss-negative
+    d2-exclusion-witness
+    d2-fail-stop-witness
     trace-validator
     two-shard
 )
@@ -142,6 +157,8 @@ all_configs=(
     fixed-crash
     fixed-partition
     fixed-simulation
+    d2-proposed-one
+    d2-proposed-two
 )
 
 list_configs() {
@@ -199,6 +216,23 @@ d1-promotion-replay-noop pass: replay, fill NoOp, activate despite replica gap
 d1-trace-actions        pass: captured commit, truncation, restart/in-place replay, failed replay
 d1-failover-actions     pass: physical NoOp fill, activation, send, redelivery, and collision
 d1-noop-collision-actions pass: physical NoOp fill, send, collision, NACK, and removal
+d2-smoke-one            pass: proposed one-write conditional exclusion, floor one
+d2-smoke-two            pass: proposed one-write conditional exclusion, floor two
+d2-proposed-one         local pass: exhaustive two-write exclusion, floor one
+d2-proposed-two         local pass: exhaustive two-write exclusion, floor two
+d2-current              pass: current fail-request acknowledgement baseline
+d2-early-exclusion      expected D2ExclusionCommitted: uncommitted exclusion
+d2-no-sticky            expected D2NoAckWithDebt: unresolved exclusion forgotten
+d2-minimum-bypass       expected D2MinimumCopies: acknowledge below configured floor
+d2-stale-self-fence     pass: stale removal is rejected and old writer stops
+d2-no-self-fence        expected D2NoPostFenceAdmission: obsolete writer continues
+d2-gap-operation        pass: durable operation can acknowledge above a gap
+d2-gap-prefix           expected temporal failure: prefix gating blocks durable write
+d2-debt-liveness        pass: fair metadata repair settles pending exclusion
+d2-quorum-loss-witness  witness D2NoQuorumIndependentAck: healthy ACK without metadata quorum
+d2-quorum-loss-negative pass: later outage cannot falsify the ACK-time witness
+d2-exclusion-witness    witness D2NoSingleCopyExclusionAck: ACK after both committed exclusions
+d2-fail-stop-witness    witness D2NoPostWalFenceOutcome: local failure closes write admission
 trace-validator         pass: strict JSONL conversion and D1 trace acceptance/rejection
 trace-validator-round4  pass: slow restart, truncation, NoOp, and late-message traces
 two-shard               pass: red sibling does not block failover/allocation
@@ -509,6 +543,93 @@ run_config() {
             cfg="MC_D1_NoOpCollisionActions.cfg"
             expected="pass"
             ;;
+        d2-proposed-one|MC_D2_AckProposedOne)
+            module="MC_D2_WriteAck.tla"
+            cfg="MC_D2_AckProposedOne.cfg"
+            expected="pass"
+            timeout_seconds=$LONG_TIMEOUT_SECONDS
+            ;;
+        d2-proposed-two|MC_D2_AckProposedTwo)
+            module="MC_D2_WriteAck.tla"
+            cfg="MC_D2_AckProposedTwo.cfg"
+            expected="pass"
+            timeout_seconds=$LONG_TIMEOUT_SECONDS
+            ;;
+        d2-smoke-one|MC_D2_AckSmokeOne)
+            module="MC_D2_WriteAck.tla"
+            cfg="MC_D2_AckSmokeOne.cfg"
+            expected="pass"
+            ;;
+        d2-smoke-two|MC_D2_AckSmokeTwo)
+            module="MC_D2_WriteAck.tla"
+            cfg="MC_D2_AckSmokeTwo.cfg"
+            expected="pass"
+            ;;
+        d2-current|MC_D2_AckCurrent)
+            module="MC_D2_WriteAck.tla"
+            cfg="MC_D2_AckCurrent.cfg"
+            expected="pass"
+            ;;
+        d2-early-exclusion|MC_D2_AckEarlyExclusion)
+            module="MC_D2_WriteAck.tla"
+            cfg="MC_D2_AckEarlyExclusion.cfg"
+            expected="D2ExclusionCommitted"
+            ;;
+        d2-no-sticky|MC_D2_AckNoSticky)
+            module="MC_D2_WriteAck.tla"
+            cfg="MC_D2_AckNoSticky.cfg"
+            expected="D2NoAckWithDebt"
+            ;;
+        d2-minimum-bypass|MC_D2_AckMinBypass)
+            module="MC_D2_WriteAck.tla"
+            cfg="MC_D2_AckMinBypass.cfg"
+            expected="D2MinimumCopies"
+            ;;
+        d2-stale-self-fence|MC_D2_AckStale)
+            module="MC_D2_WriteAck.tla"
+            cfg="MC_D2_AckStale.cfg"
+            expected="pass"
+            ;;
+        d2-no-self-fence|MC_D2_AckNoFence)
+            module="MC_D2_WriteAck.tla"
+            cfg="MC_D2_AckNoFence.cfg"
+            expected="D2NoPostFenceAdmission"
+            ;;
+        d2-gap-operation|MC_D2_AckGap)
+            module="MC_D2_WriteAck.tla"
+            cfg="MC_D2_AckGap.cfg"
+            expected="pass"
+            ;;
+        d2-gap-prefix|MC_D2_AckGapPrefix)
+            module="MC_D2_WriteAck.tla"
+            cfg="MC_D2_AckGapPrefix.cfg"
+            expected="temporal"
+            ;;
+        d2-debt-liveness|MC_D2_AckDebtLiveness)
+            module="MC_D2_WriteAck.tla"
+            cfg="MC_D2_AckDebtLiveness.cfg"
+            expected="pass"
+            ;;
+        d2-quorum-loss-witness|MC_D2_AckQuorumLossWitness)
+            module="MC_D2_WriteAck.tla"
+            cfg="MC_D2_AckQuorumLossWitness.cfg"
+            expected="D2NoQuorumIndependentAck"
+            ;;
+        d2-quorum-loss-negative|MC_D2_AckQuorumLossNegative)
+            module="MC_D2_WriteAck.tla"
+            cfg="MC_D2_AckQuorumLossNegative.cfg"
+            expected="pass"
+            ;;
+        d2-exclusion-witness|MC_D2_AckExclusionWitness)
+            module="MC_D2_WriteAck.tla"
+            cfg="MC_D2_AckExclusionWitness.cfg"
+            expected="D2NoSingleCopyExclusionAck"
+            ;;
+        d2-fail-stop-witness|MC_D2_AckFailStopWitness)
+            module="MC_D2_WriteAck.tla"
+            cfg="MC_D2_AckFailStopWitness.cfg"
+            expected="D2NoPostWalFenceOutcome"
+            ;;
         two-shard|MC_TwoShardIsolation)
             module="MC_TwoShardIsolation.tla"
             cfg="MC_TwoShardIsolation.cfg"
@@ -552,7 +673,14 @@ run_config() {
             -XX:ActiveProcessorCount=1
         )
     else
-        java_resource_args=(-XX:+UseParallelGC)
+        case "$name" in
+            d2-proposed-one|MC_D2_AckProposedOne|d2-proposed-two|MC_D2_AckProposedTwo)
+                java_resource_args=(-Xmx2g -XX:+UseParallelGC)
+                ;;
+            *)
+                java_resource_args=(-XX:+UseParallelGC)
+                ;;
+        esac
     fi
     mkdir -p "$java_tmp" "$states"
 
@@ -624,6 +752,8 @@ config_requires_isolation() {
     case "$1" in
         c1-aba|c1-aba-fixed|g2-replica|g2-primary|\
             s1-combined-replica|s1-combined-primary|s1-combined-liveness|\
+            d2-proposed-one|MC_D2_AckProposedOne|\
+            d2-proposed-two|MC_D2_AckProposedTwo|\
             trace-validator|trace-validator-round4|\
             fixed-crash|fixed-partition|fixed-simulation)
             return 0
@@ -640,6 +770,7 @@ run_parallel_batch() {
     local active=0
     local failed=0
     local index
+    local config
     local status
     if ((${#batch[@]} == 0)); then
         return
@@ -654,9 +785,11 @@ run_parallel_batch() {
     batch_root=$(mktemp -d "$RUN_ROOT/config-batch.XXXXXX")
     for index in "${!batch[@]}"; do
         (
-            set +e
-            run_config "${batch[$index]}" 1 "$SMALL_CONFIG_HEAP"
-            status=$?
+            if run_config "${batch[$index]}" 1 "$SMALL_CONFIG_HEAP"; then
+                status=0
+            else
+                status=$?
+            fi
             printf '%s\n' "$status" >"$batch_root/$index.status"
             exit 0
         ) >"$batch_root/$index.log" 2>&1 &

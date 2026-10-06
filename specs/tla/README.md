@@ -220,6 +220,7 @@ liveness configurations use neither symmetry nor a state constraint.
 | `MC_D1_TraceActions.tla` | Checked coverage for earlier captured-boundary persistence, trace truncation, restart replay, alive-copy replay, and failed-replay unavailability. |
 | `MC_D1_FailoverActions.tla` | One scripted three-copy action path covering promotion fencing, physical NoOp append/process/sync, post-activation send, apply/redelivery, sequence reuse, and fail-closed collision handling. |
 | `MC_D1_NoOpCollisionActions.tla` | One scripted path covering physical promotion NoOp fill, post-activation send, collision, NACK delivery, and exact in-sync removal. |
+| `MC_D2_WriteAck.tla` | Proposed operation-based acknowledgement/failure control policy over the owning D1 and Raft actions: conditional exclusion, sticky debt, minimum copies, outcome classes, and local permit invalidation. |
 | `TraceD1.tla` | Existential schema-v4 witness search over real `MC_D1_SeqNoApply` actions, with evidence-directed hidden D1 actions and copy-state observations. |
 | `TraceD1Authority.tla` | Exact composition with Raft routing views, failover, durable fencing, activation, and primary write gating. |
 | `TraceD1Collision.tla` | Exact composition with the bounded B1 term/sequence collision and in-sync removal actions. |
@@ -670,6 +671,136 @@ candidate to cover acknowledged operations. Its retained trace documents the
 availability-scope correction: existing available in-sync copies are always
 checked, while the promotion candidate is checked only after activation.
 
+## Proposed write acknowledgement and failure contract
+
+`MC_D2_WriteAck.tla` is a **selected design target, not current Rust behavior**.
+Current synchronous replica failure still fails the request. The new module
+reuses D1 client/WAL/planner/checkpoint transitions and the allocation-aware
+Raft relation; it does not weaken or replace the existing model or schema-v4
+trace validator.
+
+The target retains operation-based durability: every required copy proves this
+exact operation or is observed committed out of the captured set. A sparse
+processed/persisted set can prove an operation above a lower contiguous prefix.
+The future minimum is one by default, with an explicit floor of two; it never
+permits skipping another in-sync copy. Unresolved authority-scoped exclusion
+debt closes new admission and blocks already-admitted later acknowledgements.
+Stale-authority rejection and abstract post-WAL local failure revoke the local
+permit. Returned indeterminate outcomes are never retroactively successful.
+
+| Model action | Source boundary or selected target |
+| --- | --- |
+| `D2Accept`, `D2ReplicaStep`, `D2AckReply` | Reuse owning D1 admission, WAL/apply, and reply actions mapped above to primary transport handlers and `ShardManager::apply_replica_operation`. |
+| `D2ProposeRemoval`, `D2CommitRemoval`, `D2ObserveRemoval` | Future FS-013 exact-allocation, source-primary/term-conditioned exclusion and observed settlement. The existing Raft allocation CAS is reused; the added authority checks are model-only. |
+| `D2Acknowledge` | Future D2 success-after-exclusion certificate, not current `replicate_write`/`replicate_bulk` failure handling. |
+| `D2Deadline`, `D2InvalidPermitReply`, `D2LoseClientResponse` | Future D4 outcome policy; current transport can return an error after mutation but has no uniform `write_outcome_unknown` contract. |
+| `D2NotExecuted`, `D2RejectBeforeWal` | Reuse the pre-WAL input rejection frame, not a proof of an HTTP/OCC predicate. |
+| `D2PostWalFailure` | Future D14 immediate local permit invalidation; not current `record_local_apply_result` retry-budget escalation or byte-level I/O. |
+
+Run the new checks:
+
+```bash
+./scripts/tla/check.sh d2-current d2-smoke-one d2-smoke-two
+./scripts/tla/check.sh d2-proposed-one d2-proposed-two  # Larger local-only checks
+./scripts/tla/check.sh d2-early-exclusion d2-no-sticky d2-minimum-bypass
+./scripts/tla/check.sh d2-stale-self-fence d2-no-self-fence
+./scripts/tla/check.sh d2-gap-operation d2-gap-prefix d2-debt-liveness
+./scripts/tla/check.sh d2-quorum-loss-witness d2-exclusion-witness d2-fail-stop-witness
+./scripts/tla/check.sh d2-quorum-loss-witness d2-quorum-loss-negative
+```
+
+All configurations use three copies/voters, one fixed index UUID and shard,
+no process restart/recovery/disk loss, and request durability. The fast
+`d2-smoke-*` profiles, quorum-loss pair, and exclusion witness use one client write.
+The local-only `d2-proposed-*` profiles and other controls use two. Two-write
+safety/debt/stale use fixed Put-X then Put-Y; the gap pair uses Put-X then
+Delete-X. General safety permits two replica request/ACK failures, one metadata
+quorum outage/restoration, one abstract post-WAL primary failure, up to four
+Raft entries/two queued commands, and primary terms bounded by two.
+Safety uses only the valid interchange of the two replica roles; liveness and
+stale-source configurations use neither symmetry nor a state constraint.
+
+In general safety/debt, the metadata leader applies committed removal while
+replicas retain their initial views. With a fixed primary, term and no
+reallocation, follower removal application can only reject additional late
+traffic to an excluded copy; permitting that traffic is conservative for these
+acknowledgement checks. The stale-source pair separately advances a different
+leader/replica view while the old primary remains behind, so a rejected
+old-term removal must actually invalidate its still-locally-valid permit.
+
+The gap liveness pair holds the first write's messages and weakly fairly
+submits/accepts/processes/delivers the second write. Operation proof progresses;
+the rejected prefix-gated alternative stutters despite both replicas already
+holding the durable delete. Debt liveness weakly fairly restores metadata,
+proposes/commits removal, and observes its result. Neither property promises
+progress through permanent metadata/storage failure.
+
+The three `d2-*-witness` configurations check positive reachability by
+deliberately violating a negated target while retaining every safety invariant.
+They retain healthy all-copy ACK without metadata quorum, default one-copy ACK
+after both exclusions commit, and indeterminate post-WAL failure followed by
+no-WAL rejection of another request. These are reachable design behaviors,
+not unsafe-control traces or universal progress claims.
+The quorum-loss witness uses metadata availability recorded in the certificate
+at ACK time; an outage after a healthy ACK cannot satisfy it. The paired
+`d2-quorum-loss-negative` counterfactual forbids ACK during an outage and must
+keep the negated witness invariant, including after an earlier healthy ACK.
+
+October 5, 2026 results, Java 25 and pinned TLA+ tools 1.7.4:
+
+| Runner | Result | Generated / distinct | Depth |
+| --- | --- | ---: | ---: |
+| `d2-current` | Current fail-request baseline passes | 24,047 / 6,077 | 19 |
+| `d2-smoke-one` | One-write, one-copy floor passes | 6,382 / 3,024 | 17 |
+| `d2-smoke-two` | One-write, two-copy floor passes | 6,238 / 2,912 | 16 |
+| `d2-proposed-one` | Local two-write, one-copy floor passes | 4,751,001 / 1,524,280 | 25 |
+| `d2-proposed-two` | Local two-write, two-copy floor passes | 4,258,737 / 1,245,240 | 25 |
+| `d2-early-exclusion` | Retains `D2ExclusionCommitted` counterexample | 358 / 190 | 6 |
+| `d2-no-sticky` | Retains `D2NoAckWithDebt` counterexample | 3,636 / 1,357 | 12 |
+| `d2-minimum-bypass` | Retains `D2MinimumCopies` counterexample | 250,584 / 81,815 | 12 |
+| `d2-stale-self-fence` | Selected local fencing passes | 2,346 / 942 | 22 |
+| `d2-no-self-fence` | Retains `D2NoPostFenceAdmission` counterexample | 937 / 413 | 12 |
+| `d2-gap-operation` | Fair above-gap acknowledgement progresses | 57 / 35 | 10 |
+| `d2-gap-prefix` | Retains rejected-alternative temporal stutter | 56 / 34 | Lasso |
+| `d2-debt-liveness` | Fair pending exclusion settles | 10,480 / 4,301 | 20 |
+| `d2-quorum-loss-witness` | Reaches healthy all-copy ACK without metadata quorum | 926 / 498 | 9 |
+| `d2-quorum-loss-negative` | Later outage cannot satisfy the ACK-time witness | 6,277 / 2,940 | 17 |
+| `d2-exclusion-witness` | Reaches one-copy ACK after both exclusions commit | 4,188 / 2,083 | 12 |
+| `d2-fail-stop-witness` | Reaches post-WAL fencing and later no-WAL rejection | 173 / 109 | 6 |
+
+Unsafe and witness rows stop at the named counterexample; their counts are not
+completed exhaustive state graphs. Generated counts can vary with worker
+scheduling and symmetry; the rows record the retained runs, not a test-count
+contract. Initial unrestricted document
+choices exhausted the 300-second single-worker budget. The final fixed
+operation shapes preserve the requested failure orderings. The complete matrix
+with both large two-write profiles passed in 648.77s on four CPUs, above the
+eight-minute fast-matrix budget. Both remain reproducible local checks with
+isolated multi-worker, 2 GiB runs. The default matrix instead uses one-write
+safety profiles while retaining the two-write concurrent controls and fair
+progress checks. No safety invariant, legacy configuration, or expected
+counterexample was removed. Resource-exhausted and incomplete-frame development
+runs are retained as inconclusive/model diagnostics, never counted as passes.
+
+At source base `84b4ef3` plus this model/runner revision, the complete default
+matrix matched every expected result in **438.63s on four CPUs**, below the
+eight-minute budget. An execution audit verified every selected configuration
+ran once, separately accounting for the trace validator's nested D1 action
+check. The measured Linux command was:
+
+```bash
+taskset -c 0-3 env TLA_WORKERS=4 TLA_CONFIG_JOBS=4 TLA_TRACE_JOBS=4 \
+  ./scripts/tla/check.sh
+```
+
+The [control traces](traces/D2-acknowledgement-policy-controls.md) explain the
+unsafe alternatives. The model has no byte-level torn-write/fsync semantics,
+dynamic minimum setting, client retry token, allocation re-admission/ABA,
+restart debt reconstruction, general promotion inventory, or D10 rollback.
+Healthy data-copy proof is not metadata quorum, and a model-only primary
+authority guard is not evidence that Rust already has the corresponding
+permit/response machinery.
+
 ## Empty-store and copy-failure rules
 
 G1 models CreateIndex routing with `initialized = FALSE`, allocation ID 1 for
@@ -1052,11 +1183,15 @@ implicitly enable every fault class.
 | Combined S1 safety | One crash/restart; leader may change | No | Delay and crash-dropped requests | No | Yes | Yes | No |
 | Combined S1 liveness | Forced target crash/restart | No | Delay plus guarded timeout/drop failure | No | No | Yes | No |
 | D1 ordering/replay/term/gaps | Replica restart in replay variants; promotion in B1/B2 | No | Arbitrary replica order and redelivery | No | No | No | No |
+| Proposed D2 safety | No | One quorum outage/restoration | Arbitrary delivery; request/ACK loss; client response loss | No | No | Abstract local permit failure only | No |
+| Proposed D2 stale/gap/debt | No; stale pair promotes metadata authority | Debt quorum outage; stale source view remains behind | Delay/drop as declared by each relation | No | No | No | No |
 | L1/L2 recovery checks | L2 only | No | Scenario delay only | No | No | No | No |
 
-No bounded configuration combines metadata partition with storage failure,
-disk loss with storage failure, or asynchronous durability with storage
-failure. The combined S1 checks do not enable `DiskLoss` or
+The implementation-oriented families do not combine metadata partition with
+concrete storage failure, disk loss with storage failure, or asynchronous
+durability with storage failure. Proposed D2 safety combines metadata outage
+with an abstract local permit failure, not S1 retry escalation or disk I/O.
+The combined S1 checks do not enable `DiskLoss` or
 `PartitionMetadata`.
 
 ## Configurations and results
