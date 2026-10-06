@@ -9,6 +9,8 @@ const INDEX: &str = "refresh-copies";
 
 #[path = "refresh_review_tests.rs"]
 mod review;
+#[path = "write_failure_tests.rs"]
+mod write_failures;
 
 struct RefreshCluster {
     cluster: ForwardingCluster,

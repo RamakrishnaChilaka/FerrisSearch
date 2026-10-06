@@ -259,10 +259,16 @@ unchanged until FS-013 implements it.
 
 ### D4. Outcome classes
 
-**Status (2026-10-05):** Selected target response contract; not implemented as
-a uniform HTTP/transport error classification. Preserve underlying causes and
-operation-owned term/sequence metadata when known; never infer a receipt from
-a later shared checkpoint.
+**Status (2026-10-06):** Implemented for `local_shards` primary mutation,
+forwarding, and single/bulk failure responses. Typed transport details distinguish
+pre-WAL rejection, proven non-execution, and an indeterminate mutation. Preserve
+underlying causes and operation-owned term/sequence metadata when known; never
+infer a receipt from a later shared checkpoint. Metadata auto-creation and
+update preflight GET failures retain their separate error contracts.
+
+The response classification does not implement D2's exclusion/ACK refinements,
+D6 retry identity, or D14 fail-stop behavior. Required synchronous replica
+failures still fail the request after the primary may have applied it.
 
 Every write response is in exactly one class:
 
@@ -278,7 +284,19 @@ Every write response is in exactly one class:
   append, including WAL append and fsync errors, which can leave a partial
   frame.
 - **Response contents:** an indeterminate response includes the primary term
-  and `seq_no` when known.
+  and `seq_no` when known. WAL append/fsync failures without a returned receipt
+  omit the sequence, even if another operation advanced the shared checkpoint.
+  Failed homogeneous batches preserve the returned range and assign item
+  receipts by request-order offset, including duplicate IDs. Validate the range
+  against the actual submitted count, not a count inferred from that range.
+- **Transport ambiguity:** a failed connection before dispatch proves
+  non-execution. Once dispatched, an unmarked timeout, disconnect, `UNAVAILABLE`,
+  or `ABORTED` does not. Only marked, validated pre-mutation details can prove
+  non-execution. Missing, malformed, or contradictory failure details produce a
+  diagnostic indeterminate error without a fabricated receipt.
+- **Retries:** the coordinator does not retry an indeterminate mutation.
+  Existing bounded update retries apply only to rejected CAS conflicts.
+  Known sequence/term metadata is not a deduplication token.
 - **Why 500:** clients that resend automatically on 503 must never do so for
   an indeterminate write.
 
@@ -611,8 +629,8 @@ round per touched shard (D8), rather than refreshing each item.
 
 Remaining: FS-014's bounded streaming parser, backpressure, cancellation,
 and resource accounting. Request parsing and shard grouping still materialize
-the body. D2/D4 acknowledgement and indeterminate-failure refinements remain
-proposed.
+the body. Failure classification and known failure receipts follow implemented
+D4; D2's acknowledgement/exclusion refinements remain proposed.
 
 - **Results:** items return in request order. `errors` is true only when an
   item has an `error` object; delete's `404 not_found` does not set it.

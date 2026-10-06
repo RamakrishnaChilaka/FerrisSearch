@@ -353,11 +353,12 @@ restart.
 
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-001, FS-011, FS-012
 
-**Status (2026-10-05):** Design/model slice only. The selected D2/D4/D5/D14
+**Status (2026-10-06):** Acknowledgement-policy design/model slice only. The selected D2/D5/D14
 targets and copy-floor choice have bounded safety, rejection, and progress
 checks in `specs/tla/MC_D2_WriteAck.tla`. Production still fails any required
-replica error. No minimum-copy setting, success-after-exclusion, uniform
-indeterminate response type, restart exclusion-debt reconstruction, or D14
+replica error. [D4 mutation outcome classes and known failure receipts](adr/0001-write-consistency-and-retry-contract.md#d4-outcome-classes)
+are implemented, but do not close FS-013. No minimum-copy setting,
+success-after-exclusion, restart exclusion-debt reconstruction, or D14
 immediate fail-stop policy has shipped. Those require an approved runtime
 slice and result-level transport/restart tests before this task can close.
 

@@ -6,6 +6,7 @@ pub(crate) mod sequence;
 pub mod tantivy;
 pub mod vector;
 pub(crate) mod version_map;
+pub(crate) mod write_failure;
 
 use anyhow::Result;
 use datafusion::arrow::record_batch::RecordBatch;

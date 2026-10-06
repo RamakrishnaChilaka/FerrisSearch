@@ -693,7 +693,7 @@ permit. Returned indeterminate outcomes are never retroactively successful.
 | `D2Accept`, `D2ReplicaStep`, `D2AckReply` | Reuse owning D1 admission, WAL/apply, and reply actions mapped above to primary transport handlers and `ShardManager::apply_replica_operation`. |
 | `D2ProposeRemoval`, `D2CommitRemoval`, `D2ObserveRemoval` | Future FS-013 exact-allocation, source-primary/term-conditioned exclusion and observed settlement. The existing Raft allocation CAS is reused; the added authority checks are model-only. |
 | `D2Acknowledge` | Future D2 success-after-exclusion certificate, not current `replicate_write`/`replicate_bulk` failure handling. |
-| `D2Deadline`, `D2InvalidPermitReply`, `D2LoseClientResponse` | Future D4 outcome policy; current transport can return an error after mutation but has no uniform `write_outcome_unknown` contract. |
+| `D2Deadline`, `D2InvalidPermitReply`, `D2LoseClientResponse` | Selected D2/D14 permit and deadline policy remains model-only. Current mutation transport implements [D4 outcome classes and known failure receipts](../../docs/adr/0001-write-consistency-and-retry-contract.md#d4-outcome-classes), including `write_outcome_unknown`. |
 | `D2NotExecuted`, `D2RejectBeforeWal` | Reuse the pre-WAL input rejection frame, not a proof of an HTTP/OCC predicate. |
 | `D2PostWalFailure` | Future D14 immediate local permit invalidation; not current `record_local_apply_result` retry-budget escalation or byte-level I/O. |
 

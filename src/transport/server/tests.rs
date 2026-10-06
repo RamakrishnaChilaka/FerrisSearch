@@ -1705,17 +1705,16 @@ async fn expired_gap_probe_clears_an_idle_observation_when_replica_caught_up() {
     );
 }
 
-#[tokio::test]
-async fn version_map_capacity_rejection_is_resource_exhausted_before_wal_append() {
-    let dir = tempfile::tempdir().unwrap();
-    let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+fn primary_write_test_service(
+    directory: &std::path::Path,
+) -> (TransportService, Arc<CompositeEngine>) {
+    let shard_manager = Arc::new(ShardManager::new(directory, Duration::from_secs(60)));
     shard_manager
         .initialize_copy_identity_for_test("idx", 0, "uuid-1", 1, 1)
         .unwrap();
     let engine = Arc::new(
-        CompositeEngine::new(dir.path().join("uuid-1/shard_0"), Duration::from_secs(60)).unwrap(),
+        CompositeEngine::new(directory.join("uuid-1/shard_0"), Duration::from_secs(60)).unwrap(),
     );
-    engine.text_engine().set_version_map_max_bytes_for_test(1);
     shard_manager.insert_shard_for_test("idx", 0, engine.clone());
 
     let mut state = DomainClusterState::new("capacity".into());
@@ -1760,7 +1759,7 @@ async fn version_map_capacity_rejection_is_resource_exhausted_before_wal_append(
         cluster_manager,
         shard_manager,
         transport_client: crate::transport::TransportClient::new(),
-        storage_manager: test_storage_manager(dir.path()),
+        storage_manager: test_storage_manager(directory),
         remote_store_reader_cache: test_remote_store_reader_cache(),
         raft: None,
         local_node_id: "node-1".into(),
@@ -1770,7 +1769,14 @@ async fn version_map_capacity_rejection_is_resource_exhausted_before_wal_append(
         peer_recovery_state: peer_recovery::new_peer_recovery_transport_state(),
         join_lock: new_join_lock(),
     };
+    (service, engine)
+}
 
+#[tokio::test]
+async fn version_map_capacity_rejection_is_resource_exhausted_before_wal_append() {
+    let dir = tempfile::tempdir().unwrap();
+    let (service, engine) = primary_write_test_service(dir.path());
+    engine.text_engine().set_version_map_max_bytes_for_test(1);
     let error = service
         .index_doc(forwarding_request(ShardDocRequest {
             index_name: "idx".into(),
@@ -1789,6 +1795,73 @@ async fn version_map_capacity_rejection_is_resource_exhausted_before_wal_append(
             .unwrap()
             .operations
             .is_empty()
+    );
+    let failure = WriteFailure::from_rpc_status(error);
+    assert_eq!(failure.outcome, WriteFailureOutcome::Rejected);
+    assert_eq!(failure.status, 429);
+    assert_eq!(failure.seq_no, None);
+}
+
+#[tokio::test]
+async fn typed_write_failure_apply_backoff_proves_non_execution_of_the_next_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let (service, engine) = primary_write_test_service(dir.path());
+    service.shard_manager.set_copy_retry_policy_for_test(
+        3,
+        Duration::from_secs(10),
+        Duration::from_secs(10),
+        Duration::ZERO,
+    );
+    engine.inject_engine_apply_failures_for_test(28, 1);
+    let request = |id: &str| {
+        forwarding_request(ShardDocRequest {
+            index_name: "idx".into(),
+            shard_id: 0,
+            doc_id: id.into(),
+            payload_json: serde_json::to_vec(&json!({})).unwrap(),
+            ..Default::default()
+        })
+    };
+    let first = service
+        .index_doc(request("failed-after-wal"))
+        .await
+        .unwrap()
+        .into_inner();
+    let first = WriteFailure::response_failure(
+        first.failure,
+        &first.error,
+        first.seq_no,
+        first.primary_term,
+    )
+    .unwrap();
+    assert_eq!(first.outcome, WriteFailureOutcome::Indeterminate);
+    assert_eq!(first.seq_no, Some(0));
+    let before = engine.sequence_stats();
+    let blocked = service
+        .index_doc(request("blocked-before-wal"))
+        .await
+        .unwrap()
+        .into_inner();
+    let blocked = WriteFailure::response_failure(
+        blocked.failure,
+        &blocked.error,
+        blocked.seq_no,
+        blocked.primary_term,
+    )
+    .unwrap();
+    assert_eq!(blocked.outcome, WriteFailureOutcome::NotExecuted);
+    assert_eq!(blocked.status, 503);
+    assert_eq!(blocked.seq_no, None);
+    assert_eq!(blocked.primary_term, None);
+    assert!(
+        blocked.reason.contains("backing off after 1 failures"),
+        "{blocked:?}"
+    );
+    assert_eq!(engine.sequence_stats(), before);
+    assert!(
+        engine
+            .get_document_with_metadata("blocked-before-wal", true)
+            .is_err()
     );
 }
 
@@ -5061,6 +5134,16 @@ async fn primary_apply_escalation_keeps_reads_open_without_immediate_wal_replay(
             .unwrap()
             .into_inner();
         assert!(!response.success);
+        let failure = WriteFailure::response_failure(
+            response.failure,
+            &response.error,
+            response.seq_no,
+            response.primary_term,
+        )
+        .unwrap();
+        assert_eq!(failure.outcome, WriteFailureOutcome::Indeterminate);
+        assert_eq!(failure.seq_no, Some(attempt + 1));
+        assert_eq!(failure.primary_term, Some(2));
     }
     assert!(engine.get_document("baseline").unwrap().is_some());
     for attempt in 0..3 {

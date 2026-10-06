@@ -7,6 +7,7 @@ use crate::transport::proto::internal_transport_server::{
     InternalTransport, InternalTransportServer,
 };
 use crate::transport::proto::*;
+use crate::transport::write_failure::WriteFailure;
 use futures::{FutureExt, Stream, stream};
 use openraft::type_config::async_runtime::WatchReceiver;
 use std::collections::{HashMap, HashSet};
@@ -25,12 +26,17 @@ fn primary_write_condition(
     create_only: bool,
 ) -> Result<crate::engine::WriteCondition, Status> {
     let condition = crate::engine::WriteCondition::from_optional_values(if_seq_no, if_primary_term)
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        .map_err(|error| {
+            WriteFailure::rejected(400, "mapper_parsing_exception", error.to_string()).into_status()
+        })?;
     if create_only {
         if condition != crate::engine::WriteCondition::Unconditional {
-            return Err(Status::invalid_argument(
+            return Err(WriteFailure::rejected(
+                400,
+                "mapper_parsing_exception",
                 "create operations cannot use if_seq_no or if_primary_term",
-            ));
+            )
+            .into_status());
         }
         Ok(crate::engine::WriteCondition::Create)
     } else {
@@ -714,14 +720,16 @@ impl InternalTransport for TransportService {
             .get_ref()
             .refresh
             .then(|| crate::transport::refresh_deadline::RefreshDeadline::from_request(&request))
-            .transpose()?;
+            .transpose()
+            .map_err(WriteFailure::before_mutation_status)?;
         self.wait_for_forwarded_state(
             &request,
             Some(&request.get_ref().index_name),
             Some((request.get_ref().shard_id, true)),
             request.get_ref().index_uuid.as_deref(),
         )
-        .await?;
+        .await
+        .map_err(WriteFailure::before_mutation_status)?;
         let req = request.into_inner();
         let condition =
             primary_write_condition(req.if_seq_no, req.if_primary_term, req.create_only)?;
@@ -730,7 +738,10 @@ impl InternalTransport for TransportService {
             &req.index_name,
             req.index_uuid.as_deref(),
         )
-        .map_err(|error| Status::not_found(error.to_string()))?;
+        .map_err(|error| {
+            WriteFailure::rejected(404, "index_not_found_exception", error.to_string())
+                .into_status()
+        })?;
 
         let activated_primary = match self
             .ensure_primary_activated(&req.index_name, req.shard_id)
@@ -743,15 +754,13 @@ impl InternalTransport for TransportService {
                     &req.index_name,
                     req.index_uuid.as_deref(),
                 )
-                .map_err(|error| Status::not_found(error.to_string()))?;
-                return Ok(Response::new(ShardDocResponse {
-                    success: false,
-                    doc_id: req.doc_id,
-                    error,
-                    seq_no: None,
-                    primary_term: None,
-                    ..Default::default()
-                }));
+                .map_err(|error| {
+                    WriteFailure::rejected(404, "index_not_found_exception", error.to_string())
+                        .into_status()
+                })?;
+                return Ok(Response::new(
+                    WriteFailure::not_executed(error).index_response(req.doc_id),
+                ));
             }
         };
         require_index_uuid(
@@ -759,7 +768,10 @@ impl InternalTransport for TransportService {
             &req.index_name,
             req.index_uuid.as_deref(),
         )
-        .map_err(|error| Status::not_found(error.to_string()))?;
+        .map_err(|error| {
+            WriteFailure::rejected(404, "index_not_found_exception", error.to_string())
+                .into_status()
+        })?;
         let _write_guard = match self
             .peer_recovery_write_guard(&req.index_name, req.shard_id)
             .await
@@ -771,15 +783,13 @@ impl InternalTransport for TransportService {
                     &req.index_name,
                     req.index_uuid.as_deref(),
                 )
-                .map_err(|error| Status::not_found(error.to_string()))?;
-                return Ok(Response::new(ShardDocResponse {
-                    success: false,
-                    doc_id: req.doc_id,
-                    error,
-                    seq_no: None,
-                    primary_term: None,
-                    ..Default::default()
-                }));
+                .map_err(|error| {
+                    WriteFailure::rejected(404, "index_not_found_exception", error.to_string())
+                        .into_status()
+                })?;
+                return Ok(Response::new(
+                    WriteFailure::not_executed(error).index_response(req.doc_id),
+                ));
             }
         };
         require_index_uuid(
@@ -787,7 +797,10 @@ impl InternalTransport for TransportService {
             &req.index_name,
             req.index_uuid.as_deref(),
         )
-        .map_err(|error| Status::not_found(error.to_string()))?;
+        .map_err(|error| {
+            WriteFailure::rejected(404, "index_not_found_exception", error.to_string())
+                .into_status()
+        })?;
         let _pre_mapping_write_state = match self.validated_primary_write_state(
             &req.index_name,
             req.shard_id,
@@ -795,21 +808,24 @@ impl InternalTransport for TransportService {
         ) {
             Ok(state) => state,
             Err(error) => {
-                return Ok(Response::new(ShardDocResponse {
-                    success: false,
-                    doc_id: req.doc_id,
-                    error,
-                    seq_no: None,
-                    primary_term: None,
-                    ..Default::default()
-                }));
+                return Ok(Response::new(
+                    WriteFailure::not_executed(error).index_response(req.doc_id),
+                ));
             }
         };
 
-        let payload: serde_json::Value = serde_json::from_slice(&req.payload_json)
-            .map_err(|e| Status::invalid_argument(format!("invalid JSON: {e}")))?;
-        crate::common::validate_document_source(&payload)
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let payload: serde_json::Value =
+            serde_json::from_slice(&req.payload_json).map_err(|e| {
+                WriteFailure::rejected(
+                    400,
+                    "mapper_parsing_exception",
+                    format!("invalid JSON: {e}"),
+                )
+                .into_status()
+            })?;
+        crate::common::validate_document_source(&payload).map_err(|error| {
+            WriteFailure::rejected(400, "mapper_parsing_exception", error.to_string()).into_status()
+        })?;
 
         let doc_id = if req.doc_id.is_empty() {
             uuid::Uuid::new_v4().to_string()
@@ -821,13 +837,17 @@ impl InternalTransport for TransportService {
         // engine so a successful AddMappings commit can safely reopen the shard.
         let dynamic_override = self
             .ensure_dynamic_mappings(&req.index_name, req.shard_id, &payload)
-            .await?;
+            .await
+            .map_err(WriteFailure::before_mutation_status)?;
         require_index_uuid(
             &self.cluster_manager,
             &req.index_name,
             req.index_uuid.as_deref(),
         )
-        .map_err(|error| Status::not_found(error.to_string()))?;
+        .map_err(|error| {
+            WriteFailure::rejected(404, "index_not_found_exception", error.to_string())
+                .into_status()
+        })?;
         let write_state = match self.validated_primary_write_state(
             &req.index_name,
             req.shard_id,
@@ -835,25 +855,24 @@ impl InternalTransport for TransportService {
         ) {
             Ok(state) => state,
             Err(error) => {
-                return Ok(Response::new(ShardDocResponse {
-                    success: false,
-                    doc_id,
-                    error,
-                    seq_no: None,
-                    primary_term: None,
-                    ..Default::default()
-                }));
+                return Ok(Response::new(
+                    WriteFailure::not_executed(error).index_response(doc_id),
+                ));
             }
         };
         let engine = self
             .get_or_open_shard_with_override(&req.index_name, req.shard_id, dynamic_override)
-            .await?;
+            .await
+            .map_err(WriteFailure::before_mutation_status)?;
         require_index_uuid(
             &self.cluster_manager,
             &req.index_name,
             req.index_uuid.as_deref(),
         )
-        .map_err(|error| Status::not_found(error.to_string()))?;
+        .map_err(|error| {
+            WriteFailure::rejected(404, "index_not_found_exception", error.to_string())
+                .into_status()
+        })?;
         #[cfg(feature = "protocol-trace")]
         let trace_copy = crate::protocol_trace::TraceCopy {
             node: self.local_node_id.clone(),
@@ -934,9 +953,20 @@ impl InternalTransport for TransportService {
                         )
                     })
                     .await
-                    .map_err(|e| Status::internal(e.to_string()))?
+                    .map_err(|error| {
+                        WriteFailure::indeterminate(
+                            format!("primary write worker failed: {error:#}"),
+                            None,
+                            Some(activated_primary.primary_term),
+                            None,
+                        )
+                        .into_status()
+                    })?
             }
-            Err(error) => Err(error),
+            Err(error) => Err(crate::engine::write_failure::WriteMutationState::new(
+                activated_primary.primary_term,
+            )
+            .error(error)),
         };
         if let Err(error) = &write_result
             && error.is::<IndexIncarnationMismatchError>()
@@ -952,7 +982,12 @@ impl InternalTransport for TransportService {
                     Some("index_not_found"),
                 );
             }
-            return Err(Status::not_found(error.to_string()));
+            return Err(WriteFailure::rejected(
+                404,
+                "index_not_found_exception",
+                error.to_string(),
+            )
+            .into_status());
         }
         let write_result = self.shard_manager.record_local_apply_result(
             &activated_primary.index_uuid,
@@ -1036,17 +1071,18 @@ impl InternalTransport for TransportService {
                                 Some("replication"),
                             );
                         }
-                        return Ok(Response::new(ShardDocResponse {
-                            success: false,
-                            doc_id: id,
-                            error: format!(
-                                "Replication failed: {}",
-                                Self::replication_failure_message(&errors)
-                            ),
-                            seq_no: Some(seq_no),
-                            primary_term: Some(primary_term),
-                            ..Default::default()
-                        }));
+                        return Ok(Response::new(
+                            WriteFailure::indeterminate(
+                                format!(
+                                    "Replication failed: {}",
+                                    Self::replication_failure_message(&errors)
+                                ),
+                                Some(seq_no),
+                                Some(primary_term),
+                                None,
+                            )
+                            .index_response(id),
+                        ));
                     }
                 }
                 let write_refresh = if let Some(deadline) = refresh_deadline {
@@ -1072,9 +1108,13 @@ impl InternalTransport for TransportService {
                     primary_term: Some(primary_term),
                     created,
                     write_refresh,
+                    failure: None,
                 }))
             }
-            Err(e) if e.is::<crate::engine::VersionConflictError>() => {
+            Err(e)
+                if WriteFailure::before_wal(&e)
+                    && e.is::<crate::engine::VersionConflictError>() =>
+            {
                 #[cfg(feature = "protocol-trace")]
                 if let Some(trace_request) = trace_request.as_ref() {
                     crate::protocol_trace::record_client_result(
@@ -1086,9 +1126,11 @@ impl InternalTransport for TransportService {
                         Some("version_conflict"),
                     );
                 }
-                Err(Status::already_exists(e.to_string()))
+                Err(WriteFailure::from_engine(&e, activated_primary.primary_term).into_status())
             }
-            Err(e) if crate::engine::is_write_validation_error(&e) => {
+            Err(e)
+                if WriteFailure::before_wal(&e) && crate::engine::is_write_validation_error(&e) =>
+            {
                 #[cfg(feature = "protocol-trace")]
                 if let Some(trace_request) = trace_request.as_ref() {
                     crate::protocol_trace::record_client_result(
@@ -1100,9 +1142,12 @@ impl InternalTransport for TransportService {
                         Some("primary_apply"),
                     );
                 }
-                Err(Status::invalid_argument(e.to_string()))
+                Err(WriteFailure::from_engine(&e, activated_primary.primary_term).into_status())
             }
-            Err(e) if e.is::<crate::engine::version_map::VersionMapCapacityError>() => {
+            Err(e)
+                if WriteFailure::before_wal(&e)
+                    && e.is::<crate::engine::version_map::VersionMapCapacityError>() =>
+            {
                 #[cfg(feature = "protocol-trace")]
                 if let Some(trace_request) = trace_request.as_ref() {
                     crate::protocol_trace::record_client_result(
@@ -1114,10 +1159,7 @@ impl InternalTransport for TransportService {
                         Some("primary_apply"),
                     );
                 }
-                Err(Status::resource_exhausted(format!(
-                    "{}{e}",
-                    crate::engine::version_map::VERSION_MAP_CAPACITY_STATUS_PREFIX
-                )))
+                Err(WriteFailure::from_engine(&e, activated_primary.primary_term).into_status())
             }
             Err(e) => {
                 #[cfg(feature = "protocol-trace")]
@@ -1140,14 +1182,10 @@ impl InternalTransport for TransportService {
                     &e,
                 )
                 .await;
-                Ok(Response::new(ShardDocResponse {
-                    success: false,
-                    doc_id: String::new(),
-                    error: e.to_string(),
-                    seq_no: None,
-                    primary_term: None,
-                    ..Default::default()
-                }))
+                Ok(Response::new(
+                    WriteFailure::from_engine(&e, activated_primary.primary_term)
+                        .index_response(doc_id),
+                ))
             }
         }
     }
@@ -1160,24 +1198,31 @@ impl InternalTransport for TransportService {
             .get_ref()
             .refresh
             .then(|| crate::transport::refresh_deadline::RefreshDeadline::from_request(&request))
-            .transpose()?;
+            .transpose()
+            .map_err(WriteFailure::before_mutation_status)?;
         self.wait_for_forwarded_state(
             &request,
             Some(&request.get_ref().index_name),
             Some((request.get_ref().shard_id, true)),
             None,
         )
-        .await?;
+        .await
+        .map_err(WriteFailure::before_mutation_status)?;
         let req = request.into_inner();
         if !req.operations.is_empty() {
             if req.operations.len() != req.documents_json.len() {
-                return Err(Status::invalid_argument(
+                return Err(WriteFailure::rejected(
+                    400,
+                    "mapper_parsing_exception",
                     "bulk operation count does not match document count",
-                ));
+                )
+                .into_status());
             }
             for operation in &req.operations {
-                let kind = ShardBulkOpKind::try_from(operation.kind)
-                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+                let kind = ShardBulkOpKind::try_from(operation.kind).map_err(|error| {
+                    WriteFailure::rejected(400, "mapper_parsing_exception", error.to_string())
+                        .into_status()
+                })?;
                 primary_write_condition(
                     operation.if_seq_no,
                     operation.if_primary_term,
@@ -1197,14 +1242,9 @@ impl InternalTransport for TransportService {
         {
             Ok(term) => term,
             Err(error) => {
-                return Ok(Response::new(ShardBulkResponse {
-                    success: false,
-                    doc_ids: Vec::new(),
-                    error,
-                    start_seq_no: None,
-                    primary_term: None,
-                    ..Default::default()
-                }));
+                return Ok(Response::new(
+                    WriteFailure::not_executed(error).bulk_response(Vec::new()),
+                ));
             }
         };
         let _write_guard = match self
@@ -1213,14 +1253,9 @@ impl InternalTransport for TransportService {
         {
             Ok(guard) => guard,
             Err(error) => {
-                return Ok(Response::new(ShardBulkResponse {
-                    success: false,
-                    doc_ids: Vec::new(),
-                    error,
-                    start_seq_no: None,
-                    primary_term: None,
-                    ..Default::default()
-                }));
+                return Ok(Response::new(
+                    WriteFailure::not_executed(error).bulk_response(Vec::new()),
+                ));
             }
         };
         let _pre_mapping_write_state = match self.validated_primary_write_state(
@@ -1230,22 +1265,23 @@ impl InternalTransport for TransportService {
         ) {
             Ok(state) => state,
             Err(error) => {
-                return Ok(Response::new(ShardBulkResponse {
-                    success: false,
-                    doc_ids: Vec::new(),
-                    error,
-                    start_seq_no: None,
-                    primary_term: None,
-                    ..Default::default()
-                }));
+                return Ok(Response::new(
+                    WriteFailure::not_executed(error).bulk_response(Vec::new()),
+                ));
             }
         };
 
         let mut docs: Vec<(String, serde_json::Value)> =
             Vec::with_capacity(req.documents_json.len());
         for b in &req.documents_json {
-            let mut val: serde_json::Value = serde_json::from_slice(b)
-                .map_err(|e| Status::invalid_argument(format!("invalid JSON in bulk: {e}")))?;
+            let mut val: serde_json::Value = serde_json::from_slice(b).map_err(|e| {
+                WriteFailure::rejected(
+                    400,
+                    "mapper_parsing_exception",
+                    format!("invalid JSON in bulk: {e}"),
+                )
+                .into_status()
+            })?;
             let (doc_id, payload) = if val.get("_doc_id").is_some_and(serde_json::Value::is_string)
                 && val.get("_source").is_some()
             {
@@ -1256,8 +1292,10 @@ impl InternalTransport for TransportService {
             } else {
                 (uuid::Uuid::new_v4().to_string(), val)
             };
-            crate::common::validate_document_source(&payload)
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            crate::common::validate_document_source(&payload).map_err(|error| {
+                WriteFailure::rejected(400, "mapper_parsing_exception", error.to_string())
+                    .into_status()
+            })?;
             docs.push((doc_id, payload));
         }
 
@@ -1265,7 +1303,8 @@ impl InternalTransport for TransportService {
         // engine so a successful AddMappings commit can reopen safely.
         let dynamic_override = self
             .ensure_dynamic_mappings_batch(&req.index_name, req.shard_id, &docs)
-            .await?;
+            .await
+            .map_err(WriteFailure::before_mutation_status)?;
         let write_state = match self.validated_primary_write_state(
             &req.index_name,
             req.shard_id,
@@ -1273,19 +1312,15 @@ impl InternalTransport for TransportService {
         ) {
             Ok(state) => state,
             Err(error) => {
-                return Ok(Response::new(ShardBulkResponse {
-                    success: false,
-                    doc_ids: Vec::new(),
-                    error,
-                    start_seq_no: None,
-                    primary_term: None,
-                    ..Default::default()
-                }));
+                return Ok(Response::new(
+                    WriteFailure::not_executed(error).bulk_response(Vec::new()),
+                ));
             }
         };
         let engine = self
             .get_or_open_shard_with_override(&req.index_name, req.shard_id, dynamic_override)
-            .await?;
+            .await
+            .map_err(WriteFailure::before_mutation_status)?;
         #[cfg(feature = "protocol-trace")]
         let trace_copy = crate::protocol_trace::TraceCopy {
             node: self.local_node_id.clone(),
@@ -1354,9 +1389,20 @@ impl InternalTransport for TransportService {
                         engine.bulk_add_documents_with_receipt_at_term(docs_for_write, primary_term)
                     })
                     .await
-                    .map_err(|e| Status::internal(e.to_string()))?
+                    .map_err(|error| {
+                        WriteFailure::indeterminate(
+                            format!("primary bulk worker failed: {error:#}"),
+                            None,
+                            Some(activated_primary.primary_term),
+                            None,
+                        )
+                        .into_status()
+                    })?
             }
-            Err(error) => Err(error),
+            Err(error) => Err(crate::engine::write_failure::WriteMutationState::new(
+                activated_primary.primary_term,
+            )
+            .error(error)),
         };
         let write_result = self.shard_manager.record_local_apply_result(
             &activated_primary.index_uuid,
@@ -1367,11 +1413,24 @@ impl InternalTransport for TransportService {
 
         match write_result {
             Ok(receipt) => {
-                let last_seq_no = receipt
-                    .last_seq_no()
-                    .map_err(|e| Status::internal(e.to_string()))?;
-                let mut results = bulk_writes::index_batch_results(&receipt)
-                    .map_err(|error| Status::internal(error.to_string()))?;
+                let last_seq_no = receipt.last_seq_no().map_err(|error| {
+                    WriteFailure::indeterminate(
+                        format!("invalid primary bulk receipt: {error:#}"),
+                        None,
+                        Some(activated_primary.primary_term),
+                        None,
+                    )
+                    .into_status()
+                })?;
+                let mut results = bulk_writes::index_batch_results(&receipt).map_err(|error| {
+                    WriteFailure::indeterminate(
+                        format!("invalid primary bulk item receipts: {error:#}"),
+                        None,
+                        Some(activated_primary.primary_term),
+                        None,
+                    )
+                    .into_status()
+                })?;
                 let ids = receipt.doc_ids;
                 let primary_term = receipt.primary_term;
                 let primary_sequence = engine.sequence_stats();
@@ -1383,10 +1442,17 @@ impl InternalTransport for TransportService {
                         start_seq_no: None,
                         primary_term: Some(primary_term),
                         results,
+                        failure: None,
                     }));
                 };
                 last_seq_no.ok_or_else(|| {
-                    Status::internal("non-empty bulk receipt has no last sequence")
+                    WriteFailure::indeterminate(
+                        "non-empty bulk receipt has no last sequence",
+                        None,
+                        Some(activated_primary.primary_term),
+                        None,
+                    )
+                    .into_status()
                 })?;
                 self.spawn_primary_available_report_after_write(
                     &req.index_name,
@@ -1453,17 +1519,18 @@ impl InternalTransport for TransportService {
                                 Some("replication"),
                             );
                         }
-                        return Ok(Response::new(ShardBulkResponse {
-                            success: false,
-                            doc_ids: ids,
-                            error: format!(
-                                "Replication failed: {}",
-                                Self::replication_failure_message(&errors)
-                            ),
-                            start_seq_no: Some(start_seq_no),
-                            primary_term: Some(primary_term),
-                            ..Default::default()
-                        }));
+                        return Ok(Response::new(
+                            WriteFailure::indeterminate(
+                                format!(
+                                    "Replication failed: {}",
+                                    Self::replication_failure_message(&errors)
+                                ),
+                                Some(start_seq_no),
+                                Some(primary_term),
+                                last_seq_no,
+                            )
+                            .bulk_response(ids),
+                        ));
                     }
                 }
                 if let Some(deadline) = refresh_deadline {
@@ -1489,9 +1556,12 @@ impl InternalTransport for TransportService {
                     start_seq_no: Some(start_seq_no),
                     primary_term: Some(primary_term),
                     results,
+                    failure: None,
                 }))
             }
-            Err(e) if crate::engine::is_write_validation_error(&e) => {
+            Err(e)
+                if WriteFailure::before_wal(&e) && crate::engine::is_write_validation_error(&e) =>
+            {
                 #[cfg(feature = "protocol-trace")]
                 for trace_request in &trace_requests {
                     crate::protocol_trace::record_client_result(
@@ -1503,9 +1573,12 @@ impl InternalTransport for TransportService {
                         Some("primary_apply"),
                     );
                 }
-                Err(Status::invalid_argument(e.to_string()))
+                Err(WriteFailure::from_engine(&e, activated_primary.primary_term).into_status())
             }
-            Err(e) if e.is::<crate::engine::version_map::VersionMapCapacityError>() => {
+            Err(e)
+                if WriteFailure::before_wal(&e)
+                    && e.is::<crate::engine::version_map::VersionMapCapacityError>() =>
+            {
                 #[cfg(feature = "protocol-trace")]
                 for trace_request in &trace_requests {
                     crate::protocol_trace::record_client_result(
@@ -1517,10 +1590,7 @@ impl InternalTransport for TransportService {
                         Some("primary_apply"),
                     );
                 }
-                Err(Status::resource_exhausted(format!(
-                    "{}{e}",
-                    crate::engine::version_map::VERSION_MAP_CAPACITY_STATUS_PREFIX
-                )))
+                Err(WriteFailure::from_engine(&e, activated_primary.primary_term).into_status())
             }
             Err(e) => {
                 #[cfg(feature = "protocol-trace")]
@@ -1543,14 +1613,10 @@ impl InternalTransport for TransportService {
                     &e,
                 )
                 .await;
-                Ok(Response::new(ShardBulkResponse {
-                    success: false,
-                    doc_ids: vec![],
-                    error: e.to_string(),
-                    start_seq_no: None,
-                    primary_term: None,
-                    ..Default::default()
-                }))
+                Ok(Response::new(
+                    WriteFailure::from_engine(&e, activated_primary.primary_term)
+                        .bulk_response(docs.iter().map(|(id, _)| id.clone()).collect()),
+                ))
             }
         }
     }
@@ -1563,14 +1629,16 @@ impl InternalTransport for TransportService {
             .get_ref()
             .refresh
             .then(|| crate::transport::refresh_deadline::RefreshDeadline::from_request(&request))
-            .transpose()?;
+            .transpose()
+            .map_err(WriteFailure::before_mutation_status)?;
         self.wait_for_forwarded_state(
             &request,
             Some(&request.get_ref().index_name),
             Some((request.get_ref().shard_id, true)),
             None,
         )
-        .await?;
+        .await
+        .map_err(WriteFailure::before_mutation_status)?;
         let req = request.into_inner();
         let condition = primary_write_condition(req.if_seq_no, req.if_primary_term, false)?;
         let activated_primary = match self
@@ -1579,14 +1647,9 @@ impl InternalTransport for TransportService {
         {
             Ok(term) => term,
             Err(error) => {
-                return Ok(Response::new(ShardDeleteResponse {
-                    success: false,
-                    deleted: 0,
-                    error,
-                    seq_no: None,
-                    primary_term: None,
-                    write_refresh: None,
-                }));
+                return Ok(Response::new(
+                    WriteFailure::not_executed(error).delete_response(0),
+                ));
             }
         };
         let _write_guard = match self
@@ -1595,14 +1658,9 @@ impl InternalTransport for TransportService {
         {
             Ok(guard) => guard,
             Err(error) => {
-                return Ok(Response::new(ShardDeleteResponse {
-                    success: false,
-                    deleted: 0,
-                    error,
-                    seq_no: None,
-                    primary_term: None,
-                    write_refresh: None,
-                }));
+                return Ok(Response::new(
+                    WriteFailure::not_executed(error).delete_response(0),
+                ));
             }
         };
         let write_state = match self.validated_primary_write_state(
@@ -1612,19 +1670,15 @@ impl InternalTransport for TransportService {
         ) {
             Ok(state) => state,
             Err(error) => {
-                return Ok(Response::new(ShardDeleteResponse {
-                    success: false,
-                    deleted: 0,
-                    error,
-                    seq_no: None,
-                    primary_term: None,
-                    write_refresh: None,
-                }));
+                return Ok(Response::new(
+                    WriteFailure::not_executed(error).delete_response(0),
+                ));
             }
         };
         let engine = self
             .get_or_open_shard(&req.index_name, req.shard_id)
-            .await?;
+            .await
+            .map_err(WriteFailure::before_mutation_status)?;
         #[cfg(feature = "protocol-trace")]
         let trace_copy = crate::protocol_trace::TraceCopy {
             node: self.local_node_id.clone(),
@@ -1692,9 +1746,20 @@ impl InternalTransport for TransportService {
                         )
                     })
                     .await
-                    .map_err(|e| Status::internal(e.to_string()))?
+                    .map_err(|error| {
+                        WriteFailure::indeterminate(
+                            format!("primary delete worker failed: {error:#}"),
+                            None,
+                            Some(activated_primary.primary_term),
+                            None,
+                        )
+                        .into_status()
+                    })?
             }
-            Err(error) => Err(error),
+            Err(error) => Err(crate::engine::write_failure::WriteMutationState::new(
+                activated_primary.primary_term,
+            )
+            .error(error)),
         };
         let delete_result = self.shard_manager.record_local_apply_result(
             &activated_primary.index_uuid,
@@ -1776,17 +1841,18 @@ impl InternalTransport for TransportService {
                                 Some("replication"),
                             );
                         }
-                        return Ok(Response::new(ShardDeleteResponse {
-                            success: false,
-                            deleted,
-                            error: format!(
-                                "Replication failed: {}",
-                                Self::replication_failure_message(&errors)
-                            ),
-                            seq_no: Some(seq_no),
-                            primary_term: Some(primary_term),
-                            write_refresh: None,
-                        }));
+                        return Ok(Response::new(
+                            WriteFailure::indeterminate(
+                                format!(
+                                    "Replication failed: {}",
+                                    Self::replication_failure_message(&errors)
+                                ),
+                                Some(seq_no),
+                                Some(primary_term),
+                                None,
+                            )
+                            .delete_response(deleted),
+                        ));
                     }
                 }
                 let write_refresh = if let Some(deadline) = refresh_deadline {
@@ -1810,9 +1876,13 @@ impl InternalTransport for TransportService {
                     seq_no: Some(seq_no),
                     primary_term: Some(primary_term),
                     write_refresh,
+                    failure: None,
                 }))
             }
-            Err(e) if e.is::<crate::engine::VersionConflictError>() => {
+            Err(e)
+                if WriteFailure::before_wal(&e)
+                    && e.is::<crate::engine::VersionConflictError>() =>
+            {
                 #[cfg(feature = "protocol-trace")]
                 if let Some(trace_request) = trace_request.as_ref() {
                     crate::protocol_trace::record_client_result(
@@ -1824,9 +1894,11 @@ impl InternalTransport for TransportService {
                         Some("version_conflict"),
                     );
                 }
-                Err(Status::already_exists(e.to_string()))
+                Err(WriteFailure::from_engine(&e, activated_primary.primary_term).into_status())
             }
-            Err(e) if crate::engine::is_write_validation_error(&e) => {
+            Err(e)
+                if WriteFailure::before_wal(&e) && crate::engine::is_write_validation_error(&e) =>
+            {
                 #[cfg(feature = "protocol-trace")]
                 if let Some(trace_request) = trace_request.as_ref() {
                     crate::protocol_trace::record_client_result(
@@ -1838,9 +1910,12 @@ impl InternalTransport for TransportService {
                         Some("primary_apply"),
                     );
                 }
-                Err(Status::invalid_argument(e.to_string()))
+                Err(WriteFailure::from_engine(&e, activated_primary.primary_term).into_status())
             }
-            Err(e) if e.is::<crate::engine::version_map::VersionMapCapacityError>() => {
+            Err(e)
+                if WriteFailure::before_wal(&e)
+                    && e.is::<crate::engine::version_map::VersionMapCapacityError>() =>
+            {
                 #[cfg(feature = "protocol-trace")]
                 if let Some(trace_request) = trace_request.as_ref() {
                     crate::protocol_trace::record_client_result(
@@ -1852,10 +1927,7 @@ impl InternalTransport for TransportService {
                         Some("primary_apply"),
                     );
                 }
-                Err(Status::resource_exhausted(format!(
-                    "{}{e}",
-                    crate::engine::version_map::VERSION_MAP_CAPACITY_STATUS_PREFIX
-                )))
+                Err(WriteFailure::from_engine(&e, activated_primary.primary_term).into_status())
             }
             Err(e) => {
                 #[cfg(feature = "protocol-trace")]
@@ -1878,14 +1950,10 @@ impl InternalTransport for TransportService {
                     &e,
                 )
                 .await;
-                Ok(Response::new(ShardDeleteResponse {
-                    success: false,
-                    deleted: 0,
-                    error: e.to_string(),
-                    seq_no: None,
-                    primary_term: None,
-                    write_refresh: None,
-                }))
+                Ok(Response::new(
+                    WriteFailure::from_engine(&e, activated_primary.primary_term)
+                        .delete_response(0),
+                ))
             }
         }
     }

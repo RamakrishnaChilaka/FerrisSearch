@@ -102,6 +102,23 @@ message PingRequest {
 
 message Empty {}
 
+enum WriteFailureOutcome {
+    WRITE_FAILURE_OUTCOME_UNSPECIFIED = 0;
+    REJECTED = 1;
+    NOT_EXECUTED = 2;
+    INDETERMINATE = 3;
+}
+
+message WriteFailureDetails {
+    WriteFailureOutcome outcome = 1;
+    uint32 status = 2;
+    string error_type = 3;
+    string reason = 4;
+    optional uint64 seq_no = 5;
+    optional uint64 primary_term = 6;
+    optional uint64 last_seq_no = 7;
+}
+
 // ─── Shard-level Operations ──────────────────────────────────────────────────
 
 message ShardDocRequest {
@@ -124,6 +141,7 @@ message ShardDocResponse {
     optional uint64 primary_term = 5;
     bool created = 6;
     ShardWriteRefreshResult write_refresh = 7;
+    WriteFailureDetails failure = 8;
 }
 
 message ShardDeleteRequest {
@@ -142,6 +160,7 @@ message ShardDeleteResponse {
     optional uint64 seq_no = 4;
     optional uint64 primary_term = 5;
     ShardWriteRefreshResult write_refresh = 6;
+    WriteFailureDetails failure = 7;
 }
 
 message ShardGetRequest {
@@ -181,6 +200,7 @@ message ShardBulkItemResponse {
     optional uint64 seq_no = 6;
     optional uint64 primary_term = 7;
     ShardWriteRefreshResult write_refresh = 8;
+    WriteFailureDetails failure = 9;
 }
 
 message ShardBulkRequest {
@@ -200,6 +220,7 @@ message ShardBulkResponse {
     optional uint64 start_seq_no = 4; // absent for an empty batch
     optional uint64 primary_term = 5;
     repeated ShardBulkItemResponse results = 6;
+    WriteFailureDetails failure = 7;
 }
 
 message ShardCopyRefreshRequest {

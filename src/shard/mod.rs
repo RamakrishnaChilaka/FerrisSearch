@@ -1810,7 +1810,14 @@ impl ShardManager {
             }
             Err(error) if Self::is_definitive_copy_failure(&error) => Err(error),
             Err(error) if Self::is_retryable_io_failure(&error) => {
-                Err(self.record_copy_io_failure(retry_key, error))
+                let mutation = error
+                    .downcast_ref::<crate::engine::write_failure::WriteMutationError>()
+                    .map(|error| error.mutation);
+                let error = self.record_copy_io_failure(retry_key, error);
+                Err(match mutation {
+                    Some(mutation) => mutation.error(error),
+                    None => error,
+                })
             }
             Err(error) => Err(error),
         }

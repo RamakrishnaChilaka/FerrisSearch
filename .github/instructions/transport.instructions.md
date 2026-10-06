@@ -86,6 +86,27 @@ receipt metadata. FerrisSearch is pre-1.0: successful responses require these
 receipts, and metadata-free success responses from older peers fail. Do not add
 compatibility fallbacks or rollout machinery for this protocol change.
 
+Failed primary index/delete/bulk responses and failed ordered-bulk items require
+`WriteFailureDetails`: rejected, proven not executed, or indeterminate, with
+HTTP status, error type, cause, and optional operation-owned sequence/term.
+Failed homogeneous batches also carry their exact last sequence when the WAL
+returned a range. Rejections and not-executed outcomes cannot carry receipts.
+Clients validate duplicated fields, range cardinality against submitted inputs,
+and item order; missing or contradictory details fail loudly as an
+indeterminate protocol failure, never a success or safe-retry fallback.
+
+Pre-mutation RPC statuses encode the same details in `Status::details` and carry
+`x-ferris-write-failure: 1`; their gRPC code and message must match the details.
+Proven pre-mutation dynamic-mapping `ABORTED` retains that code with a typed
+not-executed 503 detail; an unmarked `ABORTED` is not the same proof.
+Only known pre-mutation call sites may emit a not-executed status. Connection
+failure before RPC dispatch is also not executed. Any unmarked dispatched RPC
+failure, including `UNAVAILABLE`, `ABORTED`, and deadline expiry, is indeterminate.
+Preserve known receipts through engine errors, storage escalation, replication
+failure, and ordered-bulk single-write conversion. Failed writes carry no
+acknowledged refresh report. This plumbing does not change the ACK policy or
+add automatic retries.
+
 Primary document/delete/bulk requests carry `refresh`. Acknowledged
 document/delete responses and acknowledged bulk items require `write_refresh`
 when requested, and omit it otherwise. Direct homogeneous and ordered bulk

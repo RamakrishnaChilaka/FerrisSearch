@@ -440,11 +440,20 @@ impl CompositeEngine {
                 Ok(())
             }
         });
+        let mutation = error
+            .downcast_ref::<super::write_failure::WriteMutationError>()
+            .map(|error| error.mutation);
         match marker_result {
             Ok(()) => error,
-            Err(marker_error) => marker_error.context(format!(
-                "failed to persist vectors-stale state after {context} failed: {error:#}"
-            )),
+            Err(marker_error) => {
+                let error = marker_error.context(format!(
+                    "failed to persist vectors-stale state after {context} failed: {error:#}"
+                ));
+                match mutation {
+                    Some(mutation) => mutation.error(error),
+                    None => error,
+                }
+            }
         }
     }
 
@@ -785,40 +794,44 @@ impl SearchEngine for CompositeEngine {
         primary_term: u64,
         condition: super::WriteCondition,
     ) -> Result<super::IndexWriteReceipt> {
-        crate::common::validate_document_source(&payload)?;
-        let _vector_recovery = self
-            .vector_recovery
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let prepared = self.prepare_vector_mutation(&payload)?;
-        let rebuild_vectors = self.prepare_vector_rebuild(false)?;
-        let receipt = match self.text.add_primary_index_with_condition_and_side_effect(
-            doc_id,
-            payload,
-            primary_term,
-            condition,
-            |operation| self.apply_prepared_vector_mutation(operation, &prepared),
-        ) {
-            Ok(receipt) => receipt,
-            Err(error) => {
-                return Err(self.record_vector_staleness_after_text_failure(
-                    "primary document indexing",
-                    error,
-                ));
+        super::write_failure::WriteMutationState::run(primary_term, |mutation| {
+            crate::common::validate_document_source(&payload)?;
+            let _vector_recovery = self
+                .vector_recovery
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let prepared = self.prepare_vector_mutation(&payload)?;
+            let rebuild_vectors = self.prepare_vector_rebuild(false)?;
+            let receipt = match self.text.add_primary_index_with_condition_and_side_effect(
+                doc_id,
+                payload,
+                primary_term,
+                condition,
+                |operation| self.apply_prepared_vector_mutation(operation, &prepared),
+            ) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    return Err(self.record_vector_staleness_after_text_failure(
+                        "primary document indexing",
+                        error,
+                    ));
+                }
+            };
+            mutation.wal_attempted = true;
+            mutation.seq_no = Some(receipt.seq_no);
+            if rebuild_vectors {
+                self.rebuild_vectors_locked()?;
+                self.apply_vector_mutation_after_rebuild(
+                    WalOperation::Index,
+                    Some(&receipt.doc_id),
+                    receipt.seq_no,
+                    receipt.primary_term,
+                    &prepared,
+                )?;
             }
-        };
-        if rebuild_vectors {
-            self.rebuild_vectors_locked()?;
-            self.apply_vector_mutation_after_rebuild(
-                WalOperation::Index,
-                Some(&receipt.doc_id),
-                receipt.seq_no,
-                receipt.primary_term,
-                &prepared,
-            )?;
-        }
-        self.update_local_checkpoint(receipt.seq_no);
-        Ok(receipt)
+            self.update_local_checkpoint(receipt.seq_no);
+            Ok(receipt)
+        })
     }
 
     fn bulk_add_documents_with_receipt_at_term(
@@ -826,57 +839,62 @@ impl SearchEngine for CompositeEngine {
         docs: Vec<(String, serde_json::Value)>,
         primary_term: u64,
     ) -> Result<super::BulkWriteReceipt> {
-        for (_, payload) in &docs {
-            crate::common::validate_document_source(payload)?;
-        }
-        let _vector_recovery = self
-            .vector_recovery
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let prepared = docs
-            .iter()
-            .map(|(_, payload)| self.prepare_vector_mutation(payload))
-            .collect::<Result<Vec<_>>>()?;
-        let rebuild_vectors = self.prepare_vector_rebuild(false)?;
+        super::write_failure::WriteMutationState::run(primary_term, |mutation| {
+            for (_, payload) in &docs {
+                crate::common::validate_document_source(payload)?;
+            }
+            let _vector_recovery = self
+                .vector_recovery
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let prepared = docs
+                .iter()
+                .map(|(_, payload)| self.prepare_vector_mutation(payload))
+                .collect::<Result<Vec<_>>>()?;
+            let rebuild_vectors = self.prepare_vector_rebuild(false)?;
 
-        let mut apply_prepared = prepared.iter();
-        let receipt =
-            match self
-                .text
-                .add_primary_bulk_with_side_effect(docs, primary_term, |operation| {
-                    let prepared = apply_prepared
-                        .next()
-                        .expect("primary bulk vector preparation matches operation order");
-                    self.apply_prepared_vector_mutation(operation, prepared)
-                }) {
-                Ok(receipt) => receipt,
-                Err(error) => {
-                    return Err(self.record_vector_staleness_after_text_failure(
-                        "primary bulk indexing",
-                        error,
-                    ));
-                }
-            };
-        if rebuild_vectors {
-            self.rebuild_vectors_locked()?;
-            if let Some(start_seq_no) = receipt.start_seq_no {
-                for (offset, (doc_id, prepared)) in
-                    receipt.doc_ids.iter().zip(&prepared).enumerate()
-                {
-                    self.apply_vector_mutation_after_rebuild(
-                        WalOperation::Index,
-                        Some(doc_id),
-                        start_seq_no + offset as u64,
-                        receipt.primary_term,
-                        prepared,
-                    )?;
+            let mut apply_prepared = prepared.iter();
+            let receipt =
+                match self
+                    .text
+                    .add_primary_bulk_with_side_effect(docs, primary_term, |operation| {
+                        let prepared = apply_prepared
+                            .next()
+                            .expect("primary bulk vector preparation matches operation order");
+                        self.apply_prepared_vector_mutation(operation, prepared)
+                    }) {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        return Err(self.record_vector_staleness_after_text_failure(
+                            "primary bulk indexing",
+                            error,
+                        ));
+                    }
+                };
+            mutation.wal_attempted = receipt.start_seq_no.is_some();
+            mutation.seq_no = receipt.start_seq_no;
+            mutation.last_seq_no = receipt.last_seq_no()?;
+            if rebuild_vectors {
+                self.rebuild_vectors_locked()?;
+                if let Some(start_seq_no) = receipt.start_seq_no {
+                    for (offset, (doc_id, prepared)) in
+                        receipt.doc_ids.iter().zip(&prepared).enumerate()
+                    {
+                        self.apply_vector_mutation_after_rebuild(
+                            WalOperation::Index,
+                            Some(doc_id),
+                            start_seq_no + offset as u64,
+                            receipt.primary_term,
+                            prepared,
+                        )?;
+                    }
                 }
             }
-        }
-        if let Some(last_seq_no) = receipt.last_seq_no()? {
-            self.update_local_checkpoint(last_seq_no);
-        }
-        Ok(receipt)
+            if let Some(last_seq_no) = receipt.last_seq_no()? {
+                self.update_local_checkpoint(last_seq_no);
+            }
+            Ok(receipt)
+        })
     }
 
     fn delete_document_with_receipt_at_term(
@@ -897,39 +915,43 @@ impl SearchEngine for CompositeEngine {
         primary_term: u64,
         condition: super::WriteCondition,
     ) -> Result<super::DeleteWriteReceipt> {
-        let _vector_recovery = self
-            .vector_recovery
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let rebuild_vectors = self.prepare_vector_rebuild(false)?;
-        let receipt = match self.text.delete_primary_with_condition_and_side_effect(
-            doc_id,
-            primary_term,
-            condition,
-            |operation| {
-                self.apply_prepared_vector_mutation(operation, &PreparedVectorMutation::Delete)
-            },
-        ) {
-            Ok(receipt) => receipt,
-            Err(error) => {
-                return Err(self.record_vector_staleness_after_text_failure(
-                    "primary document deletion",
-                    error,
-                ));
+        super::write_failure::WriteMutationState::run(primary_term, |mutation| {
+            let _vector_recovery = self
+                .vector_recovery
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let rebuild_vectors = self.prepare_vector_rebuild(false)?;
+            let receipt = match self.text.delete_primary_with_condition_and_side_effect(
+                doc_id,
+                primary_term,
+                condition,
+                |operation| {
+                    self.apply_prepared_vector_mutation(operation, &PreparedVectorMutation::Delete)
+                },
+            ) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    return Err(self.record_vector_staleness_after_text_failure(
+                        "primary document deletion",
+                        error,
+                    ));
+                }
+            };
+            mutation.wal_attempted = true;
+            mutation.seq_no = Some(receipt.seq_no);
+            if rebuild_vectors {
+                self.rebuild_vectors_locked()?;
+                self.apply_vector_mutation_after_rebuild(
+                    WalOperation::Delete,
+                    Some(doc_id),
+                    receipt.seq_no,
+                    receipt.primary_term,
+                    &PreparedVectorMutation::Delete,
+                )?;
             }
-        };
-        if rebuild_vectors {
-            self.rebuild_vectors_locked()?;
-            self.apply_vector_mutation_after_rebuild(
-                WalOperation::Delete,
-                Some(doc_id),
-                receipt.seq_no,
-                receipt.primary_term,
-                &PreparedVectorMutation::Delete,
-            )?;
-        }
-        self.update_local_checkpoint(receipt.seq_no);
-        Ok(receipt)
+            self.update_local_checkpoint(receipt.seq_no);
+            Ok(receipt)
+        })
     }
 
     fn apply_replica_operation(
@@ -2373,6 +2395,43 @@ mod tests {
         assert!(!engine.vectors_are_stale().unwrap());
         assert!(engine.vector.read().unwrap().is_none());
         assert_eq!(engine.sequence_stats().processed_checkpoint, None);
+    }
+
+    #[test]
+    fn typed_write_failure_vector_staleness_preserves_post_wal_operation_context() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = vector_engine(directory.path());
+        let first = engine
+            .add_document_with_receipt_at_term("doc", json!({"emb": [1.0, 0.0, 0.0]}), 7)
+            .unwrap();
+        assert_eq!(first.seq_no, 0);
+        engine.inject_engine_apply_failures_for_test(5, 1);
+        let error = engine
+            .add_document_with_receipt_at_term("doc", json!({"emb": [0.0, 1.0, 0.0]}), 7)
+            .unwrap_err();
+        let failure = crate::transport::write_failure::WriteFailure::from_engine(&error, 7);
+        assert_eq!(
+            failure.outcome,
+            crate::transport::proto::WriteFailureOutcome::Indeterminate
+        );
+        assert_eq!(failure.seq_no, Some(1));
+        assert_eq!(failure.primary_term, Some(7));
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(5)
+        );
+        assert!(engine.vectors_are_stale().unwrap());
+        engine.refresh().unwrap();
+        let document = engine
+            .get_document_with_metadata("doc", true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(document.seq_no, 1);
+        assert_eq!(document.primary_term, 7);
+        assert_eq!(document.source["emb"], json!([0.0, 1.0, 0.0]));
     }
 
     fn vector_state_after_failed_write(
