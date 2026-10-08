@@ -35,14 +35,17 @@ pub(super) struct BulkTargetFailure {
     pub status: StatusCode,
     pub error_type: String,
     pub reason: String,
+    pub failure: Option<Box<crate::transport::write_failure::WriteFailure>>,
 }
 
 impl BulkTargetFailure {
+    #[cfg(test)]
     pub(super) fn internal(reason: String) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             error_type: "shard_failure".into(),
             reason,
+            failure: None,
         }
     }
 
@@ -52,6 +55,10 @@ impl BulkTargetFailure {
             status,
             error_type: error_type.into(),
             reason: error.to_string(),
+            failure: error
+                .downcast_ref::<crate::transport::write_failure::WriteFailure>()
+                .cloned()
+                .map(Box::new),
         }
     }
 
@@ -66,7 +73,39 @@ impl BulkTargetFailure {
                 .as_str()
                 .map(str::to_string)
                 .unwrap_or_else(|| body.to_string()),
+            failure: None,
         }
+    }
+
+    fn item(&self, action: &str, index: &str, doc_id: &str, offset: usize, count: usize) -> Value {
+        let mut item = bulk_error_item(
+            action,
+            Some(index),
+            doc_id,
+            self.status,
+            &self.error_type,
+            &self.reason,
+        );
+        if let Some(failure) = &self.failure {
+            match failure.item_receipt(offset, count) {
+                Ok(seq_no) => {
+                    if let Some(seq_no) = seq_no {
+                        item[action]["_seq_no"] = serde_json::json!(seq_no);
+                    }
+                    if let Some(term) = failure.primary_term {
+                        item[action]["_primary_term"] = serde_json::json!(term);
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(error = %error, "Invalid failed bulk operation range");
+                    item[action]["error"]["reason"] = serde_json::json!(format!(
+                        "{}; invalid failed operation identity: {error:#}",
+                        self.reason
+                    ));
+                }
+            }
+        }
+        item
     }
 }
 
@@ -257,7 +296,7 @@ pub(super) fn route_bulk_doc(
                 "index",
                 Some(&index_name),
                 &doc_id,
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::SERVICE_UNAVAILABLE,
                 "shard_not_available_exception",
                 "Shard has no assigned primary",
             )
@@ -268,8 +307,8 @@ pub(super) fn route_bulk_doc(
             "index",
             Some(&index_name),
             &doc_id,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "node_not_found_exception",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "shard_not_available_exception",
             format!("Primary node [{node_id}] not found in cluster state"),
         ));
     }
@@ -307,8 +346,11 @@ async fn forward_bulk_batches(
         let Some(node) = cluster_state.nodes.get(&key.1) else {
             return (
                 key,
-                Err(BulkTargetFailure::internal(
-                    "Primary node missing from cluster state".into(),
+                Err(BulkTargetFailure::from_forward_error(
+                    crate::transport::write_failure::WriteFailure::not_executed(
+                        "Primary node missing from cluster state",
+                    )
+                    .into(),
                 )),
             );
         };
@@ -377,14 +419,14 @@ async fn forward_bulk_batches(
                 ),
                 Err(error) => {
                     let failure = BulkTargetFailure::from_forward_error(error);
-                    for document in run {
-                        let item = bulk_error_item(
+                    let count = run.len();
+                    for (offset, document) in run.iter().enumerate() {
+                        let item = failure.item(
                             &document.action,
-                            Some(&document.index_name),
+                            &document.index_name,
                             &document.doc_id,
-                            failure.status,
-                            &failure.error_type,
-                            &failure.reason,
+                            offset,
+                            count,
                         );
                         results.push(item[&document.action].clone());
                     }
@@ -482,6 +524,15 @@ pub(super) fn finalize_bulk_items(
     routed_docs: Vec<RoutedBulkDoc>,
     outcomes: &BulkTargetResults,
 ) -> Vec<Value> {
+    let mut counts: HashMap<BulkTargetKey, usize> = HashMap::new();
+    for document in &routed_docs {
+        let key = (
+            document.index_name.clone(),
+            document.node_id.clone(),
+            document.shard_id,
+        );
+        *counts.entry(key).or_default() += 1;
+    }
     let mut offsets: HashMap<BulkTargetKey, usize> = HashMap::new();
     for document in routed_docs {
         let key = (
@@ -505,13 +556,12 @@ pub(super) fn finalize_bulk_items(
                         "missing primary bulk item result",
                     )
                 }),
-            Some(Err(failure)) => bulk_error_item(
+            Some(Err(failure)) => failure.item(
                 &document.action,
-                Some(&document.index_name),
+                &document.index_name,
                 &document.doc_id,
-                failure.status,
-                &failure.error_type,
-                &failure.reason,
+                *offset,
+                counts[&key],
             ),
             None => bulk_error_item(
                 &document.action,
@@ -556,12 +606,14 @@ async fn bulk_metadata(
             reason: format!(
                 "index [{index}] is a protected system index and cannot be accessed through ordinary index APIs"
             ),
+            failure: None,
         });
     }
     crate::common::IndexName::new(index.to_string()).map_err(|reason| BulkTargetFailure {
         status: StatusCode::BAD_REQUEST,
         error_type: "invalid_index_name_exception".into(),
         reason: reason.to_string(),
+        failure: None,
     })?;
     state
         .security_manager
@@ -576,6 +628,7 @@ async fn bulk_metadata(
             status: error.status,
             error_type: error.error_type.into(),
             reason: error.reason.to_string(),
+            failure: None,
         })?;
     let current;
     let cluster_state = if cluster_state.indices.contains_key(index) {

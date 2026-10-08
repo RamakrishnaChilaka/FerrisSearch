@@ -89,6 +89,10 @@ pub struct ShardManager {
   reaches the fixed gap deadline (about 60 seconds), is removed, and is
   peer-recovered. This is intentionally conservative until D10 adds targeted
   repair.
+  Preserve primary `WriteMutationError` context when wrapping an Apply error
+  for persistent-I/O escalation. Native error sources can hide anyhow context
+  from direct downcasts; reattach the current operation's context without
+  changing retry accounting, availability, or the underlying cause.
   Definitive and open-level failures may quarantine only after the report
   throttle admits the attempt, except sequence/version collisions, which
   atomically persist collision quarantine before the engine is evicted and are

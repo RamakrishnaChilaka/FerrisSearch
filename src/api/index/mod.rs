@@ -24,7 +24,13 @@ fn is_document_validation_error(error: &anyhow::Error) -> bool {
         .is_some_and(|status| status.code() == tonic::Code::InvalidArgument)
 }
 
-fn forwarded_write_error_classification(error: &anyhow::Error) -> (StatusCode, &'static str) {
+fn forwarded_write_error_classification(error: &anyhow::Error) -> (StatusCode, &str) {
+    if let Some(failure) = error.downcast_ref::<crate::transport::write_failure::WriteFailure>() {
+        return (
+            StatusCode::from_u16(failure.status).expect("validated write failure HTTP status"),
+            &failure.error_type,
+        );
+    }
     if is_document_validation_error(error) {
         return (StatusCode::BAD_REQUEST, "mapper_parsing_exception");
     }
@@ -76,6 +82,19 @@ fn document_write_error_response(
     operation: &str,
     error: anyhow::Error,
 ) -> (StatusCode, Json<Value>) {
+    if let Some(failure) = error.downcast_ref::<crate::transport::write_failure::WriteFailure>() {
+        let status =
+            StatusCode::from_u16(failure.status).expect("validated write failure HTTP status");
+        let (status, Json(mut response)) =
+            crate::api::error_response(status, &failure.error_type, &failure.reason);
+        if let Some(seq_no) = failure.seq_no {
+            response["_seq_no"] = serde_json::json!(seq_no);
+        }
+        if let Some(primary_term) = failure.primary_term {
+            response["_primary_term"] = serde_json::json!(primary_term);
+        }
+        return (status, Json(response));
+    }
     let (status, error_type) = forwarded_write_error_classification(&error);
     if matches!(status, StatusCode::CONFLICT | StatusCode::NOT_FOUND)
         && let Some(error) = error
@@ -843,7 +862,7 @@ pub async fn index_document(
         Some(id) => id.clone(),
         None => {
             return crate::api::error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::SERVICE_UNAVAILABLE,
                 "shard_not_available_exception",
                 "Shard has no assigned node",
             );
@@ -855,8 +874,8 @@ pub async fn index_document(
         Some(n) => n.clone(),
         None => {
             return crate::api::error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "node_not_found_exception",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "shard_not_available_exception",
                 "Target node not in cluster state",
             );
         }
@@ -934,7 +953,7 @@ pub async fn index_document_with_id(
         Some(id) => id.clone(),
         None => {
             return crate::api::error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::SERVICE_UNAVAILABLE,
                 "shard_not_available_exception",
                 "Shard has no assigned node",
             );
@@ -946,8 +965,8 @@ pub async fn index_document_with_id(
         Some(n) => n.clone(),
         None => {
             return crate::api::error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "node_not_found_exception",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "shard_not_available_exception",
                 "Target node not in cluster state",
             );
         }
@@ -1569,7 +1588,7 @@ async fn resolve_document_primary(
         Some(id) => id.clone(),
         None => {
             return Err(crate::api::error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::SERVICE_UNAVAILABLE,
                 "shard_not_available_exception",
                 "Shard has no assigned node",
             ));
@@ -1579,8 +1598,8 @@ async fn resolve_document_primary(
         Some(n) => n.clone(),
         None => {
             return Err(crate::api::error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "node_not_found_exception",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "shard_not_available_exception",
                 "Target node not in cluster state",
             ));
         }
@@ -1766,9 +1785,7 @@ async fn execute_update(
             }
             Err(error)
                 if retries > 0
-                    && error
-                        .downcast_ref::<tonic::Status>()
-                        .is_some_and(|status| status.code() == tonic::Code::AlreadyExists) =>
+                    && forwarded_write_error_classification(&error).0 == StatusCode::CONFLICT =>
             {
                 retries -= 1;
             }
@@ -1816,7 +1833,7 @@ pub async fn delete_document(
         Some(id) => id.clone(),
         None => {
             return crate::api::error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::SERVICE_UNAVAILABLE,
                 "shard_not_available_exception",
                 "Shard has no assigned node",
             );
@@ -1827,8 +1844,8 @@ pub async fn delete_document(
         Some(n) => n.clone(),
         None => {
             return crate::api::error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "node_not_found_exception",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "shard_not_available_exception",
                 "Target node not in cluster state",
             );
         }

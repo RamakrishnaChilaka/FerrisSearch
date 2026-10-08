@@ -276,7 +276,7 @@ fn route_bulk_doc_reports_missing_primary() {
     )
     .unwrap_err();
 
-    assert_eq!(err["index"]["status"], 500);
+    assert_eq!(err["index"]["status"], 503);
     assert_eq!(
         err["index"]["error"]["type"],
         "shard_not_available_exception"
@@ -321,10 +321,10 @@ async fn bulk_index_reports_missing_primary_node_as_item_error() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["errors"], true);
     assert_eq!(body["items"].as_array().unwrap().len(), 1);
-    assert_eq!(body["items"][0]["index"]["status"], 500);
+    assert_eq!(body["items"][0]["index"]["status"], 503);
     assert_eq!(
         body["items"][0]["index"]["error"]["type"],
-        "node_not_found_exception"
+        "shard_not_available_exception"
     );
 }
 
@@ -517,6 +517,49 @@ fn retryable_aborted_write_maps_to_service_unavailable() {
             .unwrap()
             .contains("shard UUID changed")
     );
+}
+
+#[test]
+fn typed_write_failure_bulk_finalizer_uses_submitted_count_and_duplicate_id_offsets() {
+    use crate::transport::write_failure::WriteFailure;
+    let routed = |count| {
+        (0..count)
+            .map(|position| RoutedBulkDoc {
+                position,
+                index_name: "idx".into(),
+                node_id: "node-1".into(),
+                shard_id: 0,
+                doc_id: "duplicate".into(),
+                payload: Value::Null,
+                action: "index".into(),
+                condition: crate::engine::WriteCondition::Unconditional,
+                retry_on_conflict: 0,
+            })
+            .collect()
+    };
+    let failed = bulk::BulkTargetFailure::from_forward_error(
+        WriteFailure::indeterminate("replica failed", Some(0), Some(7), Some(2)).into(),
+    );
+    let outcomes = HashMap::from([(("idx".into(), "node-1".into(), 0), Err(failed))]);
+    let items = finalize_bulk_items(vec![None; 3], routed(3), &outcomes);
+    for (offset, item) in items.iter().enumerate() {
+        assert_eq!(item["index"]["status"], 500);
+        assert_eq!(item["index"]["error"]["type"], "write_outcome_unknown");
+        assert_eq!(item["index"]["_id"], "duplicate");
+        assert_eq!(item["index"]["_seq_no"], offset as u64);
+        assert_eq!(item["index"]["_primary_term"], 7);
+    }
+    let invalid = finalize_bulk_items(vec![None; 2], routed(2), &outcomes);
+    for item in invalid {
+        assert!(item["index"].get("_seq_no").is_none(), "{item}");
+        assert!(
+            item["index"]["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("does not match the submitted batch"),
+            "{item}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

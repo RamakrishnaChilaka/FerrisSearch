@@ -64,6 +64,18 @@ changes. The [restart regression](../tests/restart_regression.rs) restarts the
 cluster and checks data preservation. These do not establish a complete
 partition, stale-primary, divergent-history, and interrupted-recovery contract.
 
+> **Implementation note — October 6, 2026:** Primary document mutation failures
+> now implement [D4's typed outcome plumbing](adr/0001-write-consistency-and-retry-contract.md#d4-outcome-classes).
+> Proven pre-WAL rejection and non-execution remain distinct from 500
+> `write_outcome_unknown`. Valid known sequence/term receipts survive engine
+> apply, persistent-I/O escalation, replication failure, gRPC forwarding, and
+> REST/bulk rendering. Failed batch ranges use actual submitted cardinality
+> and request-order offsets, including duplicate IDs. An ambiguous dispatched
+> RPC or a WAL failure without its receipt never borrows a shared checkpoint.
+> The September 29 baseline table predates this classification. Retry identity,
+> D2's success-after-committed-exclusion policy, and D14's immediate fail-stop
+> behavior remain unimplemented; required replica failures still fail requests.
+
 > **Implementation note — September 29, 2026:** D1 now stores term-aware WAL v2
 > entries and versioned committed boundaries, distinguishes empty checkpoints
 > from sequence zero, tracks processed and persisted contiguous prefixes across

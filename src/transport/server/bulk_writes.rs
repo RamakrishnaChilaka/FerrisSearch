@@ -27,29 +27,32 @@ pub(super) fn index_batch_results(
 }
 
 fn failed_item(doc_id: String, error: Status) -> ShardBulkItemResponse {
-    let (status, error_type) = match error.code() {
-        tonic::Code::AlreadyExists => (409, "version_conflict_engine_exception"),
-        tonic::Code::InvalidArgument => (400, "mapper_parsing_exception"),
-        tonic::Code::Aborted => (503, "shard_not_available_exception"),
-        tonic::Code::Unavailable if crate::transport::state_wait::is_state_wait_timeout(&error) => {
-            (503, "shard_not_available_exception")
-        }
-        tonic::Code::ResourceExhausted
-            if error
-                .message()
-                .starts_with(crate::engine::version_map::VERSION_MAP_CAPACITY_STATUS_PREFIX) =>
-        {
-            (429, "version_map_capacity_exceeded")
-        }
-        _ => (500, "shard_failure"),
+    WriteFailure::from_rpc_status(error).bulk_item(doc_id)
+}
+
+fn failed_response(
+    doc_id: String,
+    details: Option<WriteFailureDetails>,
+    reason: &str,
+    seq_no: Option<u64>,
+    primary_term: Option<u64>,
+) -> ShardBulkItemResponse {
+    let failure = match WriteFailure::response_failure(details, reason, seq_no, primary_term) {
+        Ok(failure) if failure.last_seq_no.is_none() => failure,
+        Ok(_) => WriteFailure::indeterminate(
+            "single bulk mutation returned a bulk failure range",
+            None,
+            None,
+            None,
+        ),
+        Err(error) => WriteFailure::indeterminate(
+            format!("invalid bulk mutation failure response: {error:#}"),
+            None,
+            None,
+            None,
+        ),
     };
-    ShardBulkItemResponse {
-        doc_id,
-        status,
-        error: error.message().to_string(),
-        error_type: error_type.to_string(),
-        ..Default::default()
-    }
+    failure.bulk_item(doc_id)
 }
 
 pub(super) async fn execute_ordered_bulk(
@@ -74,7 +77,8 @@ pub(super) async fn execute_ordered_bulk(
             Err(error) => {
                 results.push(failed_item(
                     String::new(),
-                    Status::invalid_argument(error.to_string()),
+                    WriteFailure::rejected(400, "mapper_parsing_exception", error.to_string())
+                        .into_status(),
                 ));
                 continue;
             }
@@ -82,13 +86,22 @@ pub(super) async fn execute_ordered_bulk(
         let Some(doc_id) = document.get("_doc_id").and_then(serde_json::Value::as_str) else {
             results.push(failed_item(
                 String::new(),
-                Status::invalid_argument("bulk item has no _doc_id"),
+                WriteFailure::rejected(400, "mapper_parsing_exception", "bulk item has no _doc_id")
+                    .into_status(),
             ));
             continue;
         };
         let doc_id = doc_id.to_string();
-        let kind = ShardBulkOpKind::try_from(operation.kind)
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let kind = match ShardBulkOpKind::try_from(operation.kind) {
+            Ok(kind) => kind,
+            Err(error) => {
+                results.push(
+                    WriteFailure::rejected(400, "mapper_parsing_exception", error.to_string())
+                        .bulk_item(doc_id),
+                );
+                continue;
+            }
+        };
         let item = if kind == ShardBulkOpKind::Delete {
             match service
                 .delete_doc(service.transport_client.forwarding_request(
@@ -123,7 +136,13 @@ pub(super) async fn execute_ordered_bulk(
                             ..Default::default()
                         }
                     } else {
-                        failed_item(doc_id, Status::internal(response.error))
+                        failed_response(
+                            doc_id,
+                            response.failure,
+                            &response.error,
+                            response.seq_no,
+                            response.primary_term,
+                        )
                     }
                 }
                 Err(error) => failed_item(doc_id, error),
@@ -132,12 +151,27 @@ pub(super) async fn execute_ordered_bulk(
             let Some(source) = document.get("_source") else {
                 results.push(failed_item(
                     doc_id,
-                    Status::invalid_argument("bulk index item has no _source"),
+                    WriteFailure::rejected(
+                        400,
+                        "mapper_parsing_exception",
+                        "bulk index item has no _source",
+                    )
+                    .into_status(),
                 ));
                 continue;
             };
-            let payload_json =
-                serde_json::to_vec(source).map_err(|error| Status::internal(error.to_string()))?;
+            let payload_json = match serde_json::to_vec(source) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    results.push(
+                        WriteFailure::not_executed(format!(
+                            "failed to encode bulk source before dispatch: {error}"
+                        ))
+                        .bulk_item(doc_id),
+                    );
+                    continue;
+                }
+            };
             match service
                 .index_doc(service.transport_client.forwarding_request(
                     ShardDocRequest {
@@ -174,7 +208,13 @@ pub(super) async fn execute_ordered_bulk(
                             ..Default::default()
                         }
                     } else {
-                        failed_item(doc_id, Status::internal(response.error))
+                        failed_response(
+                            doc_id,
+                            response.failure,
+                            &response.error,
+                            response.seq_no,
+                            response.primary_term,
+                        )
                     }
                 }
                 Err(error) => failed_item(doc_id, error),

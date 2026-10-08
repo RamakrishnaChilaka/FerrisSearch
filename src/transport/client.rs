@@ -548,7 +548,10 @@ impl TransportClient {
         node: &NodeInfo,
         request: ShardDocRequest,
     ) -> Result<serde_json::Value, anyhow::Error> {
-        let mut client = self.connect(&node.host, node.transport_port).await?;
+        let mut client = self
+            .connect(&node.host, node.transport_port)
+            .await
+            .map_err(super::write_failure::WriteFailure::before_dispatch)?;
         let index_name = request.index_name.clone();
         let shard_id = request.shard_id;
         let doc_id = request.doc_id.clone();
@@ -557,15 +560,21 @@ impl TransportClient {
         if refresh {
             request.set_timeout(self.timeout);
         }
-        let response = client.index_doc(request).await?.into_inner();
+        let response = client
+            .index_doc(request)
+            .await
+            .map_err(super::write_failure::WriteFailure::from_rpc_status)?
+            .into_inner();
         if response.success {
             super::write_refresh::validate_write_refresh_response(
                 response.write_refresh.as_ref(),
                 refresh,
                 &node.id,
-            )?;
+            )
+            .map_err(super::write_failure::WriteFailure::after_dispatch)?;
         }
         decode_shard_doc_response(&index_name, shard_id, &doc_id, response)
+            .map_err(super::write_failure::WriteFailure::after_dispatch)
     }
 
     /// Forward a bulk batch to a specific shard on a node
@@ -576,7 +585,10 @@ impl TransportClient {
         shard_id: u32,
         docs: &[(String, serde_json::Value)],
     ) -> Result<crate::engine::BulkWriteReceipt, anyhow::Error> {
-        let mut client = self.connect(&node.host, node.transport_port).await?;
+        let mut client = self
+            .connect(&node.host, node.transport_port)
+            .await
+            .map_err(super::write_failure::WriteFailure::before_dispatch)?;
         let documents_json: Vec<Vec<u8>> = docs
             .iter()
             .map(|(id, payload)| encode_bulk_document(id, payload))
@@ -591,8 +603,13 @@ impl TransportClient {
             index_name,
             Some((shard_id, &node.id)),
         );
-        let response = client.bulk_index(request).await?.into_inner();
+        let response = client
+            .bulk_index(request)
+            .await
+            .map_err(super::write_failure::WriteFailure::from_rpc_status)?
+            .into_inner();
         decode_shard_bulk_response(docs, response)
+            .map_err(super::write_failure::WriteFailure::after_dispatch)
     }
 
     /// Forward a delete operation to a specific shard on a node
@@ -624,7 +641,10 @@ impl TransportClient {
         doc_id: &str,
         options: WriteOptions,
     ) -> Result<serde_json::Value, anyhow::Error> {
-        let mut client = self.connect(&node.host, node.transport_port).await?;
+        let mut client = self
+            .connect(&node.host, node.transport_port)
+            .await
+            .map_err(super::write_failure::WriteFailure::before_dispatch)?;
         let (if_seq_no, if_primary_term) = options.condition.expected_version();
         let mut request = self.forwarding_request(
             ShardDeleteRequest {
@@ -641,15 +661,21 @@ impl TransportClient {
         if options.refresh {
             request.set_timeout(self.timeout);
         }
-        let response = client.delete_doc(request).await?.into_inner();
+        let response = client
+            .delete_doc(request)
+            .await
+            .map_err(super::write_failure::WriteFailure::from_rpc_status)?
+            .into_inner();
         if response.success {
             super::write_refresh::validate_write_refresh_response(
                 response.write_refresh.as_ref(),
                 options.refresh,
                 &node.id,
-            )?;
+            )
+            .map_err(super::write_failure::WriteFailure::after_dispatch)?;
         }
         decode_shard_delete_response(index_name, shard_id, doc_id, response)
+            .map_err(super::write_failure::WriteFailure::after_dispatch)
     }
 
     /// Forward a get-by-ID request to a specific shard on a node
@@ -726,7 +752,10 @@ impl TransportClient {
         docs: &[(String, serde_json::Value, ShardBulkOperation)],
         refresh: bool,
     ) -> Result<Vec<ShardBulkItemResponse>, anyhow::Error> {
-        let mut client = self.connect(&node.host, node.transport_port).await?;
+        let mut client = self
+            .connect(&node.host, node.transport_port)
+            .await
+            .map_err(super::write_failure::WriteFailure::before_dispatch)?;
         let documents_json = docs
             .iter()
             .map(|(doc_id, source, _)| encode_bulk_document(doc_id, source))
@@ -745,49 +774,13 @@ impl TransportClient {
         if refresh {
             request.set_timeout(self.timeout);
         }
-        let response = client.bulk_index(request).await?.into_inner();
-        if !response.success {
-            anyhow::bail!("Shard bulk failed: {}", response.error);
-        }
-        if response.results.len() != docs.len() {
-            anyhow::bail!("shard bulk response has inconsistent item count");
-        }
-        for (item, (doc_id, _, operation)) in response.results.iter().zip(docs) {
-            if item.doc_id != *doc_id {
-                anyhow::bail!("shard bulk response has inconsistent document identities");
-            }
-            if item.error.is_empty() {
-                let expected = match ShardBulkOpKind::try_from(operation.kind)? {
-                    ShardBulkOpKind::Index => matches!(
-                        (item.status, item.result.as_str()),
-                        (201, "created") | (200, "updated")
-                    ),
-                    ShardBulkOpKind::Create => item.status == 201 && item.result == "created",
-                    ShardBulkOpKind::Delete => matches!(
-                        (item.status, item.result.as_str()),
-                        (200, "deleted") | (404, "not_found")
-                    ),
-                };
-                if !expected
-                    || item.seq_no.is_none()
-                    || item.primary_term.is_none_or(|term| term == 0)
-                {
-                    anyhow::bail!(
-                        "shard bulk success has invalid result or missing operation identity"
-                    );
-                }
-                super::write_refresh::validate_write_refresh_response(
-                    item.write_refresh.as_ref(),
-                    refresh,
-                    &node.id,
-                )?;
-            } else if item.status < 400 || item.error_type.is_empty() {
-                anyhow::bail!("shard bulk error has invalid status or missing error type");
-            } else if item.write_refresh.is_some() {
-                anyhow::bail!("failed bulk item contains acknowledged refresh results");
-            }
-        }
-        Ok(response.results)
+        let response = client
+            .bulk_index(request)
+            .await
+            .map_err(super::write_failure::WriteFailure::from_rpc_status)?
+            .into_inner();
+        decode_shard_bulk_operations_response(docs, refresh, &node.id, response)
+            .map_err(super::write_failure::WriteFailure::after_dispatch)
     }
 
     pub(crate) async fn refresh_shard_copy(
@@ -1970,7 +1963,33 @@ fn decode_shard_doc_response(
     response: ShardDocResponse,
 ) -> Result<serde_json::Value, anyhow::Error> {
     if !response.success {
-        anyhow::bail!("Shard index failed: {}", response.error);
+        if response.write_refresh.is_some()
+            || (!expected_doc_id.is_empty() && response.doc_id != expected_doc_id)
+        {
+            anyhow::bail!(
+                "failed shard index response has inconsistent document identity or refresh metadata; server cause: {}",
+                response.error
+            );
+        }
+        let failure = super::write_failure::WriteFailure::response_failure(
+            response.failure,
+            &response.error,
+            response.seq_no,
+            response.primary_term,
+        )?;
+        if failure.last_seq_no.is_some() {
+            anyhow::bail!("single write failure contains a bulk sequence range");
+        }
+        return Err(failure.into());
+    }
+    if response.failure.is_some() {
+        anyhow::bail!("successful shard index response contains failure details");
+    }
+    if !response.error.is_empty() {
+        anyhow::bail!(
+            "successful shard index response contains an error: {}",
+            response.error
+        );
     }
     if response.doc_id.is_empty() {
         anyhow::bail!("successful shard index response returned an empty document id");
@@ -2015,7 +2034,31 @@ fn decode_shard_bulk_response(
     response: ShardBulkResponse,
 ) -> Result<crate::engine::BulkWriteReceipt, anyhow::Error> {
     if !response.success {
-        anyhow::bail!("Shard bulk index failed: {}", response.error);
+        if !response.results.is_empty() {
+            anyhow::bail!(
+                "failed shard bulk envelope contains item results; server cause: {}",
+                response.error
+            );
+        }
+        let failure = super::write_failure::WriteFailure::response_failure(
+            response.failure,
+            &response.error,
+            response.start_seq_no,
+            response.primary_term,
+        )?;
+        if failure.seq_no.is_some() {
+            failure.item_receipt(0, docs.len())?;
+        }
+        return Err(failure.into());
+    }
+    if response.failure.is_some() {
+        anyhow::bail!("successful shard bulk response contains failure details");
+    }
+    if !response.error.is_empty() {
+        anyhow::bail!(
+            "successful shard bulk response contains an error: {}",
+            response.error
+        );
     }
     if response.doc_ids.len() != docs.len()
         || response
@@ -2048,6 +2091,8 @@ fn decode_shard_bulk_response(
             .and_then(|start| start.checked_add(offset as u64));
         if item.doc_id != *doc_id
             || !item.error.is_empty()
+            || !item.error_type.is_empty()
+            || item.failure.is_some()
             || item.write_refresh.is_some()
             || item.seq_no != expected_seq
             || item.primary_term != Some(receipt.primary_term)
@@ -2062,6 +2107,89 @@ fn decode_shard_bulk_response(
     Ok(receipt)
 }
 
+fn decode_shard_bulk_operations_response(
+    docs: &[(String, serde_json::Value, ShardBulkOperation)],
+    refresh: bool,
+    node_id: &str,
+    response: ShardBulkResponse,
+) -> Result<Vec<ShardBulkItemResponse>, anyhow::Error> {
+    if !response.success {
+        if !response.results.is_empty() {
+            anyhow::bail!(
+                "failed shard bulk envelope contains item results; server cause: {}",
+                response.error
+            );
+        }
+        let failure = super::write_failure::WriteFailure::response_failure(
+            response.failure,
+            &response.error,
+            response.start_seq_no,
+            response.primary_term,
+        )?;
+        if failure.seq_no.is_some() {
+            failure.item_receipt(0, docs.len())?;
+        }
+        return Err(failure.into());
+    }
+    if response.failure.is_some() || !response.error.is_empty() {
+        anyhow::bail!("successful shard bulk envelope contains failure details or an error");
+    }
+    if response.results.len() != docs.len() || response.doc_ids.len() != docs.len() {
+        anyhow::bail!("shard bulk response has inconsistent item count");
+    }
+    for ((item, response_id), (doc_id, _, operation)) in
+        response.results.iter().zip(&response.doc_ids).zip(docs)
+    {
+        if item.doc_id != *doc_id || response_id != doc_id {
+            anyhow::bail!("shard bulk response has inconsistent document identities");
+        }
+        if item.error.is_empty() {
+            if item.failure.is_some() || !item.error_type.is_empty() {
+                anyhow::bail!("successful bulk item contains failure details");
+            }
+            let expected = match ShardBulkOpKind::try_from(operation.kind)? {
+                ShardBulkOpKind::Index => matches!(
+                    (item.status, item.result.as_str()),
+                    (201, "created") | (200, "updated")
+                ),
+                ShardBulkOpKind::Create => item.status == 201 && item.result == "created",
+                ShardBulkOpKind::Delete => matches!(
+                    (item.status, item.result.as_str()),
+                    (200, "deleted") | (404, "not_found")
+                ),
+            };
+            if !expected || item.seq_no.is_none() || item.primary_term.is_none_or(|term| term == 0)
+            {
+                anyhow::bail!(
+                    "shard bulk success has invalid result or missing operation identity"
+                );
+            }
+            super::write_refresh::validate_write_refresh_response(
+                item.write_refresh.as_ref(),
+                refresh,
+                node_id,
+            )?;
+        } else {
+            if item.write_refresh.is_some() || !item.result.is_empty() {
+                anyhow::bail!("failed bulk item contains acknowledged result or refresh metadata");
+            }
+            let failure = super::write_failure::WriteFailure::response_failure(
+                item.failure.clone(),
+                &item.error,
+                item.seq_no,
+                item.primary_term,
+            )?;
+            if u32::from(failure.status) != item.status
+                || failure.error_type != item.error_type
+                || failure.last_seq_no.is_some()
+            {
+                anyhow::bail!("bulk item has inconsistent failure classification");
+            }
+        }
+    }
+    Ok(response.results)
+}
+
 fn decode_shard_delete_response(
     index_name: &str,
     shard_id: u32,
@@ -2069,7 +2197,31 @@ fn decode_shard_delete_response(
     response: ShardDeleteResponse,
 ) -> Result<serde_json::Value, anyhow::Error> {
     if !response.success {
-        anyhow::bail!("Delete failed: {}", response.error);
+        if response.write_refresh.is_some() {
+            anyhow::bail!(
+                "failed shard delete response contains refresh metadata; server cause: {}",
+                response.error
+            );
+        }
+        let failure = super::write_failure::WriteFailure::response_failure(
+            response.failure,
+            &response.error,
+            response.seq_no,
+            response.primary_term,
+        )?;
+        if failure.last_seq_no.is_some() {
+            anyhow::bail!("single delete failure contains a bulk sequence range");
+        }
+        return Err(failure.into());
+    }
+    if response.failure.is_some() {
+        anyhow::bail!("successful shard delete response contains failure details");
+    }
+    if !response.error.is_empty() {
+        anyhow::bail!(
+            "successful shard delete response contains an error: {}",
+            response.error
+        );
     }
     let seq_no = response.seq_no.ok_or_else(|| {
         anyhow::anyhow!("successful shard delete response is missing its assigned sequence")
@@ -2407,6 +2559,209 @@ mod tests {
     }
 
     #[test]
+    fn typed_write_failure_decoders_preserve_zero_receipts_and_exact_batch_range() {
+        use super::super::write_failure::WriteFailure;
+        let failure = WriteFailure::indeterminate("replica failed", Some(0), Some(7), None);
+        for error in [
+            decode_shard_doc_response(
+                "idx",
+                0,
+                "doc",
+                failure.clone().index_response("doc".into()),
+            )
+            .unwrap_err(),
+            decode_shard_delete_response("idx", 0, "doc", failure.clone().delete_response(1))
+                .unwrap_err(),
+        ] {
+            let decoded = error.downcast_ref::<WriteFailure>().unwrap();
+            assert_eq!(decoded.seq_no, Some(0));
+            assert_eq!(decoded.primary_term, Some(7));
+            assert_eq!(decoded.reason, "replica failed");
+        }
+        let docs = vec![
+            ("duplicate".into(), serde_json::json!({"value": 1})),
+            ("duplicate".into(), serde_json::json!({"value": 2})),
+        ];
+        let failure =
+            WriteFailure::indeterminate("batch replica failed", Some(0), Some(7), Some(1));
+        let error = decode_shard_bulk_response(
+            &docs,
+            failure.bulk_response(vec!["duplicate".into(), "duplicate".into()]),
+        )
+        .unwrap_err();
+        let failure = error.downcast_ref::<WriteFailure>().unwrap();
+        assert_eq!(failure.seq_no, Some(0));
+        assert_eq!(failure.last_seq_no, Some(1));
+        assert_eq!(failure.primary_term, Some(7));
+    }
+
+    #[tokio::test]
+    async fn typed_write_failure_connection_error_is_proven_before_dispatch() {
+        use super::super::write_failure::WriteFailure;
+        let node = NodeInfo {
+            id: "invalid-endpoint".into(),
+            name: "invalid-endpoint".into(),
+            host: "[not-an-ipv6-address]".into(),
+            transport_port: 0,
+            http_port: 0,
+            roles: vec![crate::cluster::state::NodeRole::Data],
+            raft_node_id: 0,
+        };
+        let client = TransportClient::new();
+        let errors = [
+            client
+                .forward_index_to_shard(&node, "idx", 0, "doc", &serde_json::json!({}))
+                .await
+                .unwrap_err(),
+            client
+                .forward_delete_to_shard(&node, "idx", 0, "doc")
+                .await
+                .unwrap_err(),
+            client
+                .forward_bulk_to_shard(&node, "idx", 0, &[("doc".into(), serde_json::json!({}))])
+                .await
+                .unwrap_err(),
+            client
+                .forward_bulk_operations_to_shard(
+                    &node,
+                    "idx",
+                    0,
+                    &[(
+                        "doc".into(),
+                        serde_json::json!({}),
+                        ShardBulkOperation::default(),
+                    )],
+                    false,
+                )
+                .await
+                .unwrap_err(),
+        ];
+        for error in errors {
+            let failure = error.downcast_ref::<WriteFailure>().unwrap();
+            assert_eq!(
+                failure.outcome,
+                super::super::proto::WriteFailureOutcome::NotExecuted
+            );
+            assert_eq!(failure.status, 503);
+            assert_eq!(failure.seq_no, None);
+            assert_eq!(failure.primary_term, None);
+            assert!(!failure.reason.is_empty());
+        }
+    }
+
+    #[test]
+    fn typed_write_failure_malformed_single_and_bulk_details_fail_loudly() {
+        use super::super::write_failure::WriteFailure;
+        let base = WriteFailure::indeterminate("server apply cause", Some(0), Some(7), None)
+            .index_response("doc".into());
+        let mut cases = Vec::new();
+        let mut missing = base.clone();
+        missing.failure = None;
+        cases.push(missing);
+        let mut mismatch = base.clone();
+        mismatch.seq_no = Some(1);
+        cases.push(mismatch);
+        let mut wrong_id = base.clone();
+        wrong_id.doc_id = "wrong".into();
+        cases.push(wrong_id);
+        let mut success_with_failure = base.clone();
+        success_with_failure.success = true;
+        cases.push(success_with_failure);
+        let mut invalid_term = base;
+        invalid_term.primary_term = Some(0);
+        invalid_term.failure.as_mut().unwrap().primary_term = Some(0);
+        cases.push(invalid_term);
+        for response in cases {
+            let error = decode_shard_doc_response("idx", 0, "doc", response)
+                .map_err(WriteFailure::after_dispatch)
+                .unwrap_err();
+            let failure = error.downcast_ref::<WriteFailure>().unwrap();
+            assert_eq!(failure.error_type, "write_outcome_unknown");
+            assert_eq!(failure.seq_no, None);
+        }
+        let docs = vec![("doc".into(), serde_json::json!({}))];
+        let failure = WriteFailure::indeterminate("wrong range", Some(0), Some(7), Some(1));
+        let error = decode_shard_bulk_response(&docs, failure.bulk_response(vec!["doc".into()]))
+            .map_err(WriteFailure::after_dispatch)
+            .unwrap_err();
+        assert!(error.to_string().contains("submitted batch"));
+        assert_eq!(error.downcast_ref::<WriteFailure>().unwrap().seq_no, None);
+    }
+
+    #[test]
+    fn typed_write_failure_ordered_bulk_validates_failed_and_acknowledged_neighbors() {
+        use super::super::write_failure::WriteFailure;
+        let docs = vec![
+            (
+                "duplicate".into(),
+                serde_json::json!({}),
+                ShardBulkOperation {
+                    kind: ShardBulkOpKind::Index as i32,
+                    ..Default::default()
+                },
+            ),
+            (
+                "duplicate".into(),
+                serde_json::json!({}),
+                ShardBulkOperation {
+                    kind: ShardBulkOpKind::Delete as i32,
+                    ..Default::default()
+                },
+            ),
+        ];
+        let response = ShardBulkResponse {
+            success: true,
+            doc_ids: vec!["duplicate".into(), "duplicate".into()],
+            results: vec![
+                WriteFailure::indeterminate("replica failed", Some(0), Some(7), None)
+                    .bulk_item("duplicate".into()),
+                ShardBulkItemResponse {
+                    doc_id: "duplicate".into(),
+                    status: 404,
+                    result: "not_found".into(),
+                    seq_no: Some(1),
+                    primary_term: Some(7),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let items =
+            decode_shard_bulk_operations_response(&docs, false, "primary", response.clone())
+                .unwrap();
+        assert_eq!(items[0].seq_no, Some(0));
+        assert_eq!(items[1].status, 404);
+        assert!(items[1].error.is_empty());
+        let mut cases = Vec::new();
+        let mut missing = response.clone();
+        missing.results[0].failure = None;
+        cases.push(missing);
+        let mut bad_status = response.clone();
+        bad_status.results[0].status = 503;
+        cases.push(bad_status);
+        let mut bad_type = response.clone();
+        bad_type.results[0].error_type = "shard_failure".into();
+        cases.push(bad_type);
+        let mut bad_seq = response.clone();
+        bad_seq.results[0].seq_no = Some(2);
+        cases.push(bad_seq);
+        let mut success_with_failure = response.clone();
+        success_with_failure.results[1].failure = response.results[0].failure.clone();
+        cases.push(success_with_failure);
+        let mut wrong_envelope_ids = response;
+        wrong_envelope_ids.doc_ids[0] = "wrong".into();
+        cases.push(wrong_envelope_ids);
+        for response in cases {
+            let error = decode_shard_bulk_operations_response(&docs, false, "primary", response)
+                .map_err(WriteFailure::after_dispatch)
+                .unwrap_err();
+            let failure = error.downcast_ref::<WriteFailure>().unwrap();
+            assert_eq!(failure.error_type, "write_outcome_unknown");
+            assert_eq!(failure.seq_no, None);
+        }
+    }
+
+    #[test]
     fn shard_doc_response_decoder_rejects_empty_success_id() {
         for expected_doc_id in ["", "doc"] {
             assert!(
@@ -2503,6 +2858,7 @@ mod tests {
                         ..Default::default()
                     })
                     .collect(),
+                failure: None,
             },
         )
         .unwrap();
@@ -2554,6 +2910,7 @@ mod tests {
                 seq_no: Some(0),
                 primary_term: Some(7),
                 write_refresh: None,
+                failure: None,
             },
         )
         .unwrap();
@@ -2571,6 +2928,7 @@ mod tests {
                     seq_no: None,
                     primary_term: Some(7),
                     write_refresh: None,
+                    failure: None,
                 },
             )
             .is_err()

@@ -84,6 +84,14 @@ pub trait SearchEngine: Send + Sync {
 - A receipt belongs to its operation, even if another write advances a checkpoint
   before replication. Never reconstruct its sequence from `last_seq_no()` or
   `local_checkpoint()`.
+- Primary mutation errors carry `WriteMutationError` context. Track the WAL
+  invocation boundary and capture only the sequence/range returned by that
+  invocation. Preserve context and underlying typed causes through text/vector
+  apply, rebuild, and stale-marker errors. A WAL append/fsync failure without
+  a returned receipt has no known sequence; do not borrow a checkpoint.
+  Post-WAL validation-shaped causes remain indeterminate, not client
+  rejections. Proven pre-WAL validation/conflict/capacity failures have no
+  operation receipt. This observer does not add D14 fail-stop behavior.
 - A non-empty bulk receipt has a contiguous WAL-reserved start; an empty batch
   has no assigned sequence. Replica/recovery apply methods are required
   implementations, not defaults that allocate new primary sequences.

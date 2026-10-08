@@ -33,6 +33,7 @@ cargo test --test replication_integration --features transport-tls  # Replicatio
 cargo test --test rest_api_integration          # REST API integration tests
 cargo test --test restart_regression            # Real restart/rejoin regression
 cargo test --features protocol-trace --test stale_primary_failover  # Live old-primary partition
+cargo test --lib write_failure                  # Typed mutation outcomes and owned failure receipts
 cargo test -- test_name                         # Single test by name
 ./scripts/tla/check.sh                           # Fast bounded TLA+ matrix
 ./scripts/tla/check.sh c1-aba-fixed c2-fixed l2  # Selected fixed-design checks

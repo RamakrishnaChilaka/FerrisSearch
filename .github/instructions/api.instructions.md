@@ -67,7 +67,8 @@ pub fn error_response(
 | `no_data_nodes_exception` | No data nodes available for shard allocation |
 | `shard_not_available_exception` | Shard not open on this node |
 | `node_not_found_exception` | Referenced node doesn't exist |
-| `forward_exception` | gRPC forwarding to another node failed |
+| `forward_exception` | Non-mutation forwarding or preflight read failed |
+| `write_outcome_unknown` | A document mutation may have reached the WAL, or its dispatched RPC outcome is ambiguous |
 | `raft_write_exception` | Raft client_write command failed |
 | `master_not_discovered_exception` | No master in cluster state |
 | `illegal_argument_exception` | Request shape rejected by handler-side validation (e.g. invalid `search_after` cursor) |
@@ -246,9 +247,12 @@ values return `400 illegal_argument_exception` without enqueueing work.
   path instead of adding a new wait between mapping commit and reopen.
   This is not an all-node application acknowledgement or a cross-engine
   snapshot guarantee.
-- Only the stable metadata-wait `UNAVAILABLE` marker is retryable for document
-  operations. Generic gRPC `UNAVAILABLE` and `DEADLINE_EXCEEDED` can describe
-  an unknown post-WAL outcome; do not classify them as safe-to-retry 503s.
+- Mutation forwarding uses typed `WriteFailure` outcomes, not a gRPC code or
+  message as proof of non-execution. Marked pre-mutation metadata waits,
+  activation/availability guards, and connection failures before dispatch
+  return 503 `shard_not_available_exception`. An unmarked `UNAVAILABLE`,
+  `ABORTED`, timeout, or disconnect after dispatch is 500
+  `write_outcome_unknown`, even if its text resembles a preflight marker.
   Generic create-index transport failures also remain errors with an
   indeterminate commit outcome, not retryable 503s.
 
@@ -272,6 +276,13 @@ primary WAL-assigned `_seq_no`; sequence zero is valid. Bulk finalization must
 apply each target receipt by request-order offset, not by document-ID lookup,
 because duplicate IDs can appear in one batch. Missing or inconsistent target
 receipts are item failures, never `_seq_no: 0` fallbacks.
+Failed mutations preserve known operation-owned `_seq_no` and `_primary_term`
+at the single-write and bulk-item boundaries. Validate failed homogeneous bulk
+ranges against the submitted count, then assign sequences by request-order
+offset. Never infer the submitted count from the returned range. Rejections and
+proven not-executed writes have no receipt; a WAL/engine failure or ambiguous
+dispatched RPC is 500 `write_outcome_unknown`. Missing routing targets are
+proven pre-dispatch failures and return 503.
 Bulk forwarding moves source values into target-owned batches; retained routed
 records are metadata-only for response finalization and refresh selection.
 Partial-update assembly moves the validated `doc` object and owned existing
@@ -281,14 +292,14 @@ header and the internal `_doc_id` / `_source` wrapper. The usable JSON document
 body is therefore slightly smaller and depends on its ID and serialized shape.
 Oversized single/delete writes return a validation error before mutation;
 oversized bulk documents remain attributable item failures.
-Retryable gRPC `ABORTED` document-operation failures map to HTTP 503
-`shard_not_available_exception` with the underlying cause preserved.
-Realtime GET returns this status when post-WAL apply or replay leaves the live map
+Realtime GET retains its read-side `ABORTED` to HTTP 503
+`shard_not_available_exception` mapping when post-WAL apply or replay leaves the live map
 incomplete. Single `_update` propagates the GET failure; bulk `update` returns
 an item-level 503 and sets `errors: true`, rather than attempting a CAS or upsert.
-Only `RESOURCE_EXHAUSTED` statuses carrying the stable version-map-capacity
-marker map to HTTP 429 `version_map_capacity_exceeded`; unrelated resource
-exhaustion remains a 500 forwarding failure.
+Mutation-time version-map capacity rejection is a typed pre-WAL 429
+`version_map_capacity_exceeded`; generic dispatched `RESOURCE_EXHAUSTED`
+cannot prove rejection and remains indeterminate. Update retries are bounded
+and apply only to rejected CAS conflicts, never an indeterminate outcome.
 
 GET is realtime by default; `realtime=false` reads the refreshed reader.
 Found responses carry the document's `_seq_no` and `_primary_term`.
