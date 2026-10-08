@@ -258,6 +258,7 @@ async fn get_document(
             index_name: INDEX.to_string(),
             shard_id: SHARD,
             doc_id: doc_id.to_string(),
+            realtime: Some(true),
         }))
         .await?
         .into_inner())
@@ -1696,6 +1697,7 @@ async fn run_randomized_seed(seed: u64, mutation: MutationMode, output: PathBuf)
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn conditional_and_mixed_bulk_write_protocol_trace() -> Result<()> {
+    let _trace_guard = protocol_trace_test_lock().lock().await;
     let trace_dir = tempfile::tempdir()?;
     let output = std::env::var_os("D1_WRITES_TRACE_OUTPUT")
         .map(PathBuf::from)
