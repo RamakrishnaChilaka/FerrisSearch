@@ -4,6 +4,8 @@ pub mod common;
 pub mod config;
 pub mod consensus;
 pub mod engine;
+#[cfg(feature = "protocol-trace")]
+pub mod failpoints;
 pub mod hybrid;
 pub mod indexing;
 pub mod metrics;

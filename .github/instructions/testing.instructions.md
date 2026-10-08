@@ -573,6 +573,11 @@ cargo test -- test_name                         # Single test by name
 - `tokio::time::sleep()` for Raft election settling
 - Assert on cluster state after Raft commands
 - Verify shard routing, node membership, index metadata
+- Feature-gated distributed boundary tests use named controls from
+  `src/failpoints.rs`. Install a unique failpoint, wait for its hit with a
+  timeout, perform the competing lifecycle action, and release it explicitly.
+  Dropping a pause handle must also release and unregister it so a failing test
+  cannot strand later work.
 
 ## Development Workflow
 1. **Read first** — understand existing code
