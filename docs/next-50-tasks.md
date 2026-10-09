@@ -109,7 +109,7 @@ supported API response to durable internal state.
 
 **Class:** Release blocker | **Gate:** 0 | **Depends on:** none
 
-**Status (2026-10-04):** Partial. The `protocol-trace` feature records ordered
+**Status (2026-10-09):** Partial. The `protocol-trace` feature records ordered
 schema-v4 Rust executions and checks seeded real-gRPC runs against the bounded
 D1 model. `tests/stale_primary_failover.rs` adds the named, client-scoped
 `primary_before_replication` pause and a real three-voter metadata partition.
@@ -117,9 +117,14 @@ It holds index/delete/bulk after WAL/apply, promotes through committed Raft
 commands, establishes newer-term fences, and releases the still-live old
 primary's requests. Its result-level assertions cover failed responses,
 unchanged canonical WAL/documents/checkpoints, replica engine reopen, and
-fresh-allocation peer recovery. The named boundary ledger is separate from
-schema-v4 witness traces. A general cross-process failpoint framework and
-publication/hydration/compaction crash boundaries remain open.
+fresh-allocation peer recovery. The reusable registry also provides the
+process-global `primary_after_local_apply_before_replication` pause and a
+bounded `replica_after_fence_before_local_apply` failure action. Their
+three-node regressions prove stale-term rejection and non-definitive replica
+apply failure with an indeterminate primary receipt and no failed-copy
+mutation. The named boundary ledger is separate from schema-v4 witness traces.
+A general cross-process failpoint framework and publication, hydration,
+compaction, and restart crash boundaries remain open.
 
 **Historical status (2026-09-27):** Not started as a framework. PRs #141 and #143 added
 in-process pause hooks: force-merge and refresh barriers, snapshot and setup

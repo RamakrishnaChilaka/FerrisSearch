@@ -577,7 +577,10 @@ cargo test -- test_name                         # Single test by name
   `src/failpoints.rs`. Install a unique failpoint, wait for its hit with a
   timeout, perform the competing lifecycle action, and release it explicitly.
   Dropping a pause handle must also release and unregister it so a failing test
-  cannot strand later work.
+  cannot strand later work. Named failure actions must use an explicit bounded
+  hit count, fail before the mutation they are testing, and unregister on
+  handle drop. Assert both the typed client outcome and the failed copy's
+  unchanged durable evidence.
 
 ## Development Workflow
 1. **Read first** — understand existing code
