@@ -2864,6 +2864,8 @@ impl ShardManager {
         }
         self.ensure_local_apply_allowed(context.index_uuid, shard_id, context.allocation_id)?;
         #[cfg(feature = "protocol-trace")]
+        crate::failpoints::fail(crate::failpoints::REPLICA_AFTER_FENCE_BEFORE_LOCAL_APPLY)?;
+        #[cfg(feature = "protocol-trace")]
         let result = match trace_copy {
             Some(copy) => crate::protocol_trace::with_open_copy(copy, || operation(engine)),
             None => operation(engine),

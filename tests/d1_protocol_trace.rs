@@ -17,7 +17,7 @@ use ferrissearch::shard::{PeerRecoveryTargetState, ShardManager};
 use ferrissearch::transport::TransportClient;
 use ferrissearch::transport::proto::internal_transport_client::InternalTransportClient;
 use ferrissearch::transport::proto::{
-    ShardBulkRequest, ShardDeleteRequest, ShardDocRequest, ShardGetRequest,
+    ShardBulkRequest, ShardDeleteRequest, ShardDocRequest, ShardGetRequest, WriteFailureOutcome,
 };
 use ferrissearch::transport::server::{
     TransportService, create_transport_service_for_test_with_handle,
@@ -2666,6 +2666,172 @@ async fn delayed_old_primary_replication_is_rejected_after_promotion() -> Result
         let stale = get_document(&mut client, "stale-primary-write").await?;
         assert!(!stale.found, "authoritative copy exposed the stale write");
     }
+
+    stop_node(p).await;
+    stop_node(q).await;
+    stop_node(r).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_replica_apply_failure_is_indeterminate_without_local_mutation() -> Result<()> {
+    let _trace_guard = protocol_trace_test_lock().lock().await;
+    let trace_dir = tempfile::tempdir()?;
+    let output = trace_dir.path().join("replica-apply-failure.jsonl");
+    let p_dir = tempfile::tempdir()?;
+    let q_dir = tempfile::tempdir()?;
+    let r_dir = tempfile::tempdir()?;
+    let p_cm = Arc::new(ClusterManager::new("d1-trace".to_string()));
+    let q_cm = Arc::new(ClusterManager::new("d1-trace".to_string()));
+    let r_cm = Arc::new(ClusterManager::new("d1-trace".to_string()));
+    let p_sm = Arc::new(ShardManager::new(p_dir.path(), Duration::from_secs(60)));
+    let q_sm = Arc::new(ShardManager::new(q_dir.path(), Duration::from_secs(60)));
+    let r_sm = Arc::new(ShardManager::new(r_dir.path(), Duration::from_secs(60)));
+
+    let p = start_node(p_cm.clone(), p_sm.clone(), "p", None).await?;
+    let q = start_node(q_cm.clone(), q_sm.clone(), "q", None).await?;
+    let r = start_node(r_cm.clone(), r_sm.clone(), "r", None).await?;
+
+    let initial = initial_cluster_state(p.address, q.address, r.address);
+    for manager in [&p_cm, &q_cm, &r_cm] {
+        manager.update_state(initial.clone());
+    }
+    install_empty_replica(&q_cm, &q_sm)?;
+    install_empty_replica(&r_cm, &r_sm)?;
+    p.service
+        .protocol_trace_activate_primary_for_test(INDEX, SHARD)
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    let mut initialized = initial;
+    initialized
+        .shard_allocations
+        .get_mut(INDEX)
+        .and_then(|shards| shards.get_mut(&SHARD))
+        .context("trace shard allocation metadata is missing")?
+        .primary_initialized = true;
+    initialized.version += 1;
+    for manager in [&p_cm, &q_cm, &r_cm] {
+        manager.update_state(initialized.clone());
+    }
+
+    let trace = protocol_trace::start(TraceConfig {
+        output: output.clone(),
+        run_id: "replica-apply-failure".to_string(),
+        test: "one_replica_apply_failure_is_indeterminate_without_local_mutation".to_string(),
+        durability: "request",
+        nodes: ["p", "q", "r"]
+            .into_iter()
+            .map(|node| TraceNode {
+                node: node.to_string(),
+                incarnation: 0,
+            })
+            .collect(),
+        shard_state: TraceStartShard {
+            index_uuid: INDEX_UUID.to_string(),
+            shard: SHARD,
+            primary: "p".to_string(),
+            term: 1,
+            activated: true,
+            in_sync: vec!["q".to_string(), "r".to_string()],
+            copies: ["p", "q", "r"]
+                .into_iter()
+                .map(|node| TraceStartCopy {
+                    node: node.to_string(),
+                    allocation: 1,
+                    exists: true,
+                    fence_term: 1,
+                })
+                .collect(),
+        },
+        mutation: MutationMode::None,
+        faults: Vec::new(),
+    })?;
+    for manager in [&p_cm, &q_cm, &r_cm] {
+        manager.record_protocol_trace_routing_views()?;
+    }
+
+    let fail = failpoints::install_fail(
+        failpoints::REPLICA_AFTER_FENCE_BEFORE_LOCAL_APPLY,
+        1,
+        "replica apply probe",
+    )?;
+    let mut client = connect(p.address).await?;
+    let response = index_document(&mut client, "failed-replica-write", 1).await?;
+    assert!(!response.success);
+    assert_eq!(response.seq_no, Some(0));
+    assert_eq!(response.primary_term, Some(1));
+    let failure = response
+        .failure
+        .context("replication failure response omitted typed details")?;
+    assert_eq!(failure.outcome, WriteFailureOutcome::Indeterminate as i32);
+    assert_eq!(failure.seq_no, Some(0));
+    assert_eq!(failure.primary_term, Some(1));
+    assert_eq!(fail.hit_count(), 1);
+    assert_eq!(fail.remaining(), 0);
+    drop(fail);
+
+    let mut copies_with_document = BTreeSet::new();
+    for (node, manager) in [("p", &p_sm), ("q", &q_sm), ("r", &r_sm)] {
+        let snapshot = manager.capture_protocol_trace_copy_state(INDEX, SHARD)?;
+        let has_document = snapshot
+            .live_documents
+            .iter()
+            .any(|(doc_id, _, _, _)| doc_id == "failed-replica-write");
+        let has_wal = snapshot
+            .wal_entries
+            .iter()
+            .any(|entry| entry.doc.as_deref() == Some("failed-replica-write"));
+        assert_eq!(
+            has_document, has_wal,
+            "copy {node} mutated only one local persistence surface"
+        );
+        if has_document {
+            copies_with_document.insert(node);
+        }
+        protocol_trace::record_copy_snapshot(snapshot, "trace_end")?;
+    }
+    assert!(copies_with_document.contains("p"));
+    assert_eq!(
+        copies_with_document.len(),
+        2,
+        "the primary and exactly one replica must apply the operation"
+    );
+    for manager in [&p_cm, &q_cm, &r_cm] {
+        let routing = manager
+            .get_state()
+            .indices
+            .get(INDEX)
+            .and_then(|metadata| metadata.shard_routing.get(&SHARD))
+            .cloned()
+            .context("trace routing disappeared")?;
+        assert_eq!(
+            routing.in_sync_replicas,
+            vec!["q".to_string(), "r".to_string()],
+            "a single non-definitive apply failure must not remove ISR membership"
+        );
+    }
+
+    let output = trace.finish(true)?;
+    assert_trace_completeness(&output)?;
+    let events = std::fs::read_to_string(&output)?
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let rejected = events
+        .iter()
+        .filter(|event| {
+            event["event"] == "replica_rejected"
+                && event["reason"] == "apply_failure"
+                && event["seq_no"] == 0
+                && event["term"] == 1
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rejected.len(), 1);
+    let failed_node = rejected[0]["node"]
+        .as_str()
+        .context("replica rejection omitted its node")?;
+    assert!(!copies_with_document.contains(failed_node));
 
     stop_node(p).await;
     stop_node(q).await;
