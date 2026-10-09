@@ -8,6 +8,7 @@ use ferrissearch::cluster::state::{
 };
 use ferrissearch::consensus::state_machine::ClusterStateMachine;
 use ferrissearch::consensus::types::{ClusterCommand, ClusterResponse};
+use ferrissearch::failpoints;
 use ferrissearch::protocol_trace::{
     self, FaultAction, FaultRule, MutationMode, TraceConfig, TraceNode, TraceStartCopy,
     TraceStartShard,
@@ -24,7 +25,7 @@ use ferrissearch::transport::server::{
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::{Barrier, RwLock};
@@ -32,6 +33,11 @@ use tokio::sync::{Barrier, RwLock};
 const INDEX: &str = "d1-trace";
 const INDEX_UUID: &str = "d1-trace-uuid";
 const SHARD: u32 = 0;
+
+fn protocol_trace_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 
 struct RunningNode {
     address: std::net::SocketAddr,
@@ -241,6 +247,21 @@ async fn stop_node(node: RunningNode) {
     node.server.abort();
     let _ = node.server.await;
     drop(node.service);
+}
+
+async fn get_document(
+    client: &mut InternalTransportClient<tonic::transport::Channel>,
+    doc_id: &str,
+) -> Result<ferrissearch::transport::proto::ShardGetResponse> {
+    Ok(client
+        .get_doc(tonic::Request::new(ShardGetRequest {
+            index_name: INDEX.to_string(),
+            shard_id: SHARD,
+            doc_id: doc_id.to_string(),
+            realtime: Some(true),
+        }))
+        .await?
+        .into_inner())
 }
 
 fn capture_final_copy_state(
@@ -1676,6 +1697,7 @@ async fn run_randomized_seed(seed: u64, mutation: MutationMode, output: PathBuf)
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn conditional_and_mixed_bulk_write_protocol_trace() -> Result<()> {
+    let _trace_guard = protocol_trace_test_lock().lock().await;
     let trace_dir = tempfile::tempdir()?;
     let output = std::env::var_os("D1_WRITES_TRACE_OUTPUT")
         .map(PathBuf::from)
@@ -1849,6 +1871,7 @@ async fn conditional_and_mixed_bulk_write_protocol_trace() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn seeded_three_node_fault_trace() -> Result<()> {
+    let _trace_guard = protocol_trace_test_lock().lock().await;
     let seed = parse_seed()?;
     let mutation = mutation_mode()?;
     let trace_dir = tempfile::tempdir()?;
@@ -2237,6 +2260,7 @@ async fn seeded_three_node_fault_trace() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn promotion_noop_retry_emits_every_transport_attempt() -> Result<()> {
+    let _trace_guard = protocol_trace_test_lock().lock().await;
     let trace_dir = tempfile::tempdir()?;
     let output = std::env::var_os("D1_TRACE_RETRY_OUTPUT")
         .map(PathBuf::from)
@@ -2293,6 +2317,7 @@ async fn promotion_noop_retry_emits_every_transport_attempt() -> Result<()> {
                 "unexpected promotion-gap write result: {response:?}"
             );
         }
+
         drop(client);
 
         {
@@ -2444,7 +2469,213 @@ async fn promotion_noop_retry_emits_every_transport_attempt() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delayed_old_primary_replication_is_rejected_after_promotion() -> Result<()> {
+    let _trace_guard = protocol_trace_test_lock().lock().await;
+    let trace_dir = tempfile::tempdir()?;
+    let output = trace_dir.path().join("stale-primary-failpoint.jsonl");
+    let p_dir = tempfile::tempdir()?;
+    let q_dir = tempfile::tempdir()?;
+    let r_dir = tempfile::tempdir()?;
+    let p_cm = Arc::new(ClusterManager::new("d1-trace".to_string()));
+    let q_cm = Arc::new(ClusterManager::new("d1-trace".to_string()));
+    let r_cm = Arc::new(ClusterManager::new("d1-trace".to_string()));
+    let p_sm = Arc::new(ShardManager::new(p_dir.path(), Duration::from_secs(60)));
+    let q_sm = Arc::new(ShardManager::new(q_dir.path(), Duration::from_secs(60)));
+    let r_sm = Arc::new(ShardManager::new(r_dir.path(), Duration::from_secs(60)));
+
+    let p = start_node(p_cm.clone(), p_sm.clone(), "p", None).await?;
+    let q = start_node(q_cm.clone(), q_sm.clone(), "q", None).await?;
+    let r = start_node(r_cm.clone(), r_sm.clone(), "r", None).await?;
+
+    let initial = initial_cluster_state(p.address, q.address, r.address);
+    for manager in [&p_cm, &q_cm, &r_cm] {
+        manager.update_state(initial.clone());
+    }
+    install_empty_replica(&q_cm, &q_sm)?;
+    install_empty_replica(&r_cm, &r_sm)?;
+    p.service
+        .protocol_trace_activate_primary_for_test(INDEX, SHARD)
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    let mut initialized = initial;
+    initialized
+        .shard_allocations
+        .get_mut(INDEX)
+        .and_then(|shards| shards.get_mut(&SHARD))
+        .context("trace shard allocation metadata is missing")?
+        .primary_initialized = true;
+    initialized.version += 1;
+    for manager in [&p_cm, &q_cm, &r_cm] {
+        manager.update_state(initialized.clone());
+    }
+    let state_machine =
+        ClusterStateMachine::from_state_for_protocol_trace_test(initialized.clone());
+
+    let trace = protocol_trace::start(TraceConfig {
+        output: output.clone(),
+        run_id: "stale-primary-failpoint".to_string(),
+        test: "delayed_old_primary_replication_is_rejected_after_promotion".to_string(),
+        durability: "request",
+        nodes: ["p", "q", "r"]
+            .into_iter()
+            .map(|node| TraceNode {
+                node: node.to_string(),
+                incarnation: 0,
+            })
+            .collect(),
+        shard_state: TraceStartShard {
+            index_uuid: INDEX_UUID.to_string(),
+            shard: SHARD,
+            primary: "p".to_string(),
+            term: 1,
+            activated: true,
+            in_sync: vec!["q".to_string(), "r".to_string()],
+            copies: ["p", "q", "r"]
+                .into_iter()
+                .map(|node| TraceStartCopy {
+                    node: node.to_string(),
+                    allocation: 1,
+                    exists: true,
+                    fence_term: 1,
+                })
+                .collect(),
+        },
+        mutation: MutationMode::None,
+        faults: Vec::new(),
+    })?;
+    for manager in [&p_cm, &q_cm, &r_cm] {
+        manager.record_protocol_trace_routing_views()?;
+    }
+
+    let pause =
+        failpoints::install_pause(failpoints::PRIMARY_AFTER_LOCAL_APPLY_BEFORE_REPLICATION)?;
+    let mut stale_client = connect(p.address).await?;
+    let stale_write =
+        tokio::spawn(
+            async move { index_document(&mut stale_client, "stale-primary-write", 1).await },
+        );
+    tokio::time::timeout(Duration::from_secs(5), pause.wait_until_hit())
+        .await
+        .context("old-primary write did not reach the named failpoint")?;
+    assert_eq!(pause.hit_count(), 1);
+
+    assert_command_ok(
+        state_machine.apply_command_for_protocol_trace_test(
+            &ClusterCommand::FailShardCopy {
+                index_name: INDEX.to_string(),
+                index_uuid: INDEX_UUID.to_string(),
+                shard_id: SHARD,
+                node: "p".to_string(),
+                allocation_id: 1,
+                expected_primary_term: 1,
+                promote_only: true,
+                promotion_candidate: Some("q".to_string()),
+            },
+            2,
+        ),
+        "primary promotion",
+    )?;
+    let promoted = current_authoritative_state(&state_machine);
+    for manager in [&p_cm, &q_cm, &r_cm] {
+        manager.update_state(promoted.clone());
+    }
+    assert_command_ok(
+        state_machine.apply_command_for_protocol_trace_test(
+            &ClusterCommand::ActivatePrimary {
+                index_name: INDEX.to_string(),
+                index_uuid: INDEX_UUID.to_string(),
+                shard_id: SHARD,
+                primary: "q".to_string(),
+                allocation_id: 1,
+                expected_term: 2,
+            },
+            3,
+        ),
+        "primary activation",
+    )?;
+    let activated = current_authoritative_state(&state_machine);
+    for manager in [&p_cm, &q_cm, &r_cm] {
+        manager.update_state(activated.clone());
+    }
+    q.service
+        .protocol_trace_activate_primary_for_test(INDEX, SHARD)
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    pause.release();
+    drop(pause);
+    let stale_task = tokio::time::timeout(Duration::from_secs(5), stale_write)
+        .await
+        .context("old-primary write did not finish after failpoint release")?;
+    let stale_response = stale_task.context("old-primary write task panicked")??;
+    assert!(!stale_response.success);
+    assert_eq!(stale_response.seq_no, Some(0));
+    assert_eq!(stale_response.primary_term, Some(1));
+    assert!(
+        stale_response.error.contains("Replication failed"),
+        "unexpected stale-primary response: {}",
+        stale_response.error
+    );
+
+    for (node, manager) in [("q", &q_sm), ("r", &r_sm)] {
+        let snapshot = manager.capture_protocol_trace_copy_state(INDEX, SHARD)?;
+        assert!(
+            snapshot
+                .live_documents
+                .iter()
+                .all(|(doc_id, _, _, _)| doc_id != "stale-primary-write"),
+            "promoted copy {node} applied the delayed old-primary write"
+        );
+        assert!(
+            snapshot
+                .wal_entries
+                .iter()
+                .all(|entry| entry.doc.as_deref() != Some("stale-primary-write")),
+            "promoted copy {node} appended the delayed old-primary write"
+        );
+        protocol_trace::record_copy_snapshot(snapshot, "trace_end")?;
+    }
+
+    let output = trace.finish(true)?;
+    assert_trace_completeness(&output)?;
+    let events = std::fs::read_to_string(&output)?
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let rejected = events
+        .iter()
+        .filter(|event| {
+            event["event"] == "replica_rejected"
+                && event["term"] == 1
+                && event["reason"] == "term_fence"
+        })
+        .filter_map(|event| event["node"].as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(rejected, BTreeSet::from(["q", "r"]));
+
+    let mut promoted_client = connect(q.address).await?;
+    let promoted_write = index_document(&mut promoted_client, "new-primary-write", 2).await?;
+    assert!(
+        promoted_write.success,
+        "new primary write failed: {}",
+        promoted_write.error
+    );
+    for address in [q.address, r.address] {
+        let mut client = connect(address).await?;
+        let stale = get_document(&mut client, "stale-primary-write").await?;
+        assert!(!stale.found, "authoritative copy exposed the stale write");
+    }
+
+    stop_node(p).await;
+    stop_node(q).await;
+    stop_node(r).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn randomized_three_node_fault_trace() -> Result<()> {
+    let _trace_guard = protocol_trace_test_lock().lock().await;
     let seeds = parse_random_seeds()?;
     let mutation = mutation_mode()?;
     let trace_dir = tempfile::tempdir()?;

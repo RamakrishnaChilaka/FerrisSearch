@@ -1003,6 +1003,11 @@ impl InternalTransport for TransportService {
                 let seq_no = receipt.seq_no;
                 let primary_term = receipt.primary_term;
                 let primary_sequence = engine.sequence_stats();
+                #[cfg(feature = "protocol-trace")]
+                crate::failpoints::pause(
+                    crate::failpoints::PRIMARY_AFTER_LOCAL_APPLY_BEFORE_REPLICATION,
+                )
+                .await;
                 self.spawn_primary_available_report_after_write(
                     &req.index_name,
                     req.shard_id,
@@ -1454,6 +1459,11 @@ impl InternalTransport for TransportService {
                     )
                     .into_status()
                 })?;
+                #[cfg(feature = "protocol-trace")]
+                crate::failpoints::pause(
+                    crate::failpoints::PRIMARY_AFTER_LOCAL_APPLY_BEFORE_REPLICATION,
+                )
+                .await;
                 self.spawn_primary_available_report_after_write(
                     &req.index_name,
                     req.shard_id,
@@ -1774,6 +1784,11 @@ impl InternalTransport for TransportService {
                 let seq_no = receipt.seq_no;
                 let primary_term = receipt.primary_term;
                 let primary_sequence = engine.sequence_stats();
+                #[cfg(feature = "protocol-trace")]
+                crate::failpoints::pause(
+                    crate::failpoints::PRIMARY_AFTER_LOCAL_APPLY_BEFORE_REPLICATION,
+                )
+                .await;
                 self.spawn_primary_available_report_after_write(
                     &req.index_name,
                     req.shard_id,

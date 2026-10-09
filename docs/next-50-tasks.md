@@ -6,10 +6,10 @@
 >
 > **Current-behavior authority:** source and tests.
 >
-> **Last source audit:** 2026-10-05 for FS-001 and FS-013; 2026-10-04 for FS-007
-> and FS-012; 2026-09-27 for
-> FS-014, FS-019, and FS-022 through FS-026, after PRs #142-#144. Other tasks
-> were last audited on 2026-07-10.
+> **Last source audit:** 2026-10-08 for FS-001 and FS-007; 2026-10-05 for
+> FS-013; 2026-10-04 for FS-012; 2026-09-27 for FS-014, FS-019, and FS-022
+> through FS-026, after PRs #142-#144. Other tasks were last audited on
+> 2026-07-10.
 
 This is a dependency-aware sequence, not a feature wish list. Rank expresses
 current strategic importance; a task still waits for every listed dependency.
@@ -75,7 +75,11 @@ The rest of the order is unchanged.
 
 **Class:** Release blocker | **Gate:** 0 | **Depends on:** none
 
-**Status (2026-10-05):** Partial. ADR 0001 now selects operation-based durable
+**Status (2026-10-08):** Complete. ADR 0001 is accepted. D1 is implemented;
+D2-D14 are the contract for FS-009 through FS-014, FS-024 through FS-026, and
+FS-029. Acceptance does not claim those implementation tasks are complete.
+
+**Historical status (2026-10-05):** Partial. ADR 0001 selected operation-based durable
 acknowledgement, committed term/allocation-conditioned exclusion, sticky
 authority-scoped exclusion debt, indeterminate post-mutation outcomes, and local
 permit revocation as design targets. The future minimum is one by default with
@@ -85,7 +89,7 @@ and F09 acceptance cases are reconciled with D1 and the selected target.
 proposed/current/unsafe controls, not runtime implementation or completion of
 the entire ADR's retry, promotion, storage-format, and response criteria.
 
-**Status (2026-09-27):** Proposed decision record drafted in
+**Historical status (2026-09-27):** Proposed decision record drafted in
 [`adr/0001-write-consistency-and-retry-contract.md`](adr/0001-write-consistency-and-retry-contract.md);
 not yet accepted.
 
@@ -133,6 +137,15 @@ compaction boundary.
 named boundaries with deterministic orchestration across in-process and
 process-backed tests. Failpoints also record protocol events that can be
 checked against the `specs/tla` model.
+
+**Status (2026-10-08):** Partial. A feature-gated named pause registry now
+provides the first reusable registry boundary,
+`primary_after_local_apply_before_replication`, across single, bulk, and delete
+writes. A three-node protocol-trace regression pauses a live old primary,
+promotes and activates an in-sync replica, releases the write, and proves both
+authoritative copies reject the old term without WAL or engine mutation. The
+framework still lacks named fail, crash, and delay actions, process-backed
+control, and coverage for the remaining FS-007 boundaries.
 
 **Done when:** Tests can reproduce timeout-after-commit, replica failure,
 manifest crash points, partial hydration, stale leader/writer, and restart

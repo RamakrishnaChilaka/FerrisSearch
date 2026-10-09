@@ -1,8 +1,8 @@
 # ADR 0001: Write Consistency And Retry Contract
 
-- **Status:** Partially implemented. D1, D13, and the marked parts of D8, D9, D11,
-  and D12 are implemented; the remaining decisions are proposed.
+- **Status:** Accepted. D1 is implemented; D2-D14 remain implementation work.
 - **Date:** 2026-09-27
+- **Accepted:** 2026-10-08
 - **Design revision:** 2026-10-05; acknowledgement/failure targets selected for
   bounded modeling, not implemented in production.
 - **Backlog:** [FS-001](../next-50-tasks.md#fs-001--decide-the-write-consistency-and-retry-contract)
@@ -13,8 +13,10 @@
   bulk), and the reads writes depend on (GET by ID and refresh). Remote-store
   publication is FS-002.
 
-Status lines distinguish implemented behavior from the proposed contract.
-Section 1.1 describes the historical code at 6dbf9dc, before these fixes.
+The complete decision is accepted. D1 is implemented; D2-D14 define required
+future behavior until their implementing tasks land. Acceptance does not claim
+that those behaviors exist in current source. Section 1.1 describes the code at
+6dbf9dc, before D1.
 
 ## 1. Context
 
@@ -280,9 +282,12 @@ Every write response is in exactly one class:
 | Not executed | 503 `shard_not_available_exception` or `master_not_discovered_exception` | None; failed before the WAL append | Yes |
 | Indeterminate | 500 `write_outcome_unknown` | Unknown; it can appear later through replay, recovery, or promotion | Only if idempotent (D6) |
 
-- **What is indeterminate:** every failure at or after the primary's WAL
-  append, including WAL append and fsync errors, which can leave a partial
-  frame.
+- **What is indeterminate:** a failure at or after the primary's WAL append is
+  indeterminate unless the protocol resolves it to an acknowledgement through
+  D2. A replica failure followed by committed removal is therefore
+  acknowledged; a primary WAL or engine failure, or a replica removal that
+  cannot commit, is indeterminate. WAL append and fsync errors can leave a
+  partial frame and are always indeterminate.
 - **Response contents:** an indeterminate response includes the primary term
   and `seq_no` when known. WAL append/fsync failures without a returned receipt
   omit the sequence, even if another operation advanced the shared checkpoint.
@@ -299,6 +304,24 @@ Every write response is in exactly one class:
   Known sequence/term metadata is not a deduplication token.
 - **Why 500:** clients that resend automatically on 503 must never do so for
   an indeterminate write.
+
+Supported single-document and bulk outcomes map to those classes as follows:
+
+| API outcome | HTTP/result | Outcome class |
+|---|---|---|
+| Index creates a document | 201 `created` | Acknowledged |
+| Index replaces a document | 200 `updated` | Acknowledged |
+| Create succeeds | 201 `created` | Acknowledged |
+| Create finds an existing document | 409 `version_conflict_engine_exception` | Rejected |
+| Delete removes a document | 200 `deleted` | Acknowledged |
+| Delete finds no document | 404 `not_found` | Acknowledged no-op |
+| Update mutates a document | 200 `updated` | Acknowledged |
+| Update finds no document | 404 `document_missing_exception` | Rejected |
+| Conditional write loses a race | 409 `version_conflict_engine_exception` | Rejected |
+| Primary admission fails before WAL append | 503 shard/master error | Not executed |
+| Execution reaches an unresolved post-admission failure | 500 `write_outcome_unknown` | Indeterminate |
+| Well-formed bulk request | 200 outer response; each item uses the corresponding row above | Per-item class |
+| Malformed bulk action/metadata line | 400 `illegal_argument_exception` | Rejected before any item executes |
 
 ### D5. Stale primaries and missing leaders
 
@@ -544,9 +567,10 @@ operator setting and add `_mget`. Neither is part of this implementation.
   - A map that grows past a configured limit forces a refresh.
 - **Realtime GET:** checks the map first. A tombstone returns not found, and a
   changed document is read from its WAL entry, which stores the full `_source`.
-  If that WAL position has been truncated, or the entry is absent, GET reads the
-  refreshed reader. These fallbacks require a complete map; an incomplete map
-  never authorizes a reader miss or stale version.
+  WAL truncation cannot remove that entry before a refresh covering the map
+  entry is visible. If the map points to an absent or unreadable WAL entry,
+  realtime GET and update fail explicitly instead of falling back to a stale
+  refreshed reader.
 - **`_update`:** the coordinating node performs a realtime GET from the
   primary, recursively merges `doc`, and sends a primary conditional index
   write using the index UUID, `seq_no`, and term it read. The primary compares and appends

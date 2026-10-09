@@ -38,4 +38,4 @@ the backlog tasks that implement each decision.
 
 | ADR | Title | Status | Backlog |
 |---|---|---|---|
-| [0001](0001-write-consistency-and-retry-contract.md) | Write consistency and retry contract | Proposed; D1 accepted | FS-001 |
+| [0001](0001-write-consistency-and-retry-contract.md) | Write consistency and retry contract | Accepted; D1 implemented | FS-001 |
