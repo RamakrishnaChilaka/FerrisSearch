@@ -6,10 +6,10 @@
 >
 > **Current-behavior authority:** source and tests.
 >
-> **Last source audit:** 2026-10-08 for FS-001 and FS-007; 2026-10-05 for
-> FS-013; 2026-10-04 for FS-012; 2026-09-27 for FS-014, FS-019, and FS-022
-> through FS-026, after PRs #142-#144. Other tasks were last audited on
-> 2026-07-10.
+> **Last source audit:** 2026-10-09 for FS-002; 2026-10-08 for FS-001 and
+> FS-007; 2026-10-05 for FS-013; 2026-10-04 for FS-012; 2026-09-27 for FS-014,
+> FS-019, and FS-022 through FS-026, after PRs #142-#144. Other tasks were last
+> audited on 2026-07-10.
 
 This is a dependency-aware sequence, not a feature wish list. Rank expresses
 current strategic importance; a task still waits for every listed dependency.
@@ -159,6 +159,14 @@ without sleeps as the correctness mechanism.
 ### FS-002 — Decide The Fenced Manifest Publication Protocol
 
 **Class:** Release blocker | **Gate:** 0 | **Depends on:** none
+
+**Status (2026-10-09):** Complete. Accepted
+[ADR 0002](adr/0002-fenced-manifest-publication-protocol.md) selects parallel
+immutable split producers behind one Raft-authorized, storage-CAS-fenced
+sequencer per index. It defines writer handoff, operation identity, immutable
+audit inventory, idempotent retry, typed ambiguous outcomes, filesystem and
+S3-compatible capability contracts, and the required crash/race evidence.
+Runtime implementation remains Gate 1 work.
 
 **Evidence:** `StorageManager::append_split_and_publish()` protects
 read-modify-write only with a process-local mutex and overwrites the mutable
