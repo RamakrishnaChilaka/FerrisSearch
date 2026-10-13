@@ -2,7 +2,7 @@
 
 > - **Status:** Current implemented behavior
 > - **Matrix version:** 2026-10-13
-> - **Source baseline:** `0428371afce358538b3c4d5ca36efec23ac15f3c`
+> - **Source baseline:** `f9457f1`
 > - **Product claim:** OpenSearch-style REST API subset
 > - **Canonical inventory:** [`opensearch-compatibility.json`](opensearch-compatibility.json)
 

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "matrix_version": "2026-10-13",
-  "source_baseline": "0428371afce358538b3c4d5ca36efec23ac15f3c",
+  "source_baseline": "f9457f1",
   "product": "FerrisSearch pre-1.0",
   "claim": "OpenSearch-style REST API subset",
   "classifications": {
