@@ -42,3 +42,4 @@ the backlog tasks that implement each decision.
 | [0002](0002-fenced-manifest-publication-protocol.md) | Fenced manifest publication protocol | Accepted; not implemented | FS-002 |
 | [0003](0003-read-snapshots-retention-and-visibility.md) | Read snapshots, retention, and visibility | Accepted; not implemented | FS-003 |
 | [0004](0004-unified-lifecycle-and-migration-model.md) | Unified lifecycle and migration model | Accepted; not implemented | FS-004 |
+| [0005](0005-schema-generations-and-durable-format-compatibility.md) | Schema generations and durable format compatibility | Accepted; not implemented | FS-005 |
