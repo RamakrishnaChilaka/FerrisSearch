@@ -251,6 +251,14 @@ read rules and unsupported versions fail before partial execution.
 
 **Class:** Release blocker | **Gate:** 0 | **Depends on:** FS-001
 
+**Status (2026-10-13):** Complete. The
+[human-readable matrix](opensearch-compatibility.md) and canonical
+[machine-readable inventory](opensearch-compatibility.json) classify every
+routed REST endpoint, client-critical semantic differences, and important
+unsupported surfaces with source/test evidence. CI checks route coverage and
+evidence paths through `scripts/check_opensearch_compatibility.py`. README
+compatibility claims now link to the matrix.
+
 **Evidence:** FerrisSearch exposes OpenSearch-shaped endpoints without a
 machine-verifiable inventory of semantic differences.
 

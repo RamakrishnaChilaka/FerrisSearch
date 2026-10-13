@@ -1,0 +1,600 @@
+{
+  "schema_version": 1,
+  "matrix_version": "2026-10-13",
+  "source_baseline": "0428371afce358538b3c4d5ca36efec23ac15f3c",
+  "product": "FerrisSearch pre-1.0",
+  "claim": "OpenSearch-style REST API subset",
+  "classifications": {
+    "supported": "Compatible for the explicitly documented request and response surface.",
+    "partial": "The route exists, but accepted fields or semantics are narrower or observably different.",
+    "intentionally_different": "FerrisSearch-specific API or a deliberate contract that is not OpenSearch compatible.",
+    "unsupported": "No supported route or semantic contract exists."
+  },
+  "endpoints": [
+    {
+      "id": "root",
+      "methods": ["GET"],
+      "path": "/",
+      "classification": "partial",
+      "summary": "Returns FerrisSearch node and package-version information, not the complete OpenSearch root payload.",
+      "evidence": [
+        "src/api/mod.rs#handle_root",
+        "tests/rest_api_integration.rs#rest_root_and_cluster_health_work"
+      ]
+    },
+    {
+      "id": "cluster-health",
+      "methods": ["GET"],
+      "path": "/_cluster/health",
+      "classification": "partial",
+      "summary": "Returns core health fields; red also includes an assigned primary marked storage-unavailable, which is broader than OpenSearch red.",
+      "evidence": [
+        "src/api/cluster.rs#compute_health_status",
+        "tests/rest_api_integration.rs#rest_root_and_cluster_health_work"
+      ]
+    },
+    {
+      "id": "cluster-state",
+      "methods": ["GET"],
+      "path": "/_cluster/state",
+      "classification": "intentionally_different",
+      "summary": "Returns FerrisSearch internal Raft cluster-state JSON rather than the OpenSearch cluster-state response schema.",
+      "evidence": [
+        "src/api/cluster.rs#get_state",
+        "tests/rest_api_integration.rs#rest_root_and_cluster_health_work"
+      ]
+    },
+    {
+      "id": "cluster-transfer-master",
+      "methods": ["POST"],
+      "path": "/_cluster/transfer_master",
+      "classification": "intentionally_different",
+      "summary": "FerrisSearch Raft leadership-transfer extension.",
+      "evidence": [
+        "src/api/cluster.rs#transfer_master",
+        "tests/consensus_integration.rs#transfer_leader_to_self_succeeds"
+      ]
+    },
+    {
+      "id": "metrics",
+      "methods": ["GET"],
+      "path": "/_metrics",
+      "classification": "intentionally_different",
+      "summary": "Prometheus text endpoint; not an OpenSearch metrics API.",
+      "evidence": [
+        "src/api/mod.rs#handle_metrics",
+        "src/metrics/mod.rs#tests::gather_initializes_metrics_without_traffic"
+      ]
+    },
+    {
+      "id": "cat-nodes",
+      "methods": ["GET"],
+      "path": "/_cat/nodes",
+      "classification": "partial",
+      "summary": "Text table with a FerrisSearch column subset and optional headers.",
+      "evidence": [
+        "src/api/cat.rs#cat_nodes",
+        "tests/rest_api_integration.rs#rest_cat_endpoints_work_on_single_node"
+      ]
+    },
+    {
+      "id": "cat-shards",
+      "methods": ["GET"],
+      "path": "/_cat/shards",
+      "classification": "partial",
+      "summary": "Reports allocation, in-sync, and runtime-open state; INITIALIZING and UNASSIGNED reflect FerrisSearch allocation identities.",
+      "evidence": [
+        "src/api/cat.rs#cat_shards",
+        "tests/rest_api_integration.rs#rest_cat_shards_shows_started_state"
+      ]
+    },
+    {
+      "id": "cat-indices",
+      "methods": ["GET"],
+      "path": "/_cat/indices",
+      "classification": "partial",
+      "summary": "Text index inventory with FerrisSearch health and count semantics; protected indices are hidden.",
+      "evidence": [
+        "src/api/cat.rs#cat_indices",
+        "tests/rest_api_integration.rs#rest_cat_endpoints_work_on_single_node"
+      ]
+    },
+    {
+      "id": "cat-master",
+      "methods": ["GET"],
+      "path": "/_cat/master",
+      "classification": "partial",
+      "summary": "Reports the current FerrisSearch Raft master using a small text-column subset.",
+      "evidence": [
+        "src/api/cat.rs#cat_master",
+        "tests/rest_api_integration.rs#rest_cat_endpoints_work_on_single_node"
+      ]
+    },
+    {
+      "id": "cat-segments",
+      "methods": ["GET"],
+      "path": "/_cat/segments",
+      "classification": "partial",
+      "summary": "Lists Tantivy segments across started copies; ?local restricts collection to the coordinator.",
+      "evidence": [
+        "src/api/cat.rs#cat_segments",
+        "tests/rest_api_integration.rs#rest_cat_segments_lists_cluster_segments_by_default"
+      ]
+    },
+    {
+      "id": "task-status",
+      "methods": ["GET"],
+      "path": "/_tasks/{task_id}",
+      "classification": "partial",
+      "summary": "Only coordinator-local force-merge task IDs are supported; task records are not Raft replicated.",
+      "evidence": [
+        "src/api/tasks.rs#get_task",
+        "tests/rest_api_integration.rs#rest_forcemerge_returns_task_and_task_endpoint_reports_completion"
+      ]
+    },
+    {
+      "id": "index-exists",
+      "methods": ["HEAD"],
+      "path": "/{index}",
+      "classification": "supported",
+      "summary": "Returns 200 when the index exists and 404 otherwise.",
+      "evidence": [
+        "src/api/index/mod.rs#index_exists",
+        "tests/rest_api_integration.rs#create_index_with_remote_store_engine_allows_create_but_rejects_writes"
+      ]
+    },
+    {
+      "id": "index-create",
+      "methods": ["PUT"],
+      "path": "/{index}",
+      "classification": "partial",
+      "summary": "Supports shard/replica settings, mappings, dynamic mode, and a top-level engine selector; aliases, templates, data streams, and many OpenSearch settings are absent.",
+      "evidence": [
+        "src/api/index/mod.rs#create_index",
+        "tests/rest_api_integration.rs#rest_can_create_update_settings_and_delete_index"
+      ]
+    },
+    {
+      "id": "index-delete",
+      "methods": ["DELETE"],
+      "path": "/{index}",
+      "classification": "partial",
+      "summary": "Deletes one concrete index through Raft; wildcard, alias, and data-stream deletion semantics are not implemented.",
+      "evidence": [
+        "src/api/index/mod.rs#delete_index",
+        "tests/rest_api_integration.rs#rest_can_create_update_settings_and_delete_index"
+      ]
+    },
+    {
+      "id": "index-settings-get",
+      "methods": ["GET"],
+      "path": "/{index}/_settings",
+      "classification": "partial",
+      "summary": "Returns FerrisSearch dynamic, refresh, flush-threshold, replica, and engine settings rather than the complete OpenSearch settings namespace.",
+      "evidence": [
+        "src/api/index/mod.rs#get_index_settings",
+        "tests/rest_api_integration.rs#get_settings_exposes_dynamic_field"
+      ]
+    },
+    {
+      "id": "index-settings-put",
+      "methods": ["PUT"],
+      "path": "/{index}/_settings",
+      "classification": "partial",
+      "summary": "Updates the supported reactive settings and replica count; engine changes are rejected.",
+      "evidence": [
+        "src/api/index/mod.rs#update_index_settings",
+        "tests/rest_api_integration.rs#rest_can_create_update_settings_and_delete_index"
+      ]
+    },
+    {
+      "id": "remote-store-publish",
+      "methods": ["POST"],
+      "path": "/{index}/_remote_store/publish",
+      "classification": "intentionally_different",
+      "summary": "FerrisSearch-only manual immutable split publication; not near-real-time OpenSearch ingest.",
+      "evidence": [
+        "src/engine/remote_store.rs#publish_docs",
+        "tests/rest_api_integration.rs#remote_store_search_returns_hits_from_published_split"
+      ]
+    },
+    {
+      "id": "remote-store-verify",
+      "methods": ["POST"],
+      "path": "/{index}/_remote_store/verify",
+      "classification": "intentionally_different",
+      "summary": "FerrisSearch-only checksum verification for published split bundles.",
+      "evidence": [
+        "src/engine/remote_store.rs#verify_splits",
+        "tests/rest_api_integration.rs#remote_store_verify_reports_ok_for_untouched_splits"
+      ]
+    },
+    {
+      "id": "document-index-auto-id",
+      "methods": ["POST"],
+      "path": "/{index}/_doc",
+      "classification": "partial",
+      "summary": "Auto-generates an ID and returns authoritative sequence and primary-term metadata, but omits _version and supports only a bounded parameter subset.",
+      "evidence": [
+        "src/api/index/mod.rs#index_document",
+        "tests/rest_api_integration.rs#rest_can_create_index_index_get_and_search_documents"
+      ]
+    },
+    {
+      "id": "document-index-id",
+      "methods": ["PUT", "POST"],
+      "path": "/{index}/_doc/{id}",
+      "classification": "partial",
+      "summary": "Indexes by ID with paired sequence/term conditions and op_type=create; external versioning, routing, pipelines, aliases, and retry tokens are unsupported.",
+      "evidence": [
+        "src/api/index/mod.rs#index_document_with_id",
+        "tests/rest_api_integration.rs#writes_regression_conditions_create_upsert_and_noop"
+      ]
+    },
+    {
+      "id": "document-get",
+      "methods": ["GET"],
+      "path": "/{index}/_doc/{id}",
+      "classification": "partial",
+      "summary": "Realtime by default with realtime=false reader selection; returns _seq_no, _primary_term, and FerrisSearch _index_uuid but no _version contract.",
+      "evidence": [
+        "src/api/index/mod.rs#get_document",
+        "tests/rest_api_integration.rs#writes_regression_realtime_get_survives_delete_and_wal_flush"
+      ]
+    },
+    {
+      "id": "document-delete",
+      "methods": ["DELETE"],
+      "path": "/{index}/_doc/{id}",
+      "classification": "partial",
+      "summary": "Supports paired sequence/term conditions and refresh true/false; external versioning and routing are rejected.",
+      "evidence": [
+        "src/api/index/mod.rs#delete_document",
+        "tests/rest_api_integration.rs#rest_can_index_get_update_delete_and_refresh_flush_documents"
+      ]
+    },
+    {
+      "id": "document-update",
+      "methods": ["POST"],
+      "path": "/{index}/_update/{id}",
+      "classification": "partial",
+      "summary": "Supports doc, upsert, doc_as_upsert, detect_noop, and retry_on_conflict using primary-side CAS; scripts and external versions are unsupported.",
+      "evidence": [
+        "src/api/index/mod.rs#update_document",
+        "tests/rest_api_integration.rs#writes_regression_concurrent_updates_preserve_every_acknowledged_field"
+      ]
+    },
+    {
+      "id": "document-create",
+      "methods": ["PUT", "POST"],
+      "path": "/{index}/_create/{id}",
+      "classification": "partial",
+      "summary": "Create-only write with 409 version conflicts and no sequence allocation on conflict; broader OpenSearch write parameters are unsupported.",
+      "evidence": [
+        "src/api/index/mod.rs#create_document",
+        "tests/rest_api_integration.rs#writes_regression_conditions_create_upsert_and_noop"
+      ]
+    },
+    {
+      "id": "bulk-global",
+      "methods": ["POST"],
+      "path": "/_bulk",
+      "classification": "partial",
+      "summary": "Materialized NDJSON parser supports index, create, update, and delete with per-item results; unsupported action metadata rejects the whole request before writes.",
+      "evidence": [
+        "src/api/index/bulk.rs#bulk_index_global",
+        "tests/rest_api_integration.rs#writes_regression_bulk_delete_and_update_preserve_action_boundaries"
+      ]
+    },
+    {
+      "id": "bulk-index",
+      "methods": ["POST"],
+      "path": "/{index}/_bulk",
+      "classification": "partial",
+      "summary": "Same bulk subset as /_bulk with the path index as a default; action _index overrides remain authorized and honored.",
+      "evidence": [
+        "src/api/index/bulk.rs#bulk_index",
+        "tests/rest_api_integration.rs#writes_regression_bulk_order_conflicts_and_missing_delete"
+      ]
+    },
+    {
+      "id": "security-api-key-create",
+      "methods": ["POST"],
+      "path": "/_security/api_key",
+      "classification": "intentionally_different",
+      "summary": "FerrisSearch API-key control plane; returns a generated plaintext secret once and stores only its hash in Raft state.",
+      "evidence": [
+        "src/api/security.rs#create_api_key",
+        "tests/rest_api_integration.rs#security_api_key_create_use_revoke_lifecycle"
+      ]
+    },
+    {
+      "id": "security-api-key-list",
+      "methods": ["GET"],
+      "path": "/_security/api_key",
+      "classification": "intentionally_different",
+      "summary": "Lists FerrisSearch dynamic API-key metadata without hashes or secrets.",
+      "evidence": [
+        "src/api/security.rs#list_api_keys",
+        "tests/rest_api_integration.rs#security_api_key_list_and_get_never_leak_hash"
+      ]
+    },
+    {
+      "id": "security-api-key-get",
+      "methods": ["GET"],
+      "path": "/_security/api_key/{id}",
+      "classification": "intentionally_different",
+      "summary": "Gets FerrisSearch dynamic API-key metadata; bootstrap keys are not represented.",
+      "evidence": [
+        "src/api/security.rs#get_api_key",
+        "tests/rest_api_integration.rs#security_api_key_list_and_get_never_leak_hash"
+      ]
+    },
+    {
+      "id": "security-api-key-delete",
+      "methods": ["DELETE"],
+      "path": "/_security/api_key/{id}",
+      "classification": "intentionally_different",
+      "summary": "Revokes a dynamic FerrisSearch key; bootstrap configuration keys cannot be deleted through this API.",
+      "evidence": [
+        "src/api/security.rs#delete_api_key",
+        "tests/rest_api_integration.rs#security_api_key_create_use_revoke_lifecycle"
+      ]
+    },
+    {
+      "id": "security-role-list",
+      "methods": ["GET"],
+      "path": "/_security/role",
+      "classification": "intentionally_different",
+      "summary": "Lists FerrisSearch custom roles, not the OpenSearch Security plugin role schema.",
+      "evidence": [
+        "src/api/security.rs#list_roles",
+        "tests/rest_api_integration.rs#security_role_create_get_list_delete"
+      ]
+    },
+    {
+      "id": "security-role-put",
+      "methods": ["PUT"],
+      "path": "/_security/role/{name}",
+      "classification": "intentionally_different",
+      "summary": "Creates or replaces a FerrisSearch custom role with cluster, index-pattern, and privilege lists.",
+      "evidence": [
+        "src/api/security.rs#put_role",
+        "tests/rest_api_integration.rs#security_custom_role_grants_scoped_index_access"
+      ]
+    },
+    {
+      "id": "security-role-get",
+      "methods": ["GET"],
+      "path": "/_security/role/{name}",
+      "classification": "intentionally_different",
+      "summary": "Gets one FerrisSearch custom role.",
+      "evidence": [
+        "src/api/security.rs#get_role",
+        "tests/rest_api_integration.rs#security_role_create_get_list_delete"
+      ]
+    },
+    {
+      "id": "security-role-delete",
+      "methods": ["DELETE"],
+      "path": "/_security/role/{name}",
+      "classification": "intentionally_different",
+      "summary": "Deletes one FerrisSearch custom role.",
+      "evidence": [
+        "src/api/security.rs#delete_role",
+        "tests/rest_api_integration.rs#security_role_create_get_list_delete"
+      ]
+    },
+    {
+      "id": "search-query-string",
+      "methods": ["GET"],
+      "path": "/{index}/_search",
+      "classification": "partial",
+      "summary": "Supports q, df, size, and from through a Tantivy query-string subset; this is not full Lucene syntax.",
+      "evidence": [
+        "src/api/search/mod.rs#search_documents",
+        "tests/rest_api_integration.rs#rest_qsearch_match_all_counts_every_document_across_three_shards"
+      ]
+    },
+    {
+      "id": "search-dsl",
+      "methods": ["POST"],
+      "path": "/{index}/_search",
+      "classification": "partial",
+      "summary": "Supports a bounded Query DSL, k-NN, hybrid RRF, sort, search_after, and selected aggregations; partial shard results remain enabled and PIT, scroll, msearch, scripts, and full DSL coverage are absent.",
+      "evidence": [
+        "src/api/index/mod.rs#search_documents_dsl",
+        "tests/rest_api_integration.rs#rest_can_bulk_index_and_search_via_query_and_dsl"
+      ]
+    },
+    {
+      "id": "count",
+      "methods": ["GET", "POST"],
+      "path": "/{index}/_count",
+      "classification": "partial",
+      "summary": "Supports match-all and POST query-body counting; _count?q=... is not implemented.",
+      "evidence": [
+        "src/api/search/mod.rs#count_documents",
+        "tests/rest_api_integration.rs#rest_count_returns_correct_total"
+      ]
+    },
+    {
+      "id": "sql-index",
+      "methods": ["POST"],
+      "path": "/{index}/_sql",
+      "classification": "intentionally_different",
+      "summary": "FerrisSearch search-aware SQL response with planner, execution_mode, matched_hits, truncation, and shard metadata; not the OpenSearch SQL plugin contract.",
+      "evidence": [
+        "src/api/search/mod.rs#search_sql",
+        "tests/sql_correctness.rs#sql_correctness_basic"
+      ]
+    },
+    {
+      "id": "sql-index-stream",
+      "methods": ["POST"],
+      "path": "/{index}/_sql/stream",
+      "classification": "intentionally_different",
+      "summary": "FerrisSearch NDJSON stream with one meta frame followed by row frames.",
+      "evidence": [
+        "src/api/search/mod.rs#search_sql_stream",
+        "tests/rest_api_integration.rs#rest_sql_stream_endpoint_returns_ndjson_frames"
+      ]
+    },
+    {
+      "id": "sql-index-explain",
+      "methods": ["POST"],
+      "path": "/{index}/_sql/explain",
+      "classification": "intentionally_different",
+      "summary": "FerrisSearch planner explanation; analyze=true executes and adds timings and rows.",
+      "evidence": [
+        "src/api/search/mod.rs#explain_sql",
+        "tests/rest_api_integration.rs#rest_sql_explain_analyze_returns_timings_and_rows"
+      ]
+    },
+    {
+      "id": "sql-global",
+      "methods": ["POST"],
+      "path": "/_sql",
+      "classification": "intentionally_different",
+      "summary": "FerrisSearch global SQL endpoint for SHOW TABLES, DESCRIBE, SHOW CREATE TABLE, and SELECT with FROM-based index extraction.",
+      "evidence": [
+        "src/api/search/mod.rs#global_sql",
+        "tests/rest_api_integration.rs#rest_sql_uses_tantivy_fast_fields_for_supported_query"
+      ]
+    },
+    {
+      "id": "sql-global-stream",
+      "methods": ["POST"],
+      "path": "/_sql/stream",
+      "classification": "intentionally_different",
+      "summary": "Streaming form of the FerrisSearch global SQL endpoint.",
+      "evidence": [
+        "src/api/search/mod.rs#global_sql_stream",
+        "tests/rest_api_integration.rs#rest_global_sql_stream_endpoint_routes_select_queries"
+      ]
+    },
+    {
+      "id": "refresh",
+      "methods": ["GET", "POST"],
+      "path": "/{index}/_refresh",
+      "classification": "partial",
+      "summary": "Cluster-wide fan-out returns shard counts; write refresh=true uses a separate bounded primary-owned visibility round and refresh=wait_for is rejected.",
+      "evidence": [
+        "src/api/index/maintenance.rs#refresh_index",
+        "src/api/index/refresh_tests.rs#single_visibility"
+      ]
+    },
+    {
+      "id": "flush",
+      "methods": ["GET", "POST"],
+      "path": "/{index}/_flush",
+      "classification": "partial",
+      "summary": "Cluster-wide shard flush with a small response shape; OpenSearch flush parameters and synced-flush semantics are not implemented.",
+      "evidence": [
+        "src/api/index/maintenance.rs#flush_index",
+        "tests/rest_api_integration.rs#rest_can_index_get_update_delete_and_refresh_flush_documents"
+      ]
+    },
+    {
+      "id": "force-merge",
+      "methods": ["POST"],
+      "path": "/{index}/_forcemerge",
+      "classification": "intentionally_different",
+      "summary": "Always enqueues asynchronous per-node work, returns 202 and a coordinator-local task ID, and supports only max_num_segments.",
+      "evidence": [
+        "src/api/index/maintenance.rs#force_merge_index",
+        "tests/rest_api_integration.rs#rest_distributed_forcemerge_is_async_and_tracks_all_nodes"
+      ]
+    }
+  ],
+  "important_unsupported": [
+    {
+      "id": "mapping-update",
+      "methods": ["PUT"],
+      "path": "/{index}/_mapping",
+      "classification": "unsupported",
+      "summary": "No public mapping-update route; dynamic mapping is internal and additive.",
+      "evidence": ["src/api/mod.rs#create_router"]
+    },
+    {
+      "id": "multi-search",
+      "methods": ["GET", "POST"],
+      "path": "/_msearch",
+      "classification": "unsupported",
+      "summary": "No multi-search route.",
+      "evidence": [".github/instructions/search.instructions.md#shard-failure-responses"]
+    },
+    {
+      "id": "count-query-string",
+      "methods": ["GET"],
+      "path": "/{index}/_count?q=...",
+      "classification": "unsupported",
+      "summary": "The count endpoint does not parse q; use POST with a supported query body.",
+      "evidence": [".github/instructions/search.instructions.md#shard-failure-responses"]
+    },
+    {
+      "id": "aliases",
+      "methods": ["GET", "POST"],
+      "path": "/_aliases",
+      "classification": "unsupported",
+      "summary": "Index aliases and alias-based cutover are not implemented.",
+      "evidence": ["src/api/mod.rs#create_router"]
+    },
+    {
+      "id": "index-templates",
+      "methods": ["GET", "PUT", "DELETE"],
+      "path": "/_index_template/{name}",
+      "classification": "unsupported",
+      "summary": "Composable and legacy index templates are not implemented.",
+      "evidence": ["src/api/mod.rs#create_router"]
+    },
+    {
+      "id": "data-streams",
+      "methods": ["GET", "PUT", "DELETE"],
+      "path": "/_data_stream/{name}",
+      "classification": "unsupported",
+      "summary": "Data streams and backing-index lifecycle are not implemented.",
+      "evidence": ["src/api/mod.rs#create_router"]
+    },
+    {
+      "id": "point-in-time",
+      "methods": ["POST", "DELETE"],
+      "path": "/{index}/_search/point_in_time",
+      "classification": "unsupported",
+      "summary": "Public PIT and named read snapshots are roadmap work.",
+      "evidence": ["docs/adr/0003-read-snapshots-retention-and-visibility.md#3-decision"]
+    },
+    {
+      "id": "scroll",
+      "methods": ["GET", "POST", "DELETE"],
+      "path": "/_search/scroll",
+      "classification": "unsupported",
+      "summary": "Scroll contexts are not implemented.",
+      "evidence": ["src/api/mod.rs#create_router"]
+    },
+    {
+      "id": "snapshots",
+      "methods": ["GET", "PUT", "POST", "DELETE"],
+      "path": "/_snapshot/{repository}/{snapshot}",
+      "classification": "unsupported",
+      "summary": "OpenSearch repository snapshot and restore APIs are not implemented.",
+      "evidence": ["src/api/mod.rs#create_router"]
+    },
+    {
+      "id": "index-lifecycle",
+      "methods": ["GET", "PUT", "POST", "DELETE"],
+      "path": "/_plugins/_ism/*",
+      "classification": "unsupported",
+      "summary": "OpenSearch Index State Management and lifecycle policies are not implemented.",
+      "evidence": ["src/api/mod.rs#create_router"]
+    },
+    {
+      "id": "opensearch-security-plugin",
+      "methods": ["GET", "PUT", "POST", "DELETE"],
+      "path": "/_plugins/_security/api/*",
+      "classification": "unsupported",
+      "summary": "FerrisSearch has its own smaller /_security API and does not implement the OpenSearch Security plugin REST contract.",
+      "evidence": ["src/api/mod.rs#create_router"]
+    }
+  ]
+}
