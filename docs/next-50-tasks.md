@@ -6,10 +6,10 @@
 >
 > **Current-behavior authority:** source and tests.
 >
-> **Last source audit:** 2026-10-09 for FS-002; 2026-10-08 for FS-001 and
-> FS-007; 2026-10-05 for FS-013; 2026-10-04 for FS-012; 2026-09-27 for FS-014,
-> FS-019, and FS-022 through FS-026, after PRs #142-#144. Other tasks were last
-> audited on 2026-07-10.
+> **Last source audit:** 2026-10-13 for FS-003; 2026-10-09 for FS-002;
+> 2026-10-08 for FS-001 and FS-007; 2026-10-05 for FS-013; 2026-10-04 for
+> FS-012; 2026-09-27 for FS-014, FS-019, and FS-022 through FS-026, after PRs
+> #142-#144. Other tasks were last audited on 2026-07-10.
 
 This is a dependency-aware sequence, not a feature wish list. Rank expresses
 current strategic importance; a task still waits for every listed dependency.
@@ -183,6 +183,13 @@ duplicate operations on filesystem and S3-compatible backends.
 ### FS-003 — Decide Read Snapshots, Retention, And Visibility
 
 **Class:** Release blocker | **Gate:** 0 | **Depends on:** FS-001, FS-002
+
+**Status (2026-10-13):** Complete. Accepted
+[ADR 0003](adr/0003-read-snapshots-retention-and-visibility.md) defines a
+request-stable vector snapshot, exact manifest and local-reader identity,
+operation-based visibility, the exclusive hot/immutable handoff watermark,
+forward-only rollback, bounded request and named-snapshot retention, and
+fail-closed garbage collection. Runtime implementation remains roadmap work.
 
 **Evidence:** local shards, remote manifest generations, refresh, in-flight
 root/leaf queries, and future hot deltas do not share one snapshot contract.
