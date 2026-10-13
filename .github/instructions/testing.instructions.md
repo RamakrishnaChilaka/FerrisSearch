@@ -437,6 +437,13 @@ cargo test -- test_name                         # Single test by name
   replay, malformed WAL document envelopes, idempotent replay with deletes,
   replica delete survival through promotion, idle refresh/snapshot healing,
   and full transport recovery after a transient source refresh-commit failure.
+- Client-operation retry regressions must prove exact duplicate receipts and no
+  sequence/version advance, hard conflict on ID reuse with different intent,
+  deterministic auto IDs, detected update no-op replay, per-item bulk behavior,
+  an indeterminate post-primary-mutation retry, flush/restart restoration,
+  replica rejection, peer-recovery snapshot transfer, and retry after promotion
+  under a newer term. Retention-bound unit coverage must exercise the exact
+  4,096-operation edge.
 - D1 vector recovery regressions must cover a failed post-WAL text apply
   followed by refresh or primary activation before the next write, plus
   restart persistence and successful clearing of `vectors.stale`.

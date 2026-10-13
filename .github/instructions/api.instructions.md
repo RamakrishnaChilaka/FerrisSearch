@@ -325,8 +325,19 @@ Retain only the original patch/upsert input when another retry is possible.
 Successful single/bulk index, update, and delete responses carry the
 primary-assigned nonzero `_version`; found GET responses carry the stored
 version. A detected update no-op returns the current version without consuming
-a sequence or version. Client retry identity and external version
+a document sequence or version. When `operation_id` is present, a detected
+no-op also appends a durable internal NoOp that owns the retry record while the
+response preserves the current document metadata. External version
 preconditions remain unimplemented.
+
+Single index/create, update, and delete accept `operation_id`; bulk action
+metadata accepts `_operation_id`. IDs are at most 256 bytes. Fingerprint the
+complete logical intent, including index UUID, target, source/update input, and
+condition. Auto-ID index derives a stable document ID from the operation ID.
+An exact retry returns the original result and metadata; reuse with different
+intent is 409 `operation_id_conflict`. Missing IDs preserve at-least-once
+behavior. Keep ID-bearing index-only bulk runs on the ordered item path; the
+contiguous fast batch cannot preserve per-item deduplication results.
 
 Declared keyword fields accept nested arrays of string/number/boolean scalars,
 flatten and coerce them to text for indexing, ignore nulls, and deduplicate a

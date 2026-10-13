@@ -574,11 +574,12 @@ pub(super) fn recovery_op(entry: crate::wal::TranslogEntry) -> Result<RecoveryOp
             doc_id,
             source,
             version,
+            ..
         } => (doc_id.to_string(), source.clone(), Some(version)),
-        crate::wal::WalDocumentOperation::Delete { doc_id, version } => {
-            (doc_id.to_string(), serde_json::json!({}), Some(version))
-        }
-        crate::wal::WalDocumentOperation::NoOp { reason } => (
+        crate::wal::WalDocumentOperation::Delete {
+            doc_id, version, ..
+        } => (doc_id.to_string(), serde_json::json!({}), Some(version)),
+        crate::wal::WalDocumentOperation::NoOp { reason, .. } => (
             String::new(),
             serde_json::json!({ "_reason": reason }),
             None,
@@ -592,6 +593,10 @@ pub(super) fn recovery_op(entry: crate::wal::TranslogEntry) -> Result<RecoveryOp
             .map_err(|error| Status::internal(format!("serialize recovery operation: {error}")))?,
         primary_term: entry.primary_term,
         document_version,
+        client_operation: crate::wal::client_operation(&entry)
+            .map_err(|error| Status::internal(error.to_string()))?
+            .as_ref()
+            .map(crate::transport::client_operation::record_to_proto),
     })
 }
 
@@ -2123,6 +2128,7 @@ mod tests {
                     seq_no: operation.seq_no,
                     primary_term: operation.primary_term,
                     document_version: operation.document_version.unwrap_or(0),
+                    client_operation: None,
                     mutation,
                 }
             })
@@ -4145,6 +4151,7 @@ mod tests {
                     .get_state()
                     .shard_allocation_id("idx", 0, "primary"),
                 document_version: Some(1),
+                client_operation: None,
             }))
             .await
             .unwrap()

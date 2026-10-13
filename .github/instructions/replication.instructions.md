@@ -263,7 +263,17 @@ A no-op alongside a mutation shares that bulk shard's report. See
 - Processed and persisted checkpoints are gap-aware contiguous prefixes.
   Internal redelivery is term/sequence aware, promotion fills local gaps with
   NoOps, and sustained gaps are probed before exact-allocation removal. This is
-  still not general D10 rollback/resync or client retry-token support.
+  still not general D10 rollback/resync.
+- Replicated and recovered operations preserve the primary's client-operation
+  record exactly. Replica apply rejects reuse of one client ID with a different
+  fingerprint and never allocates replacement metadata.
+- File-based peer recovery snapshots include exact retained ID-bearing WAL
+  entries at or below the committed checkpoint for the latest 4,096 sequence
+  operations. Install validates sequence bounds, operation/result agreement,
+  unique IDs, and collisions with retained delete tombstones before appending
+  them to the empty target WAL. Do not replace the original mutation with a
+  synthetic NoOp; later same-sequence delivery must compare against the exact
+  operation.
 - Promotion NoOps are replicated in bounded homogeneous bulk batches, preserving
   each explicit non-contiguous sequence number. A batch transport failure
   remains best-effort, creates the same replica gap observation as the former

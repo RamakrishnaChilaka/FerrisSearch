@@ -86,6 +86,14 @@ receipt metadata. FerrisSearch is pre-1.0: successful responses require these
 receipts, and metadata-free success responses from older peers fail. Do not add
 compatibility fallbacks or rollout machinery for this protocol change.
 
+Primary index/delete requests and ordered bulk items carry
+`ClientOperationIntent`; successful responses and replica/recovery operations
+carry the complete `ClientOperationMetadata` record. Decode and validate IDs,
+fingerprints, result variants, and required metadata at every wire boundary.
+Forwarding never regenerates an ID or fingerprint. ID-bearing index-only bulk
+must use ordered item execution rather than the contiguous fast batch, because
+each item can independently deduplicate or conflict.
+
 Failed primary index/delete/bulk responses and failed ordered-bulk items require
 `WriteFailureDetails`: rejected, proven not executed, or indeterminate, with
 HTTP status, error type, cause, and optional operation-owned sequence/term.

@@ -13,6 +13,7 @@ fn apply_index(engine: &dyn SearchEngine, doc_id: &str, seq_no: u64, primary_ter
             seq_no,
             primary_term,
             document_version: seq_no + 1,
+            client_operation: None,
             mutation: DocumentMutation::Index {
                 doc_id: doc_id.to_string(),
                 source: json!({"seq": seq_no}),

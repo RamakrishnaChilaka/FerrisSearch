@@ -197,6 +197,7 @@ fn replica_bulk_apply_cpu_cost() {
                     seq_no: number as u64,
                     primary_term: 1,
                     document_version: number as u64 + 1,
+                    client_operation: None,
                     mutation: DocumentMutation::Index {
                         doc_id: format!("doc-{number}"),
                         source: source(number),

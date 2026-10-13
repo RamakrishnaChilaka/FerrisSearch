@@ -121,6 +121,28 @@ message WriteFailureDetails {
 
 // ─── Shard-level Operations ──────────────────────────────────────────────────
 
+message ClientOperationIntent {
+    string id = 1;
+    string fingerprint = 2;
+}
+
+enum ClientOperationResultKind {
+    CLIENT_OPERATION_INDEX = 0;
+    CLIENT_OPERATION_DELETE = 1;
+    CLIENT_OPERATION_UPDATE_NOOP = 2;
+}
+
+message ClientOperationMetadata {
+    string id = 1;
+    string fingerprint = 2;
+    ClientOperationResultKind result_kind = 3;
+    uint64 version = 4;
+    bool created = 5;
+    uint64 deleted = 6;
+    optional uint64 response_seq_no = 7;
+    optional uint64 response_primary_term = 8;
+}
+
 message ShardDocRequest {
     string index_name = 1;
     uint32 shard_id = 2;
@@ -131,6 +153,7 @@ message ShardDocRequest {
     bool create_only = 7;
     optional string index_uuid = 8; // pins a read/CAS operation to one index incarnation
     bool refresh = 9;
+    ClientOperationIntent client_operation = 10;
 }
 
 message ShardDocResponse {
@@ -152,6 +175,7 @@ message ShardDeleteRequest {
     optional uint64 if_seq_no = 4;
     optional uint64 if_primary_term = 5;
     bool refresh = 6;
+    ClientOperationIntent client_operation = 7;
 }
 
 message ShardDeleteResponse {
@@ -192,6 +216,30 @@ message ShardBulkOperation {
     ShardBulkOpKind kind = 1;
     optional uint64 if_seq_no = 2;
     optional uint64 if_primary_term = 3;
+    ClientOperationIntent client_operation = 4;
+}
+
+message ShardClientNoOpRequest {
+    string index_name = 1;
+    uint32 shard_id = 2;
+    ClientOperationIntent client_operation = 3;
+    uint64 result_seq_no = 4;
+    uint64 result_primary_term = 5;
+    uint64 result_version = 6;
+    optional string index_uuid = 7;
+}
+
+message ShardClientNoOpResponse {
+    bool success = 1;
+    string error = 2;
+    optional uint64 operation_seq_no = 3;
+    optional uint64 operation_primary_term = 4;
+    optional uint64 seq_no = 5;
+    optional uint64 primary_term = 6;
+    optional uint64 version = 7;
+    WriteFailureDetails failure = 8;
+    ClientOperationMetadata client_operation = 9;
+    bool deduplicated = 10;
 }
 
 message ShardBulkItemResponse {
@@ -335,6 +383,7 @@ message ReplicateDocRequest {
     optional uint64 primary_term = 8;
     optional uint64 target_allocation_id = 9;
     optional uint64 document_version = 10; // required for index/delete; absent for NoOp
+    ClientOperationMetadata client_operation = 11;
 }
 
 message ReplicateDocResponse {
@@ -390,6 +439,7 @@ message RecoveryOperation {
     bytes payload_json = 4;  // document body or no-op metadata
     uint64 primary_term = 5;
     optional uint64 document_version = 6; // required for index/delete; absent for NoOp
+    ClientOperationMetadata client_operation = 7;
 }
 
 message RecoveryFileMetadata {
@@ -771,6 +821,7 @@ service InternalTransport {
     rpc IndexDoc(ShardDocRequest) returns (ShardDocResponse);
     rpc BulkIndex(ShardBulkRequest) returns (ShardBulkResponse);
     rpc DeleteDoc(ShardDeleteRequest) returns (ShardDeleteResponse);
+    rpc RecordClientNoOp(ShardClientNoOpRequest) returns (ShardClientNoOpResponse);
     rpc RefreshShardCopy(ShardCopyRefreshRequest) returns (ShardCopyRefreshResult);
     rpc RefreshShardWrites(ShardCopyRefreshRequest) returns (ShardWriteRefreshResult);
     rpc GetDoc(ShardGetRequest) returns (ShardGetResponse);

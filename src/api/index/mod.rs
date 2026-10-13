@@ -579,6 +579,7 @@ impl RefreshParam {
 #[derive(Default, serde::Deserialize)]
 pub struct WriteParams {
     pub refresh: Option<String>,
+    pub operation_id: Option<String>,
     pub if_seq_no: Option<u64>,
     pub if_primary_term: Option<u64>,
     pub op_type: Option<String>,
@@ -593,6 +594,10 @@ fn illegal_argument(error: impl std::fmt::Display) -> (StatusCode, Json<Value>) 
 impl WriteParams {
     fn condition(&self) -> Result<crate::engine::WriteCondition, (StatusCode, Json<Value>)> {
         self.unsupported.validate()?;
+        if let Some(operation_id) = self.operation_id.as_deref() {
+            crate::engine::ClientOperationIntent::validate_id(operation_id)
+                .map_err(illegal_argument)?;
+        }
         validate_refresh_parameter(self.refresh.as_deref())?;
         let condition = crate::engine::WriteCondition::from_optional_values(
             self.if_seq_no,
@@ -624,6 +629,7 @@ pub struct GetParams {
 #[derive(Default, serde::Deserialize)]
 pub struct UpdateParams {
     pub refresh: Option<String>,
+    pub operation_id: Option<String>,
     pub if_seq_no: Option<u64>,
     pub if_primary_term: Option<u64>,
     #[serde(default)]
@@ -635,8 +641,41 @@ pub struct UpdateParams {
 impl UpdateParams {
     fn validate(&self) -> Result<(), (StatusCode, Json<Value>)> {
         self.unsupported.validate()?;
+        if let Some(operation_id) = self.operation_id.as_deref() {
+            crate::engine::ClientOperationIntent::validate_id(operation_id)
+                .map_err(illegal_argument)?;
+        }
         validate_refresh_parameter(self.refresh.as_deref())
     }
+}
+
+fn write_condition_identity(condition: crate::engine::WriteCondition) -> Value {
+    match condition {
+        crate::engine::WriteCondition::Unconditional => serde_json::json!("unconditional"),
+        crate::engine::WriteCondition::Create => serde_json::json!("create"),
+        crate::engine::WriteCondition::IfMatch {
+            seq_no,
+            primary_term,
+        } => serde_json::json!({
+            "if_seq_no": seq_no,
+            "if_primary_term": primary_term
+        }),
+    }
+}
+
+fn client_operation_intent(
+    operation_id: Option<&str>,
+    value: Value,
+) -> Result<Option<crate::engine::ClientOperationIntent>, (StatusCode, Json<Value>)> {
+    operation_id
+        .map(|operation_id| {
+            crate::engine::ClientOperationIntent::new(
+                operation_id.to_string(),
+                crate::engine::ClientOperationIntent::fingerprint_json(&value)?,
+            )
+        })
+        .transpose()
+        .map_err(illegal_argument)
 }
 
 /// HEAD /{index} — Check if an index exists.
@@ -834,8 +873,6 @@ pub async fn index_document(
     if let Err(response) = validate_document_source_for_api(&payload) {
         return response;
     }
-    let doc_id = uuid::Uuid::new_v4().to_string();
-
     let mut cluster_state = match index_cluster_state(&state, &index_name).await {
         Ok(current) => current,
         Err(error) => return error,
@@ -854,6 +891,28 @@ pub async fn index_document(
     if let Some(resp) = crate::api::reject_write_if_engine_read_only(&metadata) {
         return resp;
     }
+    let doc_id = match refresh_param.operation_id.as_deref() {
+        Some(operation_id) => {
+            match crate::engine::ClientOperationIntent::stable_document_id(operation_id) {
+                Ok(doc_id) => doc_id,
+                Err(error) => return illegal_argument(error),
+            }
+        }
+        None => uuid::Uuid::new_v4().to_string(),
+    };
+    let client_operation = match client_operation_intent(
+        refresh_param.operation_id.as_deref(),
+        serde_json::json!({
+            "kind": "index",
+            "index_uuid": metadata.uuid,
+            "doc_id": doc_id,
+            "source": payload,
+            "condition": write_condition_identity(condition)
+        }),
+    ) {
+        Ok(operation) => operation,
+        Err(response) => return response,
+    };
     cluster_state = state.cluster_manager.get_state();
 
     // Route document to the correct shard
@@ -883,7 +942,7 @@ pub async fn index_document(
 
     match state
         .transport_client
-        .forward_index_with_options_to_shard(
+        .forward_index_with_operation_to_shard(
             &target_node,
             &index_name,
             shard_id,
@@ -893,6 +952,7 @@ pub async fn index_document(
                 condition,
                 refresh: refresh_param.should_refresh(),
             },
+            client_operation.as_ref(),
         )
         .await
     {
@@ -945,6 +1005,19 @@ pub async fn index_document_with_id(
     if let Some(resp) = crate::api::reject_write_if_engine_read_only(&metadata) {
         return resp;
     }
+    let client_operation = match client_operation_intent(
+        refresh_param.operation_id.as_deref(),
+        serde_json::json!({
+            "kind": "index",
+            "index_uuid": metadata.uuid,
+            "doc_id": doc_id,
+            "source": payload,
+            "condition": write_condition_identity(condition)
+        }),
+    ) {
+        Ok(operation) => operation,
+        Err(response) => return response,
+    };
     cluster_state = state.cluster_manager.get_state();
 
     // Route document to the correct shard
@@ -974,7 +1047,7 @@ pub async fn index_document_with_id(
 
     match state
         .transport_client
-        .forward_index_with_options_to_shard(
+        .forward_index_with_operation_to_shard(
             &target_node,
             &index_name,
             shard_id,
@@ -984,6 +1057,7 @@ pub async fn index_document_with_id(
                 condition,
                 refresh: refresh_param.should_refresh(),
             },
+            client_operation.as_ref(),
         )
         .await
     {
@@ -1622,6 +1696,7 @@ async fn execute_update(
     if let Err(response) = validate_update_body(&body) {
         return response;
     }
+    let operation_body = body.clone();
     let requested = match crate::engine::WriteCondition::from_optional_values(
         params.if_seq_no,
         params.if_primary_term,
@@ -1676,6 +1751,20 @@ async fn execute_update(
             );
         }
         let index_uuid = index_uuid.get_or_insert(read.index_uuid);
+        let client_operation = match client_operation_intent(
+            params.operation_id.as_deref(),
+            serde_json::json!({
+                "kind": "update",
+                "index_uuid": index_uuid,
+                "doc_id": doc_id,
+                "body": operation_body,
+                "condition": write_condition_identity(requested),
+                "retry_on_conflict": params.retry_on_conflict
+            }),
+        ) {
+            Ok(operation) => operation,
+            Err(response) => return response,
+        };
         let existing = read.document;
         if let Err(error) = requested.check(
             doc_id,
@@ -1705,13 +1794,69 @@ async fn execute_update(
                 .unwrap_or(true)
                 && !changed
             {
+                let (seq_no, primary_term, version, result, status) =
+                    if let Some(operation) = client_operation.as_ref() {
+                        match state
+                            .transport_client
+                            .forward_client_noop_to_shard(
+                                &target_node,
+                                index_name,
+                                shard_id,
+                                index_uuid,
+                                operation,
+                                existing.seq_no,
+                                existing.primary_term,
+                                existing.version,
+                            )
+                            .await
+                        {
+                            Ok(receipt) => {
+                                let (result, status) = match receipt.client_operation.result {
+                                    crate::engine::ClientOperationResult::Index {
+                                        created: true,
+                                        ..
+                                    } => ("created", StatusCode::CREATED),
+                                    crate::engine::ClientOperationResult::Index {
+                                        created: false,
+                                        ..
+                                    } => ("updated", StatusCode::OK),
+                                    crate::engine::ClientOperationResult::UpdateNoOp { .. } => {
+                                        ("noop", StatusCode::OK)
+                                    }
+                                    crate::engine::ClientOperationResult::Delete { .. } => {
+                                        return crate::api::error_response(
+                                            StatusCode::CONFLICT,
+                                            "operation_id_conflict",
+                                            "update operation ID resolved to a delete result",
+                                        );
+                                    }
+                                };
+                                (
+                                    receipt.seq_no,
+                                    receipt.primary_term,
+                                    receipt.version,
+                                    result,
+                                    status,
+                                )
+                            }
+                            Err(error) => return document_write_error_response("Update", error),
+                        }
+                    } else {
+                        (
+                            existing.seq_no,
+                            existing.primary_term,
+                            existing.version,
+                            "noop",
+                            StatusCode::OK,
+                        )
+                    };
                 return (
-                    StatusCode::OK,
+                    status,
                     Json(serde_json::json!({
                         "_index": index_name, "_id": doc_id,
-                        "_seq_no": existing.seq_no, "_primary_term": existing.primary_term,
-                        "_version": existing.version,
-                        "result": "noop",
+                        "_seq_no": seq_no, "_primary_term": primary_term,
+                        "_version": version,
+                        "result": result,
                         "_shards": {"total": 0, "successful": 0, "failed": 0}
                     })),
                 );
@@ -1769,6 +1914,9 @@ async fn execute_update(
             create_only: condition == crate::engine::WriteCondition::Create,
             index_uuid: Some(index_uuid.clone()),
             refresh: matches!(params.refresh.as_deref(), Some("true") | Some("")),
+            client_operation: client_operation
+                .as_ref()
+                .map(crate::transport::client_operation::intent_to_proto),
         };
         match state
             .transport_client
@@ -1829,6 +1977,18 @@ pub async fn delete_document(
     if let Some(resp) = crate::api::reject_write_if_engine_read_only(&metadata) {
         return resp;
     }
+    let client_operation = match client_operation_intent(
+        params.operation_id.as_deref(),
+        serde_json::json!({
+            "kind": "delete",
+            "index_uuid": metadata.uuid,
+            "doc_id": doc_id,
+            "condition": write_condition_identity(condition)
+        }),
+    ) {
+        Ok(operation) => operation,
+        Err(response) => return response,
+    };
 
     let shard_id = crate::engine::routing::calculate_shard(&doc_id, metadata.number_of_shards);
     let target_node_id = match metadata.primary_node(shard_id) {
@@ -1855,7 +2015,7 @@ pub async fn delete_document(
 
     match state
         .transport_client
-        .forward_delete_with_options_to_shard(
+        .forward_delete_with_operation_to_shard(
             &target_node,
             &index_name,
             shard_id,
@@ -1864,6 +2024,7 @@ pub async fn delete_document(
                 condition,
                 refresh: params.should_refresh(),
             },
+            client_operation.as_ref(),
         )
         .await
     {

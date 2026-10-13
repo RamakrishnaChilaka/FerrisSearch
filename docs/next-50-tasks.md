@@ -6,7 +6,7 @@
 >
 > **Current-behavior authority:** source and tests.
 >
-> **Last source audit:** 2026-10-13 for FS-003 and FS-004; 2026-10-09 for
+> **Last source audit:** 2026-10-13 for FS-003, FS-004, and FS-011; 2026-10-09 for
 > FS-002; 2026-10-08 for FS-001 and FS-007; 2026-10-05 for FS-013; 2026-10-04
 > for FS-012; 2026-09-27 for FS-014, FS-019, and FS-022 through FS-026, after
 > PRs #142-#144. Other tasks were last audited on 2026-07-10.
@@ -352,6 +352,19 @@ does not reset concurrency metadata.
 ### FS-011 — Add Idempotent Client Operation IDs
 
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-001, FS-009
+
+**Status (2026-10-13):** Complete for supported `local_shards` writes. Single
+and bulk index/create, update, and delete accept a client operation ID, persist
+the request fingerprint and original result in the shard WAL, replicate the
+record, restore it on restart, and transfer the retained window during
+file-based peer recovery. Exact retries return the original sequence, primary
+term, version, result, and auto-generated document ID without another mutation.
+Reuse with different intent is a 409 `operation_id_conflict`. Retention is
+bounded to the latest 4,096 shard sequence operations; retries after expiry
+have the same at-least-once behavior as writes without an ID. Evidence covers
+an indeterminate failure after primary mutation, forwarding, update no-op,
+bulk item collision, flush/restart, replica rejection, peer recovery, and
+retry after promotion.
 
 **Evidence:** a client timeout after primary mutation cannot be retried with a
 durable guarantee against duplicate application.

@@ -12,6 +12,7 @@ pub(super) struct BulkDoc {
     pub payload: Value,
     pub condition: WriteCondition,
     pub retry_on_conflict: u32,
+    pub operation_id: Option<String>,
     pub source_error: Option<String>,
 }
 
@@ -26,6 +27,7 @@ pub(super) struct RoutedBulkDoc {
     pub action: String,
     pub condition: WriteCondition,
     pub retry_on_conflict: u32,
+    pub operation_id: Option<String>,
 }
 
 pub(super) type BulkTargetKey = (String, String, u32);
@@ -186,6 +188,7 @@ pub(super) fn parse_bulk_ndjson(text: &str) -> Result<Vec<BulkDoc>, String> {
         for (name, value) in metadata {
             if matches!(name.as_str(), "if_seq_no" | "if_primary_term")
                 || (name == "retry_on_conflict" && action == "update")
+                || name == "_operation_id"
             {
                 continue;
             }
@@ -228,13 +231,24 @@ pub(super) fn parse_bulk_ndjson(text: &str) -> Result<Vec<BulkDoc>, String> {
         let retries = number("retry_on_conflict")?.unwrap_or(0);
         let retry_on_conflict = u32::try_from(retries)
             .map_err(|_| malformed("retry_on_conflict exceeds the supported range".into()))?;
-        let doc_id = string("_id")?.unwrap_or_else(|| {
-            if matches!(action.as_str(), "index" | "create") {
-                uuid::Uuid::new_v4().to_string()
-            } else {
-                String::new()
+        let operation_id = string("_operation_id")?;
+        if let Some(operation_id) = operation_id.as_deref() {
+            crate::engine::ClientOperationIntent::validate_id(operation_id)
+                .map_err(|error| malformed(error.to_string()))?;
+        }
+        let doc_id = match string("_id")? {
+            Some(doc_id) => doc_id,
+            None if matches!(action.as_str(), "index" | "create") => {
+                match operation_id.as_deref() {
+                    Some(operation_id) => {
+                        crate::engine::ClientOperationIntent::stable_document_id(operation_id)
+                            .map_err(|error| malformed(error.to_string()))?
+                    }
+                    None => uuid::Uuid::new_v4().to_string(),
+                }
             }
-        });
+            None => String::new(),
+        };
         let index = string("_index")?;
         let (payload, source_error) = if action == "delete" {
             (Value::Null, None)
@@ -260,6 +274,7 @@ pub(super) fn parse_bulk_ndjson(text: &str) -> Result<Vec<BulkDoc>, String> {
             payload,
             condition,
             retry_on_conflict,
+            operation_id,
             source_error,
         });
     }
@@ -325,6 +340,7 @@ pub(super) fn route_bulk_doc(
         action: "index".into(),
         condition: WriteCondition::Unconditional,
         retry_on_conflict: 0,
+        operation_id: None,
     })
 }
 
@@ -373,6 +389,7 @@ async fn forward_bulk_batches(
                         if_primary_term,
                         retry_on_conflict: document.retry_on_conflict,
                         refresh: None,
+                        operation_id: document.operation_id.clone(),
                         ..UpdateParams::default()
                     },
                 )
@@ -389,6 +406,7 @@ async fn forward_bulk_batches(
                 cursor += 1;
             }
             let run = &mut batch[start..cursor];
+            let index_uuid = cluster_state.indices[&key.0].uuid.to_string();
             let operations = run
                 .iter_mut()
                 .map(|document| {
@@ -399,6 +417,17 @@ async fn forward_bulk_batches(
                         _ => unreachable!("parser validated the action"),
                     };
                     let (if_seq_no, if_primary_term) = document.condition.expected_version();
+                    let client_operation = client_operation_intent(
+                        document.operation_id.as_deref(),
+                        serde_json::json!({
+                            "kind": document.action,
+                            "index_uuid": index_uuid,
+                            "doc_id": document.doc_id,
+                            "source": document.payload,
+                            "condition": write_condition_identity(document.condition)
+                        }),
+                    )
+                    .expect("bulk operation ID was validated before routing");
                     (
                         document.doc_id.clone(),
                         document.payload.take(),
@@ -406,6 +435,9 @@ async fn forward_bulk_batches(
                             kind: kind as i32,
                             if_seq_no,
                             if_primary_term,
+                            client_operation: client_operation
+                                .as_ref()
+                                .map(crate::transport::client_operation::intent_to_proto),
                         },
                     )
                 })
@@ -753,6 +785,7 @@ async fn execute_bulk(
                 target.action = document.action;
                 target.condition = document.condition;
                 target.retry_on_conflict = document.retry_on_conflict;
+                target.operation_id = document.operation_id;
                 routed.push(target);
             }
             Err(item) => {

@@ -528,6 +528,23 @@ impl TransportClient {
         payload: &serde_json::Value,
         options: WriteOptions,
     ) -> Result<serde_json::Value, anyhow::Error> {
+        self.forward_index_with_operation_to_shard(
+            node, index_name, shard_id, doc_id, payload, options, None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn forward_index_with_operation_to_shard(
+        &self,
+        node: &NodeInfo,
+        index_name: &str,
+        shard_id: u32,
+        doc_id: &str,
+        payload: &serde_json::Value,
+        options: WriteOptions,
+        client_operation: Option<&crate::engine::ClientOperationIntent>,
+    ) -> Result<serde_json::Value, anyhow::Error> {
         let (if_seq_no, if_primary_term) = options.condition.expected_version();
         let request = ShardDocRequest {
             index_name: index_name.to_string(),
@@ -539,6 +556,8 @@ impl TransportClient {
             create_only: options.condition == crate::engine::WriteCondition::Create,
             index_uuid: None,
             refresh: options.refresh,
+            client_operation: client_operation
+                .map(crate::transport::client_operation::intent_to_proto),
         };
         self.forward_index_request_to_shard(node, request).await
     }
@@ -641,6 +660,21 @@ impl TransportClient {
         doc_id: &str,
         options: WriteOptions,
     ) -> Result<serde_json::Value, anyhow::Error> {
+        self.forward_delete_with_operation_to_shard(
+            node, index_name, shard_id, doc_id, options, None,
+        )
+        .await
+    }
+
+    pub async fn forward_delete_with_operation_to_shard(
+        &self,
+        node: &NodeInfo,
+        index_name: &str,
+        shard_id: u32,
+        doc_id: &str,
+        options: WriteOptions,
+        client_operation: Option<&crate::engine::ClientOperationIntent>,
+    ) -> Result<serde_json::Value, anyhow::Error> {
         let mut client = self
             .connect(&node.host, node.transport_port)
             .await
@@ -654,6 +688,8 @@ impl TransportClient {
                 if_seq_no,
                 if_primary_term,
                 refresh: options.refresh,
+                client_operation: client_operation
+                    .map(crate::transport::client_operation::intent_to_proto),
             },
             index_name,
             Some((shard_id, &node.id)),
@@ -676,6 +712,82 @@ impl TransportClient {
         }
         decode_shard_delete_response(index_name, shard_id, doc_id, response)
             .map_err(super::write_failure::WriteFailure::after_dispatch)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn forward_client_noop_to_shard(
+        &self,
+        node: &NodeInfo,
+        index_name: &str,
+        shard_id: u32,
+        index_uuid: &str,
+        client_operation: &crate::engine::ClientOperationIntent,
+        seq_no: u64,
+        primary_term: u64,
+        version: u64,
+    ) -> Result<crate::engine::ClientNoOpWriteReceipt, anyhow::Error> {
+        let mut client = self
+            .connect(&node.host, node.transport_port)
+            .await
+            .map_err(super::write_failure::WriteFailure::before_dispatch)?;
+        let request = self.forwarding_request(
+            ShardClientNoOpRequest {
+                index_name: index_name.to_string(),
+                shard_id,
+                client_operation: Some(crate::transport::client_operation::intent_to_proto(
+                    client_operation,
+                )),
+                result_seq_no: seq_no,
+                result_primary_term: primary_term,
+                result_version: version,
+                index_uuid: Some(index_uuid.to_string()),
+            },
+            index_name,
+            Some((shard_id, &node.id)),
+        );
+        let response = client
+            .record_client_no_op(request)
+            .await
+            .map_err(super::write_failure::WriteFailure::from_rpc_status)?
+            .into_inner();
+        if !response.success {
+            return Err(super::write_failure::WriteFailure::after_dispatch(
+                anyhow::anyhow!("client operation no-op failed: {}", response.error),
+            ));
+        }
+        Ok(crate::engine::ClientNoOpWriteReceipt {
+            operation_seq_no: response.operation_seq_no.ok_or_else(|| {
+                anyhow::anyhow!("client operation no-op response has no sequence")
+            })?,
+            operation_primary_term: response
+                .operation_primary_term
+                .filter(|term| *term > 0)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("client operation no-op response has no primary term")
+                })?,
+            seq_no: response.seq_no.ok_or_else(|| {
+                anyhow::anyhow!("client operation no-op response has no result sequence")
+            })?,
+            primary_term: response
+                .primary_term
+                .filter(|term| *term > 0)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("client operation no-op response has no result primary term")
+                })?,
+            version: response
+                .version
+                .filter(|version| *version > 0)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("client operation no-op response has no result version")
+                })?,
+            client_operation: crate::transport::client_operation::record_from_proto(
+                response.client_operation,
+            )?
+            .ok_or_else(|| {
+                anyhow::anyhow!("client operation no-op response has no operation metadata")
+            })?,
+            deduplicated: response.deduplicated,
+        })
     }
 
     /// Forward a get-by-ID request to a specific shard on a node
@@ -772,7 +884,10 @@ impl TransportClient {
                 index_name: index_name.to_string(),
                 shard_id,
                 documents_json,
-                operations: docs.iter().map(|(_, _, operation)| *operation).collect(),
+                operations: docs
+                    .iter()
+                    .map(|(_, _, operation)| operation.clone())
+                    .collect(),
                 refresh,
             },
             index_name,

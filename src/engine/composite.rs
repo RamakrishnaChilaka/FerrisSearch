@@ -802,11 +802,12 @@ impl SearchEngine for CompositeEngine {
                 .unwrap_or_else(|error| error.into_inner());
             let prepared = self.prepare_vector_mutation(&payload)?;
             let rebuild_vectors = self.prepare_vector_rebuild(false)?;
-            let receipt = match self.text.add_primary_index_with_condition_and_side_effect(
+            let receipt = match self.text.add_primary_index_with_operation_and_side_effect(
                 doc_id,
                 payload,
                 primary_term,
                 condition,
+                None,
                 |operation| self.apply_prepared_vector_mutation(operation, &prepared),
             ) {
                 Ok(receipt) => receipt,
@@ -828,6 +829,49 @@ impl SearchEngine for CompositeEngine {
                     receipt.primary_term,
                     &prepared,
                 )?;
+            }
+            self.update_local_checkpoint(receipt.seq_no);
+            Ok(receipt)
+        })
+    }
+
+    fn add_document_with_operation_at_term(
+        &self,
+        doc_id: &str,
+        payload: serde_json::Value,
+        primary_term: u64,
+        condition: super::WriteCondition,
+        client_operation: Option<super::ClientOperationIntent>,
+    ) -> Result<super::IndexWriteReceipt> {
+        super::write_failure::WriteMutationState::run(primary_term, |mutation| {
+            crate::common::validate_document_source(&payload)?;
+            let _vector_recovery = self
+                .vector_recovery
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let prepared = self.prepare_vector_mutation(&payload)?;
+            let rebuild_vectors = self.prepare_vector_rebuild(false)?;
+            let receipt = self.text.add_primary_index_with_operation_and_side_effect(
+                doc_id,
+                payload,
+                primary_term,
+                condition,
+                client_operation,
+                |operation| self.apply_prepared_vector_mutation(operation, &prepared),
+            )?;
+            mutation.wal_attempted = !receipt.deduplicated;
+            mutation.seq_no = Some(receipt.seq_no);
+            if rebuild_vectors {
+                self.rebuild_vectors_locked()?;
+                if !receipt.deduplicated {
+                    self.apply_vector_mutation_after_rebuild(
+                        WalOperation::Index,
+                        Some(&receipt.doc_id),
+                        receipt.seq_no,
+                        receipt.primary_term,
+                        &prepared,
+                    )?;
+                }
             }
             self.update_local_checkpoint(receipt.seq_no);
             Ok(receipt)
@@ -921,10 +965,11 @@ impl SearchEngine for CompositeEngine {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             let rebuild_vectors = self.prepare_vector_rebuild(false)?;
-            let receipt = match self.text.delete_primary_with_condition_and_side_effect(
+            let receipt = match self.text.delete_primary_with_operation_and_side_effect(
                 doc_id,
                 primary_term,
                 condition,
+                None,
                 |operation| {
                     self.apply_prepared_vector_mutation(operation, &PreparedVectorMutation::Delete)
                 },
@@ -952,6 +997,45 @@ impl SearchEngine for CompositeEngine {
             self.update_local_checkpoint(receipt.seq_no);
             Ok(receipt)
         })
+    }
+
+    fn delete_document_with_operation_at_term(
+        &self,
+        doc_id: &str,
+        primary_term: u64,
+        condition: super::WriteCondition,
+        client_operation: Option<super::ClientOperationIntent>,
+    ) -> Result<super::DeleteWriteReceipt> {
+        let receipt = self.text.delete_primary_with_operation_and_side_effect(
+            doc_id,
+            primary_term,
+            condition,
+            client_operation,
+            |operation| {
+                self.apply_prepared_vector_mutation(operation, &PreparedVectorMutation::Delete)
+            },
+        )?;
+        self.update_local_checkpoint(receipt.seq_no);
+        Ok(receipt)
+    }
+
+    fn record_client_noop_at_term(
+        &self,
+        primary_term: u64,
+        client_operation: super::ClientOperationIntent,
+        seq_no: u64,
+        result_primary_term: u64,
+        version: u64,
+    ) -> Result<super::ClientNoOpWriteReceipt> {
+        let receipt = self.text.record_primary_client_noop(
+            primary_term,
+            client_operation,
+            seq_no,
+            result_primary_term,
+            version,
+        )?;
+        self.update_local_checkpoint(receipt.operation_seq_no);
+        Ok(receipt)
     }
 
     fn apply_replica_operation(
@@ -2005,6 +2089,7 @@ mod tests {
                         seq_no: 5,
                         primary_term: 1,
                         document_version: 1,
+                        client_operation: None,
                         mutation: super::super::DocumentMutation::Index {
                             doc_id: "c".into(),
                             source: json!({"emb": [1.0, 1.0, 0.0]}),
@@ -2029,6 +2114,7 @@ mod tests {
                                 seq_no: 5 + offset as u64,
                                 primary_term: 1,
                                 document_version: 1,
+                                client_operation: None,
                                 mutation: super::super::DocumentMutation::Index {
                                     doc_id: doc_id.into(),
                                     source: json!({"emb": [1.0, 1.0, 0.0]}),
@@ -2128,6 +2214,7 @@ mod tests {
                     seq_no,
                     primary_term: 1,
                     document_version: seq_no + 1,
+                    client_operation: None,
                     mutation: super::super::DocumentMutation::Index {
                         doc_id: doc_id.into(),
                         source: json!({"emb": [1.0, 0.0, 0.0]}),
@@ -2156,6 +2243,7 @@ mod tests {
                 seq_no: 1,
                 primary_term: 1,
                 document_version: 0,
+                client_operation: None,
                 mutation: super::super::DocumentMutation::NoOp {
                     reason: "close vector rebuild coverage gap".into(),
                 },
@@ -2177,6 +2265,7 @@ mod tests {
             seq_no,
             primary_term: 1,
             document_version: seq_no + 1,
+            client_operation: None,
             mutation: super::super::DocumentMutation::Index {
                 doc_id: doc_id.into(),
                 source: json!({"emb": [1.0, 0.0, 0.0], "value": seq_no}),
@@ -2357,6 +2446,7 @@ mod tests {
                             seq_no: 2,
                             primary_term: 1,
                             document_version: 0,
+                            client_operation: None,
                             mutation: super::super::DocumentMutation::NoOp {
                                 reason: "coverage changed during scan".into(),
                             },
@@ -3121,6 +3211,7 @@ mod tests {
                     seq_no,
                     primary_term: 1,
                     document_version: seq_no + 1,
+                    client_operation: None,
                     mutation: crate::engine::DocumentMutation::Index {
                         doc_id: format!("doc-{seq_no}"),
                         source: json!({"value": seq_no}),
@@ -3303,6 +3394,7 @@ mod tests {
                 seq_no: 7,
                 primary_term: 1,
                 document_version: 1,
+                client_operation: None,
                 mutation: super::super::DocumentMutation::Index {
                     doc_id: "replica-doc".into(),
                     source: json!({"x": 1}),
@@ -3327,6 +3419,7 @@ mod tests {
                         seq_no: 10 + offset as u64,
                         primary_term: 1,
                         document_version: 1,
+                        client_operation: None,
                         mutation: super::super::DocumentMutation::Index {
                             doc_id: doc_id.into(),
                             source: json!({"x": offset + 1}),
@@ -3447,6 +3540,7 @@ mod tests {
                 seq_no: 10,
                 primary_term: 1,
                 document_version: 1,
+                client_operation: None,
                 mutation: super::super::DocumentMutation::Index {
                     doc_id: "replica".into(),
                     source: json!({"tags": [5, 6]}),

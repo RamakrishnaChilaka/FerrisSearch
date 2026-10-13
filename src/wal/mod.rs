@@ -148,16 +148,22 @@ pub enum WalDocumentOperation<'a> {
         source: &'a serde_json::Value,
         #[serde(rename = "_version")]
         version: u64,
+        #[serde(rename = "_client_operation", skip_serializing_if = "Option::is_none")]
+        client_operation: Option<&'a crate::engine::ClientOperationRecord>,
     },
     Delete {
         #[serde(rename = "_doc_id")]
         doc_id: &'a str,
         #[serde(rename = "_version")]
         version: u64,
+        #[serde(rename = "_client_operation", skip_serializing_if = "Option::is_none")]
+        client_operation: Option<&'a crate::engine::ClientOperationRecord>,
     },
     NoOp {
         #[serde(rename = "_reason")]
         reason: &'a str,
+        #[serde(rename = "_client_operation", skip_serializing_if = "Option::is_none")]
+        client_operation: Option<&'a crate::engine::ClientOperationRecord>,
     },
 }
 
@@ -204,7 +210,10 @@ pub(crate) fn document_operation(entry: &TranslogEntry) -> Result<WalDocumentOpe
                 MAX_NOOP_REASON_BYTES
             )));
         }
-        return Ok(WalDocumentOperation::NoOp { reason });
+        return Ok(WalDocumentOperation::NoOp {
+            reason,
+            client_operation: None,
+        });
     }
     let doc_id = entry
         .payload
@@ -239,11 +248,38 @@ pub(crate) fn document_operation(entry: &TranslogEntry) -> Result<WalDocumentOpe
                 doc_id,
                 source,
                 version,
+                client_operation: None,
             })
         }
-        WalOperation::Delete => Ok(WalDocumentOperation::Delete { doc_id, version }),
+        WalOperation::Delete => Ok(WalDocumentOperation::Delete {
+            doc_id,
+            version,
+            client_operation: None,
+        }),
         WalOperation::NoOp => unreachable!("no-op operations return before document validation"),
     }
+}
+
+pub(crate) fn client_operation(
+    entry: &TranslogEntry,
+) -> Result<Option<crate::engine::ClientOperationRecord>> {
+    let Some(value) = entry.payload.get("_client_operation") else {
+        return Ok(None);
+    };
+    let record: crate::engine::ClientOperationRecord = serde_json::from_value(value.clone())
+        .map_err(|error| {
+            wal_corruption(format!(
+                "translog operation {} has invalid client operation metadata: {error}",
+                entry.seq_no
+            ))
+        })?;
+    record.validate().map_err(|error| {
+        wal_corruption(format!(
+            "translog operation {} has invalid client operation metadata: {error}",
+            entry.seq_no
+        ))
+    })?;
+    Ok(Some(record))
 }
 
 #[derive(Clone)]
@@ -630,7 +666,7 @@ fn encode_document_entry(
     operation: WalDocumentOperation<'_>,
 ) -> Result<Vec<u8>> {
     validate_primary_term(primary_term)?;
-    if let WalDocumentOperation::NoOp { reason } = operation {
+    if let WalDocumentOperation::NoOp { reason, .. } = operation {
         validate_noop_reason(reason)?;
     }
     let payload_json = serde_json::to_string(&operation)?;
@@ -2766,6 +2802,7 @@ mod tests {
                 doc_id: "doc",
                 source: &source,
                 version: 1,
+                client_operation: None,
             })
             .unwrap();
             let wire = WireEntryRef {
@@ -2803,6 +2840,7 @@ mod tests {
                 doc_id,
                 source: &source,
                 version: 9,
+                client_operation: None,
             };
             let owned = TranslogEntry {
                 seq_no: 258,
@@ -2820,6 +2858,7 @@ mod tests {
                 WalDocumentOperation::Delete {
                     doc_id: "quoted\"id",
                     version: 9,
+                    client_operation: None,
                 },
                 WalOperation::Delete,
                 json!({"_doc_id": "quoted\"id", "_version": 9}),
@@ -2827,6 +2866,7 @@ mod tests {
             (
                 WalDocumentOperation::NoOp {
                     reason: "gap \"fill\"",
+                    client_operation: None,
                 },
                 WalOperation::NoOp,
                 json!({"_reason": "gap \"fill\""}),
@@ -2851,6 +2891,7 @@ mod tests {
         let operation = WalDocumentOperation::Delete {
             doc_id: "doc",
             version: 1,
+            client_operation: None,
         };
         assert_eq!(wal.write_document_bulk_with_receipt(0, &[]).unwrap(), None);
         wal.write_document_batch_with_seq(&[]).unwrap();
@@ -2864,7 +2905,13 @@ mod tests {
         assert!(
             wal.write_document_bulk_with_receipt(
                 1,
-                &[operation, WalDocumentOperation::NoOp { reason: &reason }],
+                &[
+                    operation,
+                    WalDocumentOperation::NoOp {
+                        reason: &reason,
+                        client_operation: None,
+                    }
+                ],
             )
             .is_err()
         );
@@ -2902,6 +2949,7 @@ mod tests {
                     doc_id: "doc",
                     source: &allowed,
                     version: 1,
+                    client_operation: None,
                 },
             )
             .unwrap(),
@@ -2914,6 +2962,7 @@ mod tests {
             doc_id: "doc",
             source: &oversized,
             version: 2,
+            client_operation: None,
         };
         let error = wal.write_document_with_receipt(1, operation).unwrap_err();
         assert!(error.is::<WalFrameTooLargeError>());
@@ -2924,6 +2973,7 @@ mod tests {
         let valid = WalDocumentOperation::Delete {
             doc_id: "valid",
             version: 1,
+            client_operation: None,
         };
         assert!(
             wal.write_document_bulk_with_receipt(1, &[valid, operation])
@@ -3539,7 +3589,8 @@ mod tests {
         assert!(matches!(
             document_operation(&decoded[0]).unwrap(),
             WalDocumentOperation::NoOp {
-                reason: "promotion gap"
+                reason: "promotion gap",
+                ..
             }
         ));
     }

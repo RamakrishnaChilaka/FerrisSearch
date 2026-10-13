@@ -297,6 +297,15 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
 - `replay_translog()` and failed-writer reconstruction share the same WAL-suffix
   replay helper. They stream entries via `for_each_from()` starting at the
   persisted committed checkpoint.
+- `ClientOperationState` is shard-local retry authority for the latest 4,096
+  sequence operations. Register the validated ID, fingerprint, original result,
+  sequence, and term under the same write planning locks as the mutation.
+  Exact lookup returns the original receipt without WAL append or engine side
+  effects; a different fingerprint or result kind is a hard conflict.
+- Restore client-operation state from exact retained WAL entries before replay.
+  Flush may commit the document mutation but must retain the bounded operation
+  record. Update no-op identity is represented by an explicit WAL NoOp whose
+  result points to the unchanged document sequence, term, and version.
 - Replay must stay idempotent across repeated restart or write-path recovery:
   validate `_doc_id` for every operation and `_source` for index operations,
   delete `_id` for every operation, add content back only for index operations,

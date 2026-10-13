@@ -1881,6 +1881,7 @@ async fn grpc_disk_loss_fails_closed_and_failure_report_restores_write_set() {
         "index",
         0,
         1,
+        None,
         2,
     )
     .await;
@@ -1914,6 +1915,7 @@ async fn grpc_disk_loss_fails_closed_and_failure_report_restores_write_set() {
         "index",
         1,
         2,
+        None,
         2,
     )
     .await;

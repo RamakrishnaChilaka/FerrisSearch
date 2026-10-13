@@ -80,6 +80,9 @@ impl WriteFailure {
         if error.is::<crate::engine::VersionConflictError>() {
             return Self::rejected(409, "version_conflict_engine_exception", error.to_string());
         }
+        if error.is::<crate::engine::ClientOperationConflictError>() {
+            return Self::rejected(409, "operation_id_conflict", error.to_string());
+        }
         if crate::engine::is_write_validation_error(error) {
             return Self::rejected(400, "mapper_parsing_exception", error.to_string());
         }

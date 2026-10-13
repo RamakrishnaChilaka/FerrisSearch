@@ -1025,10 +1025,14 @@ async fn apply_recovery_operations_cursor(
             }
             other => anyhow::bail!("unknown peer recovery operation '{other}'"),
         };
+        let client_operation =
+            crate::transport::client_operation::record_from_proto(operation.client_operation)
+                .context("decode peer recovery client operation")?;
         decoded.push(crate::engine::SequencedOperation {
             seq_no: operation.seq_no,
             primary_term: operation.primary_term,
             document_version,
+            client_operation,
             mutation,
         });
     }
@@ -1180,6 +1184,7 @@ mod tests {
                 seq_no,
                 primary_term,
                 document_version: seq_no + 1,
+                client_operation: None,
                 mutation: crate::engine::DocumentMutation::Index {
                     doc_id: doc_id.to_string(),
                     source,
@@ -1273,6 +1278,7 @@ mod tests {
                     doc_id: "a".into(),
                     payload_json: serde_json::to_vec(&serde_json::json!({"value": 1})).unwrap(),
                     document_version: Some(1),
+                    client_operation: None,
                 },
                 RecoveryOperation {
                     seq_no: 8,
@@ -1281,6 +1287,7 @@ mod tests {
                     doc_id: "b".into(),
                     payload_json: Vec::new(),
                     document_version: Some(1),
+                    client_operation: None,
                 },
             ],
         )
@@ -1302,6 +1309,7 @@ mod tests {
                     doc_id: "a".into(),
                     payload_json: Vec::new(),
                     document_version: Some(2),
+                    client_operation: None,
                 },
                 RecoveryOperation {
                     seq_no: 10,
@@ -1310,6 +1318,7 @@ mod tests {
                     doc_id: "b".into(),
                     payload_json: Vec::new(),
                     document_version: Some(2),
+                    client_operation: None,
                 },
             ],
         )
@@ -2463,6 +2472,7 @@ mod tests {
                 primary_term: Some(2),
                 target_allocation_id: Some(allocation_id),
                 document_version: Some(1),
+                client_operation: None,
             }))
             .await
             .unwrap()

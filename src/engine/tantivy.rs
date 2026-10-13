@@ -23,7 +23,8 @@ use super::sequence::{
 use super::version_map::VersionValue;
 use super::version_map::{DEFAULT_VERSION_MAP_MAX_BYTES, LiveVersionMap, PrunedTombstone};
 use crate::wal::{
-    HotTranslog, TranslogDurability, WalDocumentOperation, WriteAheadLog, document_operation,
+    HotTranslog, TranslogDurability, WalDocumentOperation, WriteAheadLog, client_operation,
+    document_operation,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -473,6 +474,7 @@ pub struct HotEngine {
     // Acquire apply state before versions when both locks are needed.
     apply_state: Mutex<ApplyState>,
     versions: RwLock<VersionMapState>,
+    client_operations: Mutex<super::client_operation::ClientOperationState>,
     identity_term_state: Mutex<Option<(u64, Option<u64>)>>,
     committed_boundary_path: PathBuf,
     durability: TranslogDurability,
@@ -1291,12 +1293,17 @@ fn sequenced_wal_entry(
             doc_id,
             source,
             version: operation.document_version,
+            client_operation: operation.client_operation.as_ref(),
         },
         super::DocumentMutation::Delete { doc_id } => WalDocumentOperation::Delete {
             doc_id,
             version: operation.document_version,
+            client_operation: operation.client_operation.as_ref(),
         },
-        super::DocumentMutation::NoOp { reason } => WalDocumentOperation::NoOp { reason },
+        super::DocumentMutation::NoOp { reason } => WalDocumentOperation::NoOp {
+            reason,
+            client_operation: operation.client_operation.as_ref(),
+        },
     };
     crate::wal::BorrowedSequencedWalEntry {
         seq_no: operation.seq_no,
@@ -1335,12 +1342,16 @@ fn wal_entry_matches_operation(
     operation: &super::SequencedOperation,
 ) -> Result<bool> {
     let decoded = document_operation(entry)?;
+    if client_operation(entry)? != operation.client_operation {
+        return Ok(false);
+    }
     Ok(match (decoded, &operation.mutation) {
         (
             WalDocumentOperation::Index {
                 doc_id,
                 source,
                 version,
+                ..
             },
             super::DocumentMutation::Index {
                 doc_id: incoming_id,
@@ -1352,13 +1363,15 @@ fn wal_entry_matches_operation(
                 && version == operation.document_version
         }
         (
-            WalDocumentOperation::Delete { doc_id, version },
+            WalDocumentOperation::Delete {
+                doc_id, version, ..
+            },
             super::DocumentMutation::Delete {
                 doc_id: incoming_id,
             },
         ) => doc_id == incoming_id && version == operation.document_version,
         (
-            WalDocumentOperation::NoOp { reason },
+            WalDocumentOperation::NoOp { reason, .. },
             super::DocumentMutation::NoOp {
                 reason: incoming_reason,
             },
@@ -1371,6 +1384,7 @@ fn sequenced_operation_from_entry(
     mut entry: crate::wal::TranslogEntry,
 ) -> Result<super::SequencedOperation> {
     let document_operation = document_operation(&entry)?;
+    let client_operation = client_operation(&entry)?;
     let document_version = match document_operation {
         WalDocumentOperation::Index { version, .. }
         | WalDocumentOperation::Delete { version, .. } => version,
@@ -1401,6 +1415,7 @@ fn sequenced_operation_from_entry(
         seq_no: entry.seq_no,
         primary_term: entry.primary_term,
         document_version,
+        client_operation,
         mutation,
     })
 }
@@ -1643,6 +1658,7 @@ impl HotEngine {
             translog: Arc::new(Mutex::new(translog)),
             apply_state: Mutex::new(apply_state),
             versions: RwLock::new(VersionMapState::new()),
+            client_operations: Mutex::new(super::client_operation::ClientOperationState::default()),
             identity_term_state: Mutex::new(None),
             committed_boundary_path,
             durability,
@@ -1655,6 +1671,7 @@ impl HotEngine {
             crate::protocol_trace::record_node_restarted(&copy, engine.sequence_stats());
         }
 
+        engine.restore_client_operations_from_wal()?;
         // Replay any uncommitted translog entries from before a crash
         engine.replay_translog()?;
 
@@ -1689,6 +1706,29 @@ impl HotEngine {
             }
         };
         f(&*tl)
+    }
+
+    fn restore_client_operations_from_wal(&self) -> Result<()> {
+        self.with_translog("client operation restore", |translog| {
+            let mut restored = super::client_operation::ClientOperationState::default();
+            let mut max_seq_no = None::<u64>;
+            translog.for_each_from(0, &mut |entry| {
+                max_seq_no =
+                    Some(max_seq_no.map_or(entry.seq_no, |current| current.max(entry.seq_no)));
+                if let Some(record) = client_operation(&entry)? {
+                    restored.register(entry.seq_no, entry.primary_term, record)?;
+                }
+                Ok(())
+            })?;
+            if let Some(max_seq_no) = max_seq_no {
+                restored.prune_for_max_seq_no(max_seq_no);
+            }
+            *self
+                .client_operations
+                .lock()
+                .map_err(|_| anyhow::anyhow!("client operation state lock poisoned"))? = restored;
+            Ok(())
+        })
     }
 
     fn maintenance_guard(&self, context: &str) -> Result<std::sync::MutexGuard<'_, ()>> {
@@ -1982,10 +2022,20 @@ impl HotEngine {
         requested_checkpoint: u64,
     ) -> Result<Option<u64>> {
         let oldest_tombstone = self.version_map_read()?.map.oldest_tombstone_seq_no();
-        Ok(match oldest_tombstone {
+        let checkpoint = match oldest_tombstone {
             Some(0) => None,
             Some(seq_no) => Some(requested_checkpoint.min(seq_no - 1)),
             None => Some(requested_checkpoint),
+        };
+        let oldest_client_operation = self
+            .client_operations
+            .lock()
+            .map_err(|_| anyhow::anyhow!("client operation state lock poisoned"))?
+            .oldest_seq_no();
+        Ok(match (checkpoint, oldest_client_operation) {
+            (None, _) | (_, Some(0)) => None,
+            (Some(checkpoint), Some(seq_no)) => Some(checkpoint.min(seq_no - 1)),
+            (Some(checkpoint), None) => Some(checkpoint),
         })
     }
 
@@ -2195,6 +2245,11 @@ impl HotEngine {
             .apply_state
             .lock()
             .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+        let mut client_operations = self
+            .client_operations
+            .lock()
+            .map_err(|_| anyhow::anyhow!("client operation state lock poisoned"))?;
+        let client_operations_snapshot = client_operations.clone();
         #[cfg(test)]
         let _apply_state_timer = self
             .apply_state_timing
@@ -2225,6 +2280,9 @@ impl HotEngine {
 
         let planning_result = (|| {
             for operation in operations {
+                if let Some(record) = operation.client_operation.clone() {
+                    client_operations.register(operation.seq_no, operation.primary_term, record)?;
+                }
                 if operation.primary_term > state.term_sequences.current_term() {
                     let max_seq_no = state.checkpoints.max_seq_no();
                     state
@@ -2387,6 +2445,7 @@ impl HotEngine {
         })();
         if let Err(error) = planning_result {
             state.restore_planning_snapshot(planning_snapshot);
+            *client_operations = client_operations_snapshot;
             #[cfg(feature = "protocol-trace")]
             let trace_collision_result = match (trace_copy.as_ref(), collision_operation.as_ref()) {
                 (Some(copy), Some(operation)) => crate::protocol_trace::record_operation_collision(
@@ -2434,6 +2493,7 @@ impl HotEngine {
         };
         if appended && let Err(error) = translog.write_document_batch_with_seq(&wal_entries) {
             state.restore_planning_snapshot(planning_snapshot);
+            *client_operations = client_operations_snapshot;
             return Err(error);
         }
         #[cfg(feature = "protocol-trace")]
@@ -2617,6 +2677,9 @@ impl HotEngine {
             Ok::<(), anyhow::Error>(())
         })();
         if let Err(error) = execution_result {
+            if !appended && !wal_disposition.is_already_in_local_wal() {
+                *client_operations = client_operations_snapshot;
+            }
             if appended || wal_disposition.is_already_in_local_wal() {
                 if let Some(writer_state) = writer_state.as_mut() {
                     self.invalidate_version_map();
@@ -2628,6 +2691,9 @@ impl HotEngine {
                 }
             }
             return Err(error);
+        }
+        if let Some(max_seq_no) = state.checkpoints.max_seq_no() {
+            client_operations.prune_for_max_seq_no(max_seq_no);
         }
 
         let outcomes = planned
@@ -2729,6 +2795,28 @@ impl HotEngine {
         payload: serde_json::Value,
         primary_term: u64,
         condition: super::WriteCondition,
+        side_effect: F,
+    ) -> Result<super::IndexWriteReceipt>
+    where
+        F: FnMut(&super::SequencedOperation) -> Result<()>,
+    {
+        self.add_primary_index_with_operation_and_side_effect(
+            doc_id,
+            payload,
+            primary_term,
+            condition,
+            None,
+            side_effect,
+        )
+    }
+
+    pub(crate) fn add_primary_index_with_operation_and_side_effect<F>(
+        &self,
+        doc_id: &str,
+        payload: serde_json::Value,
+        primary_term: u64,
+        condition: super::WriteCondition,
+        client_operation: Option<super::ClientOperationIntent>,
         mut side_effect: F,
     ) -> Result<super::IndexWriteReceipt>
     where
@@ -2738,11 +2826,45 @@ impl HotEngine {
             self.validate_keyword_documents(std::iter::once(&payload))?;
             self.prepare_primary_term_before_wal(primary_term)?;
             let doc_id_owned = doc_id.to_string();
-            let (seq_no, created, version) =
-                self.with_version_map_capacity("document indexing", [doc_id], false, |translog| {
+            let (seq_no, result_primary_term, created, version, client_record, deduplicated) = self
+                .with_version_map_capacity("document indexing", [doc_id], false, |translog| {
                     drop(self.writer_state_with_replay(translog, "document indexing")?);
                     self.prepare_primary_term_before_wal(primary_term)?;
+                    if let Some(intent) = client_operation.as_ref()
+                        && let Some((seq_no, result_primary_term, record)) = self
+                            .client_operations
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("client operation state lock poisoned"))?
+                            .lookup(intent)?
+                    {
+                        let super::ClientOperationResult::Index { version, created } =
+                            record.result
+                        else {
+                            return Err(super::ClientOperationConflictError {
+                                operation_id: intent.id.clone(),
+                            }
+                            .into());
+                        };
+                        return Ok((
+                            seq_no,
+                            result_primary_term,
+                            created,
+                            version,
+                            Some(record.clone()),
+                            true,
+                        ));
+                    }
                     let (existed, version) = self.check_primary_condition(doc_id, condition)?;
+                    let created = !existed;
+                    let client_record = client_operation
+                        .clone()
+                        .map(|intent| {
+                            super::ClientOperationRecord::new(
+                                intent,
+                                super::ClientOperationResult::Index { version, created },
+                            )
+                        })
+                        .transpose()?;
                     let start_cursor = translog.recovery_read_snapshot()?.end_cursor();
                     mutation.wal_attempted = true;
                     let seq_no = translog
@@ -2752,6 +2874,7 @@ impl HotEngine {
                                 doc_id,
                                 source: &payload,
                                 version,
+                                client_operation: client_record.as_ref(),
                             },
                         )
                         .inspect_err(|error| {
@@ -2764,6 +2887,7 @@ impl HotEngine {
                         seq_no,
                         primary_term,
                         document_version: version,
+                        client_operation: client_record.clone(),
                         mutation: super::DocumentMutation::Index {
                             doc_id: doc_id_owned,
                             source: payload,
@@ -2791,14 +2915,16 @@ impl HotEngine {
                         true,
                         &mut side_effect,
                     )?;
-                    Ok((seq_no, !existed, version))
+                    Ok((seq_no, primary_term, created, version, client_record, false))
                 })?;
             Ok(super::IndexWriteReceipt {
                 doc_id: doc_id.to_string(),
                 seq_no,
-                primary_term,
+                primary_term: result_primary_term,
                 version,
                 created,
+                client_operation: client_record,
+                deduplicated,
             })
         })
     }
@@ -2873,6 +2999,7 @@ impl HotEngine {
                                 doc_id,
                                 source,
                                 version: *version,
+                                client_operation: None,
                             })
                             .collect::<Vec<_>>();
                         translog
@@ -2899,6 +3026,7 @@ impl HotEngine {
                                 )?,
                                 primary_term,
                                 document_version,
+                                client_operation: None,
                                 mutation: super::DocumentMutation::Index {
                                     doc_id,
                                     source: payload,
@@ -2965,6 +3093,26 @@ impl HotEngine {
         doc_id: &str,
         primary_term: u64,
         condition: super::WriteCondition,
+        side_effect: F,
+    ) -> Result<super::DeleteWriteReceipt>
+    where
+        F: FnMut(&super::SequencedOperation) -> Result<()>,
+    {
+        self.delete_primary_with_operation_and_side_effect(
+            doc_id,
+            primary_term,
+            condition,
+            None,
+            side_effect,
+        )
+    }
+
+    pub(crate) fn delete_primary_with_operation_and_side_effect<F>(
+        &self,
+        doc_id: &str,
+        primary_term: u64,
+        condition: super::WriteCondition,
+        client_operation: Option<super::ClientOperationIntent>,
         mut side_effect: F,
     ) -> Result<super::DeleteWriteReceipt>
     where
@@ -2973,17 +3121,57 @@ impl HotEngine {
         super::write_failure::WriteMutationState::run(primary_term, |mutation| {
             self.prepare_primary_term_before_wal(primary_term)?;
             let doc_id_owned = doc_id.to_string();
-            let (seq_no, existed, version) =
-                self.with_version_map_capacity("document delete", [doc_id], false, |translog| {
+            let (seq_no, result_primary_term, existed, version, client_record, deduplicated) = self
+                .with_version_map_capacity("document delete", [doc_id], false, |translog| {
                     drop(self.writer_state_with_replay(translog, "document delete")?);
                     self.prepare_primary_term_before_wal(primary_term)?;
+                    if let Some(intent) = client_operation.as_ref()
+                        && let Some((seq_no, result_primary_term, record)) = self
+                            .client_operations
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("client operation state lock poisoned"))?
+                            .lookup(intent)?
+                    {
+                        let super::ClientOperationResult::Delete { version, deleted } =
+                            record.result
+                        else {
+                            return Err(super::ClientOperationConflictError {
+                                operation_id: intent.id.clone(),
+                            }
+                            .into());
+                        };
+                        return Ok((
+                            seq_no,
+                            result_primary_term,
+                            deleted == 1,
+                            version,
+                            Some(record.clone()),
+                            true,
+                        ));
+                    }
                     let (existed, version) = self.check_primary_condition(doc_id, condition)?;
+                    let client_record = client_operation
+                        .clone()
+                        .map(|intent| {
+                            super::ClientOperationRecord::new(
+                                intent,
+                                super::ClientOperationResult::Delete {
+                                    version,
+                                    deleted: u64::from(existed),
+                                },
+                            )
+                        })
+                        .transpose()?;
                     let start_cursor = translog.recovery_read_snapshot()?.end_cursor();
                     mutation.wal_attempted = true;
                     let seq_no = translog
                         .write_document_with_receipt(
                             primary_term,
-                            WalDocumentOperation::Delete { doc_id, version },
+                            WalDocumentOperation::Delete {
+                                doc_id,
+                                version,
+                                client_operation: client_record.as_ref(),
+                            },
                         )
                         .inspect_err(|error| {
                             if error.is::<crate::wal::WalFrameTooLargeError>() {
@@ -2995,6 +3183,7 @@ impl HotEngine {
                         seq_no,
                         primary_term,
                         document_version: version,
+                        client_operation: client_record.clone(),
                         mutation: super::DocumentMutation::Delete {
                             doc_id: doc_id_owned,
                         },
@@ -3021,14 +3210,119 @@ impl HotEngine {
                         true,
                         &mut side_effect,
                     )?;
-                    Ok((seq_no, existed, version))
+                    Ok((seq_no, primary_term, existed, version, client_record, false))
                 })?;
             Ok(super::DeleteWriteReceipt {
                 deleted: u64::from(existed),
                 seq_no,
-                primary_term,
+                primary_term: result_primary_term,
                 version,
+                client_operation: client_record,
+                deduplicated,
             })
+        })
+    }
+
+    pub(crate) fn record_primary_client_noop(
+        &self,
+        primary_term: u64,
+        client_operation: super::ClientOperationIntent,
+        result_seq_no: u64,
+        result_primary_term: u64,
+        version: u64,
+    ) -> Result<super::ClientNoOpWriteReceipt> {
+        super::write_failure::WriteMutationState::run(primary_term, |mutation| {
+            self.prepare_primary_term_before_wal(primary_term)?;
+            self.with_version_map_capacity(
+                "client operation no-op",
+                std::iter::empty::<&str>(),
+                false,
+                |translog| {
+                    drop(self.writer_state_with_replay(translog, "client operation no-op")?);
+                    self.prepare_primary_term_before_wal(primary_term)?;
+                    if let Some((operation_seq_no, operation_primary_term, record)) = self
+                        .client_operations
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("client operation state lock poisoned"))?
+                        .lookup(&client_operation)?
+                    {
+                        let (seq_no, result_primary_term, version) = match record.result {
+                            super::ClientOperationResult::Index { version, .. } => {
+                                (operation_seq_no, operation_primary_term, version)
+                            }
+                            super::ClientOperationResult::UpdateNoOp {
+                                seq_no,
+                                primary_term,
+                                version,
+                            } => (seq_no, primary_term, version),
+                            super::ClientOperationResult::Delete { .. } => {
+                                return Err(super::ClientOperationConflictError {
+                                    operation_id: client_operation.id.clone(),
+                                }
+                                .into());
+                            }
+                        };
+                        return Ok(super::ClientNoOpWriteReceipt {
+                            operation_seq_no,
+                            operation_primary_term,
+                            seq_no,
+                            primary_term: result_primary_term,
+                            version,
+                            client_operation: record.clone(),
+                            deduplicated: true,
+                        });
+                    }
+                    let record = super::ClientOperationRecord::new(
+                        client_operation,
+                        super::ClientOperationResult::UpdateNoOp {
+                            seq_no: result_seq_no,
+                            primary_term: result_primary_term,
+                            version,
+                        },
+                    )?;
+                    let reason = format!("client operation [{}] update no-op", record.id);
+                    let start_cursor = translog.recovery_read_snapshot()?.end_cursor();
+                    mutation.wal_attempted = true;
+                    let operation_seq_no = translog.write_document_with_receipt(
+                        primary_term,
+                        WalDocumentOperation::NoOp {
+                            reason: &reason,
+                            client_operation: Some(&record),
+                        },
+                    )?;
+                    mutation.seq_no = Some(operation_seq_no);
+                    let operation = super::SequencedOperation {
+                        seq_no: operation_seq_no,
+                        primary_term,
+                        document_version: 0,
+                        client_operation: Some(record.clone()),
+                        mutation: super::DocumentMutation::NoOp { reason },
+                    };
+                    self.apply_sequenced_batch_locked(
+                        translog,
+                        std::slice::from_ref(&operation),
+                        WalDisposition::AlreadyInLocalWal {
+                            persisted: matches!(self.durability, TranslogDurability::Request),
+                            validate_redelivery: true,
+                            start_cursor: Some(start_cursor),
+                            replay_positions: None,
+                            initial_versions: None,
+                        },
+                        None,
+                        true,
+                        |_| Ok(()),
+                    )?;
+                    Ok(super::ClientNoOpWriteReceipt {
+                        operation_seq_no,
+                        operation_primary_term: primary_term,
+                        seq_no: result_seq_no,
+                        primary_term: result_primary_term,
+                        version,
+                        client_operation: record,
+                        deduplicated: false,
+                    })
+                },
+            )
         })
     }
 
@@ -8740,6 +9034,24 @@ impl super::SearchEngine for HotEngine {
         )
     }
 
+    fn add_document_with_operation_at_term(
+        &self,
+        doc_id: &str,
+        payload: serde_json::Value,
+        primary_term: u64,
+        condition: super::WriteCondition,
+        client_operation: Option<super::ClientOperationIntent>,
+    ) -> Result<super::IndexWriteReceipt> {
+        self.add_primary_index_with_operation_and_side_effect(
+            doc_id,
+            payload,
+            primary_term,
+            condition,
+            client_operation,
+            |_| Ok(()),
+        )
+    }
+
     fn bulk_add_documents_with_receipt_at_term(
         &self,
         docs: Vec<(String, serde_json::Value)>,
@@ -8765,6 +9077,39 @@ impl super::SearchEngine for HotEngine {
         self.delete_primary_with_condition_and_side_effect(doc_id, primary_term, condition, |_| {
             Ok(())
         })
+    }
+
+    fn delete_document_with_operation_at_term(
+        &self,
+        doc_id: &str,
+        primary_term: u64,
+        condition: super::WriteCondition,
+        client_operation: Option<super::ClientOperationIntent>,
+    ) -> Result<super::DeleteWriteReceipt> {
+        self.delete_primary_with_operation_and_side_effect(
+            doc_id,
+            primary_term,
+            condition,
+            client_operation,
+            |_| Ok(()),
+        )
+    }
+
+    fn record_client_noop_at_term(
+        &self,
+        primary_term: u64,
+        client_operation: super::ClientOperationIntent,
+        seq_no: u64,
+        result_primary_term: u64,
+        version: u64,
+    ) -> Result<super::ClientNoOpWriteReceipt> {
+        self.record_primary_client_noop(
+            primary_term,
+            client_operation,
+            seq_no,
+            result_primary_term,
+            version,
+        )
     }
 
     fn apply_replica_operation(
@@ -9321,6 +9666,28 @@ impl super::SearchEngine for HotEngine {
                         .version_map_read()?
                         .map
                         .peer_recovery_delete_versions(),
+                    client_operations: {
+                        let mut operations = Vec::new();
+                        if let Some(checkpoint) = committed_boundary.processed_checkpoint {
+                            let minimum_retained = checkpoint
+                                .saturating_add(1)
+                                .saturating_sub(super::CLIENT_OPERATION_RETENTION_OPERATIONS);
+                            translog.for_each_from(minimum_retained, &mut |entry| {
+                                if entry.seq_no <= checkpoint
+                                    && client_operation(&entry)?.is_some()
+                                {
+                                    operations.push(super::PeerRecoveryClientOperation {
+                                        seq_no: entry.seq_no,
+                                        primary_term: entry.primary_term,
+                                        op: entry.op.as_str().to_string(),
+                                        payload: entry.payload,
+                                    });
+                                }
+                                Ok(())
+                            })?;
+                        }
+                        operations
+                    },
                 };
                 let version_snapshot_path =
                     snapshot_dir.join(super::PEER_RECOVERY_VERSION_SNAPSHOT_FILE);
@@ -9533,6 +9900,7 @@ impl super::SearchEngine for HotEngine {
                     seq_no,
                     primary_term,
                     document_version: 0,
+                    client_operation: None,
                     mutation: super::DocumentMutation::NoOp {
                         reason: "promotion gap".to_string(),
                     },
@@ -10297,6 +10665,202 @@ mod tests {
         (dir, engine)
     }
 
+    fn client_intent(
+        id: &str,
+        payload: &serde_json::Value,
+    ) -> crate::engine::ClientOperationIntent {
+        crate::engine::ClientOperationIntent::new(
+            id.to_string(),
+            crate::engine::ClientOperationIntent::fingerprint_json(payload).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn primary_client_operation_retry_returns_original_receipt_and_rejects_collision() {
+        let (_dir, engine) = create_engine();
+        let payload = json!({"value": 1});
+        let intent = client_intent("primary-retry", &payload);
+        let original = engine
+            .add_document_with_operation_at_term(
+                "doc",
+                payload.clone(),
+                1,
+                crate::engine::WriteCondition::Unconditional,
+                Some(intent.clone()),
+            )
+            .unwrap();
+        assert!(!original.deduplicated);
+
+        let retried = engine
+            .add_document_with_operation_at_term(
+                "doc",
+                payload,
+                2,
+                crate::engine::WriteCondition::Unconditional,
+                Some(intent),
+            )
+            .unwrap();
+        assert!(retried.deduplicated);
+        assert_eq!(retried.seq_no, original.seq_no);
+        assert_eq!(retried.primary_term, original.primary_term);
+        assert_eq!(retried.version, original.version);
+        assert_eq!(engine.sequence_stats().max_seq_no, Some(original.seq_no));
+
+        let conflicting_payload = json!({"value": 2});
+        let error = engine
+            .add_document_with_operation_at_term(
+                "doc",
+                conflicting_payload.clone(),
+                2,
+                crate::engine::WriteCondition::Unconditional,
+                Some(client_intent("primary-retry", &conflicting_payload)),
+            )
+            .unwrap_err();
+        assert!(
+            error.is::<crate::engine::ClientOperationConflictError>(),
+            "{error:#}"
+        );
+        assert_eq!(engine.sequence_stats().max_seq_no, Some(original.seq_no));
+    }
+
+    #[test]
+    fn client_operation_survives_flush_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = json!({"value": "durable"});
+        let intent = client_intent("restart-retry", &payload);
+        let original = {
+            let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+            let receipt = engine
+                .add_document_with_operation_at_term(
+                    "doc",
+                    payload.clone(),
+                    1,
+                    crate::engine::WriteCondition::Unconditional,
+                    Some(intent.clone()),
+                )
+                .unwrap();
+            engine.flush().unwrap();
+            receipt
+        };
+
+        let reopened = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+        let before = reopened.sequence_stats();
+        let retried = reopened
+            .add_document_with_operation_at_term(
+                "doc",
+                payload,
+                2,
+                crate::engine::WriteCondition::Unconditional,
+                Some(intent),
+            )
+            .unwrap();
+        assert!(retried.deduplicated);
+        assert_eq!(retried.seq_no, original.seq_no);
+        assert_eq!(retried.primary_term, original.primary_term);
+        assert_eq!(retried.version, original.version);
+        assert_eq!(reopened.sequence_stats(), before);
+    }
+
+    #[test]
+    fn client_update_noop_survives_flush_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let intent_payload = json!({"doc_id": "doc", "script": "noop"});
+        let intent = client_intent("update-noop-retry", &intent_payload);
+        let original = {
+            let engine = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+            let indexed = engine
+                .add_document_with_receipt_at_term("doc", json!({"value": 1}), 1)
+                .unwrap();
+            let receipt = engine
+                .record_client_noop_at_term(
+                    1,
+                    intent.clone(),
+                    indexed.seq_no,
+                    indexed.primary_term,
+                    indexed.version,
+                )
+                .unwrap();
+            engine.flush().unwrap();
+            receipt
+        };
+
+        let reopened = HotEngine::new(dir.path(), Duration::from_secs(60)).unwrap();
+        let before = reopened.sequence_stats();
+        let retried = reopened
+            .record_client_noop_at_term(2, intent, 999, 2, 999)
+            .unwrap();
+        assert!(retried.deduplicated);
+        assert_eq!(retried.operation_seq_no, original.operation_seq_no);
+        assert_eq!(
+            retried.operation_primary_term,
+            original.operation_primary_term
+        );
+        assert_eq!(retried.seq_no, original.seq_no);
+        assert_eq!(retried.primary_term, original.primary_term);
+        assert_eq!(retried.version, original.version);
+        assert_eq!(reopened.sequence_stats(), before);
+    }
+
+    #[test]
+    fn replica_rejects_reused_client_operation_id_without_advancing() {
+        let (_dir, engine) = create_engine();
+        let first_payload = json!({"value": 1});
+        let first_intent = client_intent("replica-operation", &first_payload);
+        let first_record = crate::engine::ClientOperationRecord::new(
+            first_intent,
+            crate::engine::ClientOperationResult::Index {
+                version: 1,
+                created: true,
+            },
+        )
+        .unwrap();
+        engine
+            .apply_replica_operation(crate::engine::SequencedOperation {
+                seq_no: 0,
+                primary_term: 1,
+                document_version: 1,
+                client_operation: Some(first_record),
+                mutation: crate::engine::DocumentMutation::Index {
+                    doc_id: "doc".into(),
+                    source: first_payload,
+                },
+            })
+            .unwrap();
+
+        let conflicting_payload = json!({"value": 2});
+        let conflicting_record = crate::engine::ClientOperationRecord::new(
+            client_intent("replica-operation", &conflicting_payload),
+            crate::engine::ClientOperationResult::Index {
+                version: 2,
+                created: false,
+            },
+        )
+        .unwrap();
+        let error = engine
+            .apply_replica_operation(crate::engine::SequencedOperation {
+                seq_no: 1,
+                primary_term: 1,
+                document_version: 2,
+                client_operation: Some(conflicting_record),
+                mutation: crate::engine::DocumentMutation::Index {
+                    doc_id: "doc".into(),
+                    source: conflicting_payload,
+                },
+            })
+            .unwrap_err();
+        assert!(
+            error.is::<crate::engine::ClientOperationConflictError>(),
+            "{error:#}"
+        );
+        assert_eq!(engine.sequence_stats().max_seq_no, Some(0));
+        engine.refresh().unwrap();
+        assert_eq!(
+            engine.get_document("doc").unwrap().unwrap()["value"],
+            json!(1)
+        );
+    }
+
     #[test]
     fn reviewed_decimal_literals_preserve_integer_digits_and_fraction_signs() {
         for (text, truncated, fractional, negative) in [
@@ -10991,6 +11555,7 @@ mod tests {
                 seq_no,
                 primary_term,
                 document_version: seq_no + 1,
+                client_operation: None,
                 mutation: super::super::DocumentMutation::Index {
                     doc_id: doc_id.to_string(),
                     source,
@@ -11293,6 +11858,9 @@ mod tests {
             translog: Arc::new(Mutex::new(translog)),
             apply_state: Mutex::new(ApplyState::new(committed_boundary).unwrap()),
             versions: RwLock::new(VersionMapState::new()),
+            client_operations: Mutex::new(
+                super::super::client_operation::ClientOperationState::default(),
+            ),
             identity_term_state: Mutex::new(None),
             committed_boundary_path,
             durability: TranslogDurability::Request,
@@ -11997,6 +12565,7 @@ mod tests {
                     seq_no: 42,
                     primary_term: 1,
                     document_version: 1,
+                    client_operation: None,
                     mutation: super::super::DocumentMutation::Index {
                         doc_id: "replica".into(),
                         source: invalid,

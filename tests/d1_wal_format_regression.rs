@@ -88,6 +88,7 @@ async fn fence_raise_persists_the_pre_raise_maximum_sequence() {
             seq_no: 0,
             primary_term: 2,
             document_version: 1,
+            client_operation: None,
             mutation: ferrissearch::engine::DocumentMutation::Index {
                 doc_id: "before-raise".into(),
                 source: json!({"value": 0}),

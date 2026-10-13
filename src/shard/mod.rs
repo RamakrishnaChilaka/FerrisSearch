@@ -3575,34 +3575,130 @@ impl ShardManager {
             }
             let processed_checkpoint = committed_boundary.processed_checkpoint;
             let mut seen_doc_ids = std::collections::HashSet::new();
-            let retained_deletes = version_snapshot
-                .deletes
-                .into_iter()
-                .map(|delete| {
-                    if delete.doc_id.is_empty()
-                        || delete.version == 0
-                        || !processed_checkpoint
-                            .is_some_and(|checkpoint| delete.seq_no <= checkpoint)
-                        || !seen_doc_ids.insert(delete.doc_id.clone())
+            let minimum_retained_client_seq = processed_checkpoint
+                .map(|checkpoint| {
+                    checkpoint
+                        .saturating_add(1)
+                        .saturating_sub(crate::engine::CLIENT_OPERATION_RETENTION_OPERATIONS)
+                })
+                .unwrap_or(0);
+            if version_snapshot.client_operations.len()
+                > crate::engine::CLIENT_OPERATION_RETENTION_OPERATIONS as usize
+            {
+                return Err(definitive_shard_copy_failure(
+                    "peer recovery version snapshot has too many client operation entries",
+                ));
+            }
+            let mut seen_operation_ids = std::collections::HashSet::new();
+            let mut retained_entries = std::collections::BTreeMap::new();
+            for operation in version_snapshot.client_operations {
+                if !processed_checkpoint.is_some_and(|checkpoint| {
+                    operation.seq_no >= minimum_retained_client_seq
+                        && operation.seq_no <= checkpoint
+                }) {
+                    return Err(definitive_shard_copy_failure(
+                        "peer recovery version snapshot has an out-of-range client operation entry",
+                    ));
+                }
+                let op = WalOperation::parse(&operation.op).map_err(|error| {
+                    definitive_shard_copy_failure(format!(
+                        "peer recovery version snapshot has an invalid client operation type: {error}"
+                    ))
+                })?;
+                let entry = crate::wal::TranslogEntry {
+                    seq_no: operation.seq_no,
+                    primary_term: operation.primary_term,
+                    op,
+                    payload: operation.payload,
+                };
+                crate::wal::document_operation(&entry).map_err(|error| {
+                    definitive_shard_copy_failure(format!(
+                        "peer recovery version snapshot has an invalid client operation entry: {error}"
+                    ))
+                })?;
+                let record = crate::wal::client_operation(&entry)
+                    .map_err(|error| {
+                        definitive_shard_copy_failure(format!(
+                            "peer recovery version snapshot has an invalid client operation record: {error}"
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        definitive_shard_copy_failure(
+                            "peer recovery version snapshot client operation entry has no record",
+                        )
+                    })?;
+                let matching_result = matches!(
+                    (op, &record.result),
+                    (
+                        WalOperation::Index,
+                        crate::engine::ClientOperationResult::Index { .. }
+                    ) | (
+                        WalOperation::Delete,
+                        crate::engine::ClientOperationResult::Delete { .. }
+                    ) | (
+                        WalOperation::NoOp,
+                        crate::engine::ClientOperationResult::UpdateNoOp { .. }
+                    )
+                );
+                if !matching_result
+                    || !seen_operation_ids.insert(record.id)
+                    || retained_entries
+                        .insert(
+                            operation.seq_no,
+                            SequencedWalEntry {
+                                seq_no: operation.seq_no,
+                                primary_term: operation.primary_term,
+                                op,
+                                payload: entry.payload,
+                            },
+                        )
+                        .is_some()
+                {
+                    return Err(definitive_shard_copy_failure(
+                        "peer recovery version snapshot has a conflicting client operation entry",
+                    ));
+                }
+            }
+            for delete in version_snapshot.deletes {
+                if delete.doc_id.is_empty()
+                    || delete.version == 0
+                    || !processed_checkpoint
+                        .is_some_and(|checkpoint| delete.seq_no <= checkpoint)
+                    || !seen_doc_ids.insert(delete.doc_id.clone())
+                {
+                    return Err(definitive_shard_copy_failure(
+                        "peer recovery version snapshot has an invalid delete entry",
+                    ));
+                }
+                let retained_delete = SequencedWalEntry {
+                    seq_no: delete.seq_no,
+                    primary_term: delete.primary_term,
+                    op: WalOperation::Delete,
+                    payload: serde_json::json!({
+                        "_doc_id": delete.doc_id,
+                        "_version": delete.version,
+                    }),
+                };
+                if let Some(existing) = retained_entries.get(&delete.seq_no) {
+                    if existing.primary_term != retained_delete.primary_term
+                        || existing.op != WalOperation::Delete
+                        || existing.payload.get("_doc_id")
+                            != retained_delete.payload.get("_doc_id")
+                        || existing.payload.get("_version")
+                            != retained_delete.payload.get("_version")
                     {
                         return Err(definitive_shard_copy_failure(
-                            "peer recovery version snapshot has an invalid delete entry",
+                            "peer recovery version snapshot has conflicting retained entries",
                         ));
                     }
-                    Ok(SequencedWalEntry {
-                        seq_no: delete.seq_no,
-                        primary_term: delete.primary_term,
-                        op: WalOperation::Delete,
-                        payload: serde_json::json!({
-                            "_doc_id": delete.doc_id,
-                            "_version": delete.version,
-                        }),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            if !retained_deletes.is_empty() {
+                } else {
+                    retained_entries.insert(delete.seq_no, retained_delete);
+                }
+            }
+            let retained_entries = retained_entries.into_values().collect::<Vec<_>>();
+            if !retained_entries.is_empty() {
                 HotTranslog::open_with_durability(&shard_dir, shard_manager.durability)?
-                    .append_batch_with_seq(&retained_deletes)?;
+                    .append_batch_with_seq(&retained_entries)?;
             }
             std::fs::remove_file(&version_snapshot_path)?;
             expected_files.retain(|file| file != version_snapshot_name);
@@ -4508,6 +4604,7 @@ mod tests {
             seq_no,
             primary_term,
             document_version: seq_no + 1,
+            client_operation: None,
             mutation: crate::engine::DocumentMutation::Index {
                 doc_id: doc_id.to_string(),
                 source,
@@ -5763,6 +5860,7 @@ mod tests {
                 seq_no: 1,
                 primary_term: 1,
                 document_version: 2,
+                client_operation: None,
                 mutation: crate::engine::DocumentMutation::Delete {
                     doc_id: "doc-1".into(),
                 },
@@ -5770,10 +5868,27 @@ mod tests {
             .unwrap();
         apply_index(&source, "doc-gap", json!({"value": "filled"}), 2, 1).unwrap();
         apply_index(&source, "doc-2", json!({"value": 2}), 3, 1).unwrap();
+        let operation_payload = json!({"value": "deduplicated-after-promotion"});
+        let operation_intent = crate::engine::ClientOperationIntent::new(
+            "peer-recovery-operation".into(),
+            crate::engine::ClientOperationIntent::fingerprint_json(&operation_payload).unwrap(),
+        )
+        .unwrap();
+        let original = source
+            .add_document_with_operation_at_term(
+                "deduplicated",
+                operation_payload.clone(),
+                1,
+                crate::engine::WriteCondition::Unconditional,
+                Some(operation_intent.clone()),
+            )
+            .unwrap();
+        assert_eq!(original.seq_no, 4);
+        assert!(!original.deduplicated);
         let snapshot_dir = source_dir.path().join("peer-recovery/session");
         let snapshot = source.create_peer_recovery_snapshot(&snapshot_dir).unwrap();
-        assert_eq!(snapshot.committed_boundary.processed_checkpoint, Some(3));
-        assert_eq!(snapshot.committed_boundary.max_seq_no, Some(3));
+        assert_eq!(snapshot.committed_boundary.processed_checkpoint, Some(4));
+        assert_eq!(snapshot.committed_boundary.max_seq_no, Some(4));
 
         let target_dir = tempfile::tempdir().unwrap();
         let manager = Arc::new(ShardManager::new(
@@ -5812,13 +5927,29 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(engine.doc_count(), 2);
-        assert_eq!(engine.sequence_stats().processed_checkpoint, Some(3));
-        assert_eq!(engine.sequence_stats().max_seq_no, Some(3));
+        assert_eq!(engine.doc_count(), 3);
+        assert_eq!(engine.sequence_stats().processed_checkpoint, Some(4));
+        assert_eq!(engine.sequence_stats().max_seq_no, Some(4));
+        let retried = engine
+            .add_document_with_operation_at_term(
+                "deduplicated",
+                operation_payload,
+                2,
+                crate::engine::WriteCondition::Unconditional,
+                Some(operation_intent),
+            )
+            .unwrap();
+        assert!(retried.deduplicated);
+        assert_eq!(retried.seq_no, original.seq_no);
+        assert_eq!(retried.primary_term, original.primary_term);
+        assert_eq!(retried.version, original.version);
+        assert_eq!(engine.sequence_stats().processed_checkpoint, Some(4));
+        assert_eq!(engine.sequence_stats().max_seq_no, Some(4));
         let recreated = engine
             .add_document_with_receipt("doc-1", json!({"value": "recreated"}))
             .unwrap();
         assert_eq!(recreated.version, 3);
+        assert_eq!(recreated.seq_no, 5);
         assert!(!shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER).exists());
         source
             .release_peer_recovery_pin(snapshot.retention_pin_id)
