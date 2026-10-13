@@ -228,6 +228,14 @@ tiers and rejects isolated direct CRUD into immutable splits.
 
 **Class:** Release blocker | **Gate:** 0 | **Depends on:** FS-003, FS-004
 
+**Status (2026-10-13):** Complete. Accepted
+[ADR 0005](adr/0005-schema-generations-and-durable-format-compatibility.md)
+separates Raft-owned logical schema generations from component physical
+formats. It defines additive-field and typed-missing semantics, rejected
+in-place changes, capability-gated rolling windows, whole-request preflight,
+immutable rewrite, forward rollback, and pre-1.0 fail-closed remedies. Runtime
+implementation remains roadmap work.
+
 **Evidence:** manifests use a fail-closed schema hash, but durable WAL,
 manifest, bundle, partial-state, and mixed-generation split compatibility lack
 one declared upgrade policy.
