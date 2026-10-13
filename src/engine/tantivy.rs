@@ -287,6 +287,7 @@ struct FieldRegistry {
     source_field: Field,
     seq_no_field: Option<Field>,
     primary_term_field: Option<Field>,
+    version_field: Option<Field>,
     /// Named text fields created dynamically from document keys
     fields: HashMap<String, Field>,
     /// Logical field mappings so Date remains distinct from Integer even
@@ -310,6 +311,7 @@ impl HotEnginePurpose {
 
 const SEQ_NO_FIELD_NAME: &str = "_seq_no";
 const PRIMARY_TERM_FIELD_NAME: &str = "_primary_term";
+const VERSION_FIELD_NAME: &str = "_version";
 const VECTOR_REBUILD_BATCH_SIZE: usize = 1_024;
 
 #[cfg(test)]
@@ -608,6 +610,7 @@ fn build_schema_with_mappings(
     if purpose.requires_sequence_fields() {
         builder.add_u64_field(SEQ_NO_FIELD_NAME, FAST | STORED);
         builder.add_u64_field(PRIMARY_TERM_FIELD_NAME, FAST | STORED);
+        builder.add_u64_field(VERSION_FIELD_NAME, FAST | STORED);
     }
     builder.add_text_field("body", TEXT | STORED);
     let mut names: Vec<_> = mappings.keys().collect();
@@ -1191,7 +1194,11 @@ fn validate_internal_sequence_fields(schema: &Schema, purpose: HotEnginePurpose)
     if !purpose.requires_sequence_fields() {
         return Ok(());
     }
-    for name in [SEQ_NO_FIELD_NAME, PRIMARY_TERM_FIELD_NAME] {
+    for name in [
+        SEQ_NO_FIELD_NAME,
+        PRIMARY_TERM_FIELD_NAME,
+        VERSION_FIELD_NAME,
+    ] {
         let field = schema.get_field(name).map_err(|_| {
             crate::common::unsupported_index_format(
                 "local shard Tantivy schema",
@@ -1280,10 +1287,15 @@ fn sequenced_wal_entry(
     operation: &super::SequencedOperation,
 ) -> crate::wal::BorrowedSequencedWalEntry<'_> {
     let mutation = match &operation.mutation {
-        super::DocumentMutation::Index { doc_id, source } => {
-            WalDocumentOperation::Index { doc_id, source }
-        }
-        super::DocumentMutation::Delete { doc_id } => WalDocumentOperation::Delete { doc_id },
+        super::DocumentMutation::Index { doc_id, source } => WalDocumentOperation::Index {
+            doc_id,
+            source,
+            version: operation.document_version,
+        },
+        super::DocumentMutation::Delete { doc_id } => WalDocumentOperation::Delete {
+            doc_id,
+            version: operation.document_version,
+        },
         super::DocumentMutation::NoOp { reason } => WalDocumentOperation::NoOp { reason },
     };
     crate::wal::BorrowedSequencedWalEntry {
@@ -1293,6 +1305,31 @@ fn sequenced_wal_entry(
     }
 }
 
+fn validate_sequenced_document_versions(operations: &[super::SequencedOperation]) -> Result<()> {
+    for operation in operations {
+        match &operation.mutation {
+            super::DocumentMutation::Index { .. } | super::DocumentMutation::Delete { .. }
+                if operation.document_version == 0 =>
+            {
+                return Err(super::DocumentValidationError(format!(
+                    "sequenced document operation at primary term {} sequence {} requires a nonzero document version",
+                    operation.primary_term, operation.seq_no
+                ))
+                .into());
+            }
+            super::DocumentMutation::NoOp { .. } if operation.document_version != 0 => {
+                return Err(super::DocumentValidationError(format!(
+                    "sequenced no-op at primary term {} sequence {} requires document version zero",
+                    operation.primary_term, operation.seq_no
+                ))
+                .into());
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn wal_entry_matches_operation(
     entry: &crate::wal::TranslogEntry,
     operation: &super::SequencedOperation,
@@ -1300,18 +1337,26 @@ fn wal_entry_matches_operation(
     let decoded = document_operation(entry)?;
     Ok(match (decoded, &operation.mutation) {
         (
-            WalDocumentOperation::Index { doc_id, source },
+            WalDocumentOperation::Index {
+                doc_id,
+                source,
+                version,
+            },
             super::DocumentMutation::Index {
                 doc_id: incoming_id,
                 source: incoming_source,
             },
-        ) => doc_id == incoming_id && source == incoming_source,
+        ) => {
+            doc_id == incoming_id
+                && source == incoming_source
+                && version == operation.document_version
+        }
         (
-            WalDocumentOperation::Delete { doc_id },
+            WalDocumentOperation::Delete { doc_id, version },
             super::DocumentMutation::Delete {
                 doc_id: incoming_id,
             },
-        ) => doc_id == incoming_id,
+        ) => doc_id == incoming_id && version == operation.document_version,
         (
             WalDocumentOperation::NoOp { reason },
             super::DocumentMutation::NoOp {
@@ -1325,7 +1370,12 @@ fn wal_entry_matches_operation(
 fn sequenced_operation_from_entry(
     mut entry: crate::wal::TranslogEntry,
 ) -> Result<super::SequencedOperation> {
-    document_operation(&entry)?;
+    let document_operation = document_operation(&entry)?;
+    let document_version = match document_operation {
+        WalDocumentOperation::Index { version, .. }
+        | WalDocumentOperation::Delete { version, .. } => version,
+        WalDocumentOperation::NoOp { .. } => 0,
+    };
     let mutation = match entry.op {
         crate::wal::WalOperation::Index | crate::wal::WalOperation::Delete => {
             let serde_json::Value::String(doc_id) = entry.payload["_doc_id"].take() else {
@@ -1350,6 +1400,7 @@ fn sequenced_operation_from_entry(
     Ok(super::SequencedOperation {
         seq_no: entry.seq_no,
         primary_term: entry.primary_term,
+        document_version,
         mutation,
     })
 }
@@ -1488,6 +1539,7 @@ impl HotEngine {
         // Build the FieldRegistry from the opened schema (authoritative).
         let seq_no_field = schema.get_field(SEQ_NO_FIELD_NAME).ok();
         let primary_term_field = schema.get_field(PRIMARY_TERM_FIELD_NAME).ok();
+        let version_field = schema.get_field(VERSION_FIELD_NAME).ok();
 
         let mut fields = HashMap::new();
         let mut field_types = HashMap::new();
@@ -1539,6 +1591,7 @@ impl HotEngine {
             source_field,
             seq_no_field,
             primary_term_field,
+            version_field,
             fields,
             field_types,
             date_fields,
@@ -1864,6 +1917,78 @@ impl HotEngine {
             .map(|(_, _, version)| CurrentVersion::Native(VersionValue::Index(version))))
     }
 
+    fn restore_committed_versions_from_wal(
+        &self,
+        translog: &dyn WriteAheadLog,
+        committed_checkpoint: Option<u64>,
+    ) -> Result<()> {
+        let Some(committed_checkpoint) = committed_checkpoint else {
+            return Ok(());
+        };
+        let mut latest = HashMap::<String, (u64, u64, Option<u64>)>::new();
+        translog
+            .for_each_from_at(0, &mut |_position, entry| {
+                if entry.seq_no > committed_checkpoint {
+                    return Ok(());
+                }
+                let operation = sequenced_operation_from_entry(entry)?;
+                let (doc_id, delete_version) = match operation.mutation {
+                    super::DocumentMutation::Index { doc_id, .. } => (doc_id, None),
+                    super::DocumentMutation::Delete { doc_id } => {
+                        (doc_id, Some(operation.document_version))
+                    }
+                    super::DocumentMutation::NoOp { .. } => return Ok(()),
+                };
+                match latest.get(&doc_id).copied() {
+                    Some((seq_no, _, _)) if seq_no > operation.seq_no => {}
+                    Some((seq_no, primary_term, version))
+                        if seq_no == operation.seq_no
+                            && (primary_term != operation.primary_term
+                                || version != delete_version) =>
+                    {
+                        anyhow::bail!(
+                            "retained WAL has conflicting document operations for [{doc_id}] at primary term {} sequence {seq_no}",
+                            operation.primary_term
+                        );
+                    }
+                    Some((seq_no, _, _)) if seq_no == operation.seq_no => {}
+                    _ => {
+                        latest.insert(
+                            doc_id,
+                            (
+                                operation.seq_no,
+                                operation.primary_term,
+                                delete_version,
+                            ),
+                        );
+                    }
+                }
+                Ok(())
+            })
+            .map(|_| ())?;
+        let mut versions = self.version_map_write()?;
+        for (doc_id, (seq_no, primary_term, version)) in latest {
+            if let Some(version) = version {
+                versions
+                    .map
+                    .restore_delete_at(&doc_id, seq_no, primary_term, version)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn tombstone_safe_truncation_checkpoint(
+        &self,
+        requested_checkpoint: u64,
+    ) -> Result<Option<u64>> {
+        let oldest_tombstone = self.version_map_read()?.map.oldest_tombstone_seq_no();
+        Ok(match oldest_tombstone {
+            Some(0) => None,
+            Some(seq_no) => Some(requested_checkpoint.min(seq_no - 1)),
+            None => Some(requested_checkpoint),
+        })
+    }
+
     fn find_refreshed_document(
         &self,
         doc_id: &str,
@@ -1893,15 +2018,21 @@ impl HotEngine {
         let segment = &searcher.segment_readers()[address.segment_ord as usize];
         let seq_column = segment.fast_fields().u64(SEQ_NO_FIELD_NAME);
         let term_column = segment.fast_fields().u64(PRIMARY_TERM_FIELD_NAME);
-        let (seq_column, term_column) = match (seq_column, term_column) {
-            (Ok(seq_column), Ok(term_column)) => (seq_column, term_column),
-            _ => {
-                return Err(crate::common::unsupported_index_format(
-                    "local shard Tantivy segment",
-                    format!("document [{doc_id}] is missing _seq_no or _primary_term"),
-                ));
-            }
-        };
+        let version_column = segment.fast_fields().u64(VERSION_FIELD_NAME);
+        let (seq_column, term_column, version_column) =
+            match (seq_column, term_column, version_column) {
+                (Ok(seq_column), Ok(term_column), Ok(version_column)) => {
+                    (seq_column, term_column, version_column)
+                }
+                _ => {
+                    return Err(crate::common::unsupported_index_format(
+                        "local shard Tantivy segment",
+                        format!(
+                            "document [{doc_id}] is missing _seq_no, _primary_term, or _version"
+                        ),
+                    ));
+                }
+            };
         let mut seq_values = seq_column.values_for_doc(address.doc_id);
         let Some(seq_no) = seq_values.next() else {
             return Err(crate::common::unsupported_index_format(
@@ -1936,12 +2067,26 @@ impl HotEngine {
             }
             .into());
         }
+        let mut version_values = version_column.values_for_doc(address.doc_id);
+        let Some(version) = version_values.next().filter(|version| *version > 0) else {
+            return Err(crate::common::unsupported_index_format(
+                "local shard Tantivy segment",
+                format!("document [{doc_id}] has no nonzero {VERSION_FIELD_NAME} value"),
+            ));
+        };
+        if version_values.next().is_some() {
+            return Err(InternalSequenceFieldError {
+                message: format!("document [{doc_id}] has multiple {VERSION_FIELD_NAME} values"),
+            }
+            .into());
+        }
         Ok(Some((
             searcher,
             address,
             super::version_map::IndexVersionValue {
                 seq_no,
                 primary_term,
+                version,
                 wal_position: None,
             },
         )))
@@ -1951,19 +2096,27 @@ impl HotEngine {
         &self,
         doc_id: &str,
         condition: super::WriteCondition,
-    ) -> Result<bool> {
+    ) -> Result<(bool, u64)> {
         let state = self
             .apply_state
             .lock()
             .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
-        let current = match self.current_version(&state, doc_id)? {
+        let current = self.current_version(&state, doc_id)?;
+        let condition_version = match current {
             Some(CurrentVersion::Native(VersionValue::Index(value))) => {
                 Some((value.seq_no, value.primary_term))
             }
             _ => None,
         };
-        condition.check(doc_id, current)?;
-        Ok(current.is_some())
+        condition.check(doc_id, condition_version)?;
+        let previous_version = match current {
+            Some(CurrentVersion::Native(version)) => version.version(),
+            None => 0,
+        };
+        let version = previous_version
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("document [{doc_id}] version overflows"))?;
+        Ok((condition_version.is_some(), version))
     }
 
     fn read_refreshed_document(&self, doc_id: &str) -> Result<Option<super::DocumentRead>> {
@@ -1986,6 +2139,7 @@ impl HotEngine {
             source,
             seq_no: version.seq_no,
             primary_term: version.primary_term,
+            version: version.version,
         }))
     }
 
@@ -2022,6 +2176,7 @@ impl HotEngine {
     where
         F: FnMut(&super::SequencedOperation) -> Result<()>,
     {
+        validate_sequenced_document_versions(operations)?;
         #[cfg(not(test))]
         let _ = inject_apply_failure;
         if operations.is_empty() {
@@ -2200,6 +2355,7 @@ impl HotEngine {
                                         super::version_map::IndexVersionValue {
                                             seq_no: operation.seq_no,
                                             primary_term: operation.primary_term,
+                                            version: operation.document_version,
                                             wal_position: None,
                                         },
                                     ))
@@ -2209,6 +2365,7 @@ impl HotEngine {
                                         super::version_map::DeleteVersionValue {
                                             seq_no: operation.seq_no,
                                             primary_term: operation.primary_term,
+                                            version: operation.document_version,
                                             deleted_at: Instant::now(),
                                         },
                                     ),
@@ -2382,6 +2539,7 @@ impl HotEngine {
                             source,
                             planned_operation.operation.seq_no,
                             planned_operation.operation.primary_term,
+                            planned_operation.operation.document_version,
                         )?;
                         writer.add_document(doc)?;
                         side_effect(planned_operation.operation)?;
@@ -2407,6 +2565,7 @@ impl HotEngine {
                             doc_id,
                             planned_operation.operation.seq_no,
                             planned_operation.operation.primary_term,
+                            planned_operation.operation.document_version,
                             wal_position,
                         );
                     }
@@ -2422,10 +2581,11 @@ impl HotEngine {
                             .id_field;
                         writer.delete_term(Term::from_field_text(id_field, doc_id));
                         side_effect(planned_operation.operation)?;
-                        self.version_map_write()?.map.apply_delete(
+                        self.version_map_write()?.map.apply_delete_at(
                             doc_id,
                             planned_operation.operation.seq_no,
                             planned_operation.operation.primary_term,
+                            planned_operation.operation.document_version,
                         );
                     }
                     (_, super::ApplyOutcome::Applied) => unreachable!(),
@@ -2578,11 +2738,11 @@ impl HotEngine {
             self.validate_keyword_documents(std::iter::once(&payload))?;
             self.prepare_primary_term_before_wal(primary_term)?;
             let doc_id_owned = doc_id.to_string();
-            let (seq_no, created) =
+            let (seq_no, created, version) =
                 self.with_version_map_capacity("document indexing", [doc_id], false, |translog| {
                     drop(self.writer_state_with_replay(translog, "document indexing")?);
                     self.prepare_primary_term_before_wal(primary_term)?;
-                    let existed = self.check_primary_condition(doc_id, condition)?;
+                    let (existed, version) = self.check_primary_condition(doc_id, condition)?;
                     let start_cursor = translog.recovery_read_snapshot()?.end_cursor();
                     mutation.wal_attempted = true;
                     let seq_no = translog
@@ -2591,6 +2751,7 @@ impl HotEngine {
                             WalDocumentOperation::Index {
                                 doc_id,
                                 source: &payload,
+                                version,
                             },
                         )
                         .inspect_err(|error| {
@@ -2602,6 +2763,7 @@ impl HotEngine {
                     let operation = super::SequencedOperation {
                         seq_no,
                         primary_term,
+                        document_version: version,
                         mutation: super::DocumentMutation::Index {
                             doc_id: doc_id_owned,
                             source: payload,
@@ -2629,12 +2791,13 @@ impl HotEngine {
                         true,
                         &mut side_effect,
                     )?;
-                    Ok((seq_no, !existed))
+                    Ok((seq_no, !existed, version))
                 })?;
             Ok(super::IndexWriteReceipt {
                 doc_id: doc_id.to_string(),
                 seq_no,
                 primary_term,
+                version,
                 created,
             })
         })
@@ -2656,7 +2819,7 @@ impl HotEngine {
                 .iter()
                 .map(|(doc_id, _)| doc_id.clone())
                 .collect::<Vec<_>>();
-            let (start_seq_no, created) = self.with_version_map_capacity(
+            let (start_seq_no, created, versions) = self.with_version_map_capacity(
                 "bulk indexing",
                 doc_ids.iter().map(String::as_str),
                 true,
@@ -2664,7 +2827,9 @@ impl HotEngine {
                     drop(self.writer_state_with_replay(translog, "bulk indexing")?);
                     self.prepare_primary_term_before_wal(primary_term)?;
                     let mut initial_versions = HashMap::with_capacity(docs.len());
+                    let mut latest_versions = HashMap::with_capacity(docs.len());
                     let mut created = Vec::with_capacity(docs.len());
+                    let mut versions = Vec::with_capacity(docs.len());
                     {
                         let state = self
                             .apply_state
@@ -2675,19 +2840,27 @@ impl HotEngine {
                             .apply_state_timing
                             .start("primary_bulk_versions", docs.len());
                         for doc_id in &doc_ids {
-                            match initial_versions.entry(doc_id.as_str()) {
-                                std::collections::hash_map::Entry::Occupied(_) => {
-                                    created.push(false)
-                                }
-                                std::collections::hash_map::Entry::Vacant(entry) => {
+                            let previous_version =
+                                if let Some(version) = latest_versions.get(doc_id.as_str()) {
+                                    created.push(false);
+                                    *version
+                                } else {
                                     let current = self.current_version(&state, doc_id)?;
                                     created.push(!matches!(
                                         current,
                                         Some(CurrentVersion::Native(VersionValue::Index(_)))
                                     ));
-                                    entry.insert(current);
-                                }
-                            }
+                                    initial_versions.insert(doc_id.as_str(), current);
+                                    match current {
+                                        Some(CurrentVersion::Native(version)) => version.version(),
+                                        None => 0,
+                                    }
+                                };
+                            let version = previous_version.checked_add(1).ok_or_else(|| {
+                                anyhow::anyhow!("document [{doc_id}] version overflows")
+                            })?;
+                            latest_versions.insert(doc_id.as_str(), version);
+                            versions.push(version);
                         }
                     }
                     let start_cursor = translog.recovery_read_snapshot()?.end_cursor();
@@ -2695,7 +2868,12 @@ impl HotEngine {
                     let start_seq_no = {
                         let wal_ops = docs
                             .iter()
-                            .map(|(doc_id, source)| WalDocumentOperation::Index { doc_id, source })
+                            .zip(&versions)
+                            .map(|((doc_id, source), version)| WalDocumentOperation::Index {
+                                doc_id,
+                                source,
+                                version: *version,
+                            })
                             .collect::<Vec<_>>();
                         translog
                             .write_document_bulk_with_receipt(primary_term, &wal_ops)
@@ -2706,19 +2884,21 @@ impl HotEngine {
                             })?
                     };
                     let Some(start_seq_no) = start_seq_no else {
-                        return Ok((None, created));
+                        return Ok((None, created, versions));
                     };
                     mutation.seq_no = Some(start_seq_no);
                     mutation.last_seq_no = start_seq_no.checked_add((doc_ids.len() - 1) as u64);
                     let operations = docs
                         .into_iter()
                         .enumerate()
-                        .map(|(offset, (doc_id, payload))| {
+                        .zip(versions.iter().copied())
+                        .map(|((offset, (doc_id, payload)), document_version)| {
                             Ok(super::SequencedOperation {
                                 seq_no: start_seq_no.checked_add(offset as u64).ok_or_else(
                                     || anyhow::anyhow!("bulk write sequence range overflows"),
                                 )?,
                                 primary_term,
+                                document_version,
                                 mutation: super::DocumentMutation::Index {
                                     doc_id,
                                     source: payload,
@@ -2750,13 +2930,14 @@ impl HotEngine {
                         true,
                         &mut side_effect,
                     )?;
-                    Ok((Some(start_seq_no), created))
+                    Ok((Some(start_seq_no), created, versions))
                 },
             )?;
             Ok(super::BulkWriteReceipt {
                 doc_ids,
                 start_seq_no,
                 primary_term,
+                versions,
                 created,
             })
         })
@@ -2792,17 +2973,17 @@ impl HotEngine {
         super::write_failure::WriteMutationState::run(primary_term, |mutation| {
             self.prepare_primary_term_before_wal(primary_term)?;
             let doc_id_owned = doc_id.to_string();
-            let (seq_no, existed) =
+            let (seq_no, existed, version) =
                 self.with_version_map_capacity("document delete", [doc_id], false, |translog| {
                     drop(self.writer_state_with_replay(translog, "document delete")?);
                     self.prepare_primary_term_before_wal(primary_term)?;
-                    let existed = self.check_primary_condition(doc_id, condition)?;
+                    let (existed, version) = self.check_primary_condition(doc_id, condition)?;
                     let start_cursor = translog.recovery_read_snapshot()?.end_cursor();
                     mutation.wal_attempted = true;
                     let seq_no = translog
                         .write_document_with_receipt(
                             primary_term,
-                            WalDocumentOperation::Delete { doc_id },
+                            WalDocumentOperation::Delete { doc_id, version },
                         )
                         .inspect_err(|error| {
                             if error.is::<crate::wal::WalFrameTooLargeError>() {
@@ -2813,6 +2994,7 @@ impl HotEngine {
                     let operation = super::SequencedOperation {
                         seq_no,
                         primary_term,
+                        document_version: version,
                         mutation: super::DocumentMutation::Delete {
                             doc_id: doc_id_owned,
                         },
@@ -2839,12 +3021,13 @@ impl HotEngine {
                         true,
                         &mut side_effect,
                     )?;
-                    Ok((seq_no, existed))
+                    Ok((seq_no, existed, version))
                 })?;
             Ok(super::DeleteWriteReceipt {
                 deleted: u64::from(existed),
                 seq_no,
                 primary_term,
+                version,
             })
         })
     }
@@ -3034,6 +3217,7 @@ impl HotEngine {
         self.reload_reader()
             .with_context(|| format!("reader reload failed before {context} replay"))?;
         self.reset_apply_state_to_commit(committed.clone())?;
+        self.restore_committed_versions_from_wal(translog, committed.processed_checkpoint)?;
         #[cfg(test)]
         if let Some(sender) = self.replay_after_reset_sender.lock().unwrap().take() {
             sender.send(()).unwrap();
@@ -4038,6 +4222,7 @@ impl HotEngine {
         payload: &serde_json::Value,
         seq_no: u64,
         primary_term: u64,
+        version: u64,
     ) -> Result<TantivyDocument> {
         let registry = self
             .field_registry
@@ -4050,6 +4235,7 @@ impl HotEngine {
             payload,
             seq_no,
             primary_term,
+            version,
         )
     }
 
@@ -4062,6 +4248,7 @@ impl HotEngine {
         payload: &serde_json::Value,
         seq_no: u64,
         primary_term: u64,
+        version: u64,
     ) -> Result<TantivyDocument> {
         crate::common::validate_document_source(payload)?;
         let mut doc = TantivyDocument::new();
@@ -4073,6 +4260,9 @@ impl HotEngine {
         }
         if let Some(field) = registry.primary_term_field {
             doc.add_u64(field, primary_term);
+        }
+        if let Some(field) = registry.version_field {
+            doc.add_u64(field, version);
         }
 
         // Canonicalize mapped Date fields before persisting _source so every read path
@@ -5098,8 +5288,11 @@ impl HotEngine {
         self.reload_reader()?;
         self.persist_committed_boundary(&committed_boundary)?;
         self.validate_truncation_boundary(&*tl, &committed_boundary)?;
-        if let Some(processed_checkpoint) = committed_boundary.processed_checkpoint {
-            tl.truncate_below(global_checkpoint.min(processed_checkpoint))?;
+        if let Some(processed_checkpoint) = committed_boundary.processed_checkpoint
+            && let Some(checkpoint) = self
+                .tombstone_safe_truncation_checkpoint(global_checkpoint.min(processed_checkpoint))?
+        {
+            tl.truncate_below(checkpoint)?;
         }
         Ok(true)
     }
@@ -5118,8 +5311,12 @@ impl HotEngine {
             self.reload_reader()?;
             self.persist_committed_boundary(&committed_boundary)?;
             self.validate_truncation_boundary(tl, &committed_boundary)?;
-            if let Some(processed_checkpoint) = committed_boundary.processed_checkpoint {
-                tl.truncate_below(global_checkpoint.min(processed_checkpoint))?;
+            if let Some(processed_checkpoint) = committed_boundary.processed_checkpoint
+                && let Some(checkpoint) = self.tombstone_safe_truncation_checkpoint(
+                    global_checkpoint.min(processed_checkpoint),
+                )?
+            {
+                tl.truncate_below(checkpoint)?;
             }
             Ok(())
         })
@@ -8677,7 +8874,10 @@ impl super::SearchEngine for HotEngine {
                 let registry = self.field_registry.read().unwrap_or_else(|error| error.into_inner());
                 Self::normalize_result_source_with_registry(&registry, &mut source);
                 return Ok(Some(super::DocumentRead {
-                    source, seq_no: version.seq_no, primary_term: version.primary_term,
+                    source,
+                    seq_no: version.seq_no,
+                    primary_term: version.primary_term,
+                    version: version.version,
                 }));
             }
             // Flush reloads the reader before pruning WAL, under this same mutex.
@@ -8725,8 +8925,11 @@ impl super::SearchEngine for HotEngine {
             self.reload_reader()?;
             self.persist_committed_boundary(&committed_boundary)?;
             self.validate_truncation_boundary(tl, &committed_boundary)?;
-            if let Some(processed_checkpoint) = committed_boundary.processed_checkpoint {
-                tl.truncate_below(processed_checkpoint)?;
+            if let Some(processed_checkpoint) = committed_boundary.processed_checkpoint
+                && let Some(checkpoint) =
+                    self.tombstone_safe_truncation_checkpoint(processed_checkpoint)?
+            {
+                tl.truncate_below(checkpoint)?;
             }
             Ok(())
         })
@@ -9097,7 +9300,7 @@ impl super::SearchEngine for HotEngine {
             let retention_pin_id = translog.register_retention_pin(retention_floor)?;
 
             let result = (|| {
-                let file_names = self.peer_recovery_file_names()?;
+                let mut file_names = self.peer_recovery_file_names()?;
                 let index_path = self
                     .committed_boundary_path
                     .parent()
@@ -9112,6 +9315,21 @@ impl super::SearchEngine for HotEngine {
                         )
                     })?;
                 }
+                let version_snapshot = super::PeerRecoveryVersionSnapshot {
+                    format_version: super::PEER_RECOVERY_VERSION_SNAPSHOT_FORMAT,
+                    deletes: self
+                        .version_map_read()?
+                        .map
+                        .peer_recovery_delete_versions(),
+                };
+                let version_snapshot_path =
+                    snapshot_dir.join(super::PEER_RECOVERY_VERSION_SNAPSHOT_FILE);
+                std::fs::write(
+                    &version_snapshot_path,
+                    serde_json::to_vec(&version_snapshot)?,
+                )?;
+                std::fs::File::open(&version_snapshot_path)?.sync_all()?;
+                file_names.push(super::PEER_RECOVERY_VERSION_SNAPSHOT_FILE.to_string());
                 std::fs::File::open(snapshot_dir)?.sync_all()?;
                 #[cfg(feature = "protocol-trace")]
                 {
@@ -9314,6 +9532,7 @@ impl super::SearchEngine for HotEngine {
                 .map(|(seq_no, primary_term)| super::SequencedOperation {
                     seq_no,
                     primary_term,
+                    document_version: 0,
                     mutation: super::DocumentMutation::NoOp {
                         reason: "promotion gap".to_string(),
                     },
@@ -10771,6 +10990,7 @@ mod tests {
             .apply_replica_operation(super::super::SequencedOperation {
                 seq_no,
                 primary_term,
+                document_version: seq_no + 1,
                 mutation: super::super::DocumentMutation::Index {
                     doc_id: doc_id.to_string(),
                     source,
@@ -11010,6 +11230,7 @@ mod tests {
         schema_builder.add_text_field("_source", STORED);
         schema_builder.add_u64_field(SEQ_NO_FIELD_NAME, FAST | STORED);
         schema_builder.add_u64_field(PRIMARY_TERM_FIELD_NAME, FAST | STORED);
+        schema_builder.add_u64_field(VERSION_FIELD_NAME, FAST | STORED);
         schema_builder.add_text_field("body", TEXT | STORED);
         let index = Index::open_or_create(directory, schema_builder.build()).unwrap();
         let schema = index.schema();
@@ -11017,6 +11238,7 @@ mod tests {
         let source_field = schema.get_field("_source").unwrap();
         let seq_no_field = schema.get_field(SEQ_NO_FIELD_NAME).unwrap();
         let primary_term_field = schema.get_field(PRIMARY_TERM_FIELD_NAME).unwrap();
+        let version_field = schema.get_field(VERSION_FIELD_NAME).unwrap();
         let body_field = schema.get_field("body").unwrap();
         let writer = index.writer(TANTIVY_WRITER_HEAP_BYTES).unwrap();
         let automatic_merge_policy = writer.get_merge_policy();
@@ -11062,6 +11284,7 @@ mod tests {
                 source_field,
                 seq_no_field: Some(seq_no_field),
                 primary_term_field: Some(primary_term_field),
+                version_field: Some(version_field),
                 fields: HashMap::from([("body".to_string(), body_field)]),
                 field_types: HashMap::new(),
                 date_fields: Vec::new(),
@@ -11773,6 +11996,7 @@ mod tests {
                 .apply_replica_operation(super::super::SequencedOperation {
                     seq_no: 42,
                     primary_term: 1,
+                    document_version: 1,
                     mutation: super::super::DocumentMutation::Index {
                         doc_id: "replica".into(),
                         source: invalid,
@@ -12295,7 +12519,8 @@ mod tests {
             crate::wal::WalOperation::Index,
             json!({
                 "_doc_id": "invalid",
-                "_source": {"tags": ["valid", {"nested": "invalid"}]}
+                "_source": {"tags": ["valid", {"nested": "invalid"}]},
+                "_version": 1
             }),
         )
         .unwrap();
@@ -12595,6 +12820,7 @@ mod tests {
                 "collision",
                 version.seq_no,
                 version.primary_term + 1,
+                version.version,
                 version.wal_position.unwrap(),
             );
         }
@@ -13061,7 +13287,8 @@ mod tests {
                         crate::wal::WalOperation::Index,
                         json!({
                             "_doc_id": format!("d-{}", TRANSLOG_REPLAY_BATCH_SIZE),
-                            "_source": {"n": TRANSLOG_REPLAY_BATCH_SIZE}
+                            "_source": {"n": TRANSLOG_REPLAY_BATCH_SIZE},
+                            "_version": 1
                         }),
                     )?;
                     Ok(())
@@ -13180,22 +13407,22 @@ mod tests {
         for (operation, payload, expected) in [
             (
                 crate::wal::WalOperation::Index,
-                json!({"_source": {"value": 1}}),
+                json!({"_source": {"value": 1}, "_version": 1}),
                 "has no _doc_id",
             ),
             (
                 crate::wal::WalOperation::Index,
-                json!({"_id": "legacy-only", "_source": {"value": 1}}),
+                json!({"_id": "legacy-only", "_source": {"value": 1}, "_version": 1}),
                 "has no _doc_id",
             ),
             (
                 crate::wal::WalOperation::Index,
-                json!({"_doc_id": "missing-source"}),
+                json!({"_doc_id": "missing-source", "_version": 1}),
                 "has no _source",
             ),
             (
                 crate::wal::WalOperation::Delete,
-                json!({}),
+                json!({"_version": 1}),
                 "has no _doc_id",
             ),
         ] {

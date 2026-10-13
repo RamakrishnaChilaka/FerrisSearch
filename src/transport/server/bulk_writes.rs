@@ -8,8 +8,9 @@ pub(super) fn index_batch_results(
         .doc_ids
         .iter()
         .zip(&receipt.created)
+        .zip(&receipt.versions)
         .enumerate()
-        .map(|(offset, (doc_id, created))| {
+        .map(|(offset, ((doc_id, created), version))| {
             let seq_no = receipt
                 .start_seq_no
                 .and_then(|start| start.checked_add(offset as u64))
@@ -20,6 +21,7 @@ pub(super) fn index_batch_results(
                 result: if *created { "created" } else { "updated" }.to_string(),
                 seq_no: Some(seq_no),
                 primary_term: Some(receipt.primary_term),
+                version: Some(*version),
                 ..Default::default()
             })
         })
@@ -132,6 +134,7 @@ pub(super) async fn execute_ordered_bulk(
                             .to_string(),
                             seq_no: response.seq_no,
                             primary_term: response.primary_term,
+                            version: response.version,
                             write_refresh: response.write_refresh,
                             ..Default::default()
                         }
@@ -204,6 +207,7 @@ pub(super) async fn execute_ordered_bulk(
                             .to_string(),
                             seq_no: response.seq_no,
                             primary_term: response.primary_term,
+                            version: response.version,
                             write_refresh: response.write_refresh,
                             ..Default::default()
                         }

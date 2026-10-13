@@ -2,7 +2,7 @@
 
 > - **Status:** Current implemented behavior
 > - **Matrix version:** 2026-10-13
-> - **Source baseline:** `0428371afce358538b3c4d5ca36efec23ac15f3c`
+> - **Source baseline:** `f9457f1`
 > - **Product claim:** OpenSearch-style REST API subset
 > - **Canonical inventory:** [`opensearch-compatibility.json`](opensearch-compatibility.json)
 
@@ -37,8 +37,11 @@ missing.
 ### Writes, versions, and conflicts
 
 - Successful single and bulk mutations return the primary WAL-assigned
-  `_seq_no` and `_primary_term`. Sequence zero is valid. FerrisSearch omits
-  `_version`; external versions and client retry tokens are not implemented.
+  `_seq_no`, `_primary_term`, and internal per-document `_version`. Sequence
+  zero is valid; document versions start at 1 and increase across
+  index/update/delete, including `not_found` deletes. Detected update no-ops
+  retain the current metadata. External version preconditions and client retry
+  tokens are not implemented.
 - Index and delete accept paired `if_seq_no` and `if_primary_term`. Supplying
   only one is a 400. Create-only writes use `op_type=create` or
   `PUT/POST /{index}/_create/{id}` and return 409 without allocating a sequence

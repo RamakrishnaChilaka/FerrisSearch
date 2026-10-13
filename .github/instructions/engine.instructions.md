@@ -84,6 +84,10 @@ pub trait SearchEngine: Send + Sync {
 - A receipt belongs to its operation, even if another write advances a checkpoint
   before replication. Never reconstruct its sequence from `last_seq_no()` or
   `local_checkpoint()`.
+- Primary index/delete receipts also own a nonzero per-document version.
+  Versions start at 1 and increase across index/delete tombstones for one ID.
+  Replica/recovery apply must carry the assigned version explicitly; NoOp uses
+  zero internally and has no wire/WAL document version.
 - Primary mutation errors carry `WriteMutationError` context. Track the WAL
   invocation boundary and capture only the sequence/range returned by that
   invocation. Preserve context and underlying typed causes through text/vector
@@ -301,6 +305,11 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
 - Replay holds the translog lock for the entire retained suffix so no new WAL
   entry can be appended before reconstruction is complete. This blocks writes
   to that shard and can be a long critical section when refresh is disabled.
+- Flush truncation preserves the generation containing the oldest retained
+  delete tombstone. Restart and primary activation rebuild committed versions
+  from retained WAL before suffix replay so a promoted copy does not reset a
+  recently deleted document to version 1. Tombstone retention remains bounded;
+  once pruned, a later flush may reclaim that history.
 - Replay clears map completeness together with the map reset. It restores
   completeness only after successful reader publication and replay completion,
   including an empty suffix. Intermediate commits and failed replay leave the

@@ -298,6 +298,16 @@ manual result editing.
 
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-001
 
+**Status (2026-10-13):** Complete for the `local_shards` write surface.
+Primary receipts assign authoritative sequence, primary-term, and internal
+per-document version metadata. WAL v3, replication, recovery, coordinator
+forwarding, realtime GET, single writes, updates, deletes, and bulk items
+preserve those values. Missing wire/WAL versions fail closed. Focused engine,
+REST, transport, replica, flush/restart, and promoted-primary regressions cover
+duplicate IDs, delete tombstones, update no-ops, and failover continuity.
+Client operation IDs and durable retry deduplication remain FS-011; external
+version preconditions remain unsupported.
+
 **Evidence:** write responses contain incomplete or synthetic `_version`,
 sequence, and primary-term information.
 

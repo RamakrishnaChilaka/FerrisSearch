@@ -793,6 +793,7 @@ async fn replicate_doc_index_via_grpc() {
             index_uuid: "replica-idx-uuid".into(),
             primary_term: Some(1),
             target_allocation_id: Some(1),
+            document_version: Some(1),
         }))
         .await
         .unwrap()
@@ -850,6 +851,7 @@ async fn out_of_order_replica_delivery_keeps_the_newer_document_value() {
                 index_uuid: "d1-ordering-uuid".into(),
                 primary_term: Some(1),
                 target_allocation_id: Some(1),
+                document_version: Some(seq_no + 1),
             }))
             .await
             .unwrap()
@@ -901,6 +903,7 @@ async fn deterministic_reordering_survives_promotion_and_new_write() {
                 index_uuid: "d1-full-ordering-uuid".into(),
                 primary_term: Some(1),
                 target_allocation_id: Some(1),
+                document_version: Some(21 + offset),
             }))
             .await
             .unwrap()
@@ -918,6 +921,7 @@ async fn deterministic_reordering_survives_promotion_and_new_write() {
             index_uuid: "d1-full-ordering-uuid".into(),
             primary_term: Some(1),
             target_allocation_id: Some(1),
+            document_version: Some(seq_no + 1),
         })
         .collect();
     let response = client
@@ -1030,6 +1034,7 @@ async fn replicate_doc_delete_via_grpc() {
             index_uuid: "rep-del-idx-uuid".into(),
             primary_term: Some(1),
             target_allocation_id: Some(1),
+            document_version: Some(2),
         }))
         .await
         .unwrap();
@@ -1046,6 +1051,7 @@ async fn replicate_doc_delete_via_grpc() {
             index_uuid: "rep-del-idx-uuid".into(),
             primary_term: Some(1),
             target_allocation_id: Some(1),
+            document_version: Some(2),
         }))
         .await
         .unwrap()
@@ -1090,6 +1096,7 @@ async fn replicate_bulk_via_grpc() {
             index_uuid: "bulk-rep-idx-uuid".into(),
             primary_term: Some(1),
             target_allocation_id: Some(1),
+            document_version: Some(i + 1),
         })
         .collect();
 
@@ -1260,6 +1267,7 @@ async fn stale_primary_replication_is_rejected_by_promoted_target() {
         "index",
         0,
         1,
+        1,
     )
     .await;
 
@@ -1389,6 +1397,7 @@ async fn replica_apply_rejects_uuid_allocation_term_and_missing_identity_fields(
         index_uuid: index_uuid.into(),
         primary_term,
         target_allocation_id: allocation_id,
+        document_version: Some(1),
     };
 
     for invalid in [
@@ -1455,6 +1464,7 @@ async fn replica_fence_is_persisted_before_ack_and_restored_on_restart() {
             index_uuid: "durable-fence-uuid".into(),
             primary_term: Some(3),
             target_allocation_id: Some(1),
+            document_version: Some(1),
         }))
         .await
         .unwrap()
@@ -1491,6 +1501,7 @@ async fn replica_fence_is_persisted_before_ack_and_restored_on_restart() {
             index_uuid: "durable-fence-uuid".into(),
             primary_term: Some(1),
             target_allocation_id: Some(1),
+            document_version: Some(2),
         }))
         .await
         .unwrap()
@@ -1538,6 +1549,7 @@ async fn bulk_replication_validates_common_identity_before_first_mutation() {
         index_uuid: "bulk-fence-uuid".into(),
         primary_term: Some(2),
         target_allocation_id: Some(allocation_id),
+        document_version: Some(seq_no + 1),
     };
     let missing_term = client
         .replicate_bulk(tonic::Request::new(ReplicateBulkRequest {
@@ -3500,6 +3512,7 @@ async fn replicate_doc_returns_sequence_proof() {
             index_uuid: "cp-idx-uuid".into(),
             primary_term: Some(1),
             target_allocation_id: Some(1),
+            document_version: Some(1),
         }))
         .await
         .unwrap()
@@ -3525,6 +3538,7 @@ async fn replicate_doc_returns_sequence_proof() {
                 index_uuid: "cp-idx-uuid".into(),
                 primary_term: Some(1),
                 target_allocation_id: Some(1),
+                document_version: Some(1),
             }))
             .await
             .unwrap()
@@ -3549,6 +3563,7 @@ async fn replicate_doc_returns_sequence_proof() {
             index_uuid: "cp-idx-uuid".into(),
             primary_term: Some(1),
             target_allocation_id: Some(1),
+            document_version: Some(1),
         }))
         .await
         .unwrap()
@@ -3570,6 +3585,7 @@ async fn replicate_doc_returns_sequence_proof() {
                 index_uuid: "cp-idx-uuid".into(),
                 primary_term: Some(1),
                 target_allocation_id: Some(1),
+                document_version: Some(1),
             }))
             .await
             .unwrap()
@@ -3601,6 +3617,7 @@ async fn replicate_bulk_returns_sequence_proof() {
             index_uuid: "bulk-cp-idx-uuid".into(),
             primary_term: Some(1),
             target_allocation_id: Some(1),
+            document_version: Some(i as u64 + 1),
         })
         .collect();
 
@@ -3654,6 +3671,7 @@ async fn async_replica_response_separates_processed_from_persisted() {
             index_uuid: "async-proof-idx-uuid".into(),
             primary_term: Some(1),
             target_allocation_id: Some(1),
+            document_version: Some(1),
         }))
         .await
         .unwrap()
@@ -3866,6 +3884,7 @@ async fn writes_regression_conditional_rest_updates_and_mixed_bulk_keep_replica_
         .unwrap();
     assert_eq!(first.status(), reqwest::StatusCode::CREATED);
     let first: serde_json::Value = first.json().await.unwrap();
+    assert_eq!(first["_version"], 1);
     let term = first["_primary_term"].as_u64().unwrap();
     let conditional = format!("{base}/writes-replicated/_doc/x?if_seq_no=0&if_primary_term={term}");
     let second = client
@@ -3875,10 +3894,9 @@ async fn writes_regression_conditional_rest_updates_and_mixed_bulk_keep_replica_
         .await
         .unwrap();
     assert_eq!(second.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        second.json::<serde_json::Value>().await.unwrap()["_seq_no"],
-        1
-    );
+    let second = second.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(second["_seq_no"], 1);
+    assert_eq!(second["_version"], 2);
     let rejected = client
         .put(&conditional)
         .json(&serde_json::json!({"wrong": true}))
@@ -3917,6 +3935,14 @@ async fn writes_regression_conditional_rest_updates_and_mixed_bulk_keep_replica_
     assert_eq!(response["items"][2]["create"]["status"], 409, "{response}");
     assert_eq!(response["items"][7]["update"]["result"], "created");
     assert_eq!(response["items"][8]["delete"]["status"], 404);
+    assert_eq!(response["items"][0]["update"]["_version"], 3);
+    assert_eq!(response["items"][1]["delete"]["_version"], 2);
+    assert_eq!(response["items"][3]["index"]["_version"], 4);
+    assert_eq!(response["items"][4]["update"]["_version"], 5);
+    assert_eq!(response["items"][5]["create"]["_version"], 1);
+    assert_eq!(response["items"][6]["delete"]["_version"], 2);
+    assert_eq!(response["items"][7]["update"]["_version"], 3);
+    assert_eq!(response["items"][8]["delete"]["_version"], 1);
     let primary = primary_sm.get_shard("writes-replicated", 0).unwrap();
     let replica = replica_sm.get_shard("writes-replicated", 0).unwrap();
     for id in ["x", "y", "z", "absent"] {
@@ -3935,12 +3961,14 @@ async fn writes_regression_conditional_rest_updates_and_mixed_bulk_keep_replica_
         serde_json::json!({"base": 5, "bulk": 4, "after": 6})
     );
     assert_eq!((x.seq_no, x.primary_term), (6, term));
+    assert_eq!(x.version, 5);
     let y = primary
         .get_document_with_metadata("y", true)
         .unwrap()
         .unwrap();
     assert_eq!(y.source, serde_json::json!({"base": 8}));
     assert_eq!((y.seq_no, y.primary_term), (9, term));
+    assert_eq!(y.version, 3);
     assert!(
         primary
             .get_document_with_metadata("z", true)
@@ -4500,6 +4528,7 @@ async fn replicate_bulk_rejects_invalid_sequence_ranges_before_writing() {
         index_uuid: format!("{index}-uuid"),
         primary_term: Some(1),
         target_allocation_id: Some(1),
+        document_version: Some(seq_no.saturating_add(1)),
     };
     for ops in [
         vec![operation(10, "index"), operation(12, "index")],

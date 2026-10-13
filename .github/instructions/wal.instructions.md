@@ -58,12 +58,15 @@ pub trait WriteAheadLog: Send + Sync {
 
 ## HotTranslog (Generation-Based Binary Implementation)
 ### Wire Format
-`[u32 LE: payload_len][bincode(WireEntryV2 { format_version, seq_no, primary_term, op, payload_json })]`
+`[u32 LE: payload_len][bincode(WireEntryV3 { format_version, seq_no, primary_term, op, payload_json })]`
 - Length-prefixed frames for efficient sequential reading
 - On open, truncates only an incomplete active-generation tail; replay and
   retained-generation reads reject incomplete frames elsewhere
 - Primary allocation is contiguous, but explicit replica/recovery entries may
   arrive out of numeric order; generation metadata stores min/max ranges
+- Index/delete payloads require the primary-assigned nonzero `_version`; NoOp
+  payloads have no document version. Missing or zero document versions are WAL
+  corruption and fail closed.
 
 ### Files on Disk (per shard)
 - `{data_dir}/{index_uuid}/shard_{id}/translog-<generation>.bin` — ordered WAL generation files (`00000000000000000000`, `00000000000000000001`, ...)
@@ -92,6 +95,10 @@ pub trait WriteAheadLog: Send + Sync {
   advances the local allocator past it.
 - `append_batch_with_seq()` preserves arbitrary physical input order for live
   replica apply and peer recovery; do not sort it by sequence.
+- Checkpoint-aware and full flushes retain the WAL generation containing the
+  oldest live delete tombstone. Restart and primary activation rebuild retained
+  committed document versions before replaying the uncommitted suffix. Once
+  tombstone retention prunes that metadata, later flushes may reclaim the WAL.
 - Receipt-only document writes serialize borrowed `WalDocumentOperation`
   envelopes without constructing a deep JSON copy or unused return entries.
   They share the existing append mutation logic, frame limits, sequence

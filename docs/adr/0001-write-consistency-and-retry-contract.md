@@ -365,10 +365,16 @@ resends too.
 
 ### D7. Response metadata
 
+**Status (2026-10-13):** Implemented for `local_shards`.
+
 - **Success fields:** `_seq_no` and `_primary_term` are real on every success,
   single or bulk.
-- **`_version`:** omitted until per-document versions exist (FS-009). It is never
-  fabricated.
+- **`_version`:** primary-assigned internal per-document versions start at 1
+  and increase across index/update/delete operations, including `not_found`
+  deletes. Replicas, replay, recovery, and coordinators preserve the assigned
+  value; they never infer it from a checkpoint or sequence number. Detected
+  update no-ops return the current version without consuming a sequence or
+  version. External version preconditions remain unsupported.
 - **`result`:** index returns `created` with 201 or `updated` with 200, according
   to whether the document existed. Delete returns `deleted`, or `not_found`
   with 404.

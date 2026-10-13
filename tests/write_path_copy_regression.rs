@@ -32,11 +32,12 @@ fn primary_single_wal_bytes_match_owned_document_envelopes() {
     assert_eq!(receipt.doc_id, doc_id);
     assert_eq!(receipt.seq_no, 0);
     assert_eq!(receipt.primary_term, 7);
+    assert_eq!(receipt.version, 1);
     reference
         .append(
             7,
             WalOperation::Index,
-            json!({"_doc_id": doc_id, "_source": source()}),
+            json!({"_doc_id": doc_id, "_source": source(), "_version": 1}),
         )
         .unwrap();
     assert_eq!(
@@ -51,8 +52,13 @@ fn primary_single_wal_bytes_match_owned_document_envelopes() {
         .unwrap();
     assert_eq!(receipt.seq_no, 1);
     assert_eq!(receipt.primary_term, 7);
+    assert_eq!(receipt.version, 2);
     reference
-        .append(7, WalOperation::Delete, json!({"_doc_id": doc_id}))
+        .append(
+            7,
+            WalOperation::Delete,
+            json!({"_doc_id": doc_id, "_version": 2}),
+        )
         .unwrap();
     assert_eq!(
         wal_bytes(actual_dir.path()),
@@ -78,10 +84,11 @@ fn primary_bulk_wal_bytes_and_duplicate_id_order_are_unchanged() {
     ];
     let expected = docs
         .iter()
-        .map(|(doc_id, payload)| {
+        .zip([1, 1, 2])
+        .map(|((doc_id, payload), version)| {
             (
                 WalOperation::Index,
-                json!({"_doc_id": doc_id, "_source": payload}),
+                json!({"_doc_id": doc_id, "_source": payload, "_version": version}),
             )
         })
         .collect::<Vec<_>>();
@@ -92,6 +99,7 @@ fn primary_bulk_wal_bytes_and_duplicate_id_order_are_unchanged() {
     assert_eq!(receipt.start_seq_no, Some(0));
     assert_eq!(receipt.last_seq_no().unwrap(), Some(2));
     assert_eq!(receipt.primary_term, 7);
+    assert_eq!(receipt.versions, [1, 1, 2]);
     assert_eq!(
         reference.write_bulk_with_receipt(7, &expected).unwrap(),
         Some(0)
@@ -117,6 +125,7 @@ fn replica_single_wal_bytes_and_sequence_receipts_are_unchanged() {
     let newest = SequencedOperation {
         seq_no: 1,
         primary_term: 7,
+        document_version: 2,
         mutation: DocumentMutation::Index {
             doc_id: "same".into(),
             source: source(),
@@ -132,7 +141,7 @@ fn replica_single_wal_bytes_and_sequence_receipts_are_unchanged() {
             1,
             7,
             WalOperation::Index,
-            json!({"_doc_id": "same", "_source": source()}),
+            json!({"_doc_id": "same", "_source": source(), "_version": 2}),
         )
         .unwrap();
 
@@ -140,6 +149,7 @@ fn replica_single_wal_bytes_and_sequence_receipts_are_unchanged() {
         .apply_replica_operation(SequencedOperation {
             seq_no: 0,
             primary_term: 7,
+            document_version: 1,
             mutation: DocumentMutation::Index {
                 doc_id: "same".into(),
                 source: json!({"body": "older"}),
@@ -154,7 +164,7 @@ fn replica_single_wal_bytes_and_sequence_receipts_are_unchanged() {
             0,
             7,
             WalOperation::Index,
-            json!({"_doc_id": "same", "_source": {"body": "older"}}),
+            json!({"_doc_id": "same", "_source": {"body": "older"}, "_version": 1}),
         )
         .unwrap();
     assert_eq!(
@@ -181,6 +191,7 @@ fn replica_bulk_keeps_physical_wal_order_stale_apply_and_redelivery() {
         SequencedOperation {
             seq_no: 2,
             primary_term: 7,
+            document_version: 2,
             mutation: DocumentMutation::Index {
                 doc_id: "same".into(),
                 source: source(),
@@ -189,6 +200,7 @@ fn replica_bulk_keeps_physical_wal_order_stale_apply_and_redelivery() {
         SequencedOperation {
             seq_no: 0,
             primary_term: 7,
+            document_version: 1,
             mutation: DocumentMutation::Index {
                 doc_id: "same".into(),
                 source: json!({"body": "older"}),
@@ -197,6 +209,7 @@ fn replica_bulk_keeps_physical_wal_order_stale_apply_and_redelivery() {
         SequencedOperation {
             seq_no: 1,
             primary_term: 7,
+            document_version: 0,
             mutation: DocumentMutation::NoOp {
                 reason: "gap \"fill\"".into(),
             },
@@ -204,6 +217,7 @@ fn replica_bulk_keeps_physical_wal_order_stale_apply_and_redelivery() {
         SequencedOperation {
             seq_no: 3,
             primary_term: 7,
+            document_version: 1,
             mutation: DocumentMutation::Delete {
                 doc_id: "missing".into(),
             },
@@ -215,11 +229,19 @@ fn replica_bulk_keeps_physical_wal_order_stale_apply_and_redelivery() {
             let (op, payload) = match &operation.mutation {
                 DocumentMutation::Index { doc_id, source } => (
                     WalOperation::Index,
-                    json!({"_doc_id": doc_id, "_source": source}),
+                    json!({
+                        "_doc_id": doc_id,
+                        "_source": source,
+                        "_version": operation.document_version
+                    }),
                 ),
-                DocumentMutation::Delete { doc_id } => {
-                    (WalOperation::Delete, json!({"_doc_id": doc_id}))
-                }
+                DocumentMutation::Delete { doc_id } => (
+                    WalOperation::Delete,
+                    json!({
+                        "_doc_id": doc_id,
+                        "_version": operation.document_version
+                    }),
+                ),
                 DocumentMutation::NoOp { reason } => {
                     (WalOperation::NoOp, json!({"_reason": reason}))
                 }

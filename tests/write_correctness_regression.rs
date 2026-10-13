@@ -293,12 +293,15 @@ fn writes_regression_replay_flush_and_committed_conditions_preserve_identity() {
     let directory = tempfile::tempdir().unwrap();
     let last = {
         let engine = open(directory.path());
-        engine
+        let first = engine
             .add_document_with_receipt("doc", json!({"value": 1}))
             .unwrap();
-        engine
+        assert_eq!(first.version, 1);
+        let second = engine
             .add_document_with_receipt("doc", json!({"value": 2}))
-            .unwrap()
+            .unwrap();
+        assert_eq!(second.version, 2);
+        second
     };
     let engine = open(directory.path());
     let document = engine
@@ -307,6 +310,7 @@ fn writes_regression_replay_flush_and_committed_conditions_preserve_identity() {
         .unwrap();
     assert_eq!(document.source, json!({"value": 2}));
     assert_eq!(document.seq_no, last.seq_no);
+    assert_eq!(document.version, last.version);
     engine.flush().unwrap();
     assert!(
         engine
@@ -321,6 +325,7 @@ fn writes_regression_replay_flush_and_committed_conditions_preserve_identity() {
         .unwrap();
     assert_eq!(document.seq_no, last.seq_no);
     assert_eq!(document.primary_term, last.primary_term);
+    assert_eq!(document.version, last.version);
     engine.refresh().unwrap();
     let next = engine
         .add_document_with_condition_at_term(
@@ -334,6 +339,7 @@ fn writes_regression_replay_flush_and_committed_conditions_preserve_identity() {
         )
         .unwrap();
     assert_eq!(next.seq_no, last.seq_no + 1);
+    assert_eq!(next.version, last.version + 1);
     assert_eq!(
         engine
             .get_document_with_metadata("doc", false)
@@ -347,8 +353,8 @@ fn writes_regression_replay_flush_and_committed_conditions_preserve_identity() {
             .get_document_with_metadata("doc", true)
             .unwrap()
             .unwrap()
-            .source,
-        json!({"value": 3})
+            .version,
+        next.version
     );
 }
 
@@ -364,12 +370,14 @@ fn writes_regression_primary_bulk_and_out_of_order_replica_reads_use_correct_wal
         ])
         .unwrap();
     assert_eq!(receipt.created, [true, false, true]);
+    assert_eq!(receipt.versions, [1, 2, 1]);
     let current = primary
         .get_document_with_metadata("doc", true)
         .unwrap()
         .unwrap();
     assert_eq!(current.source, json!({"value": 2}));
     assert_eq!(current.seq_no, 1);
+    assert_eq!(current.version, 2);
     let replica_directory = tempfile::tempdir().unwrap();
     let replica = open(replica_directory.path());
     replica
@@ -377,6 +385,7 @@ fn writes_regression_primary_bulk_and_out_of_order_replica_reads_use_correct_wal
             SequencedOperation {
                 seq_no: 2,
                 primary_term: receipt.primary_term,
+                document_version: receipt.versions[2],
                 mutation: DocumentMutation::Index {
                     doc_id: "other".into(),
                     source: json!({"value": 3}),
@@ -385,6 +394,7 @@ fn writes_regression_primary_bulk_and_out_of_order_replica_reads_use_correct_wal
             SequencedOperation {
                 seq_no: 1,
                 primary_term: receipt.primary_term,
+                document_version: receipt.versions[1],
                 mutation: DocumentMutation::Index {
                     doc_id: "doc".into(),
                     source: json!({"value": 2}),
@@ -393,6 +403,7 @@ fn writes_regression_primary_bulk_and_out_of_order_replica_reads_use_correct_wal
             SequencedOperation {
                 seq_no: 0,
                 primary_term: receipt.primary_term,
+                document_version: receipt.versions[0],
                 mutation: DocumentMutation::Index {
                     doc_id: "doc".into(),
                     source: json!({"value": 1}),
@@ -411,6 +422,7 @@ fn writes_regression_primary_bulk_and_out_of_order_replica_reads_use_correct_wal
         .apply_replica_operation(SequencedOperation {
             seq_no: 3,
             primary_term: receipt.primary_term,
+            document_version: 3,
             mutation: DocumentMutation::Delete {
                 doc_id: "doc".into(),
             },
@@ -449,6 +461,7 @@ fn writes_regression_replay_positions_follow_physical_order_across_committed_ski
                 .apply_replica_operation(SequencedOperation {
                     seq_no,
                     primary_term: 1,
+                    document_version: seq_no + 1,
                     mutation: DocumentMutation::Index {
                         doc_id: doc_id.to_string(),
                         source: json!({"value": seq_no}),
@@ -462,6 +475,7 @@ fn writes_regression_replay_positions_follow_physical_order_across_committed_ski
                 .apply_replica_operation(SequencedOperation {
                     seq_no,
                     primary_term: 1,
+                    document_version: seq_no + 1,
                     mutation: DocumentMutation::Index {
                         doc_id: doc_id.to_string(),
                         source: json!({"value": seq_no}),
@@ -553,6 +567,7 @@ fn writes_regression_bulk_reuses_initial_versions_without_changing_ordered_resul
         ])
         .unwrap();
     assert_eq!(receipt.created, vec![false, true, false, true, false]);
+    assert_eq!(receipt.versions, vec![2, 1, 2, 3, 4]);
     for (doc_id, value, offset) in [("existing", 2, 0), ("new", 4, 2), ("deleted", 6, 4)] {
         let document = engine
             .get_document_with_metadata(doc_id, true)
@@ -560,6 +575,76 @@ fn writes_regression_bulk_reuses_initial_versions_without_changing_ordered_resul
             .unwrap();
         assert_eq!(document.source, json!({"value": value}));
         assert_eq!(document.seq_no, receipt.start_seq_no.unwrap() + offset);
+        assert_eq!(document.version, receipt.versions[offset as usize]);
+    }
+}
+
+#[test]
+fn writes_regression_tombstones_own_versions_across_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let absent_delete = {
+        let engine = open(directory.path());
+        let absent_delete = engine.delete_document_with_receipt("doc").unwrap();
+        assert_eq!(absent_delete.deleted, 0);
+        assert_eq!(absent_delete.version, 1);
+        let indexed = engine
+            .add_document_with_receipt("doc", json!({"value": 1}))
+            .unwrap();
+        assert_eq!(indexed.version, 2);
+        let deleted = engine.delete_document_with_receipt("doc").unwrap();
+        assert_eq!(deleted.deleted, 1);
+        assert_eq!(deleted.version, 3);
+        engine.flush().unwrap();
+        deleted
+    };
+    let engine = open(directory.path());
+    assert!(
+        engine
+            .get_document_with_metadata("doc", true)
+            .unwrap()
+            .is_none()
+    );
+    let indexed = engine
+        .add_document_with_receipt("doc", json!({"value": 2}))
+        .unwrap();
+    assert_eq!(indexed.seq_no, absent_delete.seq_no + 1);
+    assert_eq!(indexed.version, absent_delete.version + 1);
+    assert_eq!(
+        engine
+            .get_document_with_metadata("doc", true)
+            .unwrap()
+            .unwrap()
+            .version,
+        indexed.version
+    );
+}
+
+#[test]
+fn writes_regression_rejects_invalid_sequenced_document_versions_before_wal() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    for operation in [
+        SequencedOperation {
+            seq_no: 0,
+            primary_term: 1,
+            document_version: 0,
+            mutation: DocumentMutation::Index {
+                doc_id: "doc".into(),
+                source: json!({"value": 1}),
+            },
+        },
+        SequencedOperation {
+            seq_no: 0,
+            primary_term: 1,
+            document_version: 1,
+            mutation: DocumentMutation::NoOp {
+                reason: "invalid version".into(),
+            },
+        },
+    ] {
+        let error = engine.apply_replica_operation(operation).unwrap_err();
+        assert!(error.to_string().contains("document version"), "{error:#}");
+        assert_eq!(engine.wal_max_seq_no(), None);
     }
 }
 

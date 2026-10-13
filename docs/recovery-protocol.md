@@ -522,6 +522,13 @@ Per-document last-operation metadata and delete tombstones protect OCC and
 replay ordering. Retransmission of an already verified operation is idempotent;
 the same position/operation ID with different content is a hard history conflict.
 Do not apply an old update over a newer value merely because the RPC was retried.
+The implemented `local_shards` path also preserves the primary-assigned
+internal document version in WAL, replication, and peer-recovery operations.
+Committed delete entries remain retained while their in-memory tombstones are
+within the configured retention window; restart and primary activation rebuild
+those versions from retained WAL before suffix replay. Missing or zero versions
+on index/delete operations are corruption or invalid transport input, not a
+signal to derive a value from `seq_no`.
 
 Validation precedes sequence reservation when possible. A reserved gap needs a
 durable no-op before advancing its prefix, and the original attempt must be
