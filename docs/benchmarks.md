@@ -1,5 +1,16 @@
 # FerrisSearch Benchmarks
 
+For the current correctness-first, machine-readable baseline matrix, use the
+[reproducible baseline harness](reproducible-baselines.md). It runs both
+`local_shards` and `remote_store`, retains every latency sample and resource
+snapshot in JSON, and generates its Markdown summary without manual result
+editing.
+
+The measurements below are historical reports produced by older,
+workload-specific scripts. Keep their stated environments and limitations
+attached; do not treat them as substitutes for a fresh reproducible-baseline
+run.
+
 The [September 22, 2026 terms aggregation benchmark](terms-aggregation-benchmark-2026-09-22.md)
 compares the bounded dense ordinal counter against the preserved unchanged
 release binary on byte-identical Tantivy segments, with a high-cardinality

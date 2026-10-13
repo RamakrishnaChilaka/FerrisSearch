@@ -1,0 +1,29 @@
+{
+  "profiles": [
+    "local_shards",
+    "remote_store"
+  ],
+  "build": {
+    "rustflags": "-C target-cpu=native",
+    "features": [],
+    "cargo_args": []
+  },
+  "topology": {
+    "nodes": 3,
+    "local_shards": 3,
+    "replicas": 1,
+    "http_port_base": 19200,
+    "transport_port_base": 19300
+  },
+  "dataset": {
+    "documents": 10000,
+    "seed": 20261013,
+    "bulk_batch_size": 1000,
+    "publish_batch_size": 2500
+  },
+  "execution": {
+    "warmup_rounds": 3,
+    "measured_rounds": 20,
+    "concurrency": 4
+  }
+}

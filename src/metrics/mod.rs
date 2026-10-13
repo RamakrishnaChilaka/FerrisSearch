@@ -322,6 +322,36 @@ pub static COLUMN_CACHE_BUDGET_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
     gauge
 });
 
+pub static OBJECT_STORE_REQUESTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "ferrissearch_object_store_requests_total",
+            "Object-store requests by operation and outcome",
+        ),
+        &["operation", "outcome"],
+    )
+    .expect("metric: object_store_requests_total");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: object_store_requests_total");
+    counter
+});
+
+pub static OBJECT_STORE_TRANSFER_BYTES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "ferrissearch_object_store_transfer_bytes_total",
+            "Successfully transferred object-store payload bytes by direction",
+        ),
+        &["direction"],
+    )
+    .expect("metric: object_store_transfer_bytes_total");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: object_store_transfer_bytes_total");
+    counter
+});
+
 fn set_column_cache_budget_gauges(
     effective_memory_gauge: &IntGauge,
     cache_budget_gauge: &IntGauge,
@@ -359,6 +389,20 @@ fn initialize_metrics() {
     let _ = &*PROCESS_START_TIME_SECONDS;
     let _ = &*COLUMN_CACHE_EFFECTIVE_MEMORY_BYTES;
     let _ = &*COLUMN_CACHE_BUDGET_BYTES;
+    let _ = &*OBJECT_STORE_REQUESTS_TOTAL;
+    let _ = &*OBJECT_STORE_TRANSFER_BYTES_TOTAL;
+}
+
+pub fn record_object_store_request(operation: &str, outcome: &str) {
+    OBJECT_STORE_REQUESTS_TOTAL
+        .with_label_values(&[operation, outcome])
+        .inc();
+}
+
+pub fn record_object_store_transfer(direction: &str, bytes: usize) {
+    OBJECT_STORE_TRANSFER_BYTES_TOTAL
+        .with_label_values(&[direction])
+        .inc_by(bytes as u64);
 }
 
 pub fn set_column_cache_budget_metrics(
@@ -509,6 +553,8 @@ mod tests {
         CLUSTER_SHARDS.with_label_values(&["replica"]).set(6);
         INDEX_DOCS.with_label_values(&["test-index"]).set(1000.0);
         IS_MASTER.set(1);
+        record_object_store_request("get", "success");
+        record_object_store_transfer("download", 1024);
 
         let output = gather();
         assert!(output.contains("ferrissearch_http_requests_total"));
@@ -526,6 +572,8 @@ mod tests {
         assert!(output.contains("ferrissearch_cluster_shards"));
         assert!(output.contains("ferrissearch_index_docs"));
         assert!(output.contains("ferrissearch_is_master"));
+        assert!(output.contains("ferrissearch_object_store_requests_total"));
+        assert!(output.contains("ferrissearch_object_store_transfer_bytes_total"));
         assert!(output.contains("process_cpu_seconds_total"));
         assert!(output.contains("process_resident_memory_bytes"));
         assert!(output.contains("process_open_fds"));

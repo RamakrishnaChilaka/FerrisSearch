@@ -107,6 +107,11 @@ Do not run the local operation inline before remote dispatch begins.
   explicitly disabled cache, not a total-process memory ceiling.
 - Preserve SQL execution-mode and remote pruning visibility when refactoring
   response metadata.
+- Object-store GET/PUT attempts use
+  `ferrissearch_object_store_requests_total{operation,outcome}`. Successful
+  logical payload bytes use
+  `ferrissearch_object_store_transfer_bytes_total{direction}`. Keep labels
+  bounded and do not reinterpret these counters as provider billing bytes.
 
 The roadmap requires request/query IDs across HTTP, gRPC, split assignment, and
 object-store work. When adding tracing, use bounded attributes and propagate

@@ -636,6 +636,7 @@ scripts. Existing results are exploratory single-machine measurements—not
 service-level promises or proof of production scale.
 
 - [Benchmark notes and reproduction](docs/benchmarks.md)
+- [Reproducible local-shard and remote-store baselines](docs/reproducible-baselines.md)
 - [Terms aggregation optimization benchmark](docs/terms-aggregation-benchmark-2026-09-22.md)
 - [NYC Taxi hybrid benchmark](docs/nyc-taxi-hybrid-benchmark.md)
 - [Remote-store pruning design and evidence](docs/remote-store-split-pruning.md)
