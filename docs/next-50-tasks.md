@@ -274,7 +274,15 @@ link to the matrix rather than using broad compatibility language.
 
 **Class:** Research opportunity | **Gate:** 0 | **Depends on:** none
 
-**Evidence:** benchmark scripts and historical results do not yet form one
+**Status (2026-10-13):** Complete. `scripts/repro_baseline.py` and the
+checked-in FS-008 profile run an isolated three-node matrix for `local_shards`
+and `remote_store`, validate every response against a deterministic exact
+oracle, retain raw JSON samples and resource/object-store counter deltas, and
+generate the human summary automatically. The reproduction and external
+S3-compatible skipped/pass/failed contract are documented in
+`docs/reproducible-baselines.md`.
+
+**Prior evidence:** benchmark scripts and historical results did not form one
 repeatable matrix with hardware, dataset, correctness, cache, durability, and
 resource-cost controls.
 

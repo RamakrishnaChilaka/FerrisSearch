@@ -99,6 +99,10 @@ best-effort fallbacks.
   otherwise.
 - Keep object-store bytes, extraction work, open-reader memory, and Tantivy
   reader memory distinct in metrics and future reservations.
+- Route object GET/PUT operations through `StorageManager`'s metered helpers.
+  Record one bounded request outcome per attempt and successful logical
+  transfer bytes only after payload completion; do not bypass the counters
+  with direct backend calls.
 - Do not hold global cache locks across network or filesystem awaits.
 
 ## Root And Leaf Execution

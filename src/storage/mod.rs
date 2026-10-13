@@ -19,8 +19,8 @@
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use object_store::{
-    ObjectStore, ObjectStoreExt, PutPayload, aws::AmazonS3Builder, local::LocalFileSystem,
-    path::Path as ObjectPath,
+    GetResult, ObjectStore, ObjectStoreExt, PutPayload, aws::AmazonS3Builder,
+    local::LocalFileSystem, path::Path as ObjectPath,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -593,12 +593,22 @@ impl StorageManager {
             );
         }
         let object_path = self.object_path(&split.bundle_path)?;
-        let mut stream = self.object_store().get(&object_path).await?.into_stream();
+        let mut stream = self.get_object(&object_path).await?.into_stream();
         let mut hasher = Sha256::new();
+        let mut downloaded_bytes = 0usize;
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    crate::metrics::record_object_store_request("get", "error");
+                    return Err(anyhow::Error::from(error));
+                }
+            };
+            downloaded_bytes += chunk.len();
             hasher.update(&chunk);
         }
+        crate::metrics::record_object_store_request("get", "success");
+        crate::metrics::record_object_store_transfer("download", downloaded_bytes);
         Ok(format!("sha256:{:x}", hasher.finalize()))
     }
 
@@ -629,15 +639,23 @@ impl StorageManager {
     /// future PR can switch to a file-backed staging buffer for very large
     /// bundles.
     async fn download_and_hash(&self, key: &ObjectPath) -> Result<(Vec<u8>, String)> {
-        let mut stream = self.object_store().get(key).await?.into_stream();
+        let mut stream = self.get_object(key).await?.into_stream();
         let mut buf: Vec<u8> = Vec::new();
         let mut hasher = Sha256::new();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    crate::metrics::record_object_store_request("get", "error");
+                    return Err(anyhow::Error::from(error));
+                }
+            };
             hasher.update(&chunk);
             buf.extend_from_slice(&chunk);
         }
         let checksum = format!("sha256:{:x}", hasher.finalize());
+        crate::metrics::record_object_store_request("get", "success");
+        crate::metrics::record_object_store_transfer("download", buf.len());
         Ok((buf, checksum))
     }
 
@@ -668,16 +686,46 @@ impl StorageManager {
     }
 
     pub async fn put(&self, location: &ObjectPath, payload: impl Into<PutPayload>) -> Result<()> {
-        self.object_store()
-            .put(location, payload.into())
-            .await
-            .map(|_| ())
-            .map_err(anyhow::Error::from)
+        let payload = payload.into();
+        let content_length = payload.content_length();
+        match self.object_store().put(location, payload).await {
+            Ok(_) => {
+                crate::metrics::record_object_store_request("put", "success");
+                crate::metrics::record_object_store_transfer("upload", content_length);
+                Ok(())
+            }
+            Err(error) => {
+                crate::metrics::record_object_store_request("put", "error");
+                Err(anyhow::Error::from(error))
+            }
+        }
+    }
+
+    async fn get_object(&self, location: &ObjectPath) -> object_store::Result<GetResult> {
+        match self.object_store().get(location).await {
+            Ok(result) => Ok(result),
+            Err(error @ object_store::Error::NotFound { .. }) => {
+                crate::metrics::record_object_store_request("get", "not_found");
+                Err(error)
+            }
+            Err(error) => {
+                crate::metrics::record_object_store_request("get", "error");
+                Err(error)
+            }
+        }
     }
 
     pub async fn get_bytes(&self, location: &ObjectPath) -> Result<Vec<u8>> {
-        let result = self.object_store().get(location).await?;
-        let bytes = result.bytes().await?;
+        let result = self.get_object(location).await?;
+        let bytes = match result.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                crate::metrics::record_object_store_request("get", "error");
+                return Err(anyhow::Error::from(error));
+            }
+        };
+        crate::metrics::record_object_store_request("get", "success");
+        crate::metrics::record_object_store_transfer("download", bytes.len());
         Ok(bytes.to_vec())
     }
 
@@ -696,9 +744,17 @@ impl StorageManager {
         index_uuid: &str,
     ) -> Result<Option<RemoteManifestPointer>> {
         let location = self.object_path(&manifest_pointer_key(index_uuid))?;
-        match self.object_store().get(&location).await {
+        match self.get_object(&location).await {
             Ok(result) => {
-                let bytes = result.bytes().await?;
+                let bytes = match result.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        crate::metrics::record_object_store_request("get", "error");
+                        return Err(anyhow::Error::from(error));
+                    }
+                };
+                crate::metrics::record_object_store_request("get", "success");
+                crate::metrics::record_object_store_transfer("download", bytes.len());
                 let pointer: RemoteManifestPointer =
                     serde_json::from_slice(&bytes).map_err(|error| {
                         crate::common::unsupported_index_format(
@@ -735,11 +791,18 @@ impl StorageManager {
     ) -> Result<RemoteStoreManifest> {
         let location = self.object_path(&manifest_generation_key(index_uuid, generation))?;
         let result = self
-            .object_store()
-            .get(&location)
+            .get_object(&location)
             .await
             .with_context(|| format!("manifest generation {generation} not found"))?;
-        let bytes = result.bytes().await?;
+        let bytes = match result.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                crate::metrics::record_object_store_request("get", "error");
+                return Err(anyhow::Error::from(error));
+            }
+        };
+        crate::metrics::record_object_store_request("get", "success");
+        crate::metrics::record_object_store_transfer("download", bytes.len());
         let manifest: RemoteStoreManifest = serde_json::from_slice(&bytes).map_err(|error| {
             crate::common::unsupported_index_format(
                 "remote store manifest",
