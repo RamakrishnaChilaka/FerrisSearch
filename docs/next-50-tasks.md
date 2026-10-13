@@ -6,10 +6,10 @@
 >
 > **Current-behavior authority:** source and tests.
 >
-> **Last source audit:** 2026-10-13 for FS-003; 2026-10-09 for FS-002;
-> 2026-10-08 for FS-001 and FS-007; 2026-10-05 for FS-013; 2026-10-04 for
-> FS-012; 2026-09-27 for FS-014, FS-019, and FS-022 through FS-026, after PRs
-> #142-#144. Other tasks were last audited on 2026-07-10.
+> **Last source audit:** 2026-10-13 for FS-003 and FS-004; 2026-10-09 for
+> FS-002; 2026-10-08 for FS-001 and FS-007; 2026-10-05 for FS-013; 2026-10-04
+> for FS-012; 2026-09-27 for FS-014, FS-019, and FS-022 through FS-026, after
+> PRs #142-#144. Other tasks were last audited on 2026-07-10.
 
 This is a dependency-aware sequence, not a feature wish list. Rank expresses
 current strategic importance; a task still waits for every listed dependency.
@@ -205,6 +205,14 @@ query.
 ### FS-004 — Decide The Unified Lifecycle And Migration Model
 
 **Class:** Release blocker | **Gate:** 0 | **Depends on:** FS-001, FS-003
+
+**Status (2026-10-13):** Complete. Accepted
+[ADR 0004](adr/0004-unified-lifecycle-and-migration-model.md) defines one
+primary-owned logical operation/version model across mutable and immutable
+storage, explicit mutable-only/immutable-only/tiered policies, resumable
+sealing, tiered read routing, direct CRUD restrictions, conditional
+local-to-tiered migration, and forward-moving rollback. Runtime implementation
+remains roadmap work.
 
 **Evidence:** `local_shards` and `remote_store` currently expose different data
 and consistency lifecycles; `src/indexing/mod.rs` is only a placeholder.
