@@ -1,25 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== 1/7 Check formatting ==="
+echo "=== 1/8 Check OpenSearch compatibility inventory ==="
+python3 scripts/check_opensearch_compatibility.py
+
+echo "=== 2/8 Check formatting ==="
 cargo fmt --check
 
-echo "=== 2/7 Clippy lints ==="
+echo "=== 3/8 Clippy lints ==="
 cargo clippy --all-targets --all-features -- -D warnings
 
-echo "=== 3/7 Build ==="
+echo "=== 4/8 Build ==="
 cargo build
 
-echo "=== 4/7 Run tests ==="
+echo "=== 5/8 Run tests ==="
 cargo test
 
-echo "=== 5/7 Build write fault-test harnesses ==="
+echo "=== 6/8 Build write fault-test harnesses ==="
 cargo test --features protocol-trace --lib --test d1_protocol_trace --test stale_primary_failover --no-run
 
-echo "=== 6/7 Validate write fault evidence ==="
+echo "=== 7/8 Validate write fault evidence ==="
 ./scripts/tla/test_d1_protocol_trace_ci.sh
 
-echo "=== 7/7 Run bounded TLA+ checks ==="
+echo "=== 8/8 Run bounded TLA+ checks ==="
 ./scripts/tla/check.sh
 
 # ── Change-locality advisory ──────────────────────────────────────────

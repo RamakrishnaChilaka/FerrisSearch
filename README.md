@@ -39,7 +39,9 @@ It combines [Tantivy](https://github.com/quickwit-oss/tantivy),
 
 FerrisSearch is **pre-1.0**. It has substantial working code and broad automated
 coverage, but it is not yet a production-safe drop-in replacement for
-OpenSearch. The [maturity section](#current-maturity) names the important gaps.
+OpenSearch. The [compatibility matrix](docs/opensearch-compatibility.md)
+classifies every routed endpoint and the [maturity section](#current-maturity)
+names broader architecture and operations gaps.
 
 ## Why FerrisSearch
 
@@ -596,7 +598,9 @@ production ready**. The most important limits are:
   not share one complete resource budget.
 - End-to-end cancellation, deadline propagation, and admission control are
   incomplete.
-- OpenSearch compatibility is a tested subset, not a drop-in contract.
+- OpenSearch compatibility is a tested subset, not a drop-in contract. See the
+  [versioned compatibility matrix](docs/opensearch-compatibility.md) for every
+  routed endpoint, important semantic differences, and unsupported surfaces.
 - Security is API-key based and opt-in; there is no SSO/OIDC/LDAP layer.
 
 These are ranked as engineering work, not hidden as caveats:
@@ -605,6 +609,9 @@ These are ranked as engineering work, not hidden as caveats:
 ## API Surface
 
 FerrisSearch intentionally exposes an OpenSearch-style REST API **subset**.
+The table below is only a navigation summary; the
+[compatibility matrix](docs/opensearch-compatibility.md) is the canonical
+endpoint and semantics inventory.
 
 | Area | Representative endpoints |
 |---|---|
@@ -683,6 +690,7 @@ Read:
 |---|---|
 | [Architecture roadmap](docs/architecture-roadmap.md) | Canonical future direction and release gates |
 | [AI agent guide](docs/ai-agent-guide.md) | Context, planning, validation, and handoff rules for GPT/Claude/Copilot |
+| [OpenSearch compatibility matrix](docs/opensearch-compatibility.md) | Versioned endpoint, semantic-difference, evidence, and unsupported-surface inventory |
 | [Remote-store live runbook](docs/remote-store-rustfs-live-runbook.md) | Shared S3-compatible storage validation |
 | [Dynamic settings](docs/dynamic-settings.md) | Refresh and flush-threshold behavior |
 | [Vector search](docs/vector-search.md) | Current vector architecture and examples |

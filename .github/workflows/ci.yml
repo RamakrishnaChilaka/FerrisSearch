@@ -43,6 +43,9 @@ jobs:
           path: ~/.cache/ferrissearch-tla
           key: ${{ runner.os }}-tla2tools-1.7.4
 
+      - name: Check OpenSearch compatibility inventory
+        run: python3 scripts/check_opensearch_compatibility.py
+
       - name: Check formatting
         run: cargo fmt --check
 
