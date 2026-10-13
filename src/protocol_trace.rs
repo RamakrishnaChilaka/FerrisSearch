@@ -647,6 +647,11 @@ pub fn route_client_write(
     let (_, op, hash) = operation_parts(&SequencedOperation {
         seq_no: 0,
         primary_term: 1,
+        document_version: if matches!(mutation, DocumentMutation::NoOp { .. }) {
+            0
+        } else {
+            1
+        },
         mutation: mutation.clone(),
     });
     with_state(|state| {
@@ -2385,6 +2390,7 @@ mod tests {
             &SequencedOperation {
                 seq_no: 0,
                 primary_term: 1,
+                document_version: 1,
                 mutation: DocumentMutation::Index {
                     doc_id: "d".into(),
                     source: json!({"value": 1}),
@@ -2412,6 +2418,7 @@ mod tests {
         let operation = SequencedOperation {
             seq_no: 0,
             primary_term: 1,
+            document_version: 1,
             mutation: DocumentMutation::Index {
                 doc_id: "d".into(),
                 source: json!({"value": 1}),
@@ -2455,6 +2462,7 @@ mod tests {
         let primary_operation = SequencedOperation {
             seq_no: 0,
             primary_term: 1,
+            document_version: 1,
             mutation: DocumentMutation::Index {
                 doc_id: "x".into(),
                 source: json!({"value": "primary"}),
@@ -2463,6 +2471,7 @@ mod tests {
         let replica_operation = SequencedOperation {
             seq_no: 0,
             primary_term: 1,
+            document_version: 1,
             mutation: DocumentMutation::Index {
                 doc_id: "y".into(),
                 source: json!({"value": "replica"}),
@@ -2551,6 +2560,7 @@ mod tests {
         let operation = SequencedOperation {
             seq_no: 0,
             primary_term: 1,
+            document_version: 1,
             mutation: DocumentMutation::Delete { doc_id: "d".into() },
         };
         let older = route_client_write("p", "idx", 0, "p", "d", &operation.mutation).unwrap();

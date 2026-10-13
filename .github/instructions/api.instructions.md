@@ -322,8 +322,11 @@ Retain only the original patch/upsert input when another retry is possible.
 `detect_noop` defaults to true and consumes no sequence. Accept only `doc`,
 `upsert`, `doc_as_upsert`, and `detect_noop` body keys; unknown keys are
 400 `illegal_argument_exception`, not document-source mapper errors.
-Write responses omit `_version`. Client retry identity, external versions,
-and all-copy refresh remain unimplemented.
+Successful single/bulk index, update, and delete responses carry the
+primary-assigned nonzero `_version`; found GET responses carry the stored
+version. A detected update no-op returns the current version without consuming
+a sequence or version. Client retry identity and external version
+preconditions remain unimplemented.
 
 Declared keyword fields accept nested arrays of string/number/boolean scalars,
 flatten and coerce them to text for indexing, ignore nulls, and deduplicate a

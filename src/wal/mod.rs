@@ -10,10 +10,10 @@
 //! Each entry is stored as a length-prefixed bincode frame:
 //!
 //! ```text
-//! [u32 LE: payload_len] [payload_len bytes: bincode-encoded WireEntryV2]
+//! [u32 LE: payload_len] [payload_len bytes: bincode-encoded WireEntryV3]
 //! ```
 //!
-//! Each v2 entry carries its format version, primary term, sequence number,
+//! Each v3 entry carries its format version, primary term, sequence number,
 //! operation type, and JSON payload.
 
 use anyhow::{Context, Result};
@@ -41,7 +41,7 @@ pub enum TranslogDurability {
 
 const BINCODE_CONFIG: bincode_next::config::Configuration = bincode_next::config::standard();
 const TRANSLOG_MANIFEST_FILE: &str = "translog.manifest";
-pub(crate) const TRANSLOG_ENTRY_FORMAT_VERSION: u32 = 2;
+pub(crate) const TRANSLOG_ENTRY_FORMAT_VERSION: u32 = 3;
 const TRANSLOG_MANIFEST_VERSION: u32 = 2;
 const TRANSLOG_SEQNO_FILE: &str = "translog.seqno";
 const TRANSLOG_FILE_PREFIX: &str = "translog-";
@@ -146,10 +146,14 @@ pub enum WalDocumentOperation<'a> {
         doc_id: &'a str,
         #[serde(rename = "_source")]
         source: &'a serde_json::Value,
+        #[serde(rename = "_version")]
+        version: u64,
     },
     Delete {
         #[serde(rename = "_doc_id")]
         doc_id: &'a str,
+        #[serde(rename = "_version")]
+        version: u64,
     },
     NoOp {
         #[serde(rename = "_reason")]
@@ -212,6 +216,17 @@ pub(crate) fn document_operation(entry: &TranslogEntry) -> Result<WalDocumentOpe
                 entry.seq_no
             ))
         })?;
+    let version = entry
+        .payload
+        .get("_version")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|version| *version > 0)
+        .ok_or_else(|| {
+            wal_corruption(format!(
+                "translog operation {} has no nonzero _version",
+                entry.seq_no
+            ))
+        })?;
     match entry.op {
         WalOperation::Index => {
             let source = entry.payload.get("_source").ok_or_else(|| {
@@ -220,9 +235,13 @@ pub(crate) fn document_operation(entry: &TranslogEntry) -> Result<WalDocumentOpe
                     entry.seq_no
                 ))
             })?;
-            Ok(WalDocumentOperation::Index { doc_id, source })
+            Ok(WalDocumentOperation::Index {
+                doc_id,
+                source,
+                version,
+            })
         }
-        WalOperation::Delete => Ok(WalDocumentOperation::Delete { doc_id }),
+        WalOperation::Delete => Ok(WalDocumentOperation::Delete { doc_id, version }),
         WalOperation::NoOp => unreachable!("no-op operations return before document validation"),
     }
 }
@@ -329,7 +348,7 @@ impl TranslogReadSnapshot {
 /// `serde_json::Value` uses `deserialize_any()` which bincode doesn't support,
 /// so we serialize the JSON payload to a string first.
 #[derive(Serialize, Deserialize)]
-struct WireEntryV2 {
+struct WireEntryV3 {
     format_version: u32,
     seq_no: u64,
     primary_term: u64,
@@ -346,7 +365,7 @@ struct WireEntryRef<'a> {
     payload_json: &'a str,
 }
 
-impl WireEntryV2 {
+impl WireEntryV3 {
     #[cfg(test)]
     fn from_translog(entry: &TranslogEntry) -> Result<Self> {
         validate_entry_identity(entry.primary_term, entry.op, &entry.payload)?;
@@ -589,7 +608,7 @@ pub trait WriteAheadLog: Send + Sync {
 /// Encode a `TranslogEntry` into a length-prefixed binary frame.
 #[cfg(test)]
 fn encode_entry(entry: &TranslogEntry) -> Result<Vec<u8>> {
-    let wire = WireEntryV2::from_translog(entry)?;
+    let wire = WireEntryV3::from_translog(entry)?;
     encode_wire_entry(&wire)
 }
 
@@ -659,12 +678,12 @@ fn checked_frame_bytes(payload_len: usize, max_bytes: usize) -> Result<usize> {
     Ok(frame_bytes)
 }
 
-fn decode_wire_entry(payload: &[u8]) -> Result<WireEntryV2> {
+fn decode_wire_entry(payload: &[u8]) -> Result<WireEntryV3> {
     let declared_version =
         bincode_next::serde::decode_from_slice::<(u32,), _>(payload, BINCODE_CONFIG)
             .ok()
             .map(|((version,), _)| version);
-    match bincode_next::serde::decode_from_slice::<WireEntryV2, _>(payload, BINCODE_CONFIG) {
+    match bincode_next::serde::decode_from_slice::<WireEntryV3, _>(payload, BINCODE_CONFIG) {
         Ok((wire, consumed)) => {
             if wire.format_version != TRANSLOG_ENTRY_FORMAT_VERSION {
                 return Err(unsupported_wal_format(
@@ -770,7 +789,7 @@ fn decode_wire_entry_with_prefix<R: Read>(
     mut prefix: Vec<u8>,
     payload_len: usize,
     expected_seq_no: u64,
-) -> Result<WireEntryV2> {
+) -> Result<WireEntryV3> {
     let prefix_len = prefix.len();
     prefix.resize(payload_len, 0);
     reader.read_exact(&mut prefix[prefix_len..])?;
@@ -2727,7 +2746,7 @@ mod tests {
     }
 
     fn encoded_frame_len(seq_no: u64, op: WalOperation, payload: &serde_json::Value) -> usize {
-        let wire = WireEntryV2 {
+        let wire = WireEntryV3 {
             format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
             seq_no,
             primary_term: 1,
@@ -2746,6 +2765,7 @@ mod tests {
             let payload_json = serde_json::to_string(&WalDocumentOperation::Index {
                 doc_id: "doc",
                 source: &source,
+                version: 1,
             })
             .unwrap();
             let wire = WireEntryRef {
@@ -2782,12 +2802,13 @@ mod tests {
             let operation = WalDocumentOperation::Index {
                 doc_id,
                 source: &source,
+                version: 9,
             };
             let owned = TranslogEntry {
                 seq_no: 258,
                 primary_term: 800,
                 op: WalOperation::Index,
-                payload: json!({"_doc_id": doc_id, "_source": source}),
+                payload: json!({"_doc_id": doc_id, "_source": source, "_version": 9}),
             };
             assert_eq!(
                 encode_document_entry(258, 800, operation).unwrap(),
@@ -2798,9 +2819,10 @@ mod tests {
             (
                 WalDocumentOperation::Delete {
                     doc_id: "quoted\"id",
+                    version: 9,
                 },
                 WalOperation::Delete,
-                json!({"_doc_id": "quoted\"id"}),
+                json!({"_doc_id": "quoted\"id", "_version": 9}),
             ),
             (
                 WalDocumentOperation::NoOp {
@@ -2826,7 +2848,10 @@ mod tests {
     #[test]
     fn borrowed_document_writes_preserve_identity_validation_and_overflow() {
         let (_directory, wal) = open_translog();
-        let operation = WalDocumentOperation::Delete { doc_id: "doc" };
+        let operation = WalDocumentOperation::Delete {
+            doc_id: "doc",
+            version: 1,
+        };
         assert_eq!(wal.write_document_bulk_with_receipt(0, &[]).unwrap(), None);
         wal.write_document_batch_with_seq(&[]).unwrap();
         assert_eq!(
@@ -2876,6 +2901,7 @@ mod tests {
                 WalDocumentOperation::Index {
                     doc_id: "doc",
                     source: &allowed,
+                    version: 1,
                 },
             )
             .unwrap(),
@@ -2887,6 +2913,7 @@ mod tests {
         let operation = WalDocumentOperation::Index {
             doc_id: "doc",
             source: &oversized,
+            version: 2,
         };
         let error = wal.write_document_with_receipt(1, operation).unwrap_err();
         assert!(error.is::<WalFrameTooLargeError>());
@@ -2894,7 +2921,10 @@ mod tests {
         assert_eq!(wal.size_bytes().unwrap(), TEST_MAX_WAL_FRAME_BYTES as u64);
 
         let (_directory, wal) = open_translog();
-        let valid = WalDocumentOperation::Delete { doc_id: "valid" };
+        let valid = WalDocumentOperation::Delete {
+            doc_id: "valid",
+            version: 1,
+        };
         assert!(
             wal.write_document_bulk_with_receipt(1, &[valid, operation])
                 .unwrap_err()
@@ -2938,7 +2968,7 @@ mod tests {
     }
 
     fn encode_entry_without_write_limit(entry: &TranslogEntry) -> Vec<u8> {
-        let wire = WireEntryV2::from_translog(entry).unwrap();
+        let wire = WireEntryV3::from_translog(entry).unwrap();
         let encoded = bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG).unwrap();
         let mut frame = Vec::with_capacity(4 + encoded.len());
         frame.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
@@ -3540,7 +3570,7 @@ mod tests {
 
     #[test]
     fn unknown_entry_version_fails_with_typed_error() {
-        let wire = WireEntryV2 {
+        let wire = WireEntryV3 {
             format_version: TRANSLOG_ENTRY_FORMAT_VERSION + 1,
             seq_no: 0,
             primary_term: 1,
@@ -4273,7 +4303,7 @@ mod tests {
     #[test]
     fn open_returns_error_for_unknown_active_generation_wal_operation() {
         let dir = tempfile::tempdir().unwrap();
-        let wire = WireEntryV2 {
+        let wire = WireEntryV3 {
             format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
             seq_no: 0,
             primary_term: 1,
@@ -4361,7 +4391,7 @@ mod tests {
             payload: json!({"value": 0}),
         })
         .unwrap();
-        let corrupt_wire = WireEntryV2 {
+        let corrupt_wire = WireEntryV3 {
             format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
             seq_no: 1,
             primary_term: 1,

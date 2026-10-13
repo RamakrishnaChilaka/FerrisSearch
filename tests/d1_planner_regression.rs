@@ -17,6 +17,7 @@ fn apply_index(
         .apply_replica_operation(ferrissearch::engine::SequencedOperation {
             seq_no,
             primary_term,
+            document_version: seq_no + 1,
             mutation: ferrissearch::engine::DocumentMutation::Index {
                 doc_id: doc_id.to_string(),
                 source,
@@ -35,6 +36,7 @@ fn apply_delete(
         .apply_replica_operation(ferrissearch::engine::SequencedOperation {
             seq_no,
             primary_term,
+            document_version: seq_no + 1,
             mutation: ferrissearch::engine::DocumentMutation::Delete {
                 doc_id: doc_id.to_string(),
             },
@@ -121,6 +123,7 @@ fn incompatible_same_term_redelivery_fails_without_another_wal_entry() {
             .apply_replica_operation(ferrissearch::engine::SequencedOperation {
                 seq_no: 0,
                 primary_term: 1,
+                document_version: 1,
                 mutation: ferrissearch::engine::DocumentMutation::Index {
                     doc_id: "doc".into(),
                     source: json!({"value": 2}),

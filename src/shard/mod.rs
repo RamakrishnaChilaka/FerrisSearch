@@ -5,7 +5,7 @@
 use crate::cluster::settings::SettingsManager;
 use crate::cluster::state::{AllocationId, IndexSettings};
 use crate::engine::{CompositeEngine, SearchEngine};
-use crate::wal::{HotTranslog, TranslogDurability};
+use crate::wal::{HotTranslog, SequencedWalEntry, TranslogDurability, WalOperation, WriteAheadLog};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::future::Future;
@@ -3554,6 +3554,58 @@ impl ShardManager {
                 .transpose()?
                 .unwrap_or(0);
             HotTranslog::initialize_empty_at(&shard_dir, shard_manager.durability, allocator_next)?;
+            let version_snapshot_name = crate::engine::PEER_RECOVERY_VERSION_SNAPSHOT_FILE;
+            let version_snapshot_path = shard_dir.join("index").join(version_snapshot_name);
+            let version_snapshot: crate::engine::PeerRecoveryVersionSnapshot =
+                serde_json::from_slice(&std::fs::read(&version_snapshot_path)?).map_err(
+                    |error| {
+                        definitive_shard_copy_failure(format!(
+                            "decode peer recovery version snapshot: {error}"
+                        ))
+                    },
+                )?;
+            if version_snapshot.format_version
+                != crate::engine::PEER_RECOVERY_VERSION_SNAPSHOT_FORMAT
+            {
+                return Err(definitive_shard_copy_failure(format!(
+                    "unsupported peer recovery version snapshot format {}; expected {}",
+                    version_snapshot.format_version,
+                    crate::engine::PEER_RECOVERY_VERSION_SNAPSHOT_FORMAT
+                )));
+            }
+            let processed_checkpoint = committed_boundary.processed_checkpoint;
+            let mut seen_doc_ids = std::collections::HashSet::new();
+            let retained_deletes = version_snapshot
+                .deletes
+                .into_iter()
+                .map(|delete| {
+                    if delete.doc_id.is_empty()
+                        || delete.version == 0
+                        || !processed_checkpoint
+                            .is_some_and(|checkpoint| delete.seq_no <= checkpoint)
+                        || !seen_doc_ids.insert(delete.doc_id.clone())
+                    {
+                        return Err(definitive_shard_copy_failure(
+                            "peer recovery version snapshot has an invalid delete entry",
+                        ));
+                    }
+                    Ok(SequencedWalEntry {
+                        seq_no: delete.seq_no,
+                        primary_term: delete.primary_term,
+                        op: WalOperation::Delete,
+                        payload: serde_json::json!({
+                            "_doc_id": delete.doc_id,
+                            "_version": delete.version,
+                        }),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if !retained_deletes.is_empty() {
+                HotTranslog::open_with_durability(&shard_dir, shard_manager.durability)?
+                    .append_batch_with_seq(&retained_deletes)?;
+            }
+            std::fs::remove_file(&version_snapshot_path)?;
+            expected_files.retain(|file| file != version_snapshot_name);
             let committed_path = shard_dir.join("translog.committed");
             committed_boundary.persist(&committed_path)?;
             std::fs::File::open(shard_dir.join("index"))?.sync_all()?;
@@ -4455,6 +4507,7 @@ mod tests {
         engine.apply_replica_operation(crate::engine::SequencedOperation {
             seq_no,
             primary_term,
+            document_version: seq_no + 1,
             mutation: crate::engine::DocumentMutation::Index {
                 doc_id: doc_id.to_string(),
                 source,
@@ -5705,12 +5758,22 @@ mod tests {
         let source = CompositeEngine::new(source_dir.path(), Duration::from_secs(60)).unwrap();
         let source: Arc<dyn SearchEngine> = Arc::new(source);
         apply_index(&source, "doc-1", json!({"value": 1}), 0, 1).unwrap();
-        apply_index(&source, "doc-gap", json!({"value": "filled"}), 1, 1).unwrap();
-        apply_index(&source, "doc-2", json!({"value": 2}), 2, 1).unwrap();
+        source
+            .apply_replica_operation(crate::engine::SequencedOperation {
+                seq_no: 1,
+                primary_term: 1,
+                document_version: 2,
+                mutation: crate::engine::DocumentMutation::Delete {
+                    doc_id: "doc-1".into(),
+                },
+            })
+            .unwrap();
+        apply_index(&source, "doc-gap", json!({"value": "filled"}), 2, 1).unwrap();
+        apply_index(&source, "doc-2", json!({"value": 2}), 3, 1).unwrap();
         let snapshot_dir = source_dir.path().join("peer-recovery/session");
         let snapshot = source.create_peer_recovery_snapshot(&snapshot_dir).unwrap();
-        assert_eq!(snapshot.committed_boundary.processed_checkpoint, Some(2));
-        assert_eq!(snapshot.committed_boundary.max_seq_no, Some(2));
+        assert_eq!(snapshot.committed_boundary.processed_checkpoint, Some(3));
+        assert_eq!(snapshot.committed_boundary.max_seq_no, Some(3));
 
         let target_dir = tempfile::tempdir().unwrap();
         let manager = Arc::new(ShardManager::new(
@@ -5749,9 +5812,13 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(engine.doc_count(), 3);
-        assert_eq!(engine.sequence_stats().processed_checkpoint, Some(2));
-        assert_eq!(engine.sequence_stats().max_seq_no, Some(2));
+        assert_eq!(engine.doc_count(), 2);
+        assert_eq!(engine.sequence_stats().processed_checkpoint, Some(3));
+        assert_eq!(engine.sequence_stats().max_seq_no, Some(3));
+        let recreated = engine
+            .add_document_with_receipt("doc-1", json!({"value": "recreated"}))
+            .unwrap();
+        assert_eq!(recreated.version, 3);
         assert!(!shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER).exists());
         source
             .release_peer_recovery_pin(snapshot.retention_pin_id)

@@ -985,16 +985,35 @@ async fn apply_recovery_operations_cursor(
         if snapshot_processed_checkpoint.is_some_and(|checkpoint| operation.seq_no <= checkpoint) {
             continue;
         }
-        let mutation = match operation.op.as_str() {
-            "index" => crate::engine::DocumentMutation::Index {
-                doc_id: operation.doc_id,
-                source: serde_json::from_slice(&operation.payload_json)
-                    .context("decode peer recovery index payload")?,
-            },
-            "delete" => crate::engine::DocumentMutation::Delete {
-                doc_id: operation.doc_id,
-            },
+        let (mutation, document_version) = match operation.op.as_str() {
+            "index" => (
+                crate::engine::DocumentMutation::Index {
+                    doc_id: operation.doc_id,
+                    source: serde_json::from_slice(&operation.payload_json)
+                        .context("decode peer recovery index payload")?,
+                },
+                operation
+                    .document_version
+                    .filter(|version| *version > 0)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("peer recovery index operation has no document version")
+                    })?,
+            ),
+            "delete" => (
+                crate::engine::DocumentMutation::Delete {
+                    doc_id: operation.doc_id,
+                },
+                operation
+                    .document_version
+                    .filter(|version| *version > 0)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("peer recovery delete operation has no document version")
+                    })?,
+            ),
             "noop" => {
+                if operation.document_version.is_some() {
+                    anyhow::bail!("peer recovery no-op has a document version");
+                }
                 let payload: serde_json::Value = serde_json::from_slice(&operation.payload_json)
                     .context("decode peer recovery no-op payload")?;
                 let reason = payload
@@ -1002,13 +1021,14 @@ async fn apply_recovery_operations_cursor(
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("peer recovery no-op has no _reason"))?
                     .to_string();
-                crate::engine::DocumentMutation::NoOp { reason }
+                (crate::engine::DocumentMutation::NoOp { reason }, 0)
             }
             other => anyhow::bail!("unknown peer recovery operation '{other}'"),
         };
         decoded.push(crate::engine::SequencedOperation {
             seq_no: operation.seq_no,
             primary_term: operation.primary_term,
+            document_version,
             mutation,
         });
     }
@@ -1159,6 +1179,7 @@ mod tests {
             .apply_replica_operation(crate::engine::SequencedOperation {
                 seq_no,
                 primary_term,
+                document_version: seq_no + 1,
                 mutation: crate::engine::DocumentMutation::Index {
                     doc_id: doc_id.to_string(),
                     source,
@@ -1251,6 +1272,7 @@ mod tests {
                     op: "index".into(),
                     doc_id: "a".into(),
                     payload_json: serde_json::to_vec(&serde_json::json!({"value": 1})).unwrap(),
+                    document_version: Some(1),
                 },
                 RecoveryOperation {
                     seq_no: 8,
@@ -1258,6 +1280,7 @@ mod tests {
                     op: "delete".into(),
                     doc_id: "b".into(),
                     payload_json: Vec::new(),
+                    document_version: Some(1),
                 },
             ],
         )
@@ -1278,6 +1301,7 @@ mod tests {
                     op: "delete".into(),
                     doc_id: "a".into(),
                     payload_json: Vec::new(),
+                    document_version: Some(2),
                 },
                 RecoveryOperation {
                     seq_no: 10,
@@ -1285,6 +1309,7 @@ mod tests {
                     op: "delete".into(),
                     doc_id: "b".into(),
                     payload_json: Vec::new(),
+                    document_version: Some(2),
                 },
             ],
         )
@@ -2437,6 +2462,7 @@ mod tests {
                 index_uuid: "pending-uuid".into(),
                 primary_term: Some(2),
                 target_allocation_id: Some(allocation_id),
+                document_version: Some(1),
             }))
             .await
             .unwrap()

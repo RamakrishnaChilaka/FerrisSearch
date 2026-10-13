@@ -16,6 +16,7 @@ pub async fn replicate_write(
     payload: &Value,
     op: &str,          // "index" or "delete"
     seq_no: u64,       // from primary's WAL
+    document_version: u64,
     primary_term: u64,
 ) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>>
 // Err: list of error messages
@@ -27,6 +28,7 @@ pub async fn replicate_bulk(
     shard_id: u32,
     docs: &[(String, Value)],
     start_seq_no: u64,
+    versions: &[u64],
     primary_term: u64,
 ) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>>
 ```
@@ -36,7 +38,8 @@ pub async fn replicate_bulk(
 2. Primary writes to WAL → assigns monotonic `seq_no` or contiguous bulk range
 3. Primary indexes in Tantivy + USearch, updates local checkpoint
 4. The engine returns an operation-owned receipt; the primary calls
-   `replicate_write()` / `replicate_bulk()` with those exact values
+   `replicate_write()` / `replicate_bulk()` with its exact sequence, primary
+   term, and per-document version values
 5. gRPC sends only to replicas in the Raft-authoritative
    `ShardRoutingEntry.in_sync_replicas` set, concurrently via `tokio::spawn` +
    `join_all` (fan-out)
@@ -125,8 +128,10 @@ A no-op alongside a mutation shares that bulk shard's report. See
 
 ## Key Design Decisions
 - Conditions and create intent are primary-only. Replicas receive full index
-  replacements or deletes with the assigned sequence/term, including updates
-  coordinated through realtime GET plus CAS. Every applied index records its
+  replacements or deletes with the assigned sequence/term/version, including
+  updates coordinated through realtime GET plus CAS. Replica and recovery
+  decoders reject missing/zero index/delete versions and reject a version on
+  NoOp; they never derive a document version from sequence state. Every applied index records its
   local physical WAL cursor for realtime reads; never copy a primary cursor
   into replica storage.
   Complete-map misses and tombstones take only the separate version-map read

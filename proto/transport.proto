@@ -142,6 +142,7 @@ message ShardDocResponse {
     bool created = 6;
     ShardWriteRefreshResult write_refresh = 7;
     WriteFailureDetails failure = 8;
+    optional uint64 version = 9;
 }
 
 message ShardDeleteRequest {
@@ -161,6 +162,7 @@ message ShardDeleteResponse {
     optional uint64 primary_term = 5;
     ShardWriteRefreshResult write_refresh = 6;
     WriteFailureDetails failure = 7;
+    optional uint64 version = 8;
 }
 
 message ShardGetRequest {
@@ -177,6 +179,7 @@ message ShardGetResponse {
     optional uint64 seq_no = 4;
     optional uint64 primary_term = 5;
     string index_uuid = 6; // required for both found and missing documents
+    optional uint64 version = 7;
 }
 
 enum ShardBulkOpKind {
@@ -201,6 +204,7 @@ message ShardBulkItemResponse {
     optional uint64 primary_term = 7;
     ShardWriteRefreshResult write_refresh = 8;
     WriteFailureDetails failure = 9;
+    optional uint64 version = 10;
 }
 
 message ShardBulkRequest {
@@ -330,6 +334,7 @@ message ReplicateDocRequest {
     string index_uuid = 7;
     optional uint64 primary_term = 8;
     optional uint64 target_allocation_id = 9;
+    optional uint64 document_version = 10; // required for index/delete; absent for NoOp
 }
 
 message ReplicateDocResponse {
@@ -384,6 +389,7 @@ message RecoveryOperation {
     string doc_id = 3;
     bytes payload_json = 4;  // document body or no-op metadata
     uint64 primary_term = 5;
+    optional uint64 document_version = 6; // required for index/delete; absent for NoOp
 }
 
 message RecoveryFileMetadata {

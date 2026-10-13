@@ -105,6 +105,7 @@ struct ReplicaWireOperation {
     op: String,
     doc_id: String,
     payload_json: Vec<u8>,
+    document_version: Option<u64>,
 }
 
 struct ReplicaBatchRoute {
@@ -164,6 +165,7 @@ pub async fn replicate_write(
     payload: &serde_json::Value,
     op: &str,
     seq_no: u64,
+    document_version: u64,
     primary_term: u64,
 ) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>> {
     replicate_write_with_durability(
@@ -175,6 +177,7 @@ pub async fn replicate_write(
         payload,
         op,
         seq_no,
+        document_version,
         primary_term,
         TranslogDurability::Request,
     )
@@ -191,6 +194,7 @@ pub async fn replicate_write_with_durability(
     payload: &serde_json::Value,
     op: &str,
     seq_no: u64,
+    document_version: u64,
     primary_term: u64,
     durability: TranslogDurability,
 ) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>> {
@@ -202,6 +206,13 @@ pub async fn replicate_write_with_durability(
         return Ok(vec![]);
     };
     let index_uuid = metadata.uuid.to_string();
+    if !matches!(op, "index" | "delete") || document_version == 0 {
+        return Err(vec![ReplicaReplicationFailure::message(
+            "<routing>",
+            None,
+            "replicated document mutation has an invalid operation kind or version".to_string(),
+        )]);
+    }
     if routing.primary_term != primary_term {
         return Err(vec![ReplicaReplicationFailure::message(
             "<routing>",
@@ -231,6 +242,7 @@ pub async fn replicate_write_with_durability(
     let trace_operation = crate::engine::SequencedOperation {
         seq_no,
         primary_term,
+        document_version,
         mutation: match op {
             "index" => crate::engine::DocumentMutation::Index {
                 doc_id: doc_id.to_string(),
@@ -376,6 +388,7 @@ pub async fn replicate_write_with_durability(
                         index_uuid: uuid,
                         primary_term: Some(primary_term),
                         target_allocation_id: Some(target_allocation_id),
+                        document_version: Some(document_version),
                     },
                     matches!(durability, TranslogDurability::Request),
                 )
@@ -474,6 +487,7 @@ pub async fn replicate_write_with_durability(
 
 /// Replicate a bulk set of writes to all in-sync replica nodes for a shard.
 /// Replication is performed concurrently (fan-out) — latency = max(replica RTTs).
+#[allow(clippy::too_many_arguments)]
 pub async fn replicate_bulk(
     transport_client: &TransportClient,
     cluster_state: &ClusterState,
@@ -481,6 +495,7 @@ pub async fn replicate_bulk(
     shard_id: u32,
     docs: &[(String, serde_json::Value)],
     start_seq_no: u64,
+    versions: &[u64],
     primary_term: u64,
 ) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>> {
     replicate_bulk_with_durability(
@@ -490,6 +505,7 @@ pub async fn replicate_bulk(
         shard_id,
         docs,
         start_seq_no,
+        versions,
         primary_term,
         TranslogDurability::Request,
     )
@@ -504,6 +520,7 @@ pub async fn replicate_bulk_with_durability(
     shard_id: u32,
     docs: &[(String, serde_json::Value)],
     start_seq_no: u64,
+    versions: &[u64],
     primary_term: u64,
     durability: TranslogDurability,
 ) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>> {
@@ -512,6 +529,13 @@ pub async fn replicate_bulk_with_durability(
     else {
         return Ok(Vec::new());
     };
+    if versions.len() != docs.len() || versions.contains(&0) {
+        return Err(vec![ReplicaReplicationFailure::message(
+            "<bulk>",
+            None,
+            "bulk replication has inconsistent document versions".to_string(),
+        )]);
+    }
     #[cfg(feature = "protocol-trace")]
     if !docs.is_empty() {
         transport_client
@@ -531,8 +555,9 @@ pub async fn replicate_bulk_with_durability(
         {
             let trace_operations = docs
                 .iter()
+                .zip(versions)
                 .enumerate()
-                .map(|(offset, (doc_id, payload))| {
+                .map(|(offset, ((doc_id, payload), document_version))| {
                     let seq_no = start_seq_no.checked_add(offset as u64).ok_or_else(|| {
                         trace_replication_failure(
                             route.primary_node.clone(),
@@ -543,6 +568,7 @@ pub async fn replicate_bulk_with_durability(
                     Ok(crate::engine::SequencedOperation {
                         seq_no,
                         primary_term,
+                        document_version: *document_version,
                         mutation: crate::engine::DocumentMutation::Index {
                             doc_id: doc_id.clone(),
                             source: payload.clone(),
@@ -564,8 +590,9 @@ pub async fn replicate_bulk_with_durability(
     }
     let operations = docs
         .iter()
+        .zip(versions)
         .enumerate()
-        .map(|(offset, (doc_id, payload))| {
+        .map(|(offset, ((doc_id, payload), document_version))| {
             let seq_no = start_seq_no.checked_add(offset as u64).ok_or_else(|| {
                 ReplicaReplicationFailure::message(
                     "<bulk>",
@@ -585,6 +612,7 @@ pub async fn replicate_bulk_with_durability(
                 op: "index".to_string(),
                 doc_id: doc_id.clone(),
                 payload_json,
+                document_version: Some(*document_version),
             })
         })
         .collect::<Result<Vec<_>, ReplicaReplicationFailure>>()
@@ -655,6 +683,7 @@ pub async fn replicate_noop_batch_with_durability(
                 op: "noop".to_string(),
                 doc_id: String::new(),
                 payload_json,
+                document_version: None,
             })
         })
         .collect::<Result<Vec<_>, ReplicaReplicationFailure>>()
@@ -750,6 +779,7 @@ async fn replicate_explicit_batch_with_durability(
             Ok(crate::engine::SequencedOperation {
                 seq_no: operation.seq_no,
                 primary_term,
+                document_version: operation.document_version.unwrap_or(0),
                 mutation,
             })
         })
@@ -860,6 +890,7 @@ async fn replicate_explicit_batch_with_durability(
                     index_uuid: uuid.clone(),
                     primary_term: Some(primary_term),
                     target_allocation_id: Some(target_allocation_id),
+                    document_version: operation.document_version,
                 })
                 .collect();
             match client
@@ -1050,6 +1081,7 @@ mod tests {
             "index",
             0,
             1,
+            1,
         )
         .await;
         assert!(result.is_ok());
@@ -1069,6 +1101,7 @@ mod tests {
             &serde_json::json!({"field": "value"}),
             "index",
             0,
+            1,
             1,
         )
         .await
@@ -1091,6 +1124,7 @@ mod tests {
             "index",
             0,
             1,
+            1,
         )
         .await;
         assert!(result.is_ok());
@@ -1112,6 +1146,7 @@ mod tests {
             "index",
             0,
             1,
+            1,
         )
         .await;
         assert!(result.is_ok());
@@ -1131,6 +1166,7 @@ mod tests {
             &serde_json::json!({"field": "value"}),
             "index",
             0,
+            1,
             1,
         )
         .await;
@@ -1156,6 +1192,7 @@ mod tests {
             "index",
             0,
             1,
+            1,
         )
         .await;
         assert!(result.is_err());
@@ -1180,6 +1217,7 @@ mod tests {
             "index",
             0,
             1,
+            1,
         )
         .await;
         assert!(result.is_err());
@@ -1194,7 +1232,7 @@ mod tests {
         let client = TransportClient::new();
         let cs = make_cluster_state_with_nodes();
         let docs = vec![("d1".into(), serde_json::json!({"a": 1}))];
-        let result = replicate_bulk(&client, &cs, "nonexistent", 0, &docs, 0, 1).await;
+        let result = replicate_bulk(&client, &cs, "nonexistent", 0, &docs, 0, &[1], 1).await;
         assert!(result.is_ok());
     }
 
@@ -1213,7 +1251,7 @@ mod tests {
                 serde_json::json!({"payload": "y".repeat(4096)}),
             ),
         ];
-        let result = replicate_bulk(&client, &cs, "test-idx", 0, &docs, u64::MAX, 1).await;
+        let result = replicate_bulk(&client, &cs, "test-idx", 0, &docs, u64::MAX, &[1, 1], 1).await;
         assert!(result.is_ok());
     }
 
@@ -1223,7 +1261,7 @@ mod tests {
         let mut cs = make_cluster_state_with_nodes();
         add_index_with_membership(&mut cs, "test-idx", vec!["node-2".into()], vec![]);
         let docs = vec![("d1".into(), serde_json::json!({"a": 1}))];
-        let checkpoints = replicate_bulk(&client, &cs, "test-idx", 0, &docs, 0, 1)
+        let checkpoints = replicate_bulk(&client, &cs, "test-idx", 0, &docs, 0, &[1], 1)
             .await
             .unwrap();
         assert!(checkpoints.is_empty());
@@ -1238,7 +1276,7 @@ mod tests {
             ("d1".into(), serde_json::json!({"a": 1})),
             ("d2".into(), serde_json::json!({"b": 2})),
         ];
-        let result = replicate_bulk(&client, &cs, "test-idx", 0, &docs, 0, 1).await;
+        let result = replicate_bulk(&client, &cs, "test-idx", 0, &docs, 0, &[1, 1], 1).await;
         assert!(result.is_err());
         assert!(result.unwrap_err()[0].contains("phantom"));
     }
@@ -1249,7 +1287,7 @@ mod tests {
         let mut cs = make_cluster_state_with_nodes();
         add_index_with_routing(&mut cs, "test-idx", vec!["node-2".into()]);
         let docs = vec![("d1".into(), serde_json::json!({"a": 1}))];
-        let result = replicate_bulk(&client, &cs, "test-idx", 0, &docs, 0, 1).await;
+        let result = replicate_bulk(&client, &cs, "test-idx", 0, &docs, 0, &[1], 1).await;
         assert!(result.is_err());
     }
 
@@ -1269,6 +1307,7 @@ mod tests {
             "index",
             0,
             1,
+            1,
         )
         .await
         .unwrap();
@@ -1280,7 +1319,7 @@ mod tests {
         let client = TransportClient::new();
         let cs = make_cluster_state_with_nodes();
         let docs = vec![("d1".into(), serde_json::json!({"a": 1}))];
-        let checkpoints = replicate_bulk(&client, &cs, "nonexistent", 0, &docs, 0, 1)
+        let checkpoints = replicate_bulk(&client, &cs, "nonexistent", 0, &docs, 0, &[1], 1)
             .await
             .unwrap();
         assert!(checkpoints.is_empty());

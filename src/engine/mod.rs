@@ -19,6 +19,25 @@ pub use self::composite::CompositeEngine;
 pub use self::sequence::{SEQUENCE_FORMAT_VERSION, SequenceStats};
 pub use self::tantivy::HotEngine;
 
+pub(crate) const PEER_RECOVERY_VERSION_SNAPSHOT_FILE: &str = "retained-delete-versions.json";
+pub(crate) const PEER_RECOVERY_VERSION_SNAPSHOT_FORMAT: u32 = 1;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PeerRecoveryVersionSnapshot {
+    pub format_version: u32,
+    pub deletes: Vec<PeerRecoveryDeleteVersion>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PeerRecoveryDeleteVersion {
+    pub doc_id: String,
+    pub seq_no: u64,
+    pub primary_term: u64,
+    pub version: u64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum DocumentMutation {
     Index {
@@ -46,6 +65,8 @@ impl DocumentMutation {
 pub struct SequencedOperation {
     pub seq_no: u64,
     pub primary_term: u64,
+    /// Primary-assigned per-document version. NoOp operations use zero.
+    pub document_version: u64,
     pub mutation: DocumentMutation,
 }
 
@@ -160,6 +181,7 @@ pub struct DocumentRead {
     pub source: serde_json::Value,
     pub seq_no: u64,
     pub primary_term: u64,
+    pub version: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,6 +189,7 @@ pub struct IndexWriteReceipt {
     pub doc_id: String,
     pub seq_no: u64,
     pub primary_term: u64,
+    pub version: u64,
     pub created: bool,
 }
 
@@ -175,12 +198,16 @@ pub struct BulkWriteReceipt {
     pub doc_ids: Vec<String>,
     pub start_seq_no: Option<u64>,
     pub primary_term: u64,
+    pub versions: Vec<u64>,
     pub created: Vec<bool>,
 }
 
 impl BulkWriteReceipt {
     pub fn last_seq_no(&self) -> Result<Option<u64>> {
-        if self.created.len() != self.doc_ids.len() {
+        if self.created.len() != self.doc_ids.len()
+            || self.versions.len() != self.doc_ids.len()
+            || self.versions.contains(&0)
+        {
             anyhow::bail!("bulk write receipt has inconsistent item results");
         }
         match (self.start_seq_no, self.doc_ids.len()) {
@@ -199,6 +226,7 @@ pub struct DeleteWriteReceipt {
     pub deleted: u64,
     pub seq_no: u64,
     pub primary_term: u64,
+    pub version: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -529,6 +557,7 @@ pub trait SearchEngine: Send + Sync {
         self.apply_replica_operation(SequencedOperation {
             seq_no,
             primary_term,
+            document_version: 0,
             mutation: DocumentMutation::NoOp {
                 reason: reason.to_string(),
             },
@@ -785,6 +814,7 @@ mod tests {
             doc_ids: vec!["a".into(), "b".into()],
             start_seq_no: Some(0),
             primary_term: 1,
+            versions: vec![1, 1],
             created: vec![true, true],
         };
         assert_eq!(receipt.last_seq_no().unwrap(), Some(1));
@@ -793,6 +823,7 @@ mod tests {
                 doc_ids: vec!["a".into()],
                 start_seq_no: None,
                 primary_term: 1,
+                versions: vec![1],
                 created: vec![true],
             }
             .last_seq_no()
@@ -803,6 +834,7 @@ mod tests {
                 doc_ids: vec!["a".into(), "b".into()],
                 start_seq_no: Some(u64::MAX),
                 primary_term: 1,
+                versions: vec![1, 1],
                 created: vec![true, true],
             }
             .last_seq_no()
@@ -813,6 +845,7 @@ mod tests {
                 doc_ids: vec![],
                 start_seq_no: None,
                 primary_term: 1,
+                versions: vec![],
                 created: vec![],
             }
             .last_seq_no()

@@ -1459,7 +1459,8 @@ pub async fn get_document(
                     "_index": index_name, "_index_uuid": read.index_uuid,
                     "_id": doc_id, "_shard": shard_id, "found": true,
                     "_source": document.source, "_seq_no": document.seq_no,
-                    "_primary_term": document.primary_term
+                    "_primary_term": document.primary_term,
+                    "_version": document.version
                 })),
             ),
             None => (
@@ -1709,6 +1710,7 @@ async fn execute_update(
                     Json(serde_json::json!({
                         "_index": index_name, "_id": doc_id,
                         "_seq_no": existing.seq_no, "_primary_term": existing.primary_term,
+                        "_version": existing.version,
                         "result": "noop",
                         "_shards": {"total": 0, "successful": 0, "failed": 0}
                     })),

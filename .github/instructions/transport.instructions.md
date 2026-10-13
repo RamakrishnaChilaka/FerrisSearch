@@ -219,6 +219,11 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   inconsistent supplied context with `INVALID_ARGUMENT`; isolated no-Raft
   transport test constructors may omit a hint. Direct production-style test
   RPCs use `request_with_cluster_state_version()` for an explicit index floor.
+- Successful shard index/delete/bulk-item/GET responses carry a nonzero
+  primary-assigned document version. Replication and recovery index/delete
+  requests require that version; NoOp requests omit it. Missing/zero or
+  mutation-inconsistent values fail decoding with no compatibility default and
+  must not reach WAL or engine mutation.
 - The metadata wait is asynchronous on Tokio, polls every 25 ms only while
   metadata is deficient or an explicit floor is unmet, and expires after
   5 seconds. Applied state is shared directly with the Raft state machine;

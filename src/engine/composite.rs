@@ -2004,6 +2004,7 @@ mod tests {
                     .apply_replica_operation(super::super::SequencedOperation {
                         seq_no: 5,
                         primary_term: 1,
+                        document_version: 1,
                         mutation: super::super::DocumentMutation::Index {
                             doc_id: "c".into(),
                             source: json!({"emb": [1.0, 1.0, 0.0]}),
@@ -2027,6 +2028,7 @@ mod tests {
                             .map(|(offset, doc_id)| super::super::SequencedOperation {
                                 seq_no: 5 + offset as u64,
                                 primary_term: 1,
+                                document_version: 1,
                                 mutation: super::super::DocumentMutation::Index {
                                     doc_id: doc_id.into(),
                                     source: json!({"emb": [1.0, 1.0, 0.0]}),
@@ -2125,6 +2127,7 @@ mod tests {
                 .apply_replica_operation(super::super::SequencedOperation {
                     seq_no,
                     primary_term: 1,
+                    document_version: seq_no + 1,
                     mutation: super::super::DocumentMutation::Index {
                         doc_id: doc_id.into(),
                         source: json!({"emb": [1.0, 0.0, 0.0]}),
@@ -2152,6 +2155,7 @@ mod tests {
             .apply_replica_operation(super::super::SequencedOperation {
                 seq_no: 1,
                 primary_term: 1,
+                document_version: 0,
                 mutation: super::super::DocumentMutation::NoOp {
                     reason: "close vector rebuild coverage gap".into(),
                 },
@@ -2172,6 +2176,7 @@ mod tests {
         super::super::SequencedOperation {
             seq_no,
             primary_term: 1,
+            document_version: seq_no + 1,
             mutation: super::super::DocumentMutation::Index {
                 doc_id: doc_id.into(),
                 source: json!({"emb": [1.0, 0.0, 0.0], "value": seq_no}),
@@ -2351,6 +2356,7 @@ mod tests {
                         .apply_replica_operation(super::super::SequencedOperation {
                             seq_no: 2,
                             primary_term: 1,
+                            document_version: 0,
                             mutation: super::super::DocumentMutation::NoOp {
                                 reason: "coverage changed during scan".into(),
                             },
@@ -3114,6 +3120,7 @@ mod tests {
                 .apply_replica_operation(crate::engine::SequencedOperation {
                     seq_no,
                     primary_term: 1,
+                    document_version: seq_no + 1,
                     mutation: crate::engine::DocumentMutation::Index {
                         doc_id: format!("doc-{seq_no}"),
                         source: json!({"value": seq_no}),
@@ -3295,6 +3302,7 @@ mod tests {
             .apply_replica_operation(super::super::SequencedOperation {
                 seq_no: 7,
                 primary_term: 1,
+                document_version: 1,
                 mutation: super::super::DocumentMutation::Index {
                     doc_id: "replica-doc".into(),
                     source: json!({"x": 1}),
@@ -3318,6 +3326,7 @@ mod tests {
                     .map(|(offset, doc_id)| super::super::SequencedOperation {
                         seq_no: 10 + offset as u64,
                         primary_term: 1,
+                        document_version: 1,
                         mutation: super::super::DocumentMutation::Index {
                             doc_id: doc_id.into(),
                             source: json!({"x": offset + 1}),
@@ -3437,6 +3446,7 @@ mod tests {
             .apply_replica_batch(vec![super::super::SequencedOperation {
                 seq_no: 10,
                 primary_term: 1,
+                document_version: 1,
                 mutation: super::super::DocumentMutation::Index {
                     doc_id: "replica".into(),
                     source: json!({"tags": [5, 6]}),

@@ -528,6 +528,10 @@ impl RestartClusterHarness {
             body["_seq_no"].as_u64().is_some(),
             "index receipt is missing _seq_no: {body}"
         );
+        assert!(
+            body["_version"].as_u64().is_some_and(|version| version > 0),
+            "index receipt is missing a nonzero _version: {body}"
+        );
         Ok(body)
     }
 
@@ -544,6 +548,10 @@ impl RestartClusterHarness {
         assert!(
             body["_seq_no"].as_u64().is_some(),
             "delete receipt is missing _seq_no: {body}"
+        );
+        assert!(
+            body["_version"].as_u64().is_some_and(|version| version > 0),
+            "delete receipt is missing a nonzero _version: {body}"
         );
         Ok(body)
     }
@@ -600,6 +608,18 @@ impl RestartClusterHarness {
                 json!(false),
                 "bulk response had item errors: {response_body}"
             );
+            for item in response_body["items"].as_array().context("bulk items")? {
+                let result = item
+                    .as_object()
+                    .and_then(|item| item.values().next())
+                    .context("bulk item result")?;
+                assert!(
+                    result["_version"]
+                        .as_u64()
+                        .is_some_and(|version| version > 0),
+                    "bulk item is missing a nonzero _version: {result}"
+                );
+            }
         }
         Ok(())
     }
@@ -1099,6 +1119,9 @@ async fn three_node_flush_restart_preserves_uuid_dirs_and_document_count() -> Re
 
     harness.bulk_index_documents(DOC_COUNT).await?;
     harness.flush_index().await?;
+    let (status, document_before_restart) = harness.get_document("doc-0").await?;
+    assert_eq!(status, StatusCode::OK, "{document_before_restart}");
+    assert_eq!(document_before_restart["_version"], json!(1));
 
     let cluster_state_before_restart = harness.wait_for_cluster_state(3, Some(INDEX_NAME)).await?;
     assert_eq!(
@@ -1116,6 +1139,12 @@ async fn three_node_flush_restart_preserves_uuid_dirs_and_document_count() -> Re
     );
     harness.assert_expected_shard_dirs_exist(&cluster_state_after_restart, &index_uuid)?;
     harness.wait_for_count(DOC_COUNT).await?;
+    let (status, document_after_restart) = harness.get_document("doc-0").await?;
+    assert_eq!(status, StatusCode::OK, "{document_after_restart}");
+    assert_eq!(
+        document_after_restart["_version"],
+        document_before_restart["_version"]
+    );
     harness.assert_no_delete_reasons_in_logs();
 
     Ok(())
@@ -1592,12 +1621,12 @@ async fn mixed_role_node_loss_accounts_every_shard_and_preserves_acknowledged_da
             "payload": format!("preserved-value-{shard_id}"),
             "n": shard_id,
         });
-        harness.put_document(&doc_id, source.clone()).await?;
-        expected_documents.insert(doc_id, source);
+        let receipt = harness.put_document(&doc_id, source.clone()).await?;
+        expected_documents.insert(doc_id, (source, receipt["_version"].clone()));
     }
 
     let deleted_doc_id = document_id_for_shard("acknowledged-delete", promoted_shard);
-    harness
+    let deleted_index = harness
         .put_document(
             &deleted_doc_id,
             json!({
@@ -1608,13 +1637,20 @@ async fn mixed_role_node_loss_accounts_every_shard_and_preserves_acknowledged_da
             }),
         )
         .await?;
-    harness.delete_document(&deleted_doc_id).await?;
+    let deleted_receipt = harness.delete_document(&deleted_doc_id).await?;
+    assert_eq!(
+        deleted_receipt["_version"].as_u64(),
+        deleted_index["_version"]
+            .as_u64()
+            .map(|version| version + 1)
+    );
     harness.refresh_index().await?;
 
-    for (doc_id, expected_source) in &expected_documents {
+    for (doc_id, (expected_source, expected_version)) in &expected_documents {
         let (status, body) = harness.get_document(doc_id).await?;
         assert_eq!(status, StatusCode::OK, "get {doc_id}: {body}");
         assert_eq!(&body["_source"], expected_source, "get {doc_id}: {body}");
+        assert_eq!(&body["_version"], expected_version, "get {doc_id}: {body}");
     }
     let (deleted_status, deleted_body) = harness.get_document(&deleted_doc_id).await?;
     assert_eq!(deleted_status, StatusCode::NOT_FOUND, "{deleted_body}");
@@ -1684,11 +1720,15 @@ async fn mixed_role_node_loss_accounts_every_shard_and_preserves_acknowledged_da
     assert_eq!(health["status"], json!("yellow"));
     assert_eq!(health["unassigned_shards"], json!(3));
 
-    for (doc_id, expected_source) in &expected_documents {
+    for (doc_id, (expected_source, expected_version)) in &expected_documents {
         let (status, body) = harness.get_document(doc_id).await?;
         assert_eq!(
             status,
             StatusCode::OK,
+            "get after failover {doc_id}: {body}"
+        );
+        assert_eq!(
+            &body["_version"], expected_version,
             "get after failover {doc_id}: {body}"
         );
         assert_eq!(
@@ -1700,6 +1740,24 @@ async fn mixed_role_node_loss_accounts_every_shard_and_preserves_acknowledged_da
     assert_eq!(deleted_status, StatusCode::NOT_FOUND, "{deleted_body}");
     assert_eq!(deleted_body["found"], json!(false));
 
+    let recreated_deleted = harness
+        .put_document(
+            &deleted_doc_id,
+            json!({
+                "title": "recreated after failover",
+                "author": "delete-test",
+                "payload": "new value",
+                "n": 101,
+            }),
+        )
+        .await?;
+    assert_eq!(
+        recreated_deleted["_version"].as_u64(),
+        deleted_receipt["_version"]
+            .as_u64()
+            .map(|version| version + 1)
+    );
+
     let post_failover_id = document_id_for_shard("post-promotion-write", promoted_shard);
     let post_failover_source = json!({
         "title": "write through promoted primary",
@@ -1707,14 +1765,16 @@ async fn mixed_role_node_loss_accounts_every_shard_and_preserves_acknowledged_da
         "payload": "post-promotion-value",
         "n": 100,
     });
-    harness
+    let post_failover_receipt = harness
         .put_document(&post_failover_id, post_failover_source.clone())
         .await?;
+    assert_eq!(post_failover_receipt["_version"], json!(1));
     harness.refresh_index().await?;
     let (status, body) = harness.get_document(&post_failover_id).await?;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["_shard"], json!(promoted_shard));
     assert_eq!(body["_source"], post_failover_source);
+    assert_eq!(body["_version"], post_failover_receipt["_version"]);
 
     Ok(())
 }

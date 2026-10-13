@@ -10,14 +10,14 @@ const MANIFEST_FILE: &str = "translog.manifest";
 const GENERATION_FILE: &str = "translog-00000000000000000000.bin";
 
 #[test]
-fn new_translog_persists_v2_manifest_with_entry_version_and_min_max_ranges() {
+fn new_translog_persists_v2_manifest_with_v3_entries_and_min_max_ranges() {
     let dir = tempfile::tempdir().unwrap();
     let _translog = HotTranslog::open(dir.path()).unwrap();
 
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.path().join(MANIFEST_FILE)).unwrap()).unwrap();
     assert_eq!(manifest["version"], 2);
-    assert_eq!(manifest["entry_format_version"], 2);
+    assert_eq!(manifest["entry_format_version"], 3);
     assert_eq!(
         manifest["generations"][0]["min_seq_no"],
         serde_json::Value::Null
@@ -87,6 +87,7 @@ async fn fence_raise_persists_the_pre_raise_maximum_sequence() {
         .apply_replica_operation(ferrissearch::engine::SequencedOperation {
             seq_no: 0,
             primary_term: 2,
+            document_version: 1,
             mutation: ferrissearch::engine::DocumentMutation::Index {
                 doc_id: "before-raise".into(),
                 source: json!({"value": 0}),

@@ -2155,8 +2155,11 @@ async fn writes_regression_bulk_delete_and_update_preserve_action_boundaries() -
         "{response}"
     );
     assert_eq!(response["items"][0]["delete"]["result"], json!("deleted"));
+    assert_eq!(response["items"][0]["delete"]["_version"], json!(2));
     assert_eq!(response["items"][1]["index"]["result"], json!("created"));
+    assert_eq!(response["items"][1]["index"]["_version"], json!(1));
     assert_eq!(response["items"][2]["update"]["result"], json!("updated"));
+    assert_eq!(response["items"][2]["update"]["_version"], json!(2));
     assert_eq!(
         harness.get_json("/bulk-repro/_doc/old").await?.0,
         StatusCode::NOT_FOUND
@@ -2164,6 +2167,7 @@ async fn writes_regression_bulk_delete_and_update_preserve_action_boundaries() -
     let (status, document) = harness.get_json("/bulk-repro/_doc/new").await?;
     assert_eq!(status, StatusCode::OK, "{document}");
     assert_eq!(document["_source"], json!({"keep": 2, "added": 3}));
+    assert_eq!(document["_version"], json!(2));
     Ok(())
 }
 
@@ -2179,6 +2183,8 @@ async fn writes_regression_realtime_get_survives_delete_and_wal_flush() -> Resul
     assert_eq!(document["_source"], json!({"value": 1}));
     assert_eq!(document["_seq_no"], first["_seq_no"]);
     assert_eq!(document["_primary_term"], first["_primary_term"]);
+    assert_eq!(first["_version"], json!(1));
+    assert_eq!(document["_version"], first["_version"]);
     assert_eq!(
         harness.get_json("/realtime/_doc/1?realtime=false").await?.0,
         StatusCode::NOT_FOUND
@@ -2188,6 +2194,7 @@ async fn writes_regression_realtime_get_survives_delete_and_wal_flush() -> Resul
         .put_json("/realtime/_doc/1", json!({"value": 2}))
         .await?;
     assert_eq!(second["result"], "updated");
+    assert_eq!(second["_version"], json!(2));
     assert_eq!(
         harness.get_json("/realtime/_doc/1").await?.1["_source"]["value"],
         2
@@ -2198,6 +2205,7 @@ async fn writes_regression_realtime_get_survives_delete_and_wal_flush() -> Resul
     );
     let (status, deleted) = harness.delete_json("/realtime/_doc/1").await?;
     assert_eq!(status, StatusCode::OK, "{deleted}");
+    assert_eq!(deleted["_version"], json!(3));
     assert_eq!(
         harness.get_json("/realtime/_doc/1").await?.0,
         StatusCode::NOT_FOUND
@@ -2206,6 +2214,7 @@ async fn writes_regression_realtime_get_survives_delete_and_wal_flush() -> Resul
         .put_json("/realtime/_doc/1", json!({"value": 3}))
         .await?;
     assert_eq!(status, StatusCode::CREATED, "{recreated}");
+    assert_eq!(recreated["_version"], json!(4));
     let (status, flushed) = harness.post_json("/realtime/_flush", json!({})).await?;
     assert_eq!(status, StatusCode::OK, "{flushed}");
     assert_eq!(flushed["_shards"]["failed"], 0);
@@ -2214,6 +2223,7 @@ async fn writes_regression_realtime_get_survives_delete_and_wal_flush() -> Resul
     assert_eq!(document["_source"], json!({"value": 3}));
     assert_eq!(document["_seq_no"], recreated["_seq_no"]);
     assert_eq!(document["_primary_term"], recreated["_primary_term"]);
+    assert_eq!(document["_version"], recreated["_version"]);
     Ok(())
 }
 
@@ -2225,6 +2235,7 @@ async fn writes_regression_conditions_create_upsert_and_noop() -> Result<()> {
         .put_json("/conditions/_create/1", json!({"nested": {"keep": 1}}))
         .await?;
     assert_eq!(status, StatusCode::CREATED, "{first}");
+    assert_eq!(first["_version"], json!(1));
     let seq = first["_seq_no"].as_u64().unwrap();
     let term = first["_primary_term"].as_u64().unwrap();
     for path in ["/conditions/_create/1", "/conditions/_doc/1?op_type=create"] {
@@ -2268,6 +2279,7 @@ async fn writes_regression_conditions_create_upsert_and_noop() -> Result<()> {
         .await?;
     assert_eq!(status, StatusCode::OK, "{second}");
     assert_eq!(second["_seq_no"], seq + 1);
+    assert_eq!(second["_version"], json!(2));
     let (status, conflict) = harness.put_json(&path, json!({"wrong": true})).await?;
     assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
     assert!(
@@ -2282,6 +2294,7 @@ async fn writes_regression_conditions_create_upsert_and_noop() -> Result<()> {
     assert_eq!(status, StatusCode::OK, "{noop}");
     assert_eq!(noop["result"], "noop");
     assert_eq!(noop["_seq_no"], second["_seq_no"]);
+    assert_eq!(noop["_version"], second["_version"]);
     let (_, updated) = harness
         .post_json(
             "/conditions/_update/1",
@@ -2291,20 +2304,25 @@ async fn writes_regression_conditions_create_upsert_and_noop() -> Result<()> {
         )
         .await?;
     assert_eq!(updated["_seq_no"], seq + 2);
+    assert_eq!(updated["_version"], json!(3));
     let (_, document) = harness.get_json("/conditions/_doc/1").await?;
     assert_eq!(
         document["_source"]["nested"],
         json!({"keep": 1, "added": 3})
     );
+    assert_eq!(document["_version"], updated["_version"]);
     let delete = format!(
         "/conditions/_doc/1?if_seq_no={}&if_primary_term={term}",
         seq + 2
     );
-    assert_eq!(harness.delete_json(&delete).await?.0, StatusCode::OK);
+    let (status, deleted) = harness.delete_json(&delete).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(deleted["_version"], json!(4));
     assert_eq!(harness.delete_json(&delete).await?.0, StatusCode::CONFLICT);
     let (status, missing_delete) = harness.delete_json("/conditions/_doc/1").await?;
     assert_eq!(status, StatusCode::NOT_FOUND, "{missing_delete}");
     assert_eq!(missing_delete["result"], "not_found");
+    assert_eq!(missing_delete["_version"], json!(5));
     assert!(missing_delete.get("error").is_none());
     let (status, missing) = harness
         .post_json("/conditions/_update/missing", json!({"doc": {"a": 1}}))
@@ -2321,6 +2339,7 @@ async fn writes_regression_conditions_create_upsert_and_noop() -> Result<()> {
         .await?;
     assert_eq!(status, StatusCode::CREATED, "{upsert}");
     assert_eq!(upsert["result"], "created");
+    assert_eq!(upsert["_version"], json!(1));
     assert_eq!(
         harness.get_json("/conditions/_doc/upsert").await?.1["_source"],
         json!({"from_upsert": 2})
@@ -2334,6 +2353,7 @@ async fn writes_regression_conditions_create_upsert_and_noop() -> Result<()> {
         )
         .await?;
     assert_eq!(status, StatusCode::CREATED, "{upsert}");
+    assert_eq!(upsert["_version"], json!(1));
     for key in ["script", "scripted_upsert", "fields", "_source", "unknown"] {
         let (status, error) = harness
             .post_json(

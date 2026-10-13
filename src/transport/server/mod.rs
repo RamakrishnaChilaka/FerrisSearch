@@ -999,6 +999,7 @@ impl InternalTransport for TransportService {
         match write_result {
             Ok(receipt) => {
                 let created = receipt.created;
+                let version = receipt.version;
                 let id = receipt.doc_id;
                 let seq_no = receipt.seq_no;
                 let primary_term = receipt.primary_term;
@@ -1024,6 +1025,7 @@ impl InternalTransport for TransportService {
                     &payload,
                     "index",
                     seq_no,
+                    version,
                     primary_term,
                     self.shard_manager.durability(),
                 )
@@ -1114,6 +1116,7 @@ impl InternalTransport for TransportService {
                     created,
                     write_refresh,
                     failure: None,
+                    version: Some(version),
                 }))
             }
             Err(e)
@@ -1436,7 +1439,7 @@ impl InternalTransport for TransportService {
                     )
                     .into_status()
                 })?;
-                let ids = receipt.doc_ids;
+                let ids = receipt.doc_ids.clone();
                 let primary_term = receipt.primary_term;
                 let primary_sequence = engine.sequence_stats();
                 let Some(start_seq_no) = receipt.start_seq_no else {
@@ -1477,6 +1480,7 @@ impl InternalTransport for TransportService {
                     req.shard_id,
                     &docs,
                     start_seq_no,
+                    &receipt.versions,
                     primary_term,
                     self.shard_manager.durability(),
                 )
@@ -1783,6 +1787,7 @@ impl InternalTransport for TransportService {
                 let deleted = receipt.deleted;
                 let seq_no = receipt.seq_no;
                 let primary_term = receipt.primary_term;
+                let version = receipt.version;
                 let primary_sequence = engine.sequence_stats();
                 #[cfg(feature = "protocol-trace")]
                 crate::failpoints::pause(
@@ -1804,6 +1809,7 @@ impl InternalTransport for TransportService {
                     &serde_json::json!({}),
                     "delete",
                     seq_no,
+                    version,
                     primary_term,
                     self.shard_manager.durability(),
                 )
@@ -1892,6 +1898,7 @@ impl InternalTransport for TransportService {
                     primary_term: Some(primary_term),
                     write_refresh,
                     failure: None,
+                    version: Some(version),
                 }))
             }
             Err(e)
@@ -2030,6 +2037,7 @@ impl InternalTransport for TransportService {
                     seq_no: Some(document.seq_no),
                     primary_term: Some(document.primary_term),
                     index_uuid,
+                    version: Some(document.version),
                 }))
             }
             Ok(None) => Ok(Response::new(ShardGetResponse {
@@ -2691,6 +2699,25 @@ impl InternalTransport for TransportService {
             req.op, req.doc_id, req.seq_no, req.index_name, req.shard_id
         );
 
+        let document_version = match req.op.as_str() {
+            "index" | "delete" => req
+                .document_version
+                .filter(|version| *version > 0)
+                .ok_or_else(|| {
+                    Status::invalid_argument(
+                        "replication index/delete operation has no document version",
+                    )
+                })?,
+            "noop" => {
+                if req.document_version.is_some() {
+                    return Err(Status::invalid_argument(
+                        "replication no-op has a document version",
+                    ));
+                }
+                0
+            }
+            _ => 0,
+        };
         let operation = match req.op.as_str() {
             "index" => {
                 let source = index_source.ok_or_else(|| {
@@ -2729,6 +2756,7 @@ impl InternalTransport for TransportService {
         let sequenced_operation = crate::engine::SequencedOperation {
             seq_no,
             primary_term,
+            document_version,
             mutation: operation,
         };
         #[cfg(feature = "protocol-trace")]
@@ -3028,6 +3056,25 @@ impl InternalTransport for TransportService {
                     "bulk replication operations must use one operation kind",
                 ));
             }
+            let document_version = match batch_op {
+                Some("index") => op
+                    .document_version
+                    .filter(|version| *version > 0)
+                    .ok_or_else(|| {
+                        Status::invalid_argument(
+                            "bulk index replication operation has no document version",
+                        )
+                    })?,
+                Some("noop") => {
+                    if op.document_version.is_some() {
+                        return Err(Status::invalid_argument(
+                            "bulk NoOp replication operation has a document version",
+                        ));
+                    }
+                    0
+                }
+                Some(_) | None => 0,
+            };
             let mutation = match batch_op {
                 Some("index") => {
                     let expected_seq = start_seq_no
@@ -3081,6 +3128,7 @@ impl InternalTransport for TransportService {
             operations.push(crate::engine::SequencedOperation {
                 seq_no: op.seq_no,
                 primary_term,
+                document_version,
                 mutation,
             });
         }

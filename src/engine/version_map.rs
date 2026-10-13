@@ -24,6 +24,7 @@ impl MonotonicClock for SystemMonotonicClock {
 pub(crate) struct IndexVersionValue {
     pub seq_no: u64,
     pub primary_term: u64,
+    pub version: u64,
     pub wal_position: Option<crate::wal::WalCursor>,
 }
 
@@ -31,6 +32,7 @@ pub(crate) struct IndexVersionValue {
 pub(crate) struct DeleteVersionValue {
     pub seq_no: u64,
     pub primary_term: u64,
+    pub version: u64,
     pub deleted_at: Instant,
 }
 
@@ -52,6 +54,13 @@ impl VersionValue {
         match self {
             Self::Index(value) => value.primary_term,
             Self::Delete(value) => value.primary_term,
+        }
+    }
+
+    pub(crate) fn version(self) -> u64 {
+        match self {
+            Self::Index(value) => value.version,
+            Self::Delete(value) => value.version,
         }
     }
 
@@ -122,14 +131,15 @@ impl LiveVersionMap {
         doc_id: &str,
         seq_no: u64,
         primary_term: u64,
+        version: u64,
         wal_position: crate::wal::WalCursor,
     ) {
-        self.insert_index(doc_id, seq_no, primary_term, Some(wal_position));
+        self.insert_index(doc_id, seq_no, primary_term, version, Some(wal_position));
     }
 
     #[cfg(test)]
     fn apply_index(&mut self, doc_id: &str, seq_no: u64, primary_term: u64) {
-        self.insert_index(doc_id, seq_no, primary_term, None);
+        self.insert_index(doc_id, seq_no, primary_term, seq_no + 1, None);
     }
 
     fn insert_index(
@@ -137,6 +147,7 @@ impl LiveVersionMap {
         doc_id: &str,
         seq_no: u64,
         primary_term: u64,
+        version: u64,
         wal_position: Option<crate::wal::WalCursor>,
     ) {
         if self
@@ -146,6 +157,7 @@ impl LiveVersionMap {
                 IndexVersionValue {
                     seq_no,
                     primary_term,
+                    version,
                     wal_position,
                 },
             )
@@ -170,7 +182,13 @@ impl LiveVersionMap {
         }
     }
 
-    pub(crate) fn apply_delete(&mut self, doc_id: &str, seq_no: u64, primary_term: u64) {
+    pub(crate) fn apply_delete_at(
+        &mut self,
+        doc_id: &str,
+        seq_no: u64,
+        primary_term: u64,
+        version: u64,
+    ) {
         if self
             .current
             .get(doc_id)
@@ -202,6 +220,7 @@ impl LiveVersionMap {
                 DeleteVersionValue {
                     seq_no,
                     primary_term,
+                    version,
                     deleted_at: self.clock.now(),
                 },
             )
@@ -211,6 +230,58 @@ impl LiveVersionMap {
                 .estimated_bytes
                 .saturating_add(estimated_entry_bytes(doc_id));
         }
+    }
+
+    pub(crate) fn restore_delete_at(
+        &mut self,
+        doc_id: &str,
+        seq_no: u64,
+        primary_term: u64,
+        version: u64,
+    ) -> Result<()> {
+        let incoming = VersionValue::Delete(DeleteVersionValue {
+            seq_no,
+            primary_term,
+            version,
+            deleted_at: self.clock.now(),
+        });
+        if !self.should_restore(doc_id, incoming)? {
+            return Ok(());
+        }
+        self.apply_delete_at(doc_id, seq_no, primary_term, version);
+        Ok(())
+    }
+
+    fn should_restore(&self, doc_id: &str, incoming: VersionValue) -> Result<bool> {
+        let Some(existing) = self.lookup(doc_id)? else {
+            return Ok(true);
+        };
+        if existing.seq_no() > incoming.seq_no() {
+            return Ok(false);
+        }
+        if existing.seq_no() < incoming.seq_no() {
+            return Ok(true);
+        }
+        if existing.primary_term() != incoming.primary_term()
+            || existing.kind() != incoming.kind()
+            || existing.version() != incoming.version()
+        {
+            return Err(VersionMapCollisionError {
+                doc_id: doc_id.to_string(),
+                seq_no: incoming.seq_no(),
+                existing_term: existing.primary_term(),
+                incoming_term: incoming.primary_term(),
+                existing_kind: existing.kind(),
+                incoming_kind: incoming.kind(),
+            }
+            .into());
+        }
+        Ok(false)
+    }
+
+    #[cfg(test)]
+    fn apply_delete(&mut self, doc_id: &str, seq_no: u64, primary_term: u64) {
+        self.apply_delete_at(doc_id, seq_no, primary_term, seq_no + 1);
     }
 
     pub(crate) fn rotate_current_into_old(&mut self) -> Result<()> {
@@ -349,6 +420,28 @@ impl LiveVersionMap {
 
     pub(crate) fn current_and_old_are_empty(&self) -> bool {
         self.current.is_empty() && self.old.is_empty()
+    }
+
+    pub(crate) fn oldest_tombstone_seq_no(&self) -> Option<u64> {
+        self.tombstones
+            .values()
+            .map(|tombstone| tombstone.seq_no)
+            .min()
+    }
+
+    pub(crate) fn peer_recovery_delete_versions(&self) -> Vec<super::PeerRecoveryDeleteVersion> {
+        let mut deletes = self
+            .tombstones
+            .iter()
+            .map(|(doc_id, tombstone)| super::PeerRecoveryDeleteVersion {
+                doc_id: doc_id.to_string(),
+                seq_no: tombstone.seq_no,
+                primary_term: tombstone.primary_term,
+                version: tombstone.version,
+            })
+            .collect::<Vec<_>>();
+        deletes.sort_by(|left, right| left.doc_id.cmp(&right.doc_id));
+        deletes
     }
 
     pub(crate) fn can_reserve(&self, additional_bytes: usize) -> bool {
@@ -527,6 +620,7 @@ mod tests {
             Some(VersionValue::Index(IndexVersionValue {
                 seq_no: 4,
                 primary_term: 1,
+                version: 5,
                 wal_position: None,
             }))
         );

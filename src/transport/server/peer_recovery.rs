@@ -569,16 +569,20 @@ async fn record_setup_failure(
 pub(super) fn recovery_op(entry: crate::wal::TranslogEntry) -> Result<RecoveryOperation, Status> {
     let operation = crate::wal::document_operation(&entry)
         .map_err(|error| Status::internal(error.to_string()))?;
-    let (doc_id, payload) = match operation {
-        crate::wal::WalDocumentOperation::Index { doc_id, source } => {
-            (doc_id.to_string(), source.clone())
+    let (doc_id, payload, document_version) = match operation {
+        crate::wal::WalDocumentOperation::Index {
+            doc_id,
+            source,
+            version,
+        } => (doc_id.to_string(), source.clone(), Some(version)),
+        crate::wal::WalDocumentOperation::Delete { doc_id, version } => {
+            (doc_id.to_string(), serde_json::json!({}), Some(version))
         }
-        crate::wal::WalDocumentOperation::Delete { doc_id } => {
-            (doc_id.to_string(), serde_json::json!({}))
-        }
-        crate::wal::WalDocumentOperation::NoOp { reason } => {
-            (String::new(), serde_json::json!({ "_reason": reason }))
-        }
+        crate::wal::WalDocumentOperation::NoOp { reason } => (
+            String::new(),
+            serde_json::json!({ "_reason": reason }),
+            None,
+        ),
     };
     Ok(RecoveryOperation {
         seq_no: entry.seq_no,
@@ -587,6 +591,7 @@ pub(super) fn recovery_op(entry: crate::wal::TranslogEntry) -> Result<RecoveryOp
         payload_json: serde_json::to_vec(&payload)
             .map_err(|error| Status::internal(format!("serialize recovery operation: {error}")))?,
         primary_term: entry.primary_term,
+        document_version,
     })
 }
 
@@ -2117,6 +2122,7 @@ mod tests {
                 crate::engine::SequencedOperation {
                     seq_no: operation.seq_no,
                     primary_term: operation.primary_term,
+                    document_version: operation.document_version.unwrap_or(0),
                     mutation,
                 }
             })
@@ -4138,6 +4144,7 @@ mod tests {
                 target_allocation_id: cluster_manager
                     .get_state()
                     .shard_allocation_id("idx", 0, "primary"),
+                document_version: Some(1),
             }))
             .await
             .unwrap()

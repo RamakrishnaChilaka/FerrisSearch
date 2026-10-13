@@ -17,6 +17,7 @@ fn apply_index(
         .apply_replica_operation(crate::engine::SequencedOperation {
             seq_no,
             primary_term,
+            document_version: seq_no + 1,
             mutation: crate::engine::DocumentMutation::Index {
                 doc_id: doc_id.to_string(),
                 source,
@@ -699,6 +700,7 @@ async fn collision_quarantine_keeps_lifecycle_failure_reportable_until_removal()
                 index_uuid: "idx-uuid".into(),
                 primary_term: Some(3),
                 target_allocation_id: Some(allocation_id),
+                document_version: Some(1),
             },
         ))
         .await
@@ -2030,6 +2032,7 @@ async fn corrupt_in_sync_replica_is_failed_and_replication_resumes() {
             "index",
             1,
             2,
+            2,
         )
         .await
         .is_ok(),
@@ -2802,6 +2805,7 @@ async fn failed_lifecycle_report_keeps_unpersisted_collision_quarantine() {
         index_uuid: "idx-uuid".into(),
         primary_term: Some(3),
         target_allocation_id: Some(allocation_id),
+        document_version: Some(seq_no + 1),
     };
 
     // ENOSPC exactly once, while persisting the collision marker.

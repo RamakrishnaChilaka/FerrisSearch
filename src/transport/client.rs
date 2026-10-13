@@ -730,10 +730,17 @@ impl TransportClient {
                 .ok_or_else(|| {
                     anyhow::anyhow!("found shard GET response is missing its primary term")
                 })?;
+            let version = response
+                .version
+                .filter(|version| *version > 0)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("found shard GET response is missing its document version")
+                })?;
             Some(crate::engine::DocumentRead {
                 source,
                 seq_no,
                 primary_term,
+                version,
             })
         } else {
             None
@@ -2010,12 +2017,19 @@ fn decode_shard_doc_response(
         .ok_or_else(|| {
             anyhow::anyhow!("successful shard index response is missing its primary term")
         })?;
+    let version = response
+        .version
+        .filter(|version| *version > 0)
+        .ok_or_else(|| {
+            anyhow::anyhow!("successful shard index response is missing its document version")
+        })?;
     let mut result = serde_json::json!({
         "_index": index_name,
         "_id": response.doc_id,
         "_shard": shard_id,
         "_seq_no": seq_no,
         "_primary_term": primary_term,
+        "_version": version,
         "result": if response.created { "created" } else { "updated" }
     });
     if let Some(refresh) = &response.write_refresh {
@@ -2078,6 +2092,15 @@ fn decode_shard_bulk_response(
             .ok_or_else(|| {
                 anyhow::anyhow!("successful shard bulk response is missing its primary term")
             })?,
+        versions: response
+            .results
+            .iter()
+            .map(|item| {
+                item.version.filter(|version| *version > 0).ok_or_else(|| {
+                    anyhow::anyhow!("successful shard bulk item is missing its document version")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
         created: response
             .results
             .iter()
@@ -2085,7 +2108,13 @@ fn decode_shard_bulk_response(
             .collect(),
     };
     receipt.last_seq_no()?;
-    for (offset, (item, doc_id)) in response.results.iter().zip(&receipt.doc_ids).enumerate() {
+    for (offset, ((item, doc_id), version)) in response
+        .results
+        .iter()
+        .zip(&receipt.doc_ids)
+        .zip(&receipt.versions)
+        .enumerate()
+    {
         let expected_seq = receipt
             .start_seq_no
             .and_then(|start| start.checked_add(offset as u64));
@@ -2096,6 +2125,7 @@ fn decode_shard_bulk_response(
             || item.write_refresh.is_some()
             || item.seq_no != expected_seq
             || item.primary_term != Some(receipt.primary_term)
+            || item.version != Some(*version)
             || !matches!(
                 (item.status, item.result.as_str()),
                 (201, "created") | (200, "updated")
@@ -2232,12 +2262,19 @@ fn decode_shard_delete_response(
         .ok_or_else(|| {
             anyhow::anyhow!("successful shard delete response is missing its primary term")
         })?;
+    let version = response
+        .version
+        .filter(|version| *version > 0)
+        .ok_or_else(|| {
+            anyhow::anyhow!("successful shard delete response is missing its document version")
+        })?;
     let mut result = serde_json::json!({
         "_index": index_name,
         "_id": doc_id,
         "_shard": shard_id,
         "_seq_no": seq_no,
         "_primary_term": primary_term,
+        "_version": version,
         "result": if response.deleted > 0 { "deleted" } else { "not_found" }
     });
     if let Some(refresh) = &response.write_refresh {
@@ -2548,6 +2585,7 @@ mod tests {
                 error: String::new(),
                 seq_no: Some(0),
                 primary_term: Some(7),
+                version: Some(1),
                 ..Default::default()
             },
         )
@@ -2556,6 +2594,7 @@ mod tests {
         assert_eq!(index["_id"], "generated");
         assert_eq!(index["_seq_no"], 0);
         assert_eq!(index["_primary_term"], 7);
+        assert_eq!(index["_version"], 1);
     }
 
     #[test]
@@ -2775,6 +2814,7 @@ mod tests {
                         error: String::new(),
                         seq_no: Some(0),
                         primary_term: Some(7),
+                        version: Some(1),
                         ..Default::default()
                     },
                 )
@@ -2795,12 +2835,14 @@ mod tests {
                 error: String::new(),
                 seq_no: Some(0),
                 primary_term: Some(7),
+                version: Some(1),
                 ..Default::default()
             },
         )
         .unwrap();
         assert_eq!(index["_seq_no"], 0);
         assert_eq!(index["_primary_term"], 7);
+        assert_eq!(index["_version"], 1);
         assert!(
             decode_shard_doc_response(
                 "idx",
@@ -2855,6 +2897,7 @@ mod tests {
                         result: "created".to_string(),
                         seq_no: Some(offset as u64),
                         primary_term: Some(7),
+                        version: Some(1),
                         ..Default::default()
                     })
                     .collect(),
@@ -2864,6 +2907,7 @@ mod tests {
         .unwrap();
         assert_eq!(bulk.last_seq_no().unwrap(), Some(1));
         assert_eq!(bulk.primary_term, 7);
+        assert_eq!(bulk.versions, [1, 1]);
         for response in [
             ShardBulkResponse {
                 success: true,
@@ -2911,6 +2955,7 @@ mod tests {
                 primary_term: Some(7),
                 write_refresh: None,
                 failure: None,
+                version: Some(1),
             },
         )
         .unwrap();
@@ -2929,6 +2974,7 @@ mod tests {
                     primary_term: Some(7),
                     write_refresh: None,
                     failure: None,
+                    version: Some(1),
                 },
             )
             .is_err()

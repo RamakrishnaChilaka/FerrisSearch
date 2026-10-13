@@ -1880,6 +1880,7 @@ async fn grpc_disk_loss_fails_closed_and_failure_report_restores_write_set() {
         &serde_json::json!({"value": 1}),
         "index",
         0,
+        1,
         2,
     )
     .await;
@@ -1912,6 +1913,7 @@ async fn grpc_disk_loss_fails_closed_and_failure_report_restores_write_set() {
         &serde_json::json!({"value": 2}),
         "index",
         1,
+        2,
         2,
     )
     .await;

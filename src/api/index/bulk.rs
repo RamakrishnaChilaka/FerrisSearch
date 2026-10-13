@@ -144,6 +144,9 @@ fn wire_item_json(index: &str, shard: u32, item: ShardBulkItemResponse) -> Value
     if let Some(term) = item.primary_term {
         result["_primary_term"] = serde_json::json!(term);
     }
+    if let Some(version) = item.version {
+        result["_version"] = serde_json::json!(version);
+    }
     if let Some(refresh) = &item.write_refresh {
         crate::transport::write_refresh::add_write_refresh_to_response(
             &mut result,

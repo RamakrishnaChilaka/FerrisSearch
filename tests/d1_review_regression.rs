@@ -21,6 +21,7 @@ fn apply_index(
         .apply_replica_operation(ferrissearch::engine::SequencedOperation {
             seq_no,
             primary_term,
+            document_version: seq_no + 1,
             mutation: ferrissearch::engine::DocumentMutation::Index {
                 doc_id: doc_id.to_string(),
                 source,
