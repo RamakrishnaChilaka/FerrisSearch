@@ -362,6 +362,7 @@ EVENT_FIELDS = {
 EVENT_OPTIONAL_FIELDS = {
     "operation_processed": {"batch_max_seq_no"},
     "replay_entry": {"batch_max_seq_no"},
+    "recovery_installed": {"retained_wal"},
 }
 COMMON_FIELDS = {"schema", "run_id", "step", "event"}
 CHECKPOINT_FIELDS = {"processed", "persisted", "max_seq_no"}
@@ -955,6 +956,38 @@ def validate_event(
         string(value["session_id"], line, "session_id")
         if event == "recovery_installed":
             integer(value["snapshot_next_seq_no"], line, "snapshot_next_seq_no")
+            retained_wal = value.get("retained_wal", [])
+            if not isinstance(retained_wal, list):
+                fail(line, "recovery installed retained_wal must be an array")
+            previous_seq_no = None
+            for entry in retained_wal:
+                if not isinstance(entry, dict):
+                    fail(line, "retained_wal entries must be objects")
+                exact_fields(
+                    entry,
+                    {"term", "seq_no", "doc", "op", "content_hash"},
+                    line,
+                )
+                integer(entry["term"], line, "retained_wal.term", positive=True)
+                seq_no = integer(entry["seq_no"], line, "retained_wal.seq_no")
+                if previous_seq_no is not None and seq_no <= previous_seq_no:
+                    fail(line, "retained_wal seq_no values must be strictly increasing")
+                previous_seq_no = seq_no
+                if entry["op"] not in {"index", "delete", "noop"}:
+                    fail(line, "retained_wal operation kind is invalid")
+                if entry["op"] == "noop":
+                    if entry["doc"] is not None:
+                        fail(line, "retained_wal NoOp doc must be null")
+                else:
+                    string(entry["doc"], line, "retained_wal.doc")
+                digest = string(
+                    entry["content_hash"],
+                    line,
+                    "retained_wal.content_hash",
+                )
+                assert digest is not None
+                if not HASH_RE.fullmatch(digest):
+                    fail(line, "retained_wal content_hash must be lowercase SHA-256")
         elif event == "recovery_barrier":
             integer(value["barrier_next_seq_no"], line, "barrier_next_seq_no")
             if not isinstance(value["processed_seqs"], list):

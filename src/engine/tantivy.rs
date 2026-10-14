@@ -5337,15 +5337,11 @@ impl HotEngine {
                 .read_all()?
                 .into_iter()
                 .map(|entry| {
-                    let operation = sequenced_operation_from_entry(entry)?;
-                    let (doc, op, content_hash) =
-                        crate::protocol_trace::operation_parts(&operation);
-                    Ok(crate::protocol_trace::TraceWalEntry {
-                        seq_no: operation.seq_no,
-                        term: operation.primary_term,
-                        doc,
-                        op,
-                        content_hash,
+                    crate::protocol_trace::trace_wal_entry(&crate::wal::SequencedWalEntry {
+                        seq_no: entry.seq_no,
+                        primary_term: entry.primary_term,
+                        op: entry.op,
+                        payload: entry.payload,
                     })
                 })
                 .collect::<Result<Vec<_>>>()

@@ -408,7 +408,10 @@ def check_completeness(
                 if entry.seq_no > event["truncate_through"]
             ]
         elif kind == "recovery_installed":
-            copies.setdefault(event["target_node"], CopyState()).wal.clear()
+            copies.setdefault(event["target_node"], CopyState()).wal = [
+                actual_identity(entry)
+                for entry in event.get("retained_wal", [])
+            ]
         elif kind == "copy_state":
             final_copy_states[event["node"]] = (
                 event["step"],
@@ -800,7 +803,10 @@ def check_trace(
             copy.max_seq_no = snapshot.max_seq_no
             copy.documents = dict(snapshot.documents)
             copy.identities = dict(snapshot.identities)
-            copy.wal.clear()
+            copy.wal = [
+                actual_identity(entry)
+                for entry in event.get("retained_wal", [])
+            ]
             copy.history_initialized = True
         elif kind == "replay_started":
             node = event["node"]
