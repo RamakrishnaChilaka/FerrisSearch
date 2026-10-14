@@ -6,10 +6,10 @@
 >
 > **Current-behavior authority:** source and tests.
 >
-> **Last source audit:** 2026-10-14 for FS-010; 2026-10-13 for FS-003, FS-004,
-> and FS-011; 2026-10-09 for
-> FS-002; 2026-10-08 for FS-001 and FS-007; 2026-10-05 for FS-013; 2026-10-04
-> for FS-012; 2026-09-27 for FS-014, FS-019, and FS-022 through FS-026, after
+> **Last source audit:** 2026-10-14 for FS-010 and FS-012; 2026-10-13 for FS-003,
+> FS-004, and FS-011; 2026-10-09 for
+> FS-002; 2026-10-08 for FS-001 and FS-007; 2026-10-05 for FS-013; 2026-09-27
+> for FS-014, FS-019, and FS-022 through FS-026, after
 > PRs #142-#144. Other tasks were last audited on 2026-07-10.
 
 This is a dependency-aware sequence, not a feature wish list. Rank expresses
@@ -386,6 +386,18 @@ new sequence/version state, including timeout-after-commit and failover cases.
 ### FS-012 — Fence Stale Primaries And Replica Applies
 
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-007, FS-009, FS-010
+
+**Status (2026-10-14):** Partial; the large-bulk/concurrent-write replay probe
+now has bounded real-gRPC coverage in
+`large_bulk_and_same_document_writes_survive_replica_wal_replay`
+(`tests/replication_integration.rs`). Three 1,024-item bulk rounds race eight
+index/delete streams over shared document IDs. A receipt-owned oracle checks
+exact term, sequence, version, payload, final documents, and checkpoints on the
+primary and two replicas. Only a seed is committed before the workload; the
+test verifies the uncommitted suffix, closes each replica engine, and checks
+same-file WAL replay and searchable counts after reopen. This is an engine
+restart, not a full process/Raft restart, and does not close D5 self-fencing,
+D10 history convergence, or the broader failure-injection matrix.
 
 **Status (2026-10-04):** Partial. The live stale-primary criterion now has
 deterministic real-Raft/gRPC coverage in `tests/stale_primary_failover.rs`.

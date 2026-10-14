@@ -4155,6 +4155,8 @@ async fn two_replica_checkpoint_cluster(
     {
         let metadata = state.indices.get_mut(index).unwrap();
         metadata.number_of_replicas = 2;
+        metadata.settings.refresh_interval_ms = Some(3_600_000);
+        metadata.settings.flush_threshold_bytes = Some(0);
         metadata.dynamic = ferrissearch::cluster::state::DynamicMapping::Strict;
         metadata.mappings.insert(
             "message".into(),
@@ -4357,6 +4359,312 @@ async fn two_replica_concurrent_writes_converge_and_preserve_live_checkpoint_saf
         assert_eq!(replica.sequence_stats().persisted_checkpoint, Some(100));
     }
     assert_eq!(primary.global_checkpoint(), Some(100));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_bulk_and_same_document_writes_survive_replica_wal_replay() {
+    use ferrissearch::engine::{CompositeEngine, DocumentRead, SearchEngine};
+    use ferrissearch::wal::{TranslogDurability, WalOperation};
+    use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+
+    const ROUNDS: usize = 3;
+    const BULK_DOCUMENTS: usize = 1_024;
+    const WRITERS: usize = 8;
+    const HOT_DOCUMENTS: usize = 4;
+    const WRITES_PER_WRITER: usize = 16;
+    type Operation = (u64, WalOperation, Value);
+
+    fn assert_copy(engine: &dyn SearchEngine, expected: &BTreeMap<u64, Operation>) -> u64 {
+        let head = *expected.last_key_value().unwrap().0;
+        let stats = engine.sequence_stats();
+        assert_eq!(stats.max_seq_no, Some(head));
+        assert_eq!(stats.processed_checkpoint, Some(head));
+        assert_eq!(stats.persisted_checkpoint, Some(head));
+        let suffix = engine
+            .retained_recovery_ops(1, usize::MAX, usize::MAX)
+            .unwrap()
+            .operations;
+        assert_eq!(suffix.len(), expected.len() - 1);
+        let actual: BTreeMap<_, _> = suffix
+            .into_iter()
+            .map(|entry| (entry.seq_no, (entry.primary_term, entry.op, entry.payload)))
+            .collect();
+        assert_eq!(actual.len(), expected.len() - 1, "duplicate WAL identity");
+        assert_eq!(
+            actual,
+            expected
+                .range(1..)
+                .map(|(seq, op)| (*seq, op.clone()))
+                .collect()
+        );
+
+        let mut versions = BTreeMap::new();
+        let mut latest = BTreeMap::new();
+        for (seq_no, (term, operation, payload)) in expected {
+            let doc_id = payload["_doc_id"].as_str().unwrap();
+            let version = versions.entry(doc_id).or_insert(0_u64);
+            *version += 1;
+            assert_eq!(payload["_version"], *version, "version of {doc_id}");
+            let document = match operation {
+                WalOperation::Index => Some(DocumentRead {
+                    source: payload["_source"].clone(),
+                    seq_no: *seq_no,
+                    primary_term: *term,
+                    version: *version,
+                }),
+                WalOperation::Delete => None,
+                WalOperation::NoOp => panic!("client workload cannot generate a NoOp"),
+            };
+            latest.insert(doc_id, document);
+        }
+        let live = latest
+            .values()
+            .filter(|document| document.is_some())
+            .count() as u64;
+        for (doc_id, document) in latest {
+            assert_eq!(
+                engine.get_document_with_metadata(doc_id, true).unwrap(),
+                document,
+                "document {doc_id}"
+            );
+        }
+        live
+    }
+
+    let index = "bulk-concurrent-replay";
+    let (_dirs, primary, replicas, address, servers) = two_replica_checkpoint_cluster(index).await;
+    let mut client = connect_client(address).await;
+    let seed = client
+        .index_doc(forwarding_request(ShardDocRequest {
+            index_name: index.into(),
+            shard_id: 0,
+            doc_id: "seed".into(),
+            payload_json: serde_json::to_vec(&json!({"message": "seed"})).unwrap(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(seed.success, "{}", seed.error);
+    assert_eq!(seed.seq_no, Some(0));
+    let term = seed.primary_term.unwrap();
+    let mut expected = BTreeMap::from([(
+        0,
+        (
+            term,
+            WalOperation::Index,
+            json!({"_doc_id": "seed", "_source": {"message": "seed"}, "_version": seed.version.unwrap()}),
+        ),
+    )]);
+    let copies: Vec<_> = std::iter::once(primary.clone()).chain(replicas).collect();
+    let seed_copies = copies.clone();
+    tokio::task::spawn_blocking(move || {
+        for manager in seed_copies {
+            manager.get_shard(index, 0).unwrap().refresh().unwrap();
+        }
+    })
+    .await
+    .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(120), async {
+        for round in 0..ROUNDS {
+            let documents: Vec<_> = (0..BULK_DOCUMENTS)
+                .map(|item| {
+                    let id = if item % 8 == 0 {
+                        format!("hot-{}", (item / 8) % HOT_DOCUMENTS)
+                    } else {
+                        format!("bulk-{round}-{item}")
+                    };
+                    (id, json!({"message": format!("bulk-{round}-{item}")}))
+                })
+                .collect();
+            let request = ShardBulkRequest {
+                index_name: index.into(),
+                shard_id: 0,
+                documents_json: documents
+                    .iter()
+                    .map(|(id, source)| {
+                        serde_json::to_vec(&json!({"_doc_id": id, "_source": source})).unwrap()
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            let barrier = Arc::new(tokio::sync::Barrier::new(WRITERS + 1));
+            let mut bulk_client = client.clone();
+            let bulk = async {
+                barrier.wait().await;
+                let response = bulk_client
+                    .bulk_index(forwarding_request(request))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert!(response.success, "{}", response.error);
+                assert_eq!(response.results.len(), BULK_DOCUMENTS);
+                assert_eq!(response.primary_term, Some(term));
+                let start = response.start_seq_no.unwrap();
+                response
+                    .results
+                    .into_iter()
+                    .zip(documents)
+                    .enumerate()
+                    .map(|(offset, (receipt, (id, source)))| {
+                        assert!(matches!(receipt.status, 200 | 201), "{receipt:?}");
+                        assert_eq!(receipt.doc_id, id);
+                        assert_eq!(receipt.seq_no, Some(start + offset as u64));
+                        assert_eq!(receipt.primary_term, Some(term));
+                        (
+                            receipt.seq_no.unwrap(),
+                            (
+                                term,
+                                WalOperation::Index,
+                                json!({"_doc_id": id, "_source": source, "_version": receipt.version.unwrap()}),
+                            ),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let singles = futures::future::join_all((0..WRITERS).map(|writer| {
+                let mut client = client.clone();
+                let barrier = barrier.clone();
+                async move {
+                    let id = format!("hot-{}", writer % HOT_DOCUMENTS);
+                    let mut receipts = Vec::new();
+                    barrier.wait().await;
+                    for write in 0..WRITES_PER_WRITER {
+                        let (seq_no, primary_term, version, operation, source) = if (write + writer) % 4 == 3 {
+                            let receipt = client
+                                .delete_doc(forwarding_request(ShardDeleteRequest {
+                                    index_name: index.into(),
+                                    shard_id: 0,
+                                    doc_id: id.clone(),
+                                    ..Default::default()
+                                }))
+                                .await
+                                .unwrap()
+                                .into_inner();
+                            assert!(receipt.success, "{}", receipt.error);
+                            (receipt.seq_no, receipt.primary_term, receipt.version, WalOperation::Delete, None)
+                        } else {
+                            let source = json!({"message": format!("single-{round}-{writer}-{write}")});
+                            let receipt = client
+                                .index_doc(forwarding_request(ShardDocRequest {
+                                    index_name: index.into(),
+                                    shard_id: 0,
+                                    doc_id: id.clone(),
+                                    payload_json: serde_json::to_vec(&source).unwrap(),
+                                    ..Default::default()
+                                }))
+                                .await
+                                .unwrap()
+                                .into_inner();
+                            assert!(receipt.success, "{}", receipt.error);
+                            assert_eq!(receipt.doc_id, id);
+                            (receipt.seq_no, receipt.primary_term, receipt.version, WalOperation::Index, Some(source))
+                        };
+                        assert_eq!(primary_term, Some(term));
+                        let mut payload = json!({"_doc_id": id, "_version": version.unwrap()});
+                        if let Some(source) = source {
+                            payload["_source"] = source;
+                        }
+                        receipts.push((seq_no.unwrap(), (term, operation, payload)));
+                    }
+                    receipts
+                }
+            }));
+            let (bulk, singles) = tokio::join!(bulk, singles);
+            for (seq_no, operation) in bulk.into_iter().chain(singles.into_iter().flatten()) {
+                assert!(
+                    expected.insert(seq_no, operation).is_none(),
+                    "duplicate acknowledged sequence {seq_no}"
+                );
+            }
+        }
+        // Delete the committed seed without masking the raced hot-document values.
+        let receipt = client
+            .delete_doc(forwarding_request(ShardDeleteRequest {
+                index_name: index.into(),
+                shard_id: 0,
+                doc_id: "seed".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(receipt.success, "{}", receipt.error);
+        assert_eq!(receipt.deleted, 1);
+        assert_eq!(receipt.primary_term, Some(term));
+        assert!(
+            expected
+                .insert(
+                    receipt.seq_no.unwrap(),
+                    (
+                        term,
+                        WalOperation::Delete,
+                        json!({"_doc_id": "seed", "_version": receipt.version.unwrap()}),
+                    ),
+                )
+                .is_none()
+        );
+    })
+    .await
+    .unwrap();
+    let count = 2 + ROUNDS * (BULK_DOCUMENTS + WRITERS * WRITES_PER_WRITER);
+    assert_eq!(expected.len(), count);
+    assert_eq!(
+        expected.keys().copied().collect::<Vec<_>>(),
+        (0..count as u64).collect::<Vec<_>>()
+    );
+
+    tokio::task::spawn_blocking(move || {
+        for manager in &copies {
+            let path = manager.shard_data_dir(index, 0).unwrap();
+            let committed: Value =
+                serde_json::from_slice(&std::fs::read(path.join("translog.committed")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                committed["processed_checkpoint"], 0,
+                "suffix must be uncommitted"
+            );
+            assert_copy(manager.get_shard(index, 0).unwrap().as_ref(), &expected);
+        }
+        let mappings = HashMap::from([(
+            "message".into(),
+            FieldMapping {
+                field_type: FieldType::Text,
+                dimension: None,
+            },
+        )]);
+        for manager in copies.iter().skip(1) {
+            let path = manager.shard_data_dir(index, 0).unwrap();
+            manager.quarantine_shard_copy(index, 0);
+            assert!(manager.get_shard(index, 0).is_none());
+            let reopened = CompositeEngine::new_with_mappings(
+                &path,
+                Duration::from_secs(3600),
+                &mappings,
+                TranslogDurability::Request,
+                Arc::new(ferrissearch::engine::column_cache::ColumnCache::new(0, 0)),
+            )
+            .unwrap();
+            let live = assert_copy(&reopened, &expected);
+            assert_eq!(reopened.doc_count(), live);
+            let committed: Value =
+                serde_json::from_slice(&std::fs::read(path.join("translog.committed")).unwrap())
+                    .unwrap();
+            assert_eq!(committed["processed_checkpoint"], count as u64 - 1);
+        }
+        let primary = copies[0].get_shard(index, 0).unwrap();
+        primary.refresh().unwrap();
+        let live = assert_copy(primary.as_ref(), &expected);
+        assert_eq!(primary.doc_count(), live);
+        assert_eq!(primary.global_checkpoint(), Some(count as u64 - 1));
+    })
+    .await
+    .unwrap();
+    for server in servers {
+        server.abort();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
