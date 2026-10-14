@@ -386,6 +386,7 @@ fn writes_regression_primary_bulk_and_out_of_order_replica_reads_use_correct_wal
                 seq_no: 2,
                 primary_term: receipt.primary_term,
                 document_version: receipt.versions[2],
+                client_operation: None,
                 mutation: DocumentMutation::Index {
                     doc_id: "other".into(),
                     source: json!({"value": 3}),
@@ -395,6 +396,7 @@ fn writes_regression_primary_bulk_and_out_of_order_replica_reads_use_correct_wal
                 seq_no: 1,
                 primary_term: receipt.primary_term,
                 document_version: receipt.versions[1],
+                client_operation: None,
                 mutation: DocumentMutation::Index {
                     doc_id: "doc".into(),
                     source: json!({"value": 2}),
@@ -404,6 +406,7 @@ fn writes_regression_primary_bulk_and_out_of_order_replica_reads_use_correct_wal
                 seq_no: 0,
                 primary_term: receipt.primary_term,
                 document_version: receipt.versions[0],
+                client_operation: None,
                 mutation: DocumentMutation::Index {
                     doc_id: "doc".into(),
                     source: json!({"value": 1}),
@@ -423,6 +426,7 @@ fn writes_regression_primary_bulk_and_out_of_order_replica_reads_use_correct_wal
             seq_no: 3,
             primary_term: receipt.primary_term,
             document_version: 3,
+            client_operation: None,
             mutation: DocumentMutation::Delete {
                 doc_id: "doc".into(),
             },
@@ -462,6 +466,7 @@ fn writes_regression_replay_positions_follow_physical_order_across_committed_ski
                     seq_no,
                     primary_term: 1,
                     document_version: seq_no + 1,
+                    client_operation: None,
                     mutation: DocumentMutation::Index {
                         doc_id: doc_id.to_string(),
                         source: json!({"value": seq_no}),
@@ -476,6 +481,7 @@ fn writes_regression_replay_positions_follow_physical_order_across_committed_ski
                     seq_no,
                     primary_term: 1,
                     document_version: seq_no + 1,
+                    client_operation: None,
                     mutation: DocumentMutation::Index {
                         doc_id: doc_id.to_string(),
                         source: json!({"value": seq_no}),
@@ -628,6 +634,7 @@ fn writes_regression_rejects_invalid_sequenced_document_versions_before_wal() {
             seq_no: 0,
             primary_term: 1,
             document_version: 0,
+            client_operation: None,
             mutation: DocumentMutation::Index {
                 doc_id: "doc".into(),
                 source: json!({"value": 1}),
@@ -637,6 +644,7 @@ fn writes_regression_rejects_invalid_sequenced_document_versions_before_wal() {
             seq_no: 0,
             primary_term: 1,
             document_version: 1,
+            client_operation: None,
             mutation: DocumentMutation::NoOp {
                 reason: "invalid version".into(),
             },

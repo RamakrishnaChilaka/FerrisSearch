@@ -347,21 +347,31 @@ self-fencing after a rejected old-primary exclusion remains a selected target.
 
 ### D6. Retry semantics
 
-Until FS-011 adds operation IDs, client retries are at-least-once:
+**Status (2026-10-13):** Implemented for supported `local_shards` document
+writes through FS-011.
 
-| Operation | Retry behavior |
+Clients may attach `operation_id` to single index/create, update, and delete
+requests, or `_operation_id` to a bulk action. The ID is scoped to one shard
+history and may be at most 256 bytes. FerrisSearch persists the ID, a stable
+request fingerprint, and the original authoritative result in the WAL and
+preserves them through replication, restart, file-based peer recovery, and
+promotion.
+
+| Operation | Retry behavior with an operation ID |
 |---|---|
-| Index with an explicit `_id` | Converges to the same content with a new `seq_no`. |
-| Index with an auto-generated ID | Not retry-safe: a client resend creates a duplicate. Clients that retry must supply `_id`. |
-| Create (`op_type=create`, once implemented) | After an indeterminate attempt, a retry can return 409. Treat that 409 as possibly applied. |
-| Delete | Returns 404 `not_found` if the first attempt applied. |
-| Update | Retry-safe only with `if_seq_no` and `if_primary_term`. |
+| Index/create with an explicit `_id` | An exact retry returns the original result and metadata without a new sequence or version. |
+| Index with an auto-generated ID | The operation ID deterministically derives the document ID, so an exact retry returns the same document and original result. |
+| Delete | An exact retry returns the original `deleted` or `not_found` result and metadata. |
+| Update | An exact retry returns the original index result or detected no-op result. An ID-bearing detected no-op records a durable internal NoOp sequence while returning the unchanged document sequence, term, and version. |
 
-The auto-ID case is a declared deviation from roadmap invariant 6.1.2 until
-FS-011 lands. Coordinator retries are allowed only for failures classified
-"not executed"; the coordinator never resends an indeterminate operation.
-Clients also resend on connection errors, so these rules apply to those
-resends too.
+Reusing an ID with a different operation kind, target, source, condition, or
+update intent is a hard 409 `operation_id_conflict`. The retained deduplication
+window is the latest 4,096 sequence operations in that shard. After the record
+expires, or when no ID is supplied, retries remain at-least-once: explicit-ID
+index converges through a new mutation, auto-ID index can duplicate, delete can
+return `not_found`, and update needs OCC to avoid reapplying. The coordinator
+still resends only failures proven not executed; clients may safely resend an
+indeterminate supported write while its operation record remains retained.
 
 ### D7. Response metadata
 
@@ -636,7 +646,7 @@ map or the reader's `_seq_no`/`_primary_term` fast fields. Replicas apply only
 the resulting sequenced mutation, never the condition.
 Coordinator update also carries D9's index-incarnation precondition.
 
-Remaining: external versioning and client operation IDs remain unimplemented.
+Remaining: external versioning remains unimplemented.
 
 - **Conditional writes:** `if_seq_no` and `if_primary_term` are checked only on
   the primary, against the live version map or the committed index. A mismatch

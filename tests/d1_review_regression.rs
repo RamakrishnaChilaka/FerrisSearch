@@ -22,6 +22,7 @@ fn apply_index(
             seq_no,
             primary_term,
             document_version: seq_no + 1,
+            client_operation: None,
             mutation: ferrissearch::engine::DocumentMutation::Index {
                 doc_id: doc_id.to_string(),
                 source,

@@ -156,6 +156,7 @@ async fn gapped_vector_replica_transport_restart_accepts_missing_operation() {
         primary_term: Some(2),
         target_allocation_id: Some(allocation_id),
         document_version: Some(seq_no + 1),
+        client_operation: None,
     };
     {
         let path = directory.path().to_path_buf();
@@ -871,6 +872,7 @@ fn gcp_replica_operations(
             seq_no,
             primary_term: 2,
             document_version: seq_no + 1,
+            client_operation: None,
             mutation: crate::engine::DocumentMutation::Index {
                 doc_id: format!("doc-{seq_no}"),
                 source: json!({"value": seq_no}),
@@ -1288,6 +1290,7 @@ async fn promotion_noop_retry_waits_for_exclusive_recovery_barrier() {
         seq_no: 4,
         primary_term: 2,
         document_version: 0,
+        client_operation: None,
         mutation: crate::engine::DocumentMutation::NoOp {
             reason: "promotion gap".into(),
         },
@@ -1625,6 +1628,7 @@ async fn expired_gap_probe_clears_an_idle_observation_when_replica_caught_up() {
                     seq_no,
                     primary_term: 2,
                     document_version: seq_no + 1,
+                    client_operation: None,
                     mutation: crate::engine::DocumentMutation::Index {
                         doc_id: format!("doc-{seq_no}"),
                         source: json!({"seq": seq_no}),
@@ -2551,6 +2555,7 @@ async fn blocked_refresh_does_not_exhaust_write_pool_for_replica_apply() {
             primary_term: Some(1),
             target_allocation_id: Some(1),
             document_version: Some(1),
+            client_operation: None,
         })),
     )
     .await;
@@ -3519,6 +3524,7 @@ async fn persistent_replica_io_is_failed_out_of_routing() {
                 primary_term: Some(2),
                 target_allocation_id: Some(replica_allocation),
                 document_version: Some(1),
+                client_operation: None,
             }))
             .await
             .unwrap()
@@ -3542,6 +3548,7 @@ async fn persistent_replica_io_is_failed_out_of_routing() {
             "index",
             1,
             2,
+            None,
             2,
         )
         .await
@@ -3628,6 +3635,7 @@ async fn persistent_replica_bulk_wal_io_remains_typed_for_escalation() {
             primary_term: Some(2),
             target_allocation_id: Some(allocation_id),
             document_version: Some(1),
+            client_operation: None,
         };
         let response = service
             .replicate_bulk(Request::new(ReplicateBulkRequest {
@@ -3739,6 +3747,7 @@ async fn replica_index_payload_json_is_decoded_once_per_operation() {
             primary_term: Some(2),
             target_allocation_id: Some(allocation_id),
             document_version: Some(1),
+            client_operation: None,
         }))
         .await
         .unwrap()
@@ -3763,6 +3772,7 @@ async fn replica_index_payload_json_is_decoded_once_per_operation() {
             primary_term: Some(2),
             target_allocation_id: Some(allocation_id),
             document_version: Some(seq_no + 1),
+            client_operation: None,
         })
         .collect();
     start_tracking_replica_index_payload(&bulk_payload);
@@ -3797,6 +3807,7 @@ async fn replica_transport_rejects_missing_or_zero_document_versions_before_wal(
         primary_term: Some(2),
         target_allocation_id: Some(allocation_id),
         document_version,
+        client_operation: None,
     };
 
     for (seq_no, document_version) in [(0, None), (1, Some(0))] {
@@ -3898,6 +3909,7 @@ async fn replica_bulk_accepts_non_contiguous_promotion_noops() {
         primary_term: Some(2),
         target_allocation_id: Some(allocation_id),
         document_version: None,
+        client_operation: None,
     };
 
     let response = service
@@ -3944,6 +3956,7 @@ async fn promotion_noop_batches_reach_live_replica_in_two_requests() {
             seq_no: index * 2,
             primary_term: 1,
             document_version: index + 1,
+            client_operation: None,
             mutation: crate::engine::DocumentMutation::Index {
                 doc_id: format!("doc-{index}"),
                 source: json!({"value": index}),
@@ -4081,6 +4094,7 @@ async fn failed_promotion_noop_fanout_is_retried_end_to_end() {
                     seq_no,
                     primary_term: 1,
                     document_version: seq_no + 1,
+                    client_operation: None,
                     mutation: crate::engine::DocumentMutation::Index {
                         doc_id: format!("doc-{seq_no}"),
                         source: json!({"seq": seq_no}),
@@ -4290,6 +4304,7 @@ async fn promotion_noop_retry_on_one_shard_does_not_block_other_shards() {
                     seq_no,
                     primary_term: 1,
                     document_version: seq_no + 1,
+                    client_operation: None,
                     mutation: crate::engine::DocumentMutation::Index {
                         doc_id: format!("doc-{seq_no}"),
                         source: json!({"seq": seq_no}),
@@ -4505,6 +4520,7 @@ async fn promoted_primary_replays_multiple_batches_and_reopens_cleanly() {
                         seq_no,
                         primary_term: 1,
                         document_version: seq_no + 1,
+                        client_operation: None,
                         mutation: crate::engine::DocumentMutation::Index {
                             doc_id: format!("doc-{seq_no}"),
                             source: json!({"value": seq_no}),
@@ -5331,6 +5347,7 @@ async fn replica_commit_failure_recovers_writes_and_deletes_before_promotion() {
             primary_term: Some(2),
             target_allocation_id: Some(replica_allocation),
             document_version: if op == "noop" { None } else { Some(seq_no + 1) },
+            client_operation: None,
         }
     };
     assert!(
@@ -5869,6 +5886,7 @@ async fn review_c3_collision_with_lagging_view_quarantines_copy() {
                     seq_no,
                     primary_term: 1,
                     document_version: seq_no + 1,
+                    client_operation: None,
                     mutation: crate::engine::DocumentMutation::Index {
                         doc_id: format!("doc-{seq_no}"),
                         source: json!({"term": 1, "seq": seq_no}),
@@ -5906,6 +5924,7 @@ async fn review_c3_collision_with_lagging_view_quarantines_copy() {
             primary_term: Some(2),
             target_allocation_id: Some(allocation_id),
             document_version: Some(6),
+            client_operation: None,
         }))
         .await
     {
@@ -6091,6 +6110,7 @@ async fn review_c3_primary_reports_collision_from_lagging_view_replica() {
                     seq_no,
                     primary_term: 1,
                     document_version: seq_no + 1,
+                    client_operation: None,
                     mutation: crate::engine::DocumentMutation::Index {
                         doc_id: format!("doc-{seq_no}"),
                         source: json!({"term": 1, "seq": seq_no}),
@@ -6166,6 +6186,7 @@ async fn review_c3_primary_reports_collision_from_lagging_view_replica() {
         "index",
         5,
         6,
+        None,
         2,
         crate::wal::TranslogDurability::Request,
     )
@@ -6347,6 +6368,7 @@ async fn collision_quarantine_rejects_reopen_and_follow_up_replication() {
                         seq_no,
                         primary_term: 1,
                         document_version: seq_no + 1,
+                        client_operation: None,
                         mutation: crate::engine::DocumentMutation::Index {
                             doc_id: format!("doc-{seq_no}"),
                             source: json!({"term": 1, "seq": seq_no}),
@@ -6383,6 +6405,7 @@ async fn collision_quarantine_rejects_reopen_and_follow_up_replication() {
         primary_term: Some(2),
         target_allocation_id: Some(allocation_id),
         document_version: Some(seq_no + 1),
+        client_operation: None,
     };
 
     let collision = service
@@ -6509,6 +6532,7 @@ async fn collision_marker_persist_failure_keeps_transport_quarantined() {
                         seq_no,
                         primary_term: 1,
                         document_version: seq_no + 1,
+                        client_operation: None,
                         mutation: crate::engine::DocumentMutation::Index {
                             doc_id: format!("doc-{seq_no}"),
                             source: json!({"term": 1, "seq": seq_no}),
@@ -6546,6 +6570,7 @@ async fn collision_marker_persist_failure_keeps_transport_quarantined() {
         primary_term: Some(2),
         target_allocation_id: Some(allocation_id),
         document_version: Some(seq_no + 1),
+        client_operation: None,
     };
     shards.inject_collision_quarantine_persist_failures(28, 2);
 

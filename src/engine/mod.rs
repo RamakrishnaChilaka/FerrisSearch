@@ -1,3 +1,4 @@
+pub mod client_operation;
 pub mod column_cache;
 pub mod composite;
 pub mod remote_store;
@@ -15,18 +16,24 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+pub use self::client_operation::{
+    CLIENT_OPERATION_ID_MAX_BYTES, CLIENT_OPERATION_RETENTION_OPERATIONS,
+    ClientOperationConflictError, ClientOperationIntent, ClientOperationRecord,
+    ClientOperationResult,
+};
 pub use self::composite::CompositeEngine;
 pub use self::sequence::{SEQUENCE_FORMAT_VERSION, SequenceStats};
 pub use self::tantivy::HotEngine;
 
 pub(crate) const PEER_RECOVERY_VERSION_SNAPSHOT_FILE: &str = "retained-delete-versions.json";
-pub(crate) const PEER_RECOVERY_VERSION_SNAPSHOT_FORMAT: u32 = 1;
+pub(crate) const PEER_RECOVERY_VERSION_SNAPSHOT_FORMAT: u32 = 2;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PeerRecoveryVersionSnapshot {
     pub format_version: u32,
     pub deletes: Vec<PeerRecoveryDeleteVersion>,
+    pub client_operations: Vec<PeerRecoveryClientOperation>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -36,6 +43,15 @@ pub(crate) struct PeerRecoveryDeleteVersion {
     pub seq_no: u64,
     pub primary_term: u64,
     pub version: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PeerRecoveryClientOperation {
+    pub seq_no: u64,
+    pub primary_term: u64,
+    pub op: String,
+    pub payload: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -67,6 +83,7 @@ pub struct SequencedOperation {
     pub primary_term: u64,
     /// Primary-assigned per-document version. NoOp operations use zero.
     pub document_version: u64,
+    pub client_operation: Option<ClientOperationRecord>,
     pub mutation: DocumentMutation,
 }
 
@@ -191,6 +208,8 @@ pub struct IndexWriteReceipt {
     pub primary_term: u64,
     pub version: u64,
     pub created: bool,
+    pub client_operation: Option<ClientOperationRecord>,
+    pub deduplicated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,6 +246,19 @@ pub struct DeleteWriteReceipt {
     pub seq_no: u64,
     pub primary_term: u64,
     pub version: u64,
+    pub client_operation: Option<ClientOperationRecord>,
+    pub deduplicated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientNoOpWriteReceipt {
+    pub operation_seq_no: u64,
+    pub operation_primary_term: u64,
+    pub seq_no: u64,
+    pub primary_term: u64,
+    pub version: u64,
+    pub client_operation: ClientOperationRecord,
+    pub deduplicated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -504,6 +536,20 @@ pub trait SearchEngine: Send + Sync {
         condition: WriteCondition,
     ) -> Result<IndexWriteReceipt>;
 
+    fn add_document_with_operation_at_term(
+        &self,
+        doc_id: &str,
+        payload: serde_json::Value,
+        primary_term: u64,
+        condition: WriteCondition,
+        client_operation: Option<ClientOperationIntent>,
+    ) -> Result<IndexWriteReceipt> {
+        if client_operation.is_some() {
+            anyhow::bail!("client operation IDs are not supported by this search engine");
+        }
+        self.add_document_with_condition_at_term(doc_id, payload, primary_term, condition)
+    }
+
     /// Bulk-index documents. Each tuple is (doc_id, payload). Returns document IDs.
     fn bulk_add_documents(&self, docs: Vec<(String, serde_json::Value)>) -> Result<Vec<String>> {
         Ok(self.bulk_add_documents_with_receipt(docs)?.doc_ids)
@@ -544,6 +590,30 @@ pub trait SearchEngine: Send + Sync {
         condition: WriteCondition,
     ) -> Result<DeleteWriteReceipt>;
 
+    fn delete_document_with_operation_at_term(
+        &self,
+        doc_id: &str,
+        primary_term: u64,
+        condition: WriteCondition,
+        client_operation: Option<ClientOperationIntent>,
+    ) -> Result<DeleteWriteReceipt> {
+        if client_operation.is_some() {
+            anyhow::bail!("client operation IDs are not supported by this search engine");
+        }
+        self.delete_document_with_condition_at_term(doc_id, primary_term, condition)
+    }
+
+    fn record_client_noop_at_term(
+        &self,
+        _primary_term: u64,
+        _client_operation: ClientOperationIntent,
+        _seq_no: u64,
+        _result_primary_term: u64,
+        _version: u64,
+    ) -> Result<ClientNoOpWriteReceipt> {
+        anyhow::bail!("client operation no-ops are not supported by this search engine")
+    }
+
     fn apply_replica_operation(&self, operation: SequencedOperation)
     -> Result<ReplicaApplyReceipt>;
 
@@ -558,6 +628,7 @@ pub trait SearchEngine: Send + Sync {
             seq_no,
             primary_term,
             document_version: 0,
+            client_operation: None,
             mutation: DocumentMutation::NoOp {
                 reason: reason.to_string(),
             },

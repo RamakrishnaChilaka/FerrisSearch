@@ -652,6 +652,7 @@ pub fn route_client_write(
         } else {
             1
         },
+        client_operation: None,
         mutation: mutation.clone(),
     });
     with_state(|state| {
@@ -2391,6 +2392,7 @@ mod tests {
                 seq_no: 0,
                 primary_term: 1,
                 document_version: 1,
+                client_operation: None,
                 mutation: DocumentMutation::Index {
                     doc_id: "d".into(),
                     source: json!({"value": 1}),
@@ -2419,6 +2421,7 @@ mod tests {
             seq_no: 0,
             primary_term: 1,
             document_version: 1,
+            client_operation: None,
             mutation: DocumentMutation::Index {
                 doc_id: "d".into(),
                 source: json!({"value": 1}),
@@ -2463,6 +2466,7 @@ mod tests {
             seq_no: 0,
             primary_term: 1,
             document_version: 1,
+            client_operation: None,
             mutation: DocumentMutation::Index {
                 doc_id: "x".into(),
                 source: json!({"value": "primary"}),
@@ -2472,6 +2476,7 @@ mod tests {
             seq_no: 0,
             primary_term: 1,
             document_version: 1,
+            client_operation: None,
             mutation: DocumentMutation::Index {
                 doc_id: "y".into(),
                 source: json!({"value": "replica"}),
@@ -2561,6 +2566,7 @@ mod tests {
             seq_no: 0,
             primary_term: 1,
             document_version: 1,
+            client_operation: None,
             mutation: DocumentMutation::Delete { doc_id: "d".into() },
         };
         let older = route_client_write("p", "idx", 0, "p", "d", &operation.mutation).unwrap();

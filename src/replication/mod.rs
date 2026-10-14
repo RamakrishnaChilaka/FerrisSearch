@@ -106,6 +106,7 @@ struct ReplicaWireOperation {
     doc_id: String,
     payload_json: Vec<u8>,
     document_version: Option<u64>,
+    client_operation: Option<crate::engine::ClientOperationRecord>,
 }
 
 struct ReplicaBatchRoute {
@@ -166,6 +167,7 @@ pub async fn replicate_write(
     op: &str,
     seq_no: u64,
     document_version: u64,
+    client_operation: Option<&crate::engine::ClientOperationRecord>,
     primary_term: u64,
 ) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>> {
     replicate_write_with_durability(
@@ -178,6 +180,7 @@ pub async fn replicate_write(
         op,
         seq_no,
         document_version,
+        client_operation,
         primary_term,
         TranslogDurability::Request,
     )
@@ -195,6 +198,7 @@ pub async fn replicate_write_with_durability(
     op: &str,
     seq_no: u64,
     document_version: u64,
+    client_operation: Option<&crate::engine::ClientOperationRecord>,
     primary_term: u64,
     durability: TranslogDurability,
 ) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>> {
@@ -243,6 +247,7 @@ pub async fn replicate_write_with_durability(
         seq_no,
         primary_term,
         document_version,
+        client_operation: client_operation.cloned(),
         mutation: match op {
             "index" => crate::engine::DocumentMutation::Index {
                 doc_id: doc_id.to_string(),
@@ -332,6 +337,8 @@ pub async fn replicate_write_with_durability(
             Arc::new(serde_json::to_vec(payload).map_err(|error| error.to_string()))
         }));
         let uuid = index_uuid.clone();
+        let client_operation =
+            client_operation.map(crate::transport::client_operation::record_to_proto);
         #[cfg(feature = "protocol-trace")]
         let trace_message = trace_messages
             .iter()
@@ -389,6 +396,7 @@ pub async fn replicate_write_with_durability(
                         primary_term: Some(primary_term),
                         target_allocation_id: Some(target_allocation_id),
                         document_version: Some(document_version),
+                        client_operation,
                     },
                     matches!(durability, TranslogDurability::Request),
                 )
@@ -569,6 +577,7 @@ pub async fn replicate_bulk_with_durability(
                         seq_no,
                         primary_term,
                         document_version: *document_version,
+                        client_operation: None,
                         mutation: crate::engine::DocumentMutation::Index {
                             doc_id: doc_id.clone(),
                             source: payload.clone(),
@@ -613,6 +622,7 @@ pub async fn replicate_bulk_with_durability(
                 doc_id: doc_id.clone(),
                 payload_json,
                 document_version: Some(*document_version),
+                client_operation: None,
             })
         })
         .collect::<Result<Vec<_>, ReplicaReplicationFailure>>()
@@ -684,6 +694,7 @@ pub async fn replicate_noop_batch_with_durability(
                 doc_id: String::new(),
                 payload_json,
                 document_version: None,
+                client_operation: operation.client_operation.clone(),
             })
         })
         .collect::<Result<Vec<_>, ReplicaReplicationFailure>>()
@@ -780,6 +791,7 @@ async fn replicate_explicit_batch_with_durability(
                 seq_no: operation.seq_no,
                 primary_term,
                 document_version: operation.document_version.unwrap_or(0),
+                client_operation: operation.client_operation.clone(),
                 mutation,
             })
         })
@@ -891,6 +903,10 @@ async fn replicate_explicit_batch_with_durability(
                     primary_term: Some(primary_term),
                     target_allocation_id: Some(target_allocation_id),
                     document_version: operation.document_version,
+                    client_operation: operation
+                        .client_operation
+                        .as_ref()
+                        .map(crate::transport::client_operation::record_to_proto),
                 })
                 .collect();
             match client
@@ -1081,6 +1097,7 @@ mod tests {
             "index",
             0,
             1,
+            None,
             1,
         )
         .await;
@@ -1102,6 +1119,7 @@ mod tests {
             "index",
             0,
             1,
+            None,
             1,
         )
         .await
@@ -1124,6 +1142,7 @@ mod tests {
             "index",
             0,
             1,
+            None,
             1,
         )
         .await;
@@ -1146,6 +1165,7 @@ mod tests {
             "index",
             0,
             1,
+            None,
             1,
         )
         .await;
@@ -1167,6 +1187,7 @@ mod tests {
             "index",
             0,
             1,
+            None,
             1,
         )
         .await;
@@ -1192,6 +1213,7 @@ mod tests {
             "index",
             0,
             1,
+            None,
             1,
         )
         .await;
@@ -1217,6 +1239,7 @@ mod tests {
             "index",
             0,
             1,
+            None,
             1,
         )
         .await;
@@ -1307,6 +1330,7 @@ mod tests {
             "index",
             0,
             1,
+            None,
             1,
         )
         .await

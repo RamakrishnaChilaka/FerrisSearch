@@ -2,6 +2,7 @@
 //! Uses protobuf for efficient binary serialization and HTTP/2 for multiplexed connections.
 
 pub mod client;
+pub(crate) mod client_operation;
 pub(crate) mod primary_open;
 pub(crate) mod refresh_deadline;
 pub mod server;

@@ -483,6 +483,7 @@ fn finalize_bulk_items_preserves_shard_error_reason() {
         action: "index".into(),
         condition: crate::engine::WriteCondition::Unconditional,
         retry_on_conflict: 0,
+        operation_id: None,
     }];
     let failed_targets = HashMap::from([(
         ("idx".to_string(), "node-1".to_string(), 0),
@@ -534,6 +535,7 @@ fn typed_write_failure_bulk_finalizer_uses_submitted_count_and_duplicate_id_offs
                 action: "index".into(),
                 condition: crate::engine::WriteCondition::Unconditional,
                 retry_on_conflict: 0,
+                operation_id: None,
             })
             .collect()
     };
@@ -729,6 +731,7 @@ fn bulk_aborted_failure_remains_attributable_and_retryable() {
         action: "index".into(),
         condition: crate::engine::WriteCondition::Unconditional,
         retry_on_conflict: 0,
+        operation_id: None,
     }];
     let failure = bulk::BulkTargetFailure::from_forward_error(anyhow::Error::from(
         tonic::Status::aborted("stale shard reopen; retry the write"),
@@ -772,6 +775,7 @@ fn finalize_bulk_items_preserves_receipts_across_targets_and_duplicate_ids() {
             action: "index".into(),
             condition: crate::engine::WriteCondition::Unconditional,
             retry_on_conflict: 0,
+            operation_id: None,
         })
         .collect();
     let outcomes = HashMap::from([
@@ -816,6 +820,7 @@ fn finalize_bulk_items_fails_when_primary_receipt_is_missing() {
         action: "index".into(),
         condition: crate::engine::WriteCondition::Unconditional,
         retry_on_conflict: 0,
+        operation_id: None,
     }];
     let items = finalize_bulk_items(vec![None], routed, &HashMap::new());
     assert_eq!(items[0]["index"]["status"], 500);

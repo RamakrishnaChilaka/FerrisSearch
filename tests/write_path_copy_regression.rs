@@ -126,6 +126,7 @@ fn replica_single_wal_bytes_and_sequence_receipts_are_unchanged() {
         seq_no: 1,
         primary_term: 7,
         document_version: 2,
+        client_operation: None,
         mutation: DocumentMutation::Index {
             doc_id: "same".into(),
             source: source(),
@@ -150,6 +151,7 @@ fn replica_single_wal_bytes_and_sequence_receipts_are_unchanged() {
             seq_no: 0,
             primary_term: 7,
             document_version: 1,
+            client_operation: None,
             mutation: DocumentMutation::Index {
                 doc_id: "same".into(),
                 source: json!({"body": "older"}),
@@ -192,6 +194,7 @@ fn replica_bulk_keeps_physical_wal_order_stale_apply_and_redelivery() {
             seq_no: 2,
             primary_term: 7,
             document_version: 2,
+            client_operation: None,
             mutation: DocumentMutation::Index {
                 doc_id: "same".into(),
                 source: source(),
@@ -201,6 +204,7 @@ fn replica_bulk_keeps_physical_wal_order_stale_apply_and_redelivery() {
             seq_no: 0,
             primary_term: 7,
             document_version: 1,
+            client_operation: None,
             mutation: DocumentMutation::Index {
                 doc_id: "same".into(),
                 source: json!({"body": "older"}),
@@ -210,6 +214,7 @@ fn replica_bulk_keeps_physical_wal_order_stale_apply_and_redelivery() {
             seq_no: 1,
             primary_term: 7,
             document_version: 0,
+            client_operation: None,
             mutation: DocumentMutation::NoOp {
                 reason: "gap \"fill\"".into(),
             },
@@ -218,6 +223,7 @@ fn replica_bulk_keeps_physical_wal_order_stale_apply_and_redelivery() {
             seq_no: 3,
             primary_term: 7,
             document_version: 1,
+            client_operation: None,
             mutation: DocumentMutation::Delete {
                 doc_id: "missing".into(),
             },

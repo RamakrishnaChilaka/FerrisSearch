@@ -794,6 +794,7 @@ async fn replicate_doc_index_via_grpc() {
             primary_term: Some(1),
             target_allocation_id: Some(1),
             document_version: Some(1),
+            client_operation: None,
         }))
         .await
         .unwrap()
@@ -852,6 +853,7 @@ async fn out_of_order_replica_delivery_keeps_the_newer_document_value() {
                 primary_term: Some(1),
                 target_allocation_id: Some(1),
                 document_version: Some(seq_no + 1),
+                client_operation: None,
             }))
             .await
             .unwrap()
@@ -904,6 +906,7 @@ async fn deterministic_reordering_survives_promotion_and_new_write() {
                 primary_term: Some(1),
                 target_allocation_id: Some(1),
                 document_version: Some(21 + offset),
+                client_operation: None,
             }))
             .await
             .unwrap()
@@ -922,6 +925,7 @@ async fn deterministic_reordering_survives_promotion_and_new_write() {
             primary_term: Some(1),
             target_allocation_id: Some(1),
             document_version: Some(seq_no + 1),
+            client_operation: None,
         })
         .collect();
     let response = client
@@ -1035,6 +1039,7 @@ async fn replicate_doc_delete_via_grpc() {
             primary_term: Some(1),
             target_allocation_id: Some(1),
             document_version: Some(2),
+            client_operation: None,
         }))
         .await
         .unwrap();
@@ -1052,6 +1057,7 @@ async fn replicate_doc_delete_via_grpc() {
             primary_term: Some(1),
             target_allocation_id: Some(1),
             document_version: Some(2),
+            client_operation: None,
         }))
         .await
         .unwrap()
@@ -1097,6 +1103,7 @@ async fn replicate_bulk_via_grpc() {
             primary_term: Some(1),
             target_allocation_id: Some(1),
             document_version: Some(i + 1),
+            client_operation: None,
         })
         .collect();
 
@@ -1267,6 +1274,7 @@ async fn stale_primary_replication_is_rejected_by_promoted_target() {
         "index",
         0,
         1,
+        None,
         1,
     )
     .await;
@@ -1398,6 +1406,7 @@ async fn replica_apply_rejects_uuid_allocation_term_and_missing_identity_fields(
         primary_term,
         target_allocation_id: allocation_id,
         document_version: Some(1),
+        client_operation: None,
     };
 
     for invalid in [
@@ -1465,6 +1474,7 @@ async fn replica_fence_is_persisted_before_ack_and_restored_on_restart() {
             primary_term: Some(3),
             target_allocation_id: Some(1),
             document_version: Some(1),
+            client_operation: None,
         }))
         .await
         .unwrap()
@@ -1502,6 +1512,7 @@ async fn replica_fence_is_persisted_before_ack_and_restored_on_restart() {
             primary_term: Some(1),
             target_allocation_id: Some(1),
             document_version: Some(2),
+            client_operation: None,
         }))
         .await
         .unwrap()
@@ -1550,6 +1561,7 @@ async fn bulk_replication_validates_common_identity_before_first_mutation() {
         primary_term: Some(2),
         target_allocation_id: Some(allocation_id),
         document_version: Some(seq_no + 1),
+        client_operation: None,
     };
     let missing_term = client
         .replicate_bulk(tonic::Request::new(ReplicateBulkRequest {
@@ -3513,6 +3525,7 @@ async fn replicate_doc_returns_sequence_proof() {
             primary_term: Some(1),
             target_allocation_id: Some(1),
             document_version: Some(1),
+            client_operation: None,
         }))
         .await
         .unwrap()
@@ -3539,6 +3552,7 @@ async fn replicate_doc_returns_sequence_proof() {
                 primary_term: Some(1),
                 target_allocation_id: Some(1),
                 document_version: Some(1),
+                client_operation: None,
             }))
             .await
             .unwrap()
@@ -3564,6 +3578,7 @@ async fn replicate_doc_returns_sequence_proof() {
             primary_term: Some(1),
             target_allocation_id: Some(1),
             document_version: Some(1),
+            client_operation: None,
         }))
         .await
         .unwrap()
@@ -3586,6 +3601,7 @@ async fn replicate_doc_returns_sequence_proof() {
                 primary_term: Some(1),
                 target_allocation_id: Some(1),
                 document_version: Some(1),
+                client_operation: None,
             }))
             .await
             .unwrap()
@@ -3618,6 +3634,7 @@ async fn replicate_bulk_returns_sequence_proof() {
             primary_term: Some(1),
             target_allocation_id: Some(1),
             document_version: Some(i as u64 + 1),
+            client_operation: None,
         })
         .collect();
 
@@ -3672,6 +3689,7 @@ async fn async_replica_response_separates_processed_from_persisted() {
             primary_term: Some(1),
             target_allocation_id: Some(1),
             document_version: Some(1),
+            client_operation: None,
         }))
         .await
         .unwrap()
@@ -4529,6 +4547,7 @@ async fn replicate_bulk_rejects_invalid_sequence_ranges_before_writing() {
         primary_term: Some(1),
         target_allocation_id: Some(1),
         document_version: Some(seq_no.saturating_add(1)),
+        client_operation: None,
     };
     for ops in [
         vec![operation(10, "index"), operation(12, "index")],

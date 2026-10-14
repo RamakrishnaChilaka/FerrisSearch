@@ -160,6 +160,14 @@ pub trait WriteAheadLog: Send + Sync {
   index operations additionally require `_source`. Missing fields are typed
   corruption. Replay deletes the ID for every operation and adds a document
   back only for `Index`.
+- ID-bearing writes store `_client_operation` in the same WAL document
+  envelope as the mutation. The record contains the validated client ID,
+  request fingerprint, and original result. Restore the bounded deduplication
+  state from exact WAL entries before replay; never synthesize an operation
+  record from checkpoints or current document state.
+- Keep the latest 4,096 shard sequence operations that carry client IDs from
+  truncation even after their mutations are committed. This is a bounded retry
+  window, not an unbounded exactly-once ledger.
 - Writer reconstruction holds the translog lock for the entire suffix so no new
   append can race recovery. This blocks writes to that shard and may scan a
   large suffix when refresh is disabled.

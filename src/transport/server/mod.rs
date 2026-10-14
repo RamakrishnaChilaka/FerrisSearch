@@ -733,6 +733,12 @@ impl InternalTransport for TransportService {
         let req = request.into_inner();
         let condition =
             primary_write_condition(req.if_seq_no, req.if_primary_term, req.create_only)?;
+        let client_operation =
+            crate::transport::client_operation::intent_from_proto(req.client_operation.clone())
+                .map_err(|error| {
+                    WriteFailure::rejected(400, "illegal_argument_exception", error.to_string())
+                        .into_status()
+                })?;
         require_index_uuid(
             &self.cluster_manager,
             &req.index_name,
@@ -911,6 +917,7 @@ impl InternalTransport for TransportService {
                 let cluster_manager = self.cluster_manager.clone();
                 let index_name = req.index_name.clone();
                 let expected_uuid = req.index_uuid.clone();
+                let client_operation = client_operation.clone();
                 #[cfg(feature = "protocol-trace")]
                 let trace_copy = trace_copy.clone();
                 #[cfg(feature = "protocol-trace")]
@@ -932,11 +939,12 @@ impl InternalTransport for TransportService {
                                             crate::protocol_trace::ApplyOrigin::Primary,
                                             Vec::new(),
                                             || {
-                                                engine.add_document_with_condition_at_term(
+                                                engine.add_document_with_operation_at_term(
                                                     &doc_id,
                                                     payload,
                                                     primary_term,
                                                     condition,
+                                                    client_operation,
                                                 )
                                             },
                                         )
@@ -945,11 +953,12 @@ impl InternalTransport for TransportService {
                             })
                         }
                         #[cfg(not(feature = "protocol-trace"))]
-                        engine.add_document_with_condition_at_term(
+                        engine.add_document_with_operation_at_term(
                             &doc_id,
                             payload,
                             primary_term,
                             condition,
+                            client_operation,
                         )
                     })
                     .await
@@ -1003,6 +1012,8 @@ impl InternalTransport for TransportService {
                 let id = receipt.doc_id;
                 let seq_no = receipt.seq_no;
                 let primary_term = receipt.primary_term;
+                let client_operation_record = receipt.client_operation;
+                let deduplicated = receipt.deduplicated;
                 let primary_sequence = engine.sequence_stats();
                 #[cfg(feature = "protocol-trace")]
                 crate::failpoints::pause(
@@ -1016,21 +1027,27 @@ impl InternalTransport for TransportService {
                 );
 
                 // Replicate to replica shards with seq_no
-                match crate::replication::replicate_write_with_durability(
-                    &self.transport_client,
-                    &write_state,
-                    &req.index_name,
-                    req.shard_id,
-                    &id,
-                    &payload,
-                    "index",
-                    seq_no,
-                    version,
-                    primary_term,
-                    self.shard_manager.durability(),
-                )
-                .await
-                {
+                let replication_result =
+                    if deduplicated && primary_term != activated_primary.primary_term {
+                        Ok(Vec::new())
+                    } else {
+                        crate::replication::replicate_write_with_durability(
+                            &self.transport_client,
+                            &write_state,
+                            &req.index_name,
+                            req.shard_id,
+                            &id,
+                            &payload,
+                            "index",
+                            seq_no,
+                            version,
+                            client_operation_record.as_ref(),
+                            primary_term,
+                            self.shard_manager.durability(),
+                        )
+                        .await
+                    };
+                match replication_result {
                     Ok(replica_checkpoints) => {
                         self.record_replica_checkpoints(
                             &engine,
@@ -1121,7 +1138,8 @@ impl InternalTransport for TransportService {
             }
             Err(e)
                 if WriteFailure::before_wal(&e)
-                    && e.is::<crate::engine::VersionConflictError>() =>
+                    && (e.is::<crate::engine::VersionConflictError>()
+                        || e.is::<crate::engine::ClientOperationConflictError>()) =>
             {
                 #[cfg(feature = "protocol-trace")]
                 if let Some(trace_request) = trace_request.as_ref() {
@@ -1238,7 +1256,9 @@ impl InternalTransport for TransportService {
                 )?;
             }
             if req.operations.iter().any(|operation| {
-                operation.kind != ShardBulkOpKind::Index as i32 || operation.if_seq_no.is_some()
+                operation.kind != ShardBulkOpKind::Index as i32
+                    || operation.if_seq_no.is_some()
+                    || operation.client_operation.is_some()
             }) {
                 return bulk_writes::execute_ordered_bulk(self, req, refresh_deadline).await;
             }
@@ -1655,6 +1675,12 @@ impl InternalTransport for TransportService {
         .map_err(WriteFailure::before_mutation_status)?;
         let req = request.into_inner();
         let condition = primary_write_condition(req.if_seq_no, req.if_primary_term, false)?;
+        let client_operation =
+            crate::transport::client_operation::intent_from_proto(req.client_operation.clone())
+                .map_err(|error| {
+                    WriteFailure::rejected(400, "illegal_argument_exception", error.to_string())
+                        .into_status()
+                })?;
         let activated_primary = match self
             .ensure_primary_activated(&req.index_name, req.shard_id)
             .await
@@ -1725,6 +1751,7 @@ impl InternalTransport for TransportService {
                 let engine = engine.clone();
                 let doc_id = req.doc_id.clone();
                 let primary_term = activated_primary.primary_term;
+                let client_operation = client_operation.clone();
                 #[cfg(feature = "protocol-trace")]
                 let trace_copy = trace_copy.clone();
                 #[cfg(feature = "protocol-trace")]
@@ -1741,10 +1768,11 @@ impl InternalTransport for TransportService {
                                             crate::protocol_trace::ApplyOrigin::Primary,
                                             Vec::new(),
                                             || {
-                                                engine.delete_document_with_condition_at_term(
+                                                engine.delete_document_with_operation_at_term(
                                                     &doc_id,
                                                     primary_term,
                                                     condition,
+                                                    client_operation,
                                                 )
                                             },
                                         )
@@ -1753,10 +1781,11 @@ impl InternalTransport for TransportService {
                             })
                         }
                         #[cfg(not(feature = "protocol-trace"))]
-                        engine.delete_document_with_condition_at_term(
+                        engine.delete_document_with_operation_at_term(
                             &doc_id,
                             primary_term,
                             condition,
+                            client_operation,
                         )
                     })
                     .await
@@ -1788,6 +1817,8 @@ impl InternalTransport for TransportService {
                 let seq_no = receipt.seq_no;
                 let primary_term = receipt.primary_term;
                 let version = receipt.version;
+                let client_operation_record = receipt.client_operation;
+                let deduplicated = receipt.deduplicated;
                 let primary_sequence = engine.sequence_stats();
                 #[cfg(feature = "protocol-trace")]
                 crate::failpoints::pause(
@@ -1800,21 +1831,27 @@ impl InternalTransport for TransportService {
                     &activated_primary,
                 );
                 // Replicate delete to replica shards
-                match crate::replication::replicate_write_with_durability(
-                    &self.transport_client,
-                    &write_state,
-                    &req.index_name,
-                    req.shard_id,
-                    &req.doc_id,
-                    &serde_json::json!({}),
-                    "delete",
-                    seq_no,
-                    version,
-                    primary_term,
-                    self.shard_manager.durability(),
-                )
-                .await
-                {
+                let replication_result =
+                    if deduplicated && primary_term != activated_primary.primary_term {
+                        Ok(Vec::new())
+                    } else {
+                        crate::replication::replicate_write_with_durability(
+                            &self.transport_client,
+                            &write_state,
+                            &req.index_name,
+                            req.shard_id,
+                            &req.doc_id,
+                            &serde_json::json!({}),
+                            "delete",
+                            seq_no,
+                            version,
+                            client_operation_record.as_ref(),
+                            primary_term,
+                            self.shard_manager.durability(),
+                        )
+                        .await
+                    };
+                match replication_result {
                     Ok(replica_checkpoints) => {
                         self.record_replica_checkpoints(
                             &engine,
@@ -1836,6 +1873,7 @@ impl InternalTransport for TransportService {
                             );
                         }
                     }
+
                     Err(errors) => {
                         self.report_definitive_replica_failures(
                             &write_state,
@@ -1903,7 +1941,8 @@ impl InternalTransport for TransportService {
             }
             Err(e)
                 if WriteFailure::before_wal(&e)
-                    && e.is::<crate::engine::VersionConflictError>() =>
+                    && (e.is::<crate::engine::VersionConflictError>()
+                        || e.is::<crate::engine::ClientOperationConflictError>()) =>
             {
                 #[cfg(feature = "protocol-trace")]
                 if let Some(trace_request) = trace_request.as_ref() {
@@ -1978,6 +2017,156 @@ impl InternalTransport for TransportService {
                 ))
             }
         }
+    }
+
+    async fn record_client_no_op(
+        &self,
+        request: Request<ShardClientNoOpRequest>,
+    ) -> Result<Response<ShardClientNoOpResponse>, Status> {
+        self.wait_for_forwarded_state(
+            &request,
+            Some(&request.get_ref().index_name),
+            Some((request.get_ref().shard_id, true)),
+            request.get_ref().index_uuid.as_deref(),
+        )
+        .await
+        .map_err(WriteFailure::before_mutation_status)?;
+        let req = request.into_inner();
+        let client_operation =
+            crate::transport::client_operation::intent_from_proto(req.client_operation)
+                .map_err(|error| {
+                    WriteFailure::rejected(400, "illegal_argument_exception", error.to_string())
+                        .into_status()
+                })?
+                .ok_or_else(|| {
+                    WriteFailure::rejected(
+                        400,
+                        "illegal_argument_exception",
+                        "client operation no-op requires an operation ID",
+                    )
+                    .into_status()
+                })?;
+        require_index_uuid(
+            &self.cluster_manager,
+            &req.index_name,
+            req.index_uuid.as_deref(),
+        )
+        .map_err(|error| {
+            WriteFailure::rejected(404, "index_not_found_exception", error.to_string())
+                .into_status()
+        })?;
+        let activated_primary = self
+            .ensure_primary_activated(&req.index_name, req.shard_id)
+            .await
+            .map_err(|error| WriteFailure::not_executed(error.to_string()).into_status())?;
+        let _write_guard = self
+            .peer_recovery_write_guard(&req.index_name, req.shard_id)
+            .await
+            .map_err(|error| WriteFailure::not_executed(error).into_status())?;
+        let write_state = self
+            .validated_primary_write_state(&req.index_name, req.shard_id, &activated_primary)
+            .map_err(|error| WriteFailure::not_executed(error).into_status())?;
+        let engine = self
+            .get_or_open_shard(&req.index_name, req.shard_id)
+            .await
+            .map_err(WriteFailure::before_mutation_status)?;
+        self.shard_manager
+            .ensure_local_apply_allowed(
+                &activated_primary.index_uuid,
+                req.shard_id,
+                activated_primary.allocation_id,
+            )
+            .map_err(|error| WriteFailure::not_executed(error.to_string()).into_status())?;
+        let engine_for_write = engine.clone();
+        let operation_for_write = client_operation.clone();
+        let primary_term = activated_primary.primary_term;
+        let result_seq_no = req.result_seq_no;
+        let result_primary_term = req.result_primary_term;
+        let result_version = req.result_version;
+        let receipt = self
+            .worker_pools
+            .spawn_write(move || {
+                engine_for_write.record_client_noop_at_term(
+                    primary_term,
+                    operation_for_write,
+                    result_seq_no,
+                    result_primary_term,
+                    result_version,
+                )
+            })
+            .await
+            .map_err(|error| {
+                WriteFailure::indeterminate(
+                    format!("client operation no-op worker failed: {error:#}"),
+                    None,
+                    Some(primary_term),
+                    None,
+                )
+                .into_status()
+            })?
+            .map_err(|error| WriteFailure::from_engine(&error, primary_term).into_status())?;
+        let replica_checkpoints = if matches!(
+            receipt.client_operation.result,
+            crate::engine::ClientOperationResult::UpdateNoOp { .. }
+        ) && receipt.operation_primary_term
+            == activated_primary.primary_term
+        {
+            let operation = crate::engine::SequencedOperation {
+                seq_no: receipt.operation_seq_no,
+                primary_term: receipt.operation_primary_term,
+                document_version: 0,
+                client_operation: Some(receipt.client_operation.clone()),
+                mutation: crate::engine::DocumentMutation::NoOp {
+                    reason: format!("client operation [{}] update no-op", client_operation.id),
+                },
+            };
+            crate::replication::replicate_noop_batch_with_durability(
+                &self.transport_client,
+                &write_state,
+                &req.index_name,
+                req.shard_id,
+                std::slice::from_ref(&operation),
+                activated_primary.primary_term,
+                self.shard_manager.durability(),
+            )
+            .await
+            .map_err(|errors| {
+                WriteFailure::indeterminate(
+                    format!(
+                        "Replication failed: {}",
+                        Self::replication_failure_message(&errors)
+                    ),
+                    Some(receipt.operation_seq_no),
+                    Some(receipt.operation_primary_term),
+                    None,
+                )
+                .into_status()
+            })?
+        } else {
+            Vec::new()
+        };
+        self.record_replica_checkpoints(
+            &engine,
+            &req.index_name,
+            req.shard_id,
+            &activated_primary,
+            engine.sequence_stats(),
+            &replica_checkpoints,
+        );
+        Ok(Response::new(ShardClientNoOpResponse {
+            success: true,
+            error: String::new(),
+            operation_seq_no: Some(receipt.operation_seq_no),
+            operation_primary_term: Some(receipt.operation_primary_term),
+            seq_no: Some(receipt.seq_no),
+            primary_term: Some(receipt.primary_term),
+            version: Some(receipt.version),
+            failure: None,
+            client_operation: Some(crate::transport::client_operation::record_to_proto(
+                &receipt.client_operation,
+            )),
+            deduplicated: receipt.deduplicated,
+        }))
     }
 
     async fn get_doc(
@@ -2718,6 +2907,9 @@ impl InternalTransport for TransportService {
             }
             _ => 0,
         };
+        let client_operation =
+            crate::transport::client_operation::record_from_proto(req.client_operation.clone())
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let operation = match req.op.as_str() {
             "index" => {
                 let source = index_source.ok_or_else(|| {
@@ -2757,6 +2949,7 @@ impl InternalTransport for TransportService {
             seq_no,
             primary_term,
             document_version,
+            client_operation,
             mutation: operation,
         };
         #[cfg(feature = "protocol-trace")]
@@ -3124,11 +3317,15 @@ impl InternalTransport for TransportService {
                 }
                 None => unreachable!("the operation loop is empty when no batch kind exists"),
             };
+            let client_operation =
+                crate::transport::client_operation::record_from_proto(op.client_operation.clone())
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
             previous_seq_no = Some(op.seq_no);
             operations.push(crate::engine::SequencedOperation {
                 seq_no: op.seq_no,
                 primary_term,
                 document_version,
+                client_operation,
                 mutation,
             });
         }
