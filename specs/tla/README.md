@@ -499,6 +499,10 @@ replication, promotion NoOps, fresh-allocation replacement, and ordered
 catch-up. Snapshot and barrier observations compare the exact processed
 sequence set, including promotion NoOps; live-document evidence projects
 delete identities to absence while the model retains tombstone metadata. The
+recovery-install observation also records the ordered physical WAL identities
+restored solely for tombstone and client-operation retention. The semantic
+model treats that prefix as bookkeeping, while the actual-state completeness
+checker compares it exactly with the target translog. The
 ordering premise is an activated-primary source scanning the pinned physical
 WAL in file order with one exclusive sequence cursor. Out-of-order or
 duplicate catch-up batches are therefore not expressible in either

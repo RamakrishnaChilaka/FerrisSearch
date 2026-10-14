@@ -3461,7 +3461,7 @@ impl ShardManager {
         self: &Arc<Self>,
         install: PeerRecoveryTargetInstall,
     ) -> Result<Arc<dyn SearchEngine>> {
-        self.finalize_peer_recovery_target_blocking_with_observer(install, || {})
+        self.finalize_peer_recovery_target_blocking_with_observer(install, |_| Ok(()))
             .await
     }
 
@@ -3471,17 +3471,25 @@ impl ShardManager {
         install: PeerRecoveryTargetInstall,
         trace: crate::protocol_trace::RecoveryTraceContext,
     ) -> Result<Arc<dyn SearchEngine>> {
-        self.finalize_peer_recovery_target_blocking_with_observer(install, move || {
-            crate::protocol_trace::record_recovery_installed(
-                &trace.source_node,
-                &trace.target_node,
-                &trace.index_uuid,
-                trace.shard,
-                trace.allocation,
-                &trace.session_id,
-                trace.snapshot_next_seq_no,
-            );
-        })
+        self.finalize_peer_recovery_target_blocking_with_observer(
+            install,
+            move |retained_entries| {
+                let retained_wal = retained_entries
+                    .iter()
+                    .map(crate::protocol_trace::trace_wal_entry)
+                    .collect::<Result<Vec<_>>>()?;
+                crate::protocol_trace::record_recovery_installed(
+                    &trace.source_node,
+                    &trace.target_node,
+                    &trace.index_uuid,
+                    trace.shard,
+                    trace.allocation,
+                    &trace.session_id,
+                    trace.snapshot_next_seq_no,
+                    retained_wal,
+                )
+            },
+        )
         .await
     }
 
@@ -3491,7 +3499,7 @@ impl ShardManager {
         observer: F,
     ) -> Result<Arc<dyn SearchEngine>>
     where
-        F: FnOnce() + Send + 'static,
+        F: FnOnce(&[SequencedWalEntry]) -> Result<()> + Send + 'static,
     {
         let shard_manager = self.clone();
         tokio::task::spawn_blocking(move || {
@@ -3751,6 +3759,7 @@ impl ShardManager {
                 .reconcile_term_sequence_state(identity.replica_fence, identity.fence_max_seq_no)?;
             std::fs::remove_file(&marker_path)?;
             std::fs::File::open(&shard_dir)?.sync_all()?;
+            observer(&retained_entries)?;
 
             CompositeEngine::start_refresh_loop_reactive(
                 engine.clone(),
@@ -3765,7 +3774,6 @@ impl ShardManager {
                     .write()
                     .unwrap_or_else(|error| error.into_inner())
                     .insert(key.clone(), dynamic_engine.clone());
-                observer();
                 Ok(dynamic_engine)
             })
         })

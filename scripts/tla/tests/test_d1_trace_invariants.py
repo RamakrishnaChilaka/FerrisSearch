@@ -221,6 +221,57 @@ class D1TraceInvariantTests(unittest.TestCase):
         self.assertEqual(caught.exception.event, "trace_end")
         self.assertIn("node t has no final copy_state", str(caught.exception))
 
+    def test_recovery_install_restores_retained_physical_wal(self) -> None:
+        retained = {
+            "term": 1,
+            "seq_no": 2,
+            "doc": "deleted",
+            "op": "delete",
+            "content_hash": "a" * 64,
+        }
+        events = [
+            {
+                "event": "trace_start",
+                "shard_state": {
+                    "copies": [
+                        {
+                            "node": "t",
+                            "exists": True,
+                            "fence_term": 1,
+                        }
+                    ]
+                },
+            },
+            {
+                "event": "recovery_installed",
+                "target_node": "t",
+                "retained_wal": [retained],
+            },
+            {
+                "event": "copy_state",
+                "step": 2,
+                "node": "t",
+                "allocation": 5,
+                "documents": [],
+            },
+            {"event": "trace_end", "step": 3},
+        ]
+        actual = {
+            "t": {
+                "copy": {"allocation": 5},
+                "documents": [],
+                "wal": [retained],
+            }
+        }
+        checker.check_completeness(events, actual)
+
+        without_retained_wal = copy.deepcopy(events)
+        without_retained_wal[1].pop("retained_wal")
+        with self.assertRaises(checker.InvariantViolation) as caught:
+            checker.check_completeness(without_retained_wal, actual)
+        self.assertEqual(caught.exception.event, "actual_state")
+        self.assertIn("actual WAL for t differs", str(caught.exception))
+
     def test_applied_content_mismatch_is_rejected(self) -> None:
         events = copy.deepcopy(
             checker.load_trace(FIXTURES / "valid-concurrent-order.jsonl")

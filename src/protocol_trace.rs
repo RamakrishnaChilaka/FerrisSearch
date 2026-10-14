@@ -1,5 +1,6 @@
 use crate::cluster::state::ClusterState;
 use crate::engine::{ApplyOutcome, DocumentMutation, SequenceStats, SequencedOperation};
+use crate::wal::{SequencedWalEntry, TranslogEntry, WalDocumentOperation};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -626,6 +627,42 @@ pub(crate) fn operation_parts(
         ),
         DocumentMutation::NoOp { .. } => (None, "noop", content_hash(&operation.mutation)),
     }
+}
+
+pub(crate) fn trace_wal_entry(entry: &SequencedWalEntry) -> Result<TraceWalEntry> {
+    let translog_entry = TranslogEntry {
+        seq_no: entry.seq_no,
+        primary_term: entry.primary_term,
+        op: entry.op,
+        payload: entry.payload.clone(),
+    };
+    let mutation = match crate::wal::document_operation(&translog_entry)? {
+        WalDocumentOperation::Index { doc_id, source, .. } => DocumentMutation::Index {
+            doc_id: doc_id.to_string(),
+            source: source.clone(),
+        },
+        WalDocumentOperation::Delete { doc_id, .. } => DocumentMutation::Delete {
+            doc_id: doc_id.to_string(),
+        },
+        WalDocumentOperation::NoOp { reason, .. } => DocumentMutation::NoOp {
+            reason: reason.to_string(),
+        },
+    };
+    let operation = SequencedOperation {
+        seq_no: entry.seq_no,
+        primary_term: entry.primary_term,
+        document_version: 1,
+        client_operation: None,
+        mutation,
+    };
+    let (doc, op, content_hash) = operation_parts(&operation);
+    Ok(TraceWalEntry {
+        seq_no: entry.seq_no,
+        term: entry.primary_term,
+        doc,
+        op,
+        content_hash,
+    })
 }
 
 fn checkpoints_value(stats: SequenceStats) -> Value {
@@ -2100,8 +2137,9 @@ pub fn record_recovery_installed(
     allocation: u64,
     session_id: &str,
     snapshot_next_seq_no: u64,
-) {
-    let _ = with_state(|state| {
+    retained_wal: Vec<TraceWalEntry>,
+) -> Result<()> {
+    match with_state(|state| {
         if let Some(snapshot) = state.recovery_snapshots.get(session_id) {
             state.copy_documents.insert(
                 TraceCopy {
@@ -2124,9 +2162,14 @@ pub fn record_recovery_installed(
                 "allocation": allocation,
                 "session_id": session_id,
                 "snapshot_next_seq_no": snapshot_next_seq_no,
+                "retained_wal": retained_wal,
             }),
         );
-    });
+        Ok(())
+    }) {
+        Some(result) => result,
+        None => Ok(()),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2693,7 +2736,26 @@ mod tests {
             ],
         );
         record_recovery_started("p", "r", "idx", 0, 2, "session");
-        record_recovery_installed("p", "r", "idx", 0, 2, "session", 2);
+        record_recovery_installed(
+            "p",
+            "r",
+            "idx",
+            0,
+            2,
+            "session",
+            2,
+            vec![TraceWalEntry {
+                seq_no: 1,
+                term: 1,
+                doc: Some("b".into()),
+                op: "index",
+                content_hash: content_hash(&DocumentMutation::Index {
+                    doc_id: "b".into(),
+                    source: json!({"value": 2}),
+                }),
+            }],
+        )
+        .unwrap();
         record_recovery_barrier("p", "r", "idx", 0, 2, "session", 2, vec![1, 0]);
         record_recovery_membership("p", "r", "idx", 0, 2, "session", "admitted");
         record_copy_state(
@@ -2751,5 +2813,7 @@ mod tests {
         assert_eq!(records[1]["processed_seqs"], json!([0, 1]));
         assert_eq!(records[1]["documents"][0]["doc"], "a");
         assert_eq!(records[1]["documents"][1]["doc"], "b");
+        assert_eq!(records[3]["retained_wal"][0]["seq_no"], 1);
+        assert_eq!(records[3]["retained_wal"][0]["doc"], "b");
     }
 }
