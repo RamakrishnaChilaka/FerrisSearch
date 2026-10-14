@@ -297,6 +297,10 @@ cargo test -- test_name                         # Single test by name
   Wait for applied metadata instead of copying newly created indices into
   followers. Initial fixtures may still seed state before an operation.
   Keep direct transport rejection coverage for malformed or missing metadata.
+- After Raft creates an index, wait for its metadata version on every node
+  before installing fixture copy identities or engines. A leader-only snapshot
+  can race the follower's incarnation-retirement poller, detaching the fixture
+  while a retained engine Arc still holds the Tantivy writer lock.
 - Create-then-write regressions use the `cfg(test)` one-shot apply gate in
   `ClusterStateMachine`. Block application, not log replication, and preserve
   the real quorum. Keep a short deadline test, exact document results, and

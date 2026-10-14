@@ -20,6 +20,16 @@ struct RefreshCluster {
 }
 
 impl RefreshCluster {
+    async fn wait_for_applied_metadata(cluster: &ForwardingCluster, version: u64) {
+        for node in &cluster.nodes {
+            node.state
+                .cluster_manager
+                .wait_for_version(version)
+                .await
+                .unwrap();
+        }
+    }
+
     async fn start(shards: u32) -> Self {
         Self::start_with_topology(
             shards,
@@ -79,6 +89,8 @@ impl RefreshCluster {
                 .unwrap();
         }
         let state = leader.cluster_manager.get_state();
+        // Premature fixtures can be retired while their retained Arcs still hold the writer lock.
+        Self::wait_for_applied_metadata(&cluster, state.version).await;
         let mut engines = HashMap::new();
         for shard in 0..shards {
             let metadata = &state.indices[INDEX];
@@ -141,12 +153,18 @@ impl RefreshCluster {
             }
         }
         let version = leader.cluster_manager.version();
-        for node in &cluster.nodes {
-            node.state
-                .cluster_manager
-                .wait_for_version(version)
-                .await
-                .unwrap();
+        Self::wait_for_applied_metadata(&cluster, version).await;
+        for ((node, shard), engine) in &engines {
+            let served = cluster.nodes[*node]
+                .state
+                .shard_manager
+                .get_shard(INDEX, *shard)
+                .expect("fixture copy must remain installed after metadata application");
+            let expected: Arc<dyn SearchEngine> = engine.clone();
+            assert!(
+                Arc::ptr_eq(&served, &expected),
+                "fixture copy must be the served engine, not a detached writer"
+            );
         }
         assert!(cluster.nodes[0].state.shard_manager.all_shards().is_empty());
         for shard in 0..shards {
@@ -265,6 +283,51 @@ impl RefreshCluster {
         assert_eq!(response.status(), StatusCode::OK);
         (response.json().await.unwrap(), started.elapsed())
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_fixture_metadata_barrier_waits_for_follower_apply() {
+    let cluster = ForwardingCluster::start().await;
+    let leader = &cluster.nodes[0].state;
+    RefreshCluster::wait_for_applied_metadata(&cluster, leader.cluster_manager.version()).await;
+    cluster.gate.pause();
+    let metadata = IndexMetadata::from_create_request_body(
+        INDEX,
+        &json!({"settings": {"number_of_shards": 1, "number_of_replicas": 0}}),
+        &["node-2".into()],
+    )
+    .unwrap();
+    let uuid = metadata.uuid.clone();
+    leader
+        .raft
+        .client_write(ClusterCommand::CreateIndex { metadata })
+        .await
+        .unwrap()
+        .data
+        .into_result()
+        .unwrap();
+    cluster.gate.wait_until_entered().await;
+    let version = leader.cluster_manager.version();
+    let barrier = RefreshCluster::wait_for_applied_metadata(&cluster, version);
+    tokio::pin!(barrier);
+    assert!(
+        futures::poll!(barrier.as_mut()).is_pending(),
+        "leader commit is not follower application"
+    );
+    assert!(
+        !cluster.nodes[1]
+            .state
+            .cluster_manager
+            .get_state()
+            .indices
+            .contains_key(INDEX)
+    );
+    cluster.gate.resume();
+    barrier.await;
+    assert_eq!(
+        cluster.nodes[1].state.cluster_manager.get_state().indices[INDEX].uuid,
+        uuid
+    );
 }
 
 #[derive(Clone, Copy)]
