@@ -6,7 +6,8 @@
 >
 > **Current-behavior authority:** source and tests.
 >
-> **Last source audit:** 2026-10-13 for FS-003, FS-004, and FS-011; 2026-10-09 for
+> **Last source audit:** 2026-10-14 for FS-010; 2026-10-13 for FS-003, FS-004,
+> and FS-011; 2026-10-09 for
 > FS-002; 2026-10-08 for FS-001 and FS-007; 2026-10-05 for FS-013; 2026-10-04
 > for FS-012; 2026-09-27 for FS-014, FS-019, and FS-022 through FS-026, after
 > PRs #142-#144. Other tasks were last audited on 2026-07-10.
@@ -322,14 +323,21 @@ from committed internal state, and failover/retry tests prove continuity.
 
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-009
 
-**Status (2026-09-30):** The `local_shards` CRUD subset is implemented:
-realtime GET, primary-side sequence/term conditions, create-only writes, and
-coordinator update with CAS retries, upsert, and no-op detection. Conflicts
-allocate no sequence and append no WAL. Evidence:
+**Status (2026-10-14):** Complete for supported `local_shards` sequence/term
+preconditions and create-only writes. Realtime GET, primary-side conditions,
+and coordinator update with CAS retries, upsert, and no-op detection are
+implemented; conflicts allocate no sequence and append no WAL. Evidence:
 `tests/write_correctness_regression.rs`, the `writes_regression_*` REST tests,
 and replicated REST/bulk coverage in `tests/replication_integration.rs`.
-Restart/flush preserves the stored concurrency identity. This does not close
-the task's failover criteria or implement client retry tokens/external versions.
+The process-backed
+`conditional_writes_preserve_occ_across_restart_and_primary_failover` regression
+in `tests/restart_regression.rs` preserves document tokens across flush/restart
+and real-Raft primary promotion, requires exactly one concurrent CAS winner,
+checks no-effect stale/wrong-term single and bulk conflicts, and verifies exact
+metadata on surviving, recovered, and restarted copies. Delete/recreate
+versions remain monotonic. Client retry tokens are covered by FS-011;
+external version preconditions remain unsupported. This is not D5
+self-fencing or D10 unacknowledged-history convergence evidence.
 
 **Integration note (2026-09-30):** Update pins the primary GET's index UUID
 across CAS and retries. A deleted/recreated incarnation returns
