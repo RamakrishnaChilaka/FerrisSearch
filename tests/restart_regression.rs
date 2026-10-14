@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, bail};
 use ferrissearch::engine::routing::calculate_shard;
-use ferrissearch::transport::proto::ShardGetRequest;
 use ferrissearch::transport::proto::internal_transport_client::InternalTransportClient;
+use ferrissearch::transport::proto::{
+    GetShardSequenceStateRequest, GetShardSequenceStateResponse, ShardGetRequest, ShardGetResponse,
+};
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -561,6 +563,71 @@ impl RestartClusterHarness {
             .await
     }
 
+    async fn assert_document_copies(
+        &self,
+        doc_id: &str,
+        source: &Value,
+        receipt: &Value,
+    ) -> Result<()> {
+        let (status, document) = self.get_document(doc_id).await?;
+        assert_eq!(status, StatusCode::OK, "{document}");
+        assert_eq!(&document["_source"], source);
+        for field in ["_seq_no", "_primary_term", "_version"] {
+            assert_eq!(document[field], receipt[field], "{field}: {document}");
+        }
+        for node in &self.nodes {
+            let copy = get_local_document_response(&node.config, doc_id).await?;
+            assert!(copy.found, "{} is missing {doc_id}", node.config.name);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&copy.source_json)?,
+                *source,
+                "source on {}",
+                node.config.name
+            );
+            assert_eq!(copy.seq_no, receipt["_seq_no"].as_u64());
+            assert_eq!(copy.primary_term, receipt["_primary_term"].as_u64());
+            assert_eq!(copy.version, receipt["_version"].as_u64());
+        }
+        Ok(())
+    }
+
+    async fn local_sequence_states(
+        &self,
+    ) -> Result<BTreeMap<String, GetShardSequenceStateResponse>> {
+        let (status, state) = self
+            .request_json(Method::GET, "/_cluster/state", None)
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{state}");
+        let index_uuid = state["indices"][INDEX_NAME]["uuid"]
+            .as_str()
+            .context("index UUID is missing")?;
+        let primary_term = state["indices"][INDEX_NAME]["shard_routing"]["0"]["primary_term"]
+            .as_u64()
+            .context("primary term is missing")?;
+        let mut states = BTreeMap::new();
+        for node in &self.nodes {
+            let allocation_id = allocation_id_for_node(&state, INDEX_NAME, 0, &node.config.name)?
+                .context("local allocation is missing")?;
+            let mut client = InternalTransportClient::connect(format!(
+                "http://127.0.0.1:{}",
+                node.config.transport_port
+            ))
+            .await?;
+            let response = client
+                .get_shard_sequence_state(tonic::Request::new(GetShardSequenceStateRequest {
+                    index_name: INDEX_NAME.into(),
+                    index_uuid: index_uuid.into(),
+                    shard_id: 0,
+                    allocation_id: Some(allocation_id),
+                    expected_primary_term: primary_term,
+                }))
+                .await?
+                .into_inner();
+            states.insert(node.config.name.clone(), response);
+        }
+        Ok(states)
+    }
+
     async fn refresh_index(&self) -> Result<()> {
         let (status, body) = self
             .request_json(
@@ -1024,6 +1091,14 @@ fn expected_document(doc_id: usize) -> Value {
 }
 
 async fn get_local_document(node: &NodeConfig, doc_id: &str) -> Result<Option<Value>> {
+    let response = get_local_document_response(node, doc_id).await?;
+    if !response.found {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_slice(&response.source_json)?))
+}
+
+async fn get_local_document_response(node: &NodeConfig, doc_id: &str) -> Result<ShardGetResponse> {
     let mut client =
         InternalTransportClient::connect(format!("http://127.0.0.1:{}", node.transport_port))
             .await?;
@@ -1039,10 +1114,20 @@ async fn get_local_document(node: &NodeConfig, doc_id: &str) -> Result<Option<Va
         ))
         .await?
         .into_inner();
-    if !response.found {
-        return Ok(None);
+    if !response.error.is_empty() {
+        bail!("GET {doc_id} on {} failed: {}", node.name, response.error);
     }
-    Ok(Some(serde_json::from_slice(&response.source_json)?))
+    Ok(response)
+}
+
+fn condition_query(receipt: &Value) -> Result<String> {
+    Ok(format!(
+        "if_seq_no={}&if_primary_term={}",
+        receipt["_seq_no"].as_u64().context("sequence is missing")?,
+        receipt["_primary_term"]
+            .as_u64()
+            .context("primary term is missing")?
+    ))
 }
 
 fn document_id_for_shard(prefix: &str, shard_id: u32) -> String {
@@ -1147,6 +1232,268 @@ async fn three_node_flush_restart_preserves_uuid_dirs_and_document_count() -> Re
     );
     harness.assert_no_delete_reasons_in_logs();
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conditional_writes_preserve_occ_across_restart_and_primary_failover() -> Result<()> {
+    const WRITERS: usize = 8;
+    const DOC_ID: &str = "conditional";
+
+    let mut harness = RestartClusterHarness::start().await?;
+    harness.create_index_with_shards(1, 2).await?;
+    harness.wait_for_in_sync_replicas(2).await?;
+    harness.wait_for_green().await?;
+    let initial_source = expected_document(0);
+    let initial = harness.put_document(DOC_ID, initial_source.clone()).await?;
+    harness.flush_index_copies(3).await?;
+    harness.restart_all().await?;
+    harness.wait_for_in_sync_replicas(2).await?;
+    harness.wait_for_green().await?;
+    harness
+        .assert_document_copies(DOC_ID, &initial_source, &initial)
+        .await?;
+
+    let (status, updated) = harness
+        .request_json(
+            Method::POST,
+            &format!(
+                "/{INDEX_NAME}/_update/{DOC_ID}?{}",
+                condition_query(&initial)?
+            ),
+            Some(json!({"doc": {"n": 1}})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    assert_eq!(updated["result"], "updated");
+    assert_eq!(
+        updated["_seq_no"].as_u64(),
+        initial["_seq_no"].as_u64().map(|seq| seq + 1)
+    );
+    assert_eq!(updated["_version"], 2);
+    let mut updated_source = initial_source;
+    updated_source["n"] = json!(1);
+    harness
+        .assert_document_copies(DOC_ID, &updated_source, &updated)
+        .await?;
+
+    let (_, before) = harness.wait_for_in_sync_replicas(2).await?;
+    let old_primary = harness.stop_node(&before.primary)?;
+    let promoted = harness.wait_for_primary_promotion(&before.primary).await?;
+    assert!(before.in_sync_replicas.contains(&promoted.primary));
+    harness
+        .wait_for_index_shards(INDEX_NAME, 2, 1, READY_TIMEOUT)
+        .await?;
+    harness
+        .assert_document_copies(DOC_ID, &updated_source, &updated)
+        .await?;
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(WRITERS));
+    let query = condition_query(&updated)?;
+    let responses = futures::future::try_join_all((0..WRITERS).map(|writer| {
+        let barrier = barrier.clone();
+        let client = harness.client.clone();
+        let coordinator = &harness.nodes[writer % harness.nodes.len()];
+        let url = format!(
+            "{}/{INDEX_NAME}/_doc/{DOC_ID}?{query}",
+            coordinator.config.base_url()
+        );
+        async move {
+            let source = json!({
+                "title": format!("conditional winner {writer}"),
+                "author": "occ",
+                "payload": format!("writer-{writer}"),
+                "n": writer + 10,
+            });
+            barrier.wait().await;
+            let response = client.put(url).json(&source).send().await?;
+            let status = response.status();
+            let body = response.json::<Value>().await?;
+            Ok::<_, anyhow::Error>((status, body, source))
+        }
+    }))
+    .await?;
+    let mut winners = Vec::new();
+    for (status, receipt, source) in responses {
+        match status {
+            StatusCode::OK => winners.push((receipt, source)),
+            StatusCode::CONFLICT => {
+                assert_eq!(
+                    receipt["error"]["type"],
+                    "version_conflict_engine_exception"
+                );
+            }
+            _ => bail!("unexpected conditional write result {status}: {receipt}"),
+        }
+    }
+    assert_eq!(winners.len(), 1, "{winners:?}");
+    let (winner, winner_source) = winners.pop().unwrap();
+    let seq_no = winner["_seq_no"]
+        .as_u64()
+        .context("winner sequence is missing")?;
+    let term = winner["_primary_term"]
+        .as_u64()
+        .context("winner term is missing")?;
+    let old_term = updated["_primary_term"]
+        .as_u64()
+        .context("old term is missing")?;
+    assert_eq!(Some(seq_no), updated["_seq_no"].as_u64().map(|seq| seq + 1));
+    assert!(term > old_term, "promotion must assign a new primary epoch");
+    assert_eq!(winner["_version"], 3);
+    harness
+        .assert_document_copies(DOC_ID, &winner_source, &winner)
+        .await?;
+
+    let checkpoints = harness.local_sequence_states().await?;
+    for query in [
+        condition_query(&updated)?,
+        format!("if_seq_no={seq_no}&if_primary_term={old_term}"),
+        format!("if_seq_no={}&if_primary_term={term}", seq_no - 1),
+    ] {
+        for (method, endpoint, body) in [
+            (Method::PUT, "_doc", Some(json!({"n": 999}))),
+            (Method::POST, "_update", Some(json!({"doc": {"n": 999}}))),
+            (Method::DELETE, "_doc", None),
+        ] {
+            let (status, response) = harness
+                .request_json(
+                    method,
+                    &format!("/{INDEX_NAME}/{endpoint}/{DOC_ID}?{query}"),
+                    body,
+                )
+                .await?;
+            assert_eq!(status, StatusCode::CONFLICT, "{response}");
+            assert_eq!(
+                response["error"]["type"],
+                "version_conflict_engine_exception"
+            );
+        }
+    }
+    assert_eq!(harness.local_sequence_states().await?, checkpoints);
+    harness
+        .assert_document_copies(DOC_ID, &winner_source, &winner)
+        .await?;
+
+    let bulk_source = expected_document(100);
+    let old_seq = updated["_seq_no"].as_u64().unwrap();
+    let bulk = format!(
+        "{{\"index\":{{\"_id\":\"{DOC_ID}\",\"if_seq_no\":{old_seq},\"if_primary_term\":{old_term}}}}}\n{{\"n\":999}}\n\
+         {{\"update\":{{\"_id\":\"{DOC_ID}\",\"if_seq_no\":{seq_no},\"if_primary_term\":{old_term}}}}}\n{{\"doc\":{{\"n\":999}}}}\n\
+         {{\"delete\":{{\"_id\":\"{DOC_ID}\",\"if_seq_no\":{old_seq},\"if_primary_term\":{term}}}}}\n\
+         {{\"create\":{{\"_id\":\"{DOC_ID}\"}}}}\n{{\"n\":999}}\n\
+         {{\"index\":{{\"_id\":\"{DOC_ID}\",\"if_seq_no\":{seq_no},\"if_primary_term\":{term}}}}}\n{bulk_source}\n"
+    );
+    let (status, bulk) = harness
+        .post_ndjson(&format!("/{INDEX_NAME}/_bulk"), bulk)
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{bulk}");
+    assert_eq!(bulk["errors"], true, "{bulk}");
+    assert_eq!(bulk["items"].as_array().map(Vec::len), Some(5));
+    for (item, action) in ["index", "update", "delete", "create"]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(bulk["items"][item][action]["status"], 409, "{bulk}");
+        assert_eq!(
+            bulk["items"][item][action]["error"]["type"], "version_conflict_engine_exception",
+            "{bulk}"
+        );
+    }
+    let bulk_winner = &bulk["items"][4]["index"];
+    assert_eq!(bulk_winner["status"], 200, "{bulk}");
+    assert_eq!(bulk_winner["_seq_no"], seq_no + 1);
+    assert_eq!(bulk_winner["_primary_term"], term);
+    assert_eq!(bulk_winner["_version"], 4);
+    harness
+        .assert_document_copies(DOC_ID, &bulk_source, bulk_winner)
+        .await?;
+
+    let (status, deleted) = harness
+        .request_json(
+            Method::DELETE,
+            &format!(
+                "/{INDEX_NAME}/_doc/{DOC_ID}?{}",
+                condition_query(bulk_winner)?
+            ),
+            None,
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{deleted}");
+    assert_eq!(deleted["_seq_no"], seq_no + 2);
+    assert_eq!(deleted["_primary_term"], term);
+    assert_eq!(deleted["_version"], 5);
+    for node in &harness.nodes {
+        assert!(
+            get_local_document(&node.config, DOC_ID).await?.is_none(),
+            "delete must be visible on {} before recreation",
+            node.config.name
+        );
+    }
+    let recreated_source = expected_document(200);
+    let (status, recreated) = harness
+        .request_json(
+            Method::PUT,
+            &format!("/{INDEX_NAME}/_create/{DOC_ID}"),
+            Some(recreated_source.clone()),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CREATED, "{recreated}");
+    assert_eq!(recreated["_seq_no"], seq_no + 3);
+    assert_eq!(recreated["_version"], 6);
+
+    harness.restart_node(old_primary).await?;
+    let (_, routing) = harness.wait_for_in_sync_replicas(2).await?;
+    harness.wait_for_green().await?;
+    harness
+        .assert_document_copies(DOC_ID, &recreated_source, &recreated)
+        .await?;
+    let replica = routing
+        .in_sync_replicas
+        .first()
+        .context("replica is missing")?;
+    let stopped = harness.stop_node(replica)?;
+    harness.restart_node(stopped).await?;
+    harness.wait_for_in_sync_replicas(2).await?;
+    harness.wait_for_green().await?;
+    harness
+        .assert_document_copies(DOC_ID, &recreated_source, &recreated)
+        .await?;
+
+    let checkpoints = harness.local_sequence_states().await?;
+    let (status, response) = harness
+        .request_json(
+            Method::DELETE,
+            &format!(
+                "/{INDEX_NAME}/_doc/{DOC_ID}?{}",
+                condition_query(bulk_winner)?
+            ),
+            None,
+        )
+        .await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(
+        response["error"]["type"],
+        "version_conflict_engine_exception"
+    );
+    assert_eq!(harness.local_sequence_states().await?, checkpoints);
+    let (status, final_write) = harness
+        .request_json(
+            Method::POST,
+            &format!(
+                "/{INDEX_NAME}/_update/{DOC_ID}?{}",
+                condition_query(&recreated)?
+            ),
+            Some(json!({"doc": {"n": 201}})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{final_write}");
+    assert_eq!(final_write["_seq_no"], seq_no + 4);
+    assert_eq!(final_write["_version"], 7);
+    let mut final_source = recreated_source;
+    final_source["n"] = json!(201);
+    harness
+        .assert_document_copies(DOC_ID, &final_source, &final_write)
+        .await?;
     Ok(())
 }
 
