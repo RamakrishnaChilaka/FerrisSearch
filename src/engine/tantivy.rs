@@ -27,6 +27,8 @@ use crate::wal::{
     document_operation,
 };
 
+mod canonical;
+
 #[derive(Debug, thiserror::Error)]
 #[error("authoritative shard schema validation failed: {message}")]
 pub(crate) struct AuthoritativeSchemaError {
@@ -471,6 +473,7 @@ pub struct HotEngine {
     pub refresh_interval: Duration,
     /// Write-ahead log for crash durability
     translog: Arc<Mutex<dyn WriteAheadLog>>,
+    write_state: Arc<super::write_authority::CopyWriteState>,
     // Acquire apply state before versions when both locks are needed.
     apply_state: Mutex<ApplyState>,
     versions: RwLock<VersionMapState>,
@@ -489,6 +492,12 @@ pub struct HotEngine {
 // holding the translog lock.
 const TRANSLOG_REPLAY_BATCH_SIZE: u64 = 1_000;
 const TANTIVY_WRITER_HEAP_BYTES: usize = 64 * 1024 * 1024;
+
+struct HotEngineOpenOptions {
+    existing_only: bool,
+    purpose: HotEnginePurpose,
+    write_state: Arc<super::write_authority::CopyWriteState>,
+}
 
 struct AutomaticMergePolicyRestore<'a> {
     engine: &'a HotEngine,
@@ -1467,8 +1476,11 @@ impl HotEngine {
             mappings,
             durability,
             column_cache,
-            false,
-            HotEnginePurpose::LocalShard,
+            HotEngineOpenOptions {
+                existing_only: false,
+                purpose: HotEnginePurpose::LocalShard,
+                write_state: super::write_authority::CopyWriteState::unbound(),
+            },
         )
     }
 
@@ -1484,11 +1496,15 @@ impl HotEngine {
             mappings,
             TranslogDurability::Request,
             column_cache,
-            false,
-            HotEnginePurpose::RemoteSplit,
+            HotEngineOpenOptions {
+                existing_only: false,
+                purpose: HotEnginePurpose::RemoteSplit,
+                write_state: super::write_authority::CopyWriteState::unbound(),
+            },
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn open_existing_with_mappings<P: AsRef<Path>>(
         data_dir: P,
         refresh_interval: Duration,
@@ -1502,8 +1518,34 @@ impl HotEngine {
             mappings,
             durability,
             column_cache,
-            true,
-            HotEnginePurpose::LocalShard,
+            HotEngineOpenOptions {
+                existing_only: true,
+                purpose: HotEnginePurpose::LocalShard,
+                write_state: super::write_authority::CopyWriteState::unbound(),
+            },
+        )
+    }
+
+    pub(crate) fn open_with_copy_state(
+        data_dir: impl AsRef<Path>,
+        refresh_interval: Duration,
+        mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+        durability: TranslogDurability,
+        column_cache: Arc<super::column_cache::ColumnCache>,
+        write_state: Arc<super::write_authority::CopyWriteState>,
+        existing_only: bool,
+    ) -> Result<Self> {
+        Self::new_with_mappings_mode(
+            data_dir,
+            refresh_interval,
+            mappings,
+            durability,
+            column_cache,
+            HotEngineOpenOptions {
+                existing_only,
+                purpose: HotEnginePurpose::LocalShard,
+                write_state,
+            },
         )
     }
 
@@ -1513,9 +1555,13 @@ impl HotEngine {
         mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
         durability: TranslogDurability,
         column_cache: Arc<super::column_cache::ColumnCache>,
-        existing_only: bool,
-        purpose: HotEnginePurpose,
+        options: HotEngineOpenOptions,
     ) -> Result<Self> {
+        let HotEngineOpenOptions {
+            existing_only,
+            purpose,
+            write_state,
+        } = options;
         let data_dir = data_dir.as_ref();
         validate_authoritative_mappings(mappings)?;
         let index_path = data_dir.join("index");
@@ -1527,6 +1573,12 @@ impl HotEngine {
             std::fs::create_dir_all(&index_path)?;
         }
         let index_exists = meta_json_path.is_file();
+        let translog = HotTranslog::open_with_failure_state(
+            data_dir,
+            durability,
+            !(index_exists && matches!(purpose, HotEnginePurpose::LocalShard)),
+            write_state.failure_cell(),
+        )?;
 
         // If an existing index is on disk, evolve its schema to include any
         // new mapped fields before opening.  This preserves the existing field
@@ -1588,8 +1640,6 @@ impl HotEngine {
             .reload_policy(ReloadPolicy::Manual)
             .try_into()?;
 
-        // Open or create the translog in the data directory (not index_path)
-        let translog = HotTranslog::open_with_durability(data_dir, durability)?;
         if matches!(durability, TranslogDurability::Async { .. }) {
             translog.start_sync_task();
         }
@@ -1656,6 +1706,7 @@ impl HotEngine {
             field_registry: RwLock::new(field_registry),
             refresh_interval,
             translog: Arc::new(Mutex::new(translog)),
+            write_state,
             apply_state: Mutex::new(apply_state),
             versions: RwLock::new(VersionMapState::new()),
             client_operations: Mutex::new(super::client_operation::ClientOperationState::default()),
@@ -1683,10 +1734,11 @@ impl HotEngine {
         context: &'static str,
         f: impl FnOnce(&dyn WriteAheadLog) -> Result<T>,
     ) -> Result<T> {
-        let tl = self
-            .translog
-            .lock()
-            .map_err(|_| anyhow::anyhow!("translog lock poisoned during {context}"))?;
+        let tl = self.translog.lock().map_err(|_| {
+            self.fail_stop_writes(&format!("translog lock poisoned during {context}"));
+            anyhow::anyhow!("translog lock poisoned during {context}")
+        })?;
+        self.ensure_write_health()?;
         f(&*tl)
     }
 
@@ -1934,6 +1986,7 @@ impl HotEngine {
     }
 
     fn prepare_primary_term_before_wal(&self, primary_term: u64) -> Result<()> {
+        self.write_state.validate_primary_mutation(primary_term)?;
         let mut state = self
             .apply_state
             .lock()
@@ -2458,6 +2511,9 @@ impl HotEngine {
             #[cfg(feature = "protocol-trace")]
             trace_collision_result.context("record protocol trace operation collision")?;
             if wal_disposition.is_already_in_local_wal() {
+                translog.fail_write(&format!(
+                    "sequenced operation planning failed after WAL persistence: {error:#}"
+                ));
                 if let Some(writer_state) = writer_override.as_deref_mut() {
                     self.invalidate_version_map();
                     writer_state.fail(format!(
@@ -2681,6 +2737,9 @@ impl HotEngine {
                 *client_operations = client_operations_snapshot;
             }
             if appended || wal_disposition.is_already_in_local_wal() {
+                translog.fail_write(&format!(
+                    "sequenced operation apply failed after WAL persistence: {error:#}"
+                ));
                 if let Some(writer_state) = writer_state.as_mut() {
                     self.invalidate_version_map();
                     (*writer_state).fail(format!(
@@ -3327,6 +3386,9 @@ impl HotEngine {
     }
 
     fn fail_writer_after_wal(&self, error: &anyhow::Error) {
+        self.fail_stop_writes(&format!(
+            "sequenced operation failed after WAL persistence: {error:#}"
+        ));
         self.invalidate_version_map();
         self.writer
             .write()
@@ -3347,13 +3409,16 @@ impl HotEngine {
         I: IntoIterator<Item = &'a str>,
         F: FnOnce(&dyn WriteAheadLog) -> Result<T>,
     {
+        let _local_mutation = self.write_state.mutation_guard()?;
         let reservation_bytes = LiveVersionMap::estimate_reservation(doc_ids);
         let mut refreshed = false;
         loop {
-            let translog = self
-                .translog
-                .lock()
-                .map_err(|_| anyhow::anyhow!("translog lock poisoned during {context}"))?;
+            let translog = self.translog.lock().map_err(|_| {
+                self.fail_stop_writes(&format!("translog lock poisoned during {context}"));
+                anyhow::anyhow!("translog lock poisoned during {context}")
+            })?;
+            self.ensure_write_health()?;
+            translog.ensure_writable()?;
             let (can_reserve, current_old_empty, estimated_bytes, max_bytes) = {
                 let versions = self.version_map_read()?;
                 (
@@ -3368,6 +3433,11 @@ impl HotEngine {
                 || (allow_oversized_bulk && oversized_bulk && refreshed && current_old_empty)
             {
                 let result = operation(&*translog);
+                if let Err(error) = &result
+                    && !super::write_failure::is_expected_pre_wal_rejection(error)
+                {
+                    self.fail_stop_writes(&format!("write failed during {context}: {error:#}"));
+                }
                 drop(translog);
                 if result.is_ok()
                     && allow_oversized_bulk
@@ -8995,6 +9065,26 @@ impl tantivy::collector::SegmentCollector for AggSegmentCollector {
 }
 
 impl super::SearchEngine for HotEngine {
+    fn copy_write_state(&self) -> Arc<super::write_authority::CopyWriteState> {
+        self.write_state.clone()
+    }
+
+    fn write_failure_reason(&self) -> Option<String> {
+        if self.translog.is_poisoned() {
+            self.fail_stop_writes("engine translog mutex was poisoned");
+        }
+        self.write_state.failure_reason()
+    }
+
+    fn fail_stop_writes(&self, reason: &str) {
+        self.write_state.fail(reason);
+    }
+
+    #[cfg(test)]
+    fn inject_refresh_commit_failures_for_test(&self, attempts: usize) {
+        HotEngine::inject_refresh_commit_failures_for_test(self, attempts);
+    }
+
     #[cfg(test)]
     fn inject_replay_commit_failure_for_test(&self, raw_os_error: i32, successful_commits: usize) {
         HotEngine::inject_replay_commit_failure_for_test(self, raw_os_error, successful_commits);
@@ -9656,8 +9746,35 @@ impl super::SearchEngine for HotEngine {
                         )
                     })?;
                 }
+                let copy = self.copy_write_state();
+                let canonical_history = copy.canonical_history()?;
+                let history_end_seq_no =
+                    super::canonical::exclusive_next(committed_boundary.max_seq_no)?;
+                let history_start_seq_no = match &canonical_history {
+                    Some(history) => {
+                        history.validate().map_err(anyhow::Error::msg)?;
+                        if history.max_seq_no > committed_boundary.persisted_checkpoint
+                            || history.primary_term != committed_boundary.term_sequence_state.current_term
+                        {
+                            anyhow::bail!("snapshot certificate does not match the committed source history");
+                        }
+                        super::canonical::exclusive_next(history.max_seq_no)?
+                    }
+                    None if !copy.enforces_primary_authority() => history_end_seq_no,
+                    None => anyhow::bail!("production recovery source has no committed canonical certificate"),
+                };
+                translog.recovery_read_snapshot()?.export_snapshot_history(
+                    &snapshot_dir.join(super::PEER_RECOVERY_CANONICAL_HISTORY_FILE),
+                    snapshot_cursor,
+                    history_start_seq_no,
+                    history_end_seq_no,
+                )?;
+                file_names.push(super::PEER_RECOVERY_CANONICAL_HISTORY_FILE.to_string());
                 let version_snapshot = super::PeerRecoveryVersionSnapshot {
                     format_version: super::PEER_RECOVERY_VERSION_SNAPSHOT_FORMAT,
+                    canonical_history,
+                    history_start_seq_no,
+                    history_end_seq_no,
                     deletes: self
                         .version_map_read()?
                         .map
@@ -9948,6 +10065,48 @@ impl super::SearchEngine for HotEngine {
             }
             Ok(operations)
         })
+    }
+
+    fn retained_client_operation(
+        &self,
+        seq_no: u64,
+        primary_term: u64,
+        record: &super::ClientOperationRecord,
+    ) -> Result<super::SequencedOperation> {
+        self.retained_client_operation_inner(seq_no, primary_term, record)
+    }
+
+    fn freeze_canonical_history(&self) -> Result<super::canonical::FrozenEngineHistory> {
+        self.freeze_canonical_history_inner()
+    }
+
+    fn canonical_inventory(
+        &self,
+        end_cursor: crate::wal::WalCursor,
+        start_seq_no: u64,
+        end_seq_no: u64,
+    ) -> Result<super::canonical::HistoryInventory> {
+        self.canonical_inventory_inner(end_cursor, start_seq_no, end_seq_no)
+    }
+
+    fn canonical_operation_at(
+        &self,
+        cursor: crate::wal::WalCursor,
+        end_cursor: crate::wal::WalCursor,
+    ) -> Result<super::SequencedOperation> {
+        self.canonical_operation_at_inner(cursor, end_cursor)
+    }
+
+    fn append_canonical_operations(
+        &self,
+        operations: &[super::SequencedOperation],
+    ) -> Result<super::ReplicaBulkApplyReceipt> {
+        self.validate_canonical_append(operations)?;
+        let mut receipt =
+            self.apply_sequenced_batch_with_side_effect(operations, false, |_| Ok(()))?;
+        receipt.sequence = self.seal_processed_history()?;
+        receipt.all_operations_persisted = receipt.all_operations_processed;
+        Ok(receipt)
     }
 
     fn peer_recovery_commit_files(&self) -> Result<Vec<String>> {
@@ -11851,6 +12010,9 @@ mod tests {
                 date_fields: Vec::new(),
             }),
             refresh_interval: Duration::from_secs(60),
+            write_state: super::super::write_authority::CopyWriteState::unbound_with_failure(
+                translog.write_failure_state(),
+            ),
             translog: Arc::new(Mutex::new(translog)),
             apply_state: Mutex::new(ApplyState::new(committed_boundary).unwrap()),
             versions: RwLock::new(VersionMapState::new()),
@@ -12047,6 +12209,8 @@ mod tests {
     fn no_compat_missing_sequence_schema_requires_recreate() {
         let dir = tempfile::tempdir().unwrap();
         create_pre_d1_schema_fixture(dir.path());
+        drop(HotTranslog::open(dir.path()).unwrap());
+        persist_empty_committed_boundary(dir.path());
 
         let error = match HotEngine::open_existing_with_mappings(
             dir.path(),
@@ -13571,7 +13735,7 @@ mod tests {
 
     #[test]
     fn realtime_get_after_post_wal_apply_failure_fails_closed() {
-        let (_directory, engine) = create_engine();
+        let (directory, engine) = create_engine();
         engine.add_document("old", json!({"value": 1})).unwrap();
         engine.refresh().unwrap();
         engine.inject_engine_apply_failures_for_test(28, 1);
@@ -13588,7 +13752,7 @@ mod tests {
         );
         for doc_id in ["old", "pending", "missing"] {
             let error = engine.get_document_with_metadata(doc_id, true).unwrap_err();
-            assert!(error.is::<TantivyWriterUnavailableError>(), "{error:#}");
+            assert!(error.is::<crate::wal::WalFailStoppedError>(), "{error:#}");
             assert!(format!("{error:#}").contains("No space left"), "{error:#}");
         }
         assert_eq!(
@@ -13599,6 +13763,10 @@ mod tests {
                 .source,
             json!({"value": 1})
         );
+        assert!(engine.refresh().is_err());
+        assert_eq!(engine.sequence_stats().max_seq_no, Some(1));
+        drop(engine);
+        let engine = HotEngine::new(directory.path(), Duration::from_secs(60)).unwrap();
         engine.refresh().unwrap();
         assert_eq!(
             engine

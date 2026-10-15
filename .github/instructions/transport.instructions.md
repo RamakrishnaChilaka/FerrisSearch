@@ -42,7 +42,6 @@ PrepareFinalizeRecovery(PrepareFinalizeRecoveryRequest) → PrepareFinalizeRecov
 CompleteFinalizeRecovery(CompleteFinalizeRecoveryRequest) → CompleteFinalizeRecoveryResponse
 FailShardCopy(FailShardCopyRequest) → FailShardCopyResponse
 MarkPrimaryUnavailable(MarkPrimaryUnavailableRequest) → MarkPrimaryUnavailableResponse
-MarkPrimaryAvailable(MarkPrimaryAvailableRequest) → MarkPrimaryAvailableResponse
 
 // Forwarded to leader
 UpdateSettings(UpdateSettingsRequest) → UpdateSettingsResponse
@@ -86,6 +85,15 @@ receipt metadata. FerrisSearch is pre-1.0: successful responses require these
 receipts, and metadata-free success responses from older peers fail. Do not add
 compatibility fallbacks or rollout machinery for this protocol change.
 
+Every successful document/delete/ID-bearing no-op response and successful
+bulk item requires `write_acknowledgement`. Nonempty homogeneous index-only
+bulk also requires an identical common envelope report; ordered mixed bulk
+has only per-item reports, and empty bulk has none. Require positive exact
+allocation IDs, unique nodes, exactly one acknowledged primary matching the
+RPC target, and explicit acknowledged-true or nonempty replica-error outcomes.
+Failed writes/items carry no acknowledged data report. REST `_shards` comes
+from these actual data-copy outcomes, never a fabricated one-copy success.
+
 Primary index/delete requests and ordered bulk items carry
 `ClientOperationIntent`; successful responses and replica/recovery operations
 carry the complete `ClientOperationMetadata` record. Decode and validate IDs,
@@ -113,7 +121,8 @@ failure, including `UNAVAILABLE`, `ABORTED`, and deadline expiry, is indetermina
 Preserve known receipts through engine errors, storage escalation, replication
 failure, and ordered-bulk single-write conversion. Failed writes carry no
 acknowledged refresh report. This plumbing does not change the ACK policy or
-add automatic retries.
+add automatic retries. FS013's separate certification path resolves a missing
+replica proof only through observed conditional exclusion and the copy floor.
 
 Primary document/delete/bulk requests carry `refresh`. Acknowledged
 document/delete responses and acknowledged bulk items require `write_refresh`
@@ -154,7 +163,9 @@ it losslessly and reject duplicate IDs, the primary ID, or any ID absent from
 `replica_node_ids` with `INVALID_ARGUMENT`.
 `ShardAssignment` also carries primary/replica allocation IDs, the initial
 CreateIndex allocation ID, `primary_initialized`, and the status-only
-`primary_unavailable` flag. Missing allocation metadata is rejected on join
+`primary_unavailable` flag, which also closes write admission. Canonical
+phase/activation/certificate metadata is mandatory; cached ACTIVE state cannot
+authorize a restarted process. Missing allocation metadata is rejected on join
 snapshots; pre-1.0 snapshots are not adopted.
 
 ### Runtime And Code Generation
@@ -321,7 +332,7 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   while retaining the shared recovery write guard. Do not consult coordinator
   metadata or replace the captured acknowledgement set with a newer one.
   Refresh-only failures preserve acknowledged status/receipt and become
-  `_shards` copy failures; `forced_refresh` reflects primary publication.
+    `_refresh` visibility failures; `forced_refresh` reflects primary publication.
   No refresh/false adds no RPCs or engine refreshes.
 - **refresh_shard_copy**: require index name/UUID, primary identity, positive
   term, and target allocation ID. Revalidate current authoritative assignment,
@@ -330,8 +341,9 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   or replaced engines are failures, not reopen/create opportunities. Run
   refresh on Tokio's blocking maintenance pool through the existing public
   engine refresh/reader-reload path, never on Tokio workers or the write pool.
-- **replicate_doc / replicate_bulk**: Require index UUID, sender primary term,
-  and target allocation ID. Revalidate the current local assignment inside the
+- **replicate_doc / replicate_bulk**: Require exact current ACTIVE source
+  authority/certificate, index UUID, and target allocation ID. Keep original
+  operation term separate from current sending authority. Revalidate the current local assignment inside the
   write worker; then validate durable identity, recovery gate, and term fence
   before WAL/engine mutation. A higher term is fsynced before mutation. Bulk
   validates the shared envelope and every item before the first mutation and
@@ -349,18 +361,14 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   whole-value fallback and its validation errors for non-envelope inputs.
 - `ReplicateBulk` accepts either contiguous ordered index operations or a
   strictly increasing, potentially non-contiguous homogeneous NoOp batch.
-  Promotion activation uses bounded NoOp batches rather than one RPC per
-  missing sequence number.
-- A failed promotion NoOp batch remains pending in process-local activation
-  state. While that entry survives, the next lifecycle or request activation
-  retries it even when the local UUID/shard/allocation/term cache already says
-  the primary is active. Successful redelivery or copy invalidation removes the
-  entry. Restart, or an activation error after the NoOps were applied locally
-  but before retry state was retained, loses the intent; it is not reconstructed
-  from the WAL. The affected replica then follows the fixed gap deadline and
-  peer-recovery path. Activation and pending-NoOp retry mutexes are keyed by
-  exact index UUID, shard, and allocation. Never hold a node-wide or index-wide
-  lock across activation forwarding or replica fan-out.
+  Legacy no-Raft D1 activation uses bounded NoOp fan-out batches; production
+  canonical activation uses its separately authorized promotion channel.
+- `promotion.rs` coalesces first writers and lifecycle activation by exact
+  allocation. Reserve PROMOTING through Raft, freeze bounded process-bound
+  inventories, preserve/adopt protected history, compare an entire peer range
+  before append, seal matching copies, finish ACTIVE, and observe it before
+  installing an epoch. Independent coordinator/job slots retain owned work
+  across cancellation; no mutation gate spans network work.
 - Successful replica responses carry optional processed and persisted
   checkpoints and must prove the exact single operation or every bulk item was
   processed. A behind contiguous checkpoint is a gap observation, not failure
@@ -432,8 +440,10 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
 - **join_cluster MUST forward on followers**: A follower receiving a JoinCluster RPC must forward it to the Raft leader. It must NEVER fall through to `cluster_manager.add_node()` when Raft is active, as this would add the node to local state without Raft membership.
 - **ping MUST reject unknown nodes**: `Ping` is not just a transport liveness check. If `source_node_id` is absent from cluster state, return `NOT_FOUND` instead of silently succeeding, or removed/stale nodes will keep serving an old cluster view forever and never trigger `JoinCluster` recovery.
 - **Join identity MUST be unique and stable**: `raft_node_id` cannot be reused by a different logical node, and an existing `node_id` cannot silently switch to a different `raft_node_id`. Reject the join instead of mutating membership.
-- **Shard writes MUST fail on replication failure**: single writes and
-  index-only bulk batches return `success: false` on replication failure.
+- **Shard writes MUST fail without certification**: every captured copy needs
+  an exact-operation proof or observed settled conditional exclusion, with a
+  valid permit and the copy floor. Missing/unknown proof is never success.
+  Uncertified single/index-only bulk writes return typed failures.
   Mixed bulk RPCs return a per-item 5xx error for each failed mutation; an RPC
   envelope may succeed only with those failures preserved in its results.
   Never acknowledge a failed item or ignore its error because the envelope
@@ -451,26 +461,19 @@ Implements `InternalTransport` trait. All RPC handlers check Raft leadership or 
   The in-progress marker still prevents a partial install from being opened.
 - Local copy failure forwarding reports corruption-class identity, marker, WAL,
   and Tantivy decode/validation failures immediately. Other open/fence/marker
-  and Apply I/O remains retryable under operation-specific per-copy state until
+  I/O remains retryable under operation-specific per-copy state until
   the shared count/time policy is exhausted. Quarantine happens only after the
-  report throttle and only for definitive or open-level failures; Apply
-  escalation leaves the engine open for reads and never triggers runtime WAL
-  replay. Sequence/version collisions bypass the ordinary quarantine throttle.
+  report throttle for ordinary definitive/open-level failures. WAL/post-WAL
+  uncertainty immediately fail-stops the copy/permits without retry-window
+  healing. Sequence/version collisions bypass the ordinary quarantine throttle.
   Replica escalation removes the copy; primary escalation is
   promote-only and requires an in-sync candidate.
 - Production transport and node lifecycle share one primary-activation state.
   Proactive lifecycle activation and request-triggered activation are
-  idempotent for the same UUID/shard/allocation/term. The unavailable flag alone
-  does not bypass that cache, but pending promotion NoOps do bypass the fast
-  return so their best-effort fan-out is retried. A repaired quarantined
-  open-level failure forces a fresh activation; a successful local write after
-  an Apply-level failure spawns throttled best-effort `MarkPrimaryAvailable`
-  reporting without a term bump. The already-successful write response must not
-  wait for Raft leadership discovery, forwarding, or the transport timeout of
-  that status-only report.
-  Check `primary_unavailable` through the shared applied-state read lock before
-  cloning the service or spawning the task, so ordinary writes allocate no
-  status-report work.
+  coalesced for the same allocation. Cached ACTIVE metadata after restart is
+  not a permit. `primary_unavailable` and shared fail-stop close admission;
+  only fresh canonical activation clears availability. Healthy all-copy ACKs
+  require no new metadata quorum or status-clearing RPC.
 - **Primary handlers hold the shared recovery barrier** from before engine
   mutation through replication and read the authoritative in-sync targets
   inside that guard.

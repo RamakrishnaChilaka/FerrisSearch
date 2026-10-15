@@ -1,3 +1,4 @@
+pub mod canonical;
 pub mod client_operation;
 pub mod column_cache;
 pub mod composite;
@@ -7,6 +8,7 @@ pub(crate) mod sequence;
 pub mod tantivy;
 pub mod vector;
 pub(crate) mod version_map;
+pub mod write_authority;
 pub(crate) mod write_failure;
 
 use anyhow::Result;
@@ -26,12 +28,17 @@ pub use self::sequence::{SEQUENCE_FORMAT_VERSION, SequenceStats};
 pub use self::tantivy::HotEngine;
 
 pub(crate) const PEER_RECOVERY_VERSION_SNAPSHOT_FILE: &str = "retained-delete-versions.json";
-pub(crate) const PEER_RECOVERY_VERSION_SNAPSHOT_FORMAT: u32 = 2;
+pub(crate) const PEER_RECOVERY_CANONICAL_HISTORY_FILE: &str = "retained-canonical-history.bin";
+pub(crate) const PEER_RECOVERY_VERSION_SNAPSHOT_FORMAT: u32 = 3;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PeerRecoveryVersionSnapshot {
     pub format_version: u32,
+    #[serde(deserialize_with = "serde::Deserialize::deserialize")]
+    pub canonical_history: Option<crate::cluster::state::CanonicalHistory>,
+    pub history_start_seq_no: u64,
+    pub history_end_seq_no: u64,
     pub deletes: Vec<PeerRecoveryDeleteVersion>,
     pub client_operations: Vec<PeerRecoveryClientOperation>,
 }
@@ -54,7 +61,8 @@ pub(crate) struct PeerRecoveryClientOperation {
     pub payload: serde_json::Value,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
 pub enum DocumentMutation {
     Index {
         doc_id: String,
@@ -77,12 +85,14 @@ impl DocumentMutation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SequencedOperation {
     pub seq_no: u64,
     pub primary_term: u64,
     /// Primary-assigned per-document version. NoOp operations use zero.
     pub document_version: u64,
+    #[serde(deserialize_with = "serde::Deserialize::deserialize")]
     pub client_operation: Option<ClientOperationRecord>,
     pub mutation: DocumentMutation,
 }
@@ -484,6 +494,19 @@ pub type ProtocolTraceCopyEvidence = (
 /// - Remote storage backends
 /// - Warm/cold tiered engines
 pub trait SearchEngine: Send + Sync {
+    fn copy_write_state(&self) -> Arc<write_authority::CopyWriteState>;
+
+    fn write_failure_reason(&self) -> Option<String>;
+
+    fn fail_stop_writes(&self, reason: &str);
+
+    fn ensure_write_health(&self) -> Result<()> {
+        match self.write_failure_reason() {
+            Some(reason) => Err(crate::wal::WalFailStoppedError { reason }.into()),
+            None => Ok(()),
+        }
+    }
+
     #[cfg(test)]
     fn inject_wal_write_failures_for_test(&self, _raw_os_error: i32, _attempts: usize) {}
 
@@ -492,6 +515,11 @@ pub trait SearchEngine: Send + Sync {
 
     #[cfg(test)]
     fn inject_engine_apply_failures_for_test(&self, _raw_os_error: i32, _attempts: usize) {}
+
+    #[cfg(test)]
+    fn inject_refresh_commit_failures_for_test(&self, _attempts: usize) {
+        panic!("refresh commit fault injection requires a local shard engine");
+    }
 
     #[cfg(test)]
     fn inject_replay_commit_failure_for_test(
@@ -612,6 +640,15 @@ pub trait SearchEngine: Send + Sync {
         _version: u64,
     ) -> Result<ClientNoOpWriteReceipt> {
         anyhow::bail!("client operation no-ops are not supported by this search engine")
+    }
+
+    fn retained_client_operation(
+        &self,
+        _seq_no: u64,
+        _primary_term: u64,
+        _record: &ClientOperationRecord,
+    ) -> Result<SequencedOperation> {
+        anyhow::bail!("retained client operations are not supported by this search engine")
     }
 
     fn apply_replica_operation(&self, operation: SequencedOperation)
@@ -864,6 +901,34 @@ pub trait SearchEngine: Send + Sync {
 
     fn peer_recovery_barrier(&self) -> Result<PeerRecoveryBarrier> {
         anyhow::bail!("peer recovery barriers are not supported by this engine")
+    }
+
+    fn freeze_canonical_history(&self) -> Result<canonical::FrozenEngineHistory> {
+        anyhow::bail!("canonical history freezing is not supported by this engine")
+    }
+
+    fn canonical_inventory(
+        &self,
+        _end_cursor: crate::wal::WalCursor,
+        _start_seq_no: u64,
+        _end_seq_no: u64,
+    ) -> Result<canonical::HistoryInventory> {
+        anyhow::bail!("canonical history inventory is not supported by this engine")
+    }
+
+    fn canonical_operation_at(
+        &self,
+        _cursor: crate::wal::WalCursor,
+        _end_cursor: crate::wal::WalCursor,
+    ) -> Result<SequencedOperation> {
+        anyhow::bail!("canonical history reads are not supported by this engine")
+    }
+
+    fn append_canonical_operations(
+        &self,
+        _operations: &[SequencedOperation],
+    ) -> Result<ReplicaBulkApplyReceipt> {
+        anyhow::bail!("canonical history resynchronization is not supported by this engine")
     }
 
     fn prepare_primary_activation(&self, _primary_term: u64) -> Result<Vec<SequencedOperation>> {

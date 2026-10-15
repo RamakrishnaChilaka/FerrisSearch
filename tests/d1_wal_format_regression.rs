@@ -10,14 +10,17 @@ const MANIFEST_FILE: &str = "translog.manifest";
 const GENERATION_FILE: &str = "translog-00000000000000000000.bin";
 
 #[test]
-fn new_translog_persists_v2_manifest_with_v3_entries_and_min_max_ranges() {
+fn new_translog_persists_protected_v3_manifest_with_checksummed_v4_entries() {
     let dir = tempfile::tempdir().unwrap();
     let _translog = HotTranslog::open(dir.path()).unwrap();
 
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.path().join(MANIFEST_FILE)).unwrap()).unwrap();
-    assert_eq!(manifest["version"], 2);
-    assert_eq!(manifest["entry_format_version"], 3);
+    assert_eq!(manifest["version"], 3);
+    assert_eq!(manifest["entry_format_version"], 4);
+    assert_eq!(manifest["next_seq_no"], 0);
+    assert_eq!(manifest["generation_hashes"].as_array().unwrap().len(), 1);
+    assert_eq!(manifest["checksum"].as_array().unwrap().len(), 32);
     assert_eq!(
         manifest["generations"][0]["min_seq_no"],
         serde_json::Value::Null

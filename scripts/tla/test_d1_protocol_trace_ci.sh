@@ -18,6 +18,18 @@ cargo test \
     --features protocol-trace \
     --lib primary_replication_pause
 
+if ! FS013_AUTHORITY_EVIDENCE_OUTPUT="$RUN_DIR/write-authority.json" \
+    cargo test \
+        --manifest-path "$ROOT_DIR/Cargo.toml" \
+        --features protocol-trace \
+        --lib write_authority_protocol_trace_runtime_canonical_and_observed_exclusion \
+        -- --nocapture; then
+    if [[ -f "$RUN_DIR/write-authority.json" ]]; then
+        cat "$RUN_DIR/write-authority.json" >&2
+    fi
+    exit 1
+fi
+
 if ! STALE_PRIMARY_EVIDENCE_OUTPUT="$RUN_DIR/live-stale-primary.jsonl" \
     cargo test \
         --manifest-path "$ROOT_DIR/Cargo.toml" \

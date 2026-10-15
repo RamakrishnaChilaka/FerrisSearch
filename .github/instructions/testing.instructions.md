@@ -49,6 +49,7 @@ cargo test -- test_name                         # Single test by name
 ./scripts/tla/check.sh d2-stale-self-fence d2-no-self-fence d2-gap-operation d2-gap-prefix d2-debt-liveness
 ./scripts/tla/check.sh d2-quorum-loss-witness d2-exclusion-witness d2-fail-stop-witness
 ./scripts/tla/check.sh d2-quorum-loss-witness d2-quorum-loss-negative
+./scripts/tla/check.sh fs013-one fs013-two fs013-no-journal fs013-cached-restart fs013-cross-epoch fs013-restart-witness
 ./scripts/tla/check.sh trace-validator          # Converter and trace acceptance/rejection
 ./scripts/tla/validate_trace.sh path/to/trace.jsonl
 ./scripts/tla/check_d1_trace_invariants.py path/to/trace.jsonl
@@ -89,7 +90,9 @@ cargo test -- test_name                         # Single test by name
   `d1-promotion-replay-noop`, `d1-trace-actions`, `trace-validator`,
   `two-shard`, `fixed-crash`, and
   `fixed-partition` are expected-pass configurations.
-- D2 policy checks are selected design targets, not Rust fixes. Keep
+- D2 policy checks retain stable historical profile names: `Current` is the
+  former fail-request baseline; `Proposed` abstracts FS013's runtime policy.
+  They are bounded policy evidence, not implementation tests. Keep
   `d2-current`, both `d2-smoke-*` and local-only `d2-proposed-*` floors,
   `d2-stale-self-fence`, `d2-gap-operation`, and `d2-debt-liveness` green.
   Preserve the named unsafe controls for uncommitted exclusion, forgotten
@@ -104,6 +107,15 @@ cargo test -- test_name                         # Single test by name
   Document fixed operation shapes, replica symmetry, fairness, and the
   abstract post-WAL permit failure. Do not infer byte-level I/O, restart-debt,
   dynamic configuration, ABA, or D10 proof from these bounds.
+- Supplementary FS013 checks separately cover two copies/two operations/two
+  epochs/one restart with durable-journal, observed-settlement, fail-stop, and
+  fresh-authority abstractions. Both floors pass; no-journal/cached-restart/
+  cross-epoch controls must hit their exact named invariants. The restart
+  witness keeps every safety invariant and violates only negated reachability.
+  Never infer protected-byte verification or full D10 from its seal action.
+- The separate serialized authority witness is not a schema-v4 D1 trace or a
+  concurrent linearization proof. Run its strict Python checker and mutation
+  controls through the exact protocol-trace CI wrapper.
 - An expected-pass failure stops the modeling task. Preserve the raw trace,
   decide whether the model or implementation is wrong, and do not weaken an
   invariant or transition merely to obtain green output.
@@ -244,6 +256,12 @@ cargo test -- test_name                         # Single test by name
   `arrival-order` and `seq-only-redelivery` at the causal
   `operation_processed` event in both the independent invariant checker and
   TLC. Keep the seed in failure output so the run is reproducible.
+- Legacy D1 fixtures explicitly supply synthetic identity-anchor certificates
+  and direct no-Raft activation state; current wire/proof guards still run.
+  They do not prove FS013 canonical inventory/resync. The separate serialized
+  authority witness and real-Raft stale-primary suite cover those runtime
+  boundaries. Recovery-install emission must include the actual dense archive,
+  not only retained client records; never filter actual state to obtain a pass.
 - Keep the real three-voter `stale_primary_failover` regression separate from
   the schema-v4 D1 witness harness. Its client-scoped one-shot pause must
   observe primary WAL/apply before metadata isolation; the still-live primary
@@ -408,23 +426,20 @@ cargo test -- test_name                         # Single test by name
   promote-only primary failover and no-survivor rejection, idle lifecycle
   activation after primary restart, post-rename pending-state repair, and
   delete/recreate-safe recovery abort.
-- Round-3 allocation/fencing regressions cover persistent ENOSPC/read-only
-  apply failures on already-open primary and replica copies, transient apply
-  failure reset, bounded apply backoff, local-storage versus network recovery
+- Allocation/fencing regressions cover ENOSPC/read-only
+  apply failures on already-open primary and replica copies, immediate sticky
+  fail-stop, ordinary open-I/O backoff, local-storage versus network recovery
   accounting, structural Tantivy metadata/mapping corruption, exact replica
   removal with resumed writes, leader-selected primary promotion, and
-  no-candidate status-only primary unavailability   without routing change.
-- Round-4 allocation/fencing regressions cover stable unavailable status across
-  repeated write-only faults, same-term clearing after the first repaired
-  write, fresh activation after repaired open failure, stale availability CAS
-  rejection, throttled definitive quarantine, no Apply-level quarantine or
-  runtime WAL replay, readable failed-writer copies, and escalation of a
-  force-merge replacement failure through the Apply key.
-- Round-5 allocation/fencing regressions cover a one-shot force-merge
-  replacement failure rebuilding successfully on the next write, persistent
-  rebuild failure remaining reportable under the Apply budget, and successful
-  write responses remaining independent of a blocked or slow
-  `MarkPrimaryAvailable` report.
+  no-candidate primary unavailability without routing change.
+- Availability regressions keep failed epochs closed after filesystem repair
+  and same-allocation reopen, reject stale authority, and require fresh
+  canonical activation after verified restart. Do not retain historical
+  successful-write/same-term clearing expectations.
+- Maintenance-only force-merge replacement errors can rebuild on a healthy
+  next write. Failed reconstruction and uncertain post-WAL mutation fail-stop;
+  no shared failure is cleared by rebuild or later fsync. Healthy all-copy
+  acknowledgements still succeed after metadata quorum disappears.
 - Collision quarantine regressions must assert repeated immediate single and
   bulk replication attempts remain `DATA_LOSS`; a definitive marker must never
   be masked by copy-I/O backoff. Inject collision-marker persistence failure
@@ -566,6 +581,19 @@ cargo test -- test_name                         # Single test by name
 - This does not prove file recovery, in-sync admission, terms/fencing, or
   restarted-replica gap handling.
 - Asserts destructive delete reasons do not appear in logs during the preserved-data workflow
+- Clean primary process restart requires a fresh canonical term/activation,
+  unchanged allocation, preserved original operation identity, and next sequence.
+- Process copy comparisons wait for fresh ACTIVE authority, restored in-sync
+  membership, and matching applied routing/allocation views on every running
+  data node. With the default floor of one, a certified write may exclude a
+  failed copy; a running process is not proof of read eligibility. Keep bounded
+  recovery plus exact source/version/sequence assertions on every restored copy,
+  rather than skipping out-of-sync nodes or weakening their read rejection.
+- An exact identity-publication temporary-directory fault must return
+  HTTP500 `write_outcome_unknown` with its owned sequence/term and original
+  cause, stop realtime reads, promote a live ISR copy, and recover the repaired
+  old process under fresh allocation. Verify known and uncertain operations
+  plus all final durable certificates; never heal the old in-process copy.
 
 ### Request Crash Regression (tests/request_crash_regression.rs)
 - Use child processes for abort-reproducing requests and worker probes; an

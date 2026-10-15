@@ -585,6 +585,11 @@ impl TransportClient {
             .map_err(super::write_failure::WriteFailure::from_rpc_status)?
             .into_inner();
         if response.success {
+            super::write_acknowledgement::validate_write_acknowledgement(
+                response.write_acknowledgement.as_ref(),
+                Some(&node.id),
+            )
+            .map_err(super::write_failure::WriteFailure::after_dispatch)?;
             super::write_refresh::validate_write_refresh_response(
                 response.write_refresh.as_ref(),
                 refresh,
@@ -627,6 +632,13 @@ impl TransportClient {
             .await
             .map_err(super::write_failure::WriteFailure::from_rpc_status)?
             .into_inner();
+        if response.success && !docs.is_empty() {
+            super::write_acknowledgement::validate_write_acknowledgement(
+                response.write_acknowledgement.as_ref(),
+                Some(&node.id),
+            )
+            .map_err(super::write_failure::WriteFailure::after_dispatch)?;
+        }
         decode_shard_bulk_response(docs, response)
             .map_err(super::write_failure::WriteFailure::after_dispatch)
     }
@@ -703,6 +715,11 @@ impl TransportClient {
             .map_err(super::write_failure::WriteFailure::from_rpc_status)?
             .into_inner();
         if response.success {
+            super::write_acknowledgement::validate_write_acknowledgement(
+                response.write_acknowledgement.as_ref(),
+                Some(&node.id),
+            )
+            .map_err(super::write_failure::WriteFailure::after_dispatch)?;
             super::write_refresh::validate_write_refresh_response(
                 response.write_refresh.as_ref(),
                 options.refresh,
@@ -725,7 +742,13 @@ impl TransportClient {
         seq_no: u64,
         primary_term: u64,
         version: u64,
-    ) -> Result<crate::engine::ClientNoOpWriteReceipt, anyhow::Error> {
+    ) -> Result<
+        (
+            crate::engine::ClientNoOpWriteReceipt,
+            ShardWriteAcknowledgement,
+        ),
+        anyhow::Error,
+    > {
         let mut client = self
             .connect(&node.host, node.transport_port)
             .await
@@ -750,44 +773,8 @@ impl TransportClient {
             .await
             .map_err(super::write_failure::WriteFailure::from_rpc_status)?
             .into_inner();
-        if !response.success {
-            return Err(super::write_failure::WriteFailure::after_dispatch(
-                anyhow::anyhow!("client operation no-op failed: {}", response.error),
-            ));
-        }
-        Ok(crate::engine::ClientNoOpWriteReceipt {
-            operation_seq_no: response.operation_seq_no.ok_or_else(|| {
-                anyhow::anyhow!("client operation no-op response has no sequence")
-            })?,
-            operation_primary_term: response
-                .operation_primary_term
-                .filter(|term| *term > 0)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("client operation no-op response has no primary term")
-                })?,
-            seq_no: response.seq_no.ok_or_else(|| {
-                anyhow::anyhow!("client operation no-op response has no result sequence")
-            })?,
-            primary_term: response
-                .primary_term
-                .filter(|term| *term > 0)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("client operation no-op response has no result primary term")
-                })?,
-            version: response
-                .version
-                .filter(|version| *version > 0)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("client operation no-op response has no result version")
-                })?,
-            client_operation: crate::transport::client_operation::record_from_proto(
-                response.client_operation,
-            )?
-            .ok_or_else(|| {
-                anyhow::anyhow!("client operation no-op response has no operation metadata")
-            })?,
-            deduplicated: response.deduplicated,
-        })
+        decode_shard_client_noop_response(&node.id, client_operation, response)
+            .map_err(super::write_failure::WriteFailure::after_dispatch)
     }
 
     /// Forward a get-by-ID request to a specific shard on a node
@@ -1548,6 +1535,109 @@ impl TransportClient {
         Ok(())
     }
 
+    pub async fn forward_finish_primary_activation(
+        &self,
+        master: &NodeInfo,
+        index_name: &str,
+        activation: &crate::cluster::state::PrimaryActivationFinish,
+    ) -> Result<(), anyhow::Error> {
+        activation.validate().map_err(anyhow::Error::msg)?;
+        let mut client = self
+            .connect(&master.host, master.transport_port)
+            .await
+            .context("connect to leader for canonical activation")?;
+        let mut request = tonic::Request::new(ShardAuthorityMutationRequest {
+            index_name: index_name.to_string(),
+            record_json: serde_json::to_vec(activation)?,
+        });
+        request.set_timeout(Duration::from_secs(5));
+        let response = client
+            .finish_primary_activation(request)
+            .await
+            .context("FinishPrimaryActivation RPC")?
+            .into_inner();
+        Self::decode_shard_authority_result(response, None)
+    }
+
+    pub(crate) async fn reconcile_primary_history(
+        &self,
+        node: &NodeInfo,
+        request: &crate::shard::promotion::PromotionRequest,
+    ) -> Result<crate::shard::promotion::PromotionReply, anyhow::Error> {
+        request.validate()?;
+        let record_json = serde_json::to_vec(request)?;
+        let limit = crate::engine::canonical::MAX_HISTORY_BATCH_BYTES + 64 * 1024;
+        if record_json.len() > limit {
+            anyhow::bail!("promotion request exceeds its encoded transfer budget");
+        }
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut client = self
+                .connect(&node.host, node.transport_port)
+                .await
+                .context("connect for primary history reconciliation")?;
+            let mut request = tonic::Request::new(ReconcilePrimaryHistoryRequest { record_json });
+            request.set_timeout(Duration::from_secs(20));
+            let response = client
+                .reconcile_primary_history(request)
+                .await
+                .context("ReconcilePrimaryHistory RPC")?
+                .into_inner();
+            if response.result_json.len() > limit {
+                anyhow::bail!("promotion response exceeds its encoded transfer budget");
+            }
+            serde_json::from_slice(&response.result_json)
+                .context("decode strict promotion response")
+        })
+        .await
+        .context("primary history reconciliation deadline expired")?
+    }
+
+    pub async fn forward_exclude_failed_shard_copies(
+        &self,
+        master: &NodeInfo,
+        index_name: &str,
+        exclusion: &crate::cluster::state::FailedCopyExclusion,
+    ) -> Result<(), anyhow::Error> {
+        exclusion.validate().map_err(anyhow::Error::msg)?;
+        let mut client = self
+            .connect(&master.host, master.transport_port)
+            .await
+            .context("connect to leader for failed-copy exclusion")?;
+        let mut request = tonic::Request::new(ShardAuthorityMutationRequest {
+            index_name: index_name.to_string(),
+            record_json: serde_json::to_vec(exclusion)?,
+        });
+        request.set_timeout(Duration::from_secs(5));
+        let response = client
+            .exclude_failed_shard_copies(request)
+            .await
+            .context("ExcludeFailedShardCopies RPC")?
+            .into_inner();
+        Self::decode_shard_authority_result(response, Some(&exclusion.transition_id))
+    }
+
+    fn decode_shard_authority_result(
+        response: ShardAuthorityMutationResponse,
+        transition_id: Option<&str>,
+    ) -> Result<(), anyhow::Error> {
+        use crate::consensus::types::{ClusterResponse, WriteAuthorityRejectedError};
+        let result: ClusterResponse = serde_json::from_slice(&response.result_json)
+            .context("decode strict shard authority result")?;
+        match result {
+            ClusterResponse::Ok if transition_id.is_none() => Ok(()),
+            ClusterResponse::ExclusionApplied {
+                transition_id: applied,
+            } if transition_id == Some(applied.as_str()) => Ok(()),
+            ClusterResponse::WriteAuthorityRejected { reason } => {
+                Err(WriteAuthorityRejectedError { reason }.into())
+            }
+            ClusterResponse::Error(reason) => Err(anyhow::Error::msg(reason)),
+            other => Err(anyhow::anyhow!(
+                "inconsistent shard authority result: {other:?}"
+            )),
+        }
+    }
+
     pub async fn forward_mark_primary_unavailable(
         &self,
         master: &NodeInfo,
@@ -1569,29 +1659,6 @@ impl TransportClient {
             return Err(anyhow::anyhow!(
                 "MarkPrimaryUnavailable was not acknowledged"
             ));
-        }
-        Ok(())
-    }
-
-    pub async fn forward_mark_primary_available(
-        &self,
-        master: &NodeInfo,
-        request: MarkPrimaryAvailableRequest,
-    ) -> Result<(), anyhow::Error> {
-        let mut client = self
-            .connect(&master.host, master.transport_port)
-            .await
-            .map_err(|e| anyhow::anyhow!("connect to master: {e}"))?;
-        let response = client
-            .mark_primary_available(tonic::Request::new(request))
-            .await
-            .map_err(|e| anyhow::anyhow!("MarkPrimaryAvailable RPC: {e}"))?
-            .into_inner();
-        if !response.error.is_empty() {
-            return Err(anyhow::anyhow!("{}", response.error));
-        }
-        if !response.acknowledged {
-            return Err(anyhow::anyhow!("MarkPrimaryAvailable was not acknowledged"));
         }
         Ok(())
     }
@@ -2086,6 +2153,7 @@ fn decode_shard_doc_response(
 ) -> Result<serde_json::Value, anyhow::Error> {
     if !response.success {
         if response.write_refresh.is_some()
+            || response.write_acknowledgement.is_some()
             || (!expected_doc_id.is_empty() && response.doc_id != expected_doc_id)
         {
             anyhow::bail!(
@@ -2147,6 +2215,16 @@ fn decode_shard_doc_response(
         "_version": version,
         "result": if response.created { "created" } else { "updated" }
     });
+    let acknowledgement = super::write_acknowledgement::validate_write_acknowledgement(
+        response.write_acknowledgement.as_ref(),
+        None,
+    )?;
+    super::write_acknowledgement::add_write_acknowledgement_to_response(
+        &mut result,
+        index_name,
+        shard_id,
+        acknowledgement,
+    );
     if let Some(refresh) = &response.write_refresh {
         super::write_refresh::add_write_refresh_to_response(
             &mut result,
@@ -2163,7 +2241,7 @@ fn decode_shard_bulk_response(
     response: ShardBulkResponse,
 ) -> Result<crate::engine::BulkWriteReceipt, anyhow::Error> {
     if !response.success {
-        if !response.results.is_empty() {
+        if !response.results.is_empty() || response.write_acknowledgement.is_some() {
             anyhow::bail!(
                 "failed shard bulk envelope contains item results; server cause: {}",
                 response.error
@@ -2188,6 +2266,16 @@ fn decode_shard_bulk_response(
             "successful shard bulk response contains an error: {}",
             response.error
         );
+    }
+    if docs.is_empty() {
+        if response.write_acknowledgement.is_some() {
+            anyhow::bail!("empty shard bulk response contains a data-copy acknowledgement");
+        }
+    } else {
+        super::write_acknowledgement::validate_write_acknowledgement(
+            response.write_acknowledgement.as_ref(),
+            None,
+        )?;
     }
     if response.doc_ids.len() != docs.len()
         || response
@@ -2238,6 +2326,7 @@ fn decode_shard_bulk_response(
             || !item.error_type.is_empty()
             || item.failure.is_some()
             || item.write_refresh.is_some()
+            || item.write_acknowledgement != response.write_acknowledgement
             || item.seq_no != expected_seq
             || item.primary_term != Some(receipt.primary_term)
             || item.version != Some(*version)
@@ -2259,7 +2348,7 @@ fn decode_shard_bulk_operations_response(
     response: ShardBulkResponse,
 ) -> Result<Vec<ShardBulkItemResponse>, anyhow::Error> {
     if !response.success {
-        if !response.results.is_empty() {
+        if !response.results.is_empty() || response.write_acknowledgement.is_some() {
             anyhow::bail!(
                 "failed shard bulk envelope contains item results; server cause: {}",
                 response.error
@@ -2282,6 +2371,23 @@ fn decode_shard_bulk_operations_response(
     if response.results.len() != docs.len() || response.doc_ids.len() != docs.len() {
         anyhow::bail!("shard bulk response has inconsistent item count");
     }
+    let common_batch = !docs.is_empty()
+        && docs.iter().all(|(_, _, operation)| {
+            operation.kind == ShardBulkOpKind::Index as i32
+                && operation.if_seq_no.is_none()
+                && operation.if_primary_term.is_none()
+                && operation.client_operation.is_none()
+        });
+    if common_batch {
+        super::write_acknowledgement::validate_write_acknowledgement(
+            response.write_acknowledgement.as_ref(),
+            Some(node_id),
+        )?;
+    } else if response.write_acknowledgement.is_some() {
+        anyhow::bail!(
+            "ordered or empty bulk response contains a fabricated common acknowledgement"
+        );
+    }
     for ((item, response_id), (doc_id, _, operation)) in
         response.results.iter().zip(&response.doc_ids).zip(docs)
     {
@@ -2291,6 +2397,13 @@ fn decode_shard_bulk_operations_response(
         if item.error.is_empty() {
             if item.failure.is_some() || !item.error_type.is_empty() {
                 anyhow::bail!("successful bulk item contains failure details");
+            }
+            super::write_acknowledgement::validate_write_acknowledgement(
+                item.write_acknowledgement.as_ref(),
+                Some(node_id),
+            )?;
+            if common_batch && item.write_acknowledgement != response.write_acknowledgement {
+                anyhow::bail!("index-only bulk item contradicts its common acknowledgement");
             }
             let expected = match ShardBulkOpKind::try_from(operation.kind)? {
                 ShardBulkOpKind::Index => matches!(
@@ -2315,7 +2428,10 @@ fn decode_shard_bulk_operations_response(
                 node_id,
             )?;
         } else {
-            if item.write_refresh.is_some() || !item.result.is_empty() {
+            if item.write_refresh.is_some()
+                || item.write_acknowledgement.is_some()
+                || !item.result.is_empty()
+            {
                 anyhow::bail!("failed bulk item contains acknowledged result or refresh metadata");
             }
             let failure = super::write_failure::WriteFailure::response_failure(
@@ -2342,7 +2458,7 @@ fn decode_shard_delete_response(
     response: ShardDeleteResponse,
 ) -> Result<serde_json::Value, anyhow::Error> {
     if !response.success {
-        if response.write_refresh.is_some() {
+        if response.write_refresh.is_some() || response.write_acknowledgement.is_some() {
             anyhow::bail!(
                 "failed shard delete response contains refresh metadata; server cause: {}",
                 response.error
@@ -2392,6 +2508,16 @@ fn decode_shard_delete_response(
         "_version": version,
         "result": if response.deleted > 0 { "deleted" } else { "not_found" }
     });
+    let acknowledgement = super::write_acknowledgement::validate_write_acknowledgement(
+        response.write_acknowledgement.as_ref(),
+        None,
+    )?;
+    super::write_acknowledgement::add_write_acknowledgement_to_response(
+        &mut result,
+        index_name,
+        shard_id,
+        acknowledgement,
+    );
     if let Some(refresh) = &response.write_refresh {
         super::write_refresh::add_write_refresh_to_response(
             &mut result,
@@ -2401,6 +2527,97 @@ fn decode_shard_delete_response(
         );
     }
     Ok(result)
+}
+
+fn decode_shard_client_noop_response(
+    primary_node: &str,
+    intent: &crate::engine::ClientOperationIntent,
+    response: ShardClientNoOpResponse,
+) -> anyhow::Result<(
+    crate::engine::ClientNoOpWriteReceipt,
+    ShardWriteAcknowledgement,
+)> {
+    if !response.success {
+        if response.write_acknowledgement.is_some()
+            || response.client_operation.is_some()
+            || response.seq_no.is_some()
+            || response.primary_term.is_some()
+            || response.version.is_some()
+        {
+            anyhow::bail!("failed client no-op response contains acknowledged result metadata");
+        }
+        let failure = super::write_failure::WriteFailure::response_failure(
+            response.failure,
+            &response.error,
+            response.operation_seq_no,
+            response.operation_primary_term,
+        )?;
+        if failure.last_seq_no.is_some() {
+            anyhow::bail!("client no-op failure contains a bulk sequence range");
+        }
+        return Err(failure.into());
+    }
+    if response.failure.is_some() || !response.error.is_empty() {
+        anyhow::bail!("successful client no-op response contains failure details");
+    }
+    let acknowledgement = super::write_acknowledgement::validate_write_acknowledgement(
+        response.write_acknowledgement.as_ref(),
+        Some(primary_node),
+    )?
+    .clone();
+    let receipt = crate::engine::ClientNoOpWriteReceipt {
+        operation_seq_no: response
+            .operation_seq_no
+            .ok_or_else(|| anyhow::anyhow!("client operation no-op response has no sequence"))?,
+        operation_primary_term: response
+            .operation_primary_term
+            .filter(|term| *term > 0)
+            .ok_or_else(|| {
+                anyhow::anyhow!("client operation no-op response has no primary term")
+            })?,
+        seq_no: response.seq_no.ok_or_else(|| {
+            anyhow::anyhow!("client operation no-op response has no result sequence")
+        })?,
+        primary_term: response
+            .primary_term
+            .filter(|term| *term > 0)
+            .ok_or_else(|| {
+                anyhow::anyhow!("client operation no-op response has no result primary term")
+            })?,
+        version: response
+            .version
+            .filter(|version| *version > 0)
+            .ok_or_else(|| {
+                anyhow::anyhow!("client operation no-op response has no result version")
+            })?,
+        client_operation: crate::transport::client_operation::record_from_proto(
+            response.client_operation,
+        )?
+        .ok_or_else(|| {
+            anyhow::anyhow!("client operation no-op response has no operation metadata")
+        })?,
+        deduplicated: response.deduplicated,
+    };
+    if receipt.client_operation.id != intent.id
+        || receipt.client_operation.fingerprint != intent.fingerprint
+    {
+        anyhow::bail!("client no-op response contradicts its requested operation identity");
+    }
+    match receipt.client_operation.result {
+        crate::engine::ClientOperationResult::UpdateNoOp {
+            seq_no,
+            primary_term,
+            version,
+        } if receipt.seq_no == seq_no
+            && receipt.primary_term == primary_term
+            && receipt.version == version => {}
+        crate::engine::ClientOperationResult::Index { version, .. }
+            if receipt.version == version
+                && receipt.seq_no == receipt.operation_seq_no
+                && receipt.primary_term == receipt.operation_primary_term => {}
+        _ => anyhow::bail!("client no-op response contradicts its original operation result"),
+    }
+    Ok((receipt, acknowledgement))
 }
 
 struct ReplicaApplyResponseFields<'a> {
@@ -2688,6 +2905,17 @@ mod tests {
         assert!(err.to_string().contains("boom"));
     }
 
+    fn data_acknowledgement() -> Option<ShardWriteAcknowledgement> {
+        Some(ShardWriteAcknowledgement {
+            copies: vec![ShardWriteCopyResult {
+                node_id: "primary".into(),
+                allocation_id: 1,
+                primary: true,
+                outcome: Some(shard_write_copy_result::Outcome::Acknowledged(true)),
+            }],
+        })
+    }
+
     #[test]
     fn shard_doc_response_decoder_accepts_server_generated_id() {
         let index = decode_shard_doc_response(
@@ -2701,6 +2929,7 @@ mod tests {
                 seq_no: Some(0),
                 primary_term: Some(7),
                 version: Some(1),
+                write_acknowledgement: data_acknowledgement(),
                 ..Default::default()
             },
         )
@@ -2875,6 +3104,7 @@ mod tests {
                     result: "not_found".into(),
                     seq_no: Some(1),
                     primary_term: Some(7),
+                    write_acknowledgement: data_acknowledgement(),
                     ..Default::default()
                 },
             ],
@@ -2951,6 +3181,7 @@ mod tests {
                 seq_no: Some(0),
                 primary_term: Some(7),
                 version: Some(1),
+                write_acknowledgement: data_acknowledgement(),
                 ..Default::default()
             },
         )
@@ -3013,10 +3244,12 @@ mod tests {
                         seq_no: Some(offset as u64),
                         primary_term: Some(7),
                         version: Some(1),
+                        write_acknowledgement: data_acknowledgement(),
                         ..Default::default()
                     })
                     .collect(),
                 failure: None,
+                write_acknowledgement: data_acknowledgement(),
             },
         )
         .unwrap();
@@ -3071,6 +3304,7 @@ mod tests {
                 write_refresh: None,
                 failure: None,
                 version: Some(1),
+                write_acknowledgement: data_acknowledgement(),
             },
         )
         .unwrap();
@@ -3090,6 +3324,7 @@ mod tests {
                     write_refresh: None,
                     failure: None,
                     version: Some(1),
+                    write_acknowledgement: data_acknowledgement(),
                 },
             )
             .is_err()

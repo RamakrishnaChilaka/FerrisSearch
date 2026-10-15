@@ -102,8 +102,22 @@ async fn review_followup_b1_delayed_old_registration_preserves_current_engine() 
                 },
             )
             .unwrap();
+        assert!(
+            engine
+                .add_document_with_receipt_at_term("not-active", json!({"value": 0}), 1)
+                .is_err()
+        );
         engine
-            .add_document_with_receipt_at_term("new", json!({"value": 2}), 1)
+            .apply_replica_operation(SequencedOperation {
+                seq_no: 0,
+                primary_term: 1,
+                document_version: 1,
+                client_operation: None,
+                mutation: crate::engine::DocumentMutation::Index {
+                    doc_id: "new".into(),
+                    source: json!({"value": 2}),
+                },
+            })
             .unwrap();
         engine
     })
@@ -312,6 +326,15 @@ impl Drop for DropGateEngine {
 }
 
 impl SearchEngine for DropGateEngine {
+    fn copy_write_state(&self) -> Arc<crate::engine::write_authority::CopyWriteState> {
+        self.inner.copy_write_state()
+    }
+    fn write_failure_reason(&self) -> Option<String> {
+        self.inner.write_failure_reason()
+    }
+    fn fail_stop_writes(&self, reason: &str) {
+        self.inner.fail_stop_writes(reason);
+    }
     fn add_document_with_receipt_at_term(
         &self,
         id: &str,

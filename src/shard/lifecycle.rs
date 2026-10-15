@@ -64,6 +64,14 @@ impl ShardManager {
                 && authority.local_node_id == local_node_id,
             "a shard manager must keep one applied Raft authority"
         );
+        for copy in self
+            .copy_write_states
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+        {
+            copy.require_primary_authority();
+        }
     }
 
     pub(super) fn index_lifecycle_lock(&self, index: &str) -> Arc<RwLock<()>> {
@@ -292,6 +300,29 @@ impl ShardManager {
             .write()
             .unwrap_or_else(|error| error.into_inner())
             .remove(key);
+        if let Some(engine) = &removed
+            && let Err(error) = engine
+                .copy_write_state()
+                .revoke_and_drain("local shard copy was removed from service")
+        {
+            tracing::warn!(
+                index = key.index, shard_id = key.shard_id, error = %error,
+                "Removed copy remains fail-stopped"
+            );
+        }
+        let frozen = self
+            .copy_identity(&key.index, key.shard_id)
+            .and_then(|identity| {
+                self.frozen_histories
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(&CopyWriteBinding {
+                        index_uuid: identity.index_uuid,
+                        shard_id: key.shard_id,
+                        allocation_id: identity.allocation_id,
+                    })
+            });
+        drop(frozen);
         self.copy_identities
             .write()
             .unwrap_or_else(|error| error.into_inner())
@@ -304,6 +335,23 @@ impl ShardManager {
         self: &Arc<Self>,
         state: ClusterState,
     ) -> Result<(), IndexIncarnationRetirementErrors> {
+        self.with_applied_state(|current| {
+            if let (Some(current), Some(authority)) = (current, self.applied_authority.get()) {
+                self.copy_write_states
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .retain(|binding, _| {
+                        current.indices.values().any(|metadata| {
+                            metadata.uuid.as_str() == binding.index_uuid
+                                && current.shard_allocation_id(
+                                    &metadata.name,
+                                    binding.shard_id,
+                                    &authority.local_node_id,
+                                ) == Some(binding.allocation_id)
+                        })
+                    });
+            }
+        });
         let mut errors = IndexIncarnationRetirementErrors::default();
         for (index, uuid) in self.local_index_incarnations() {
             if self.incarnation_is_obsolete(&state, &index, &uuid)
@@ -394,14 +442,17 @@ impl ShardManager {
                 }
                 let state = authority.cluster_manager.get_state();
                 let version = state.version;
-                match manager.reconcile_index_incarnations_blocking(state).await {
-                    Ok(()) => reconciled_version = Some(version),
-                    Err(error) => {
-                        tracing::warn!(
-                            version,
-                            error = %format!("{error:#}"),
-                            "Applied index incarnation cleanup failed; retrying"
-                        );
+                let pins = manager.reconcile_frozen_histories_blocking().await;
+                let incarnations = manager.reconcile_index_incarnations_blocking(state).await;
+                match (pins, incarnations) {
+                    (Ok(()), Ok(())) => reconciled_version = Some(version),
+                    (pins, incarnations) => {
+                        if let Err(error) = pins {
+                            tracing::warn!(version, error = %format!("{error:#}"), "Applied promotion-pin cleanup failed; retrying");
+                        }
+                        if let Err(error) = incarnations {
+                            tracing::warn!(version, error = %format!("{error:#}"), "Applied index incarnation cleanup failed; retrying");
+                        }
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                 }
@@ -559,6 +610,10 @@ impl ShardManager {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .retain(|key, _| key.index_uuid != index_uuid);
+        self.copy_write_states
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|binding, _| binding.index_uuid != index_uuid);
         self.copy_io_attempt_locks
             .lock()
             .unwrap_or_else(|error| error.into_inner())

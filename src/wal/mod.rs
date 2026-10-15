@@ -10,18 +10,20 @@
 //! Each entry is stored as a length-prefixed bincode frame:
 //!
 //! ```text
-//! [u32 LE: payload_len] [payload_len bytes: bincode-encoded WireEntryV3]
+//! [u32 LE: payload_len] [bincode-encoded WireEntryV4] [SHA-256 of encoded entry]
 //! ```
 //!
-//! Each v3 entry carries its format version, primary term, sequence number,
-//! operation type, and JSON payload.
+//! The protected manifest seals physical generation ends and their hashes after
+//! fsync. Bytes beyond that frontier are unacknowledged recovery evidence.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 /// Controls when the translog is fsynced to disk.
@@ -41,9 +43,9 @@ pub enum TranslogDurability {
 
 const BINCODE_CONFIG: bincode_next::config::Configuration = bincode_next::config::standard();
 const TRANSLOG_MANIFEST_FILE: &str = "translog.manifest";
-pub(crate) const TRANSLOG_ENTRY_FORMAT_VERSION: u32 = 3;
-const TRANSLOG_MANIFEST_VERSION: u32 = 2;
-const TRANSLOG_SEQNO_FILE: &str = "translog.seqno";
+pub(crate) const TRANSLOG_ENTRY_FORMAT_VERSION: u32 = 4;
+const TRANSLOG_MANIFEST_VERSION: u32 = 3;
+const FRAME_CHECKSUM_BYTES: usize = 32;
 const TRANSLOG_FILE_PREFIX: &str = "translog-";
 const TRANSLOG_FILE_SUFFIX: &str = ".bin";
 const TRANSLOG_GENERATION_WIDTH: usize = 20;
@@ -68,6 +70,12 @@ fn wal_corruption(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(WalCorruptionError {
         message: message.into(),
     })
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("shard copy is fail-stopped: {reason}; verified recovery and fresh authority are required")]
+pub(crate) struct WalFailStoppedError {
+    pub(crate) reason: String,
 }
 
 fn unsupported_wal_format(component: &'static str, found: u32, expected: u32) -> anyhow::Error {
@@ -331,6 +339,107 @@ impl TranslogReadSnapshot {
             })
     }
 
+    pub(crate) fn for_each_captured_at(
+        &self,
+        end_cursor: WalCursor,
+        mut visit: impl FnMut(WalCursor, TranslogEntry) -> Result<()>,
+    ) -> Result<()> {
+        if end_cursor.position() > self.end_cursor().position()
+            || !self
+                .generations
+                .iter()
+                .any(|generation| generation.id == end_cursor.generation_id)
+        {
+            anyhow::bail!("captured WAL end does not belong to the retained snapshot");
+        }
+        for generation in self
+            .generations
+            .iter()
+            .filter(|generation| generation.id <= end_cursor.generation_id)
+        {
+            let end = if generation.id == end_cursor.generation_id {
+                end_cursor.byte_offset
+            } else {
+                generation.size_bytes
+            };
+            if end > generation.size_bytes {
+                anyhow::bail!("captured WAL end exceeds its generation");
+            }
+            let file = File::open(&generation.path)
+                .with_context(|| format!("open captured WAL generation {:?}", generation.path))?;
+            let mut reader = BufReader::new(file);
+            let mut offset = 0u64;
+            while offset < end {
+                let (entry, bytes) =
+                    read_next_entry(&mut reader, Some(end - offset))?.ok_or_else(|| {
+                        wal_corruption(
+                            "captured WAL generation ended before its protected frontier",
+                        )
+                    })?;
+                visit(
+                    WalCursor {
+                        generation_id: generation.id,
+                        byte_offset: offset,
+                    },
+                    entry,
+                )?;
+                offset = offset
+                    .checked_add(bytes as u64)
+                    .ok_or_else(|| wal_corruption("captured WAL cursor overflow"))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn export_snapshot_history(
+        &self,
+        path: &Path,
+        end_cursor: WalCursor,
+        start_seq_no: u64,
+        end_seq_no: u64,
+    ) -> Result<()> {
+        if start_seq_no > end_seq_no {
+            anyhow::bail!("canonical snapshot history has an inverted range");
+        }
+        let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+        let mut start = start_seq_no;
+        while start < end_seq_no {
+            let end = start
+                .saturating_add(crate::engine::canonical::MAX_HISTORY_WINDOW)
+                .min(end_seq_no);
+            let mut positions = BTreeMap::new();
+            self.for_each_captured_at(end_cursor, |cursor, entry| {
+                if entry.seq_no >= start
+                    && entry.seq_no < end
+                    && positions.insert(entry.seq_no, cursor).is_some()
+                {
+                    anyhow::bail!(
+                        "canonical snapshot history has duplicate sequence {}",
+                        entry.seq_no
+                    );
+                }
+                Ok(())
+            })?;
+            if positions.len() as u64 != end - start {
+                anyhow::bail!("canonical snapshot is missing post-certificate operation history");
+            }
+            for (seq_no, cursor) in positions {
+                let batch = self.read_bounded_cursor(cursor, end_cursor, 1, MAX_WAL_FRAME_BYTES)?;
+                let entry = batch
+                    .entries
+                    .first()
+                    .filter(|entry| entry.seq_no == seq_no)
+                    .ok_or_else(|| {
+                        wal_corruption("canonical snapshot cursor changed while exporting")
+                    })?;
+                file.write_all(&encode_wire_entry(&WireEntryV4::from_translog(entry)?)?)?;
+            }
+            start = end;
+        }
+        file.sync_all()?;
+        Ok(())
+    }
+
     pub fn read_bounded_cursor(
         &self,
         cursor: WalCursor,
@@ -384,7 +493,7 @@ impl TranslogReadSnapshot {
 /// `serde_json::Value` uses `deserialize_any()` which bincode doesn't support,
 /// so we serialize the JSON payload to a string first.
 #[derive(Serialize, Deserialize)]
-struct WireEntryV3 {
+struct WireEntryV4 {
     format_version: u32,
     seq_no: u64,
     primary_term: u64,
@@ -401,8 +510,7 @@ struct WireEntryRef<'a> {
     payload_json: &'a str,
 }
 
-impl WireEntryV3 {
-    #[cfg(test)]
+impl WireEntryV4 {
     fn from_translog(entry: &TranslogEntry) -> Result<Self> {
         validate_entry_identity(entry.primary_term, entry.op, &entry.payload)?;
         Ok(Self {
@@ -487,6 +595,10 @@ fn validate_noop_reason(reason: &str) -> Result<()> {
 /// The current default is `HotTranslog` (binary file, fsync-per-write).
 /// Future implementations could use memory-only WAL, remote WAL, etc.
 pub trait WriteAheadLog: Send + Sync {
+    fn ensure_writable(&self) -> Result<()>;
+
+    fn fail_write(&self, reason: &str);
+
     /// Append a single operation and fsync for durability.
     fn append(
         &self,
@@ -644,7 +756,7 @@ pub trait WriteAheadLog: Send + Sync {
 /// Encode a `TranslogEntry` into a length-prefixed binary frame.
 #[cfg(test)]
 fn encode_entry(entry: &TranslogEntry) -> Result<Vec<u8>> {
-    let wire = WireEntryV3::from_translog(entry)?;
+    let wire = WireEntryV4::from_translog(entry)?;
     encode_wire_entry(&wire)
 }
 
@@ -691,12 +803,17 @@ fn encode_payload_json(
 
 fn encode_wire_entry(wire: &impl Serialize) -> Result<Vec<u8>> {
     let encoded = bincode_next::serde::encode_to_vec(wire, BINCODE_CONFIG)?;
-    let frame_bytes = checked_frame_bytes(encoded.len(), MAX_WAL_FRAME_BYTES)?;
-    let len = u32::try_from(encoded.len())
+    let payload_len = encoded
+        .len()
+        .checked_add(FRAME_CHECKSUM_BYTES)
+        .ok_or_else(|| anyhow::anyhow!("WAL frame length overflow"))?;
+    let frame_bytes = checked_frame_bytes(payload_len, MAX_WAL_FRAME_BYTES)?;
+    let len = u32::try_from(payload_len)
         .map_err(|_| anyhow::anyhow!("WAL frame payload length exceeds u32"))?;
     let mut frame = Vec::with_capacity(frame_bytes);
     frame.extend_from_slice(&len.to_le_bytes());
     frame.extend_from_slice(&encoded);
+    frame.extend_from_slice(&Sha256::digest(&encoded));
     Ok(frame)
 }
 
@@ -714,12 +831,32 @@ fn checked_frame_bytes(payload_len: usize, max_bytes: usize) -> Result<usize> {
     Ok(frame_bytes)
 }
 
-fn decode_wire_entry(payload: &[u8]) -> Result<WireEntryV3> {
+fn decode_wire_entry(payload: &[u8]) -> Result<WireEntryV4> {
     let declared_version =
         bincode_next::serde::decode_from_slice::<(u32,), _>(payload, BINCODE_CONFIG)
-            .ok()
-            .map(|((version,), _)| version);
-    match bincode_next::serde::decode_from_slice::<WireEntryV3, _>(payload, BINCODE_CONFIG) {
+            .map(|((version,), _)| version)
+            .map_err(|error| {
+                crate::common::unsupported_index_format(
+                    "translog entry",
+                    format!("cannot decode current version header: {error}"),
+                )
+            })?;
+    if declared_version != TRANSLOG_ENTRY_FORMAT_VERSION {
+        return Err(unsupported_wal_format(
+            "translog entry",
+            declared_version,
+            TRANSLOG_ENTRY_FORMAT_VERSION,
+        ));
+    }
+    let encoded_len = payload
+        .len()
+        .checked_sub(FRAME_CHECKSUM_BYTES)
+        .ok_or_else(|| wal_corruption("translog frame is missing its checksum"))?;
+    let (payload, checksum) = payload.split_at(encoded_len);
+    if &Sha256::digest(payload)[..] != checksum {
+        return Err(wal_corruption("translog frame checksum mismatch"));
+    }
+    match bincode_next::serde::decode_from_slice::<WireEntryV4, _>(payload, BINCODE_CONFIG) {
         Ok((wire, consumed)) => {
             if wire.format_version != TRANSLOG_ENTRY_FORMAT_VERSION {
                 return Err(unsupported_wal_format(
@@ -738,14 +875,9 @@ fn decode_wire_entry(payload: &[u8]) -> Result<WireEntryV3> {
         }
         Err(v2_error) => Err(crate::common::unsupported_index_format(
             "translog entry",
-            match declared_version {
-                Some(version) => format!(
-                    "version {version} cannot be decoded as current version {TRANSLOG_ENTRY_FORMAT_VERSION}: {v2_error}"
-                ),
-                None => format!(
-                    "cannot decode current version {TRANSLOG_ENTRY_FORMAT_VERSION}: {v2_error}"
-                ),
-            },
+            format!(
+                "version {declared_version} cannot be decoded as current version {TRANSLOG_ENTRY_FORMAT_VERSION}: {v2_error}"
+            ),
         )),
     }
 }
@@ -825,7 +957,7 @@ fn decode_wire_entry_with_prefix<R: Read>(
     mut prefix: Vec<u8>,
     payload_len: usize,
     expected_seq_no: u64,
-) -> Result<WireEntryV3> {
+) -> Result<WireEntryV4> {
     let prefix_len = prefix.len();
     prefix.resize(payload_len, 0);
     reader.read_exact(&mut prefix[prefix_len..])?;
@@ -869,6 +1001,7 @@ fn decode_entries_streaming_at<R: Read>(
 struct GenerationScan {
     min_seq_no: Option<u64>,
     max_seq_no: Option<u64>,
+    sequences: crate::engine::sequence::SeqNoIntervals,
 }
 
 #[derive(Debug)]
@@ -880,6 +1013,7 @@ struct ActiveGenerationScan {
 
 impl GenerationScan {
     fn observe(&mut self, seq_no: u64) {
+        self.sequences.insert(seq_no);
         self.min_seq_no = Some(match self.min_seq_no {
             Some(minimum) => minimum.min(seq_no),
             None => seq_no,
@@ -959,7 +1093,11 @@ struct TranslogManifest {
     entry_format_version: u32,
     active_generation_id: u64,
     next_generation_id: u64,
+    next_seq_no: u64,
+    durable_sequences: Vec<crate::engine::sequence::SeqNoRange>,
     generations: Vec<ManifestGenerationInfo>,
+    generation_hashes: Vec<[u8; 32]>,
+    checksum: [u8; 32],
 }
 
 #[derive(Deserialize)]
@@ -968,18 +1106,45 @@ struct ManifestVersionHeader {
 }
 
 impl TranslogManifest {
-    fn from_state(state: &TranslogState) -> Self {
-        Self {
+    fn from_state(state: &TranslogState) -> Result<Self> {
+        Ok(Self {
             version: TRANSLOG_MANIFEST_VERSION,
             entry_format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
             active_generation_id: state.active_generation_id,
             next_generation_id: state.next_generation_id,
+            next_seq_no: state.next_seq_no,
+            durable_sequences: state.sequences.ranges(),
             generations: state
                 .generations
                 .iter()
                 .map(ManifestGenerationInfo::from)
                 .collect(),
-        }
+            generation_hashes: state
+                .generations
+                .iter()
+                .map(|generation| {
+                    Ok(state
+                        .generation_hashes
+                        .get(&generation.id)
+                        .ok_or_else(|| {
+                            wal_corruption(format!(
+                                "live generation {} has no running hash",
+                                generation.id
+                            ))
+                        })?
+                        .clone()
+                        .finalize()
+                        .into())
+                })
+                .collect::<Result<_>>()?,
+            checksum: [0; 32],
+        })
+    }
+
+    fn calculated_checksum(&self) -> Result<[u8; 32]> {
+        let mut unsigned = self.clone();
+        unsigned.checksum = [0; 32];
+        Ok(Sha256::digest(serde_json::to_vec(&unsigned)?).into())
     }
 
     fn validate(&self) -> Result<()> {
@@ -995,6 +1160,28 @@ impl TranslogManifest {
                 "translog entry",
                 self.entry_format_version,
                 TRANSLOG_ENTRY_FORMAT_VERSION,
+            ));
+        }
+        if self.checksum != self.calculated_checksum()? {
+            return Err(wal_corruption(
+                "protected translog manifest checksum mismatch",
+            ));
+        }
+        if self.generation_hashes.len() != self.generations.len() {
+            return Err(wal_corruption(
+                "protected translog manifest has inconsistent generation hashes",
+            ));
+        }
+        crate::engine::sequence::SeqNoIntervals::from_ranges(&self.durable_sequences).map_err(
+            |error| wal_corruption(format!("invalid protected sequence ranges: {error}")),
+        )?;
+        if self
+            .durable_sequences
+            .last()
+            .is_some_and(|range| range.end >= self.next_seq_no)
+        {
+            return Err(wal_corruption(
+                "protected sequence range exceeds the WAL allocator",
             ));
         }
         if self.generations.is_empty() {
@@ -1059,11 +1246,49 @@ struct TranslogState {
     active_generation_id: u64,
     active_file: File,
     generations: Vec<GenerationInfo>,
+    generation_hashes: BTreeMap<u64, Sha256>,
+    sequences: crate::engine::sequence::SeqNoIntervals,
+    manifest_path: PathBuf,
+    failure: Arc<OnceLock<String>>,
+    #[cfg(test)]
+    sync_io_failure: Option<i32>,
     next_retention_pin_id: u64,
     retention_pins: std::collections::BTreeMap<u64, u64>,
 }
 
 impl TranslogState {
+    fn ensure_writable(&self) -> Result<()> {
+        match self.failure.get() {
+            Some(reason) => Err(WalFailStoppedError {
+                reason: reason.clone(),
+            }
+            .into()),
+            None => Ok(()),
+        }
+    }
+
+    fn fail(&mut self, error: anyhow::Error) -> anyhow::Error {
+        let reason = self.failure.get_or_init(|| format!("{error:#}")).clone();
+        if error.is::<WalFailStoppedError>() {
+            error
+        } else {
+            error.context(WalFailStoppedError { reason })
+        }
+    }
+
+    fn sync_and_seal(&mut self) -> Result<()> {
+        self.ensure_writable()?;
+        let result = (|| {
+            #[cfg(test)]
+            if let Some(raw_os_error) = self.sync_io_failure.take() {
+                return Err(std::io::Error::from_raw_os_error(raw_os_error).into());
+            }
+            self.active_file.sync_data()?;
+            persist_translog_manifest(&self.manifest_path, &TranslogManifest::from_state(self)?)
+        })();
+        result.map_err(|error| self.fail(error))
+    }
+
     fn active_generation_index(&self) -> Result<usize> {
         let active_id = self.active_generation_id;
         self.generations
@@ -1108,7 +1333,6 @@ fn scan_max_seq_no<R: Read>(reader: &mut R) -> Result<u64> {
     Ok(scan_generation(reader)?.next_seq_no())
 }
 
-#[cfg(test)]
 fn scan_generation<R: Read>(reader: &mut R) -> Result<GenerationScan> {
     let mut scan = GenerationScan::default();
     decode_entries_streaming(reader, None, |entry| {
@@ -1259,7 +1483,9 @@ fn load_translog_manifest(data_dir: &Path) -> Result<Option<TranslogManifest>> {
 
 fn persist_translog_manifest(path: &Path, manifest: &TranslogManifest) -> Result<()> {
     let tmp_path = path.with_extension("tmp");
-    let json = serde_json::to_vec(manifest)?;
+    let mut manifest = manifest.clone();
+    manifest.checksum = manifest.calculated_checksum()?;
+    let json = serde_json::to_vec(&manifest)?;
 
     let mut file = OpenOptions::new()
         .create(true)
@@ -1271,7 +1497,29 @@ fn persist_translog_manifest(path: &Path, manifest: &TranslogManifest) -> Result
     drop(file);
 
     fs::rename(&tmp_path, path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("translog manifest has no parent directory"))?;
+    File::open(parent)?.sync_all()?;
     Ok(())
+}
+
+fn hash_generation_prefix(path: &Path, length: u64) -> Result<Sha256> {
+    let mut reader = BufReader::new(File::open(path)?).take(length);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut remaining = length;
+    while remaining > 0 {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Err(wal_corruption(format!(
+                "generation {path:?} ends inside its protected physical frontier"
+            )));
+        }
+        hasher.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    Ok(hasher)
 }
 
 fn remove_unreferenced_generation_files(
@@ -1360,6 +1608,7 @@ fn create_empty_generation(data_dir: &Path, generation_id: u64) -> Result<(Gener
     ))
 }
 
+#[cfg(test)]
 fn recover_lock<'a, T>(mutex: &'a Mutex<T>, lock_name: &'static str) -> MutexGuard<'a, T> {
     match mutex.lock() {
         Ok(guard) => guard,
@@ -1369,6 +1618,20 @@ fn recover_lock<'a, T>(mutex: &'a Mutex<T>, lock_name: &'static str) -> MutexGua
                 "translog lock poisoned; continuing with inner state"
             );
             poisoned.into_inner()
+        }
+    }
+}
+
+fn lock_translog_state(state: &Mutex<TranslogState>) -> MutexGuard<'_, TranslogState> {
+    match state.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            let guard = poisoned.into_inner();
+            guard
+                .failure
+                .get_or_init(|| "WAL mutation lock was poisoned".to_string());
+            tracing::error!("WAL mutation lock poisoned; copy remains fail-stopped");
+            guard
         }
     }
 }
@@ -1383,10 +1646,8 @@ fn recover_lock<'a, T>(mutex: &'a Mutex<T>, lock_name: &'static str) -> MutexGua
 /// truncation. This enables replica recovery via seq_no-based translog replay.
 pub struct HotTranslog {
     state: Arc<Mutex<TranslogState>>,
+    failure: Arc<OnceLock<String>>,
     data_dir: PathBuf,
-    manifest_path: PathBuf,
-    /// Path to the file that persists the seq_no high-water mark across truncations.
-    seq_no_path: PathBuf,
     /// Controls whether writes are fsynced immediately or on a timer.
     durability: TranslogDurability,
     #[cfg(test)]
@@ -1395,18 +1656,66 @@ pub struct HotTranslog {
     append_frame_barrier: Arc<Mutex<Option<Arc<std::sync::Barrier>>>>,
     #[cfg(test)]
     write_io_failure: Arc<Mutex<Option<(i32, usize)>>>,
+    #[cfg(test)]
+    partial_write_io_failure: Mutex<Option<(usize, i32)>>,
 }
 
-async fn sync_file_in_background(state: Arc<Mutex<TranslogState>>) -> std::io::Result<()> {
-    tokio::task::spawn_blocking(move || {
-        let state = recover_lock(state.as_ref(), "state");
-        state.active_file.sync_data()
-    })
-    .await
-    .map_err(|e| std::io::Error::other(format!("background translog sync task failed: {e}")))?
+async fn sync_file_in_background(state: Arc<Mutex<TranslogState>>) -> Result<()> {
+    tokio::task::spawn_blocking(move || lock_translog_state(state.as_ref()).sync_and_seal())
+        .await
+        .context("background translog sync task failed")?
 }
 
 impl HotTranslog {
+    pub(crate) fn import_snapshot_history(
+        &self,
+        path: &Path,
+        start_seq_no: u64,
+        end_seq_no: u64,
+        mut validate: impl FnMut(&TranslogEntry) -> Result<()>,
+    ) -> Result<()> {
+        if start_seq_no > end_seq_no {
+            anyhow::bail!("canonical snapshot history has an inverted range");
+        }
+        let file = File::open(path)?;
+        let length = file.metadata()?.len();
+        let mut reader = BufReader::new(file);
+        let mut consumed = 0u64;
+        let mut expected_seq_no = start_seq_no;
+        while consumed < length {
+            let (entry, frame_bytes) = read_next_entry(&mut reader, Some(length - consumed))?
+                .ok_or_else(|| {
+                    wal_corruption("canonical snapshot archive ended before its declared length")
+                })?;
+            if entry.seq_no != expected_seq_no || entry.seq_no >= end_seq_no {
+                anyhow::bail!(
+                    "canonical snapshot archive has an out-of-range or duplicate sequence {}",
+                    entry.seq_no
+                );
+            }
+            document_operation(&entry)?;
+            client_operation(&entry)?;
+            validate(&entry)?;
+            WriteAheadLog::append_with_seq(
+                self,
+                entry.seq_no,
+                entry.primary_term,
+                entry.op,
+                entry.payload,
+            )?;
+            expected_seq_no = expected_seq_no
+                .checked_add(1)
+                .ok_or_else(|| wal_corruption("canonical snapshot archive sequence overflow"))?;
+            consumed = consumed
+                .checked_add(frame_bytes as u64)
+                .ok_or_else(|| wal_corruption("canonical snapshot archive offset overflow"))?;
+        }
+        if expected_seq_no != end_seq_no {
+            anyhow::bail!("canonical snapshot archive is missing post-certificate history");
+        }
+        self.sync()
+    }
+
     /// Open or create the translog at the given directory.
     /// Uses `TranslogDurability::Request` (fsync per write) by default.
     pub fn open<P: AsRef<Path>>(data_dir: P) -> Result<Self> {
@@ -1418,31 +1727,80 @@ impl HotTranslog {
         data_dir: P,
         durability: TranslogDurability,
     ) -> Result<Self> {
-        let data_dir = data_dir.as_ref();
-        fs::create_dir_all(data_dir)?;
-        let manifest_path = manifest_path(data_dir);
-        let seq_no_path = data_dir.join(TRANSLOG_SEQNO_FILE);
+        Self::open_with_failure_state(
+            data_dir.as_ref(),
+            durability,
+            true,
+            Arc::new(OnceLock::new()),
+        )
+    }
 
-        // Load the persisted high-water mark (survives truncation)
-        let persisted_seq = if seq_no_path.exists() {
-            let s = fs::read_to_string(&seq_no_path)?;
-            s.trim().parse::<u64>().map_err(|error| {
-                wal_corruption(format!(
-                    "invalid translog sequence high-water mark {seq_no_path:?}: {error}"
-                ))
-            })?
-        } else {
-            0
-        };
+    pub(crate) fn open_with_failure_state(
+        data_dir: &Path,
+        durability: TranslogDurability,
+        allow_creation: bool,
+        failure: Arc<OnceLock<String>>,
+    ) -> Result<Self> {
+        if let Some(reason) = failure.get() {
+            return Err(WalFailStoppedError {
+                reason: reason.clone(),
+            }
+            .into());
+        }
+        if allow_creation {
+            fs::create_dir_all(data_dir)?;
+        }
+        let manifest_path = manifest_path(data_dir);
+        let mut persisted_seq = 0;
+        let mut sequences = crate::engine::sequence::SeqNoIntervals::default();
+        let mut generation_hashes = BTreeMap::new();
 
         let (generations, active_generation_id, next_generation_id, active_file) = if let Some(
             manifest,
         ) =
             load_translog_manifest(data_dir)?
         {
-            remove_unreferenced_generation_files(data_dir, &manifest)?;
+            persisted_seq = manifest.next_seq_no;
+            sequences =
+                crate::engine::sequence::SeqNoIntervals::from_ranges(&manifest.durable_sequences)?;
             let mut generations = generations_from_manifest(data_dir, &manifest)?;
             let active_generation_id = manifest.active_generation_id;
+            for ((generation, protected), expected_hash) in generations
+                .iter()
+                .zip(&manifest.generations)
+                .zip(&manifest.generation_hashes)
+            {
+                if generation.size_bytes < protected.size_bytes
+                    || (generation.id != active_generation_id
+                        && generation.size_bytes != protected.size_bytes)
+                {
+                    return Err(wal_corruption(format!(
+                        "generation {} length {} disagrees with protected frontier {}",
+                        generation.id, generation.size_bytes, protected.size_bytes
+                    )));
+                }
+                let hasher = hash_generation_prefix(&generation.path, protected.size_bytes)?;
+                let actual_hash: [u8; 32] = hasher.clone().finalize().into();
+                if actual_hash != *expected_hash {
+                    return Err(wal_corruption(format!(
+                        "generation {} protected history checksum mismatch",
+                        generation.id
+                    )));
+                }
+                if generation.id != active_generation_id {
+                    let mut reader = BufReader::new(File::open(&generation.path)?);
+                    let scan = scan_generation(&mut reader)?;
+                    if scan.min_seq_no != protected.min_seq_no
+                        || scan.max_seq_no != protected.max_seq_no
+                    {
+                        return Err(wal_corruption(format!(
+                            "generation {} sequence bounds disagree with protected history",
+                            generation.id
+                        )));
+                    }
+                }
+                generation_hashes.insert(generation.id, hasher);
+            }
             let active_generation = generations
                     .iter_mut()
                     .find(|generation| generation.id == active_generation_id)
@@ -1452,6 +1810,17 @@ impl HotTranslog {
                         ))
                     })?;
             let active_scan = scan_active_generation_from_path(&active_generation.path)?;
+            let protected_end = manifest
+                .generations
+                .iter()
+                .find(|generation| generation.id == active_generation_id)
+                .ok_or_else(|| wal_corruption("protected active generation is missing"))?
+                .size_bytes;
+            if active_scan.valid_bytes < protected_end {
+                return Err(wal_corruption(
+                    "active WAL tail damage overlaps protected history",
+                ));
+            }
             if active_scan.trailing_bytes > 0 {
                 truncate_incomplete_active_tail(
                     &active_generation.path,
@@ -1464,7 +1833,15 @@ impl HotTranslog {
             active_generation.min_seq_no = active_scan.generation.min_seq_no;
             active_generation.max_seq_no = active_scan.generation.max_seq_no;
             active_generation.size_bytes = active_scan.valid_bytes;
+            for range in active_scan.generation.sequences.ranges() {
+                sequences.insert_range(range.start, range.end);
+            }
+            generation_hashes.insert(
+                active_generation_id,
+                hash_generation_prefix(&active_generation.path, active_scan.valid_bytes)?,
+            );
             let active_file = open_generation_writer(&active_generation.path)?;
+            remove_unreferenced_generation_files(data_dir, &manifest)?;
 
             (
                 generations,
@@ -1473,6 +1850,11 @@ impl HotTranslog {
                 active_file,
             )
         } else {
+            if !allow_creation {
+                return Err(wal_corruption(format!(
+                    "existing shard is missing its protected translog manifest {manifest_path:?}; recover from a verified peer or recreate the index"
+                )));
+            }
             let existing_generations = discover_generation_files(data_dir)?;
             if !existing_generations.is_empty() {
                 return Err(wal_corruption(format!(
@@ -1487,12 +1869,17 @@ impl HotTranslog {
                 entry_format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
                 active_generation_id: 0,
                 next_generation_id: 1,
+                next_seq_no: 0,
+                durable_sequences: Vec::new(),
                 generations: generations
                     .iter()
                     .map(ManifestGenerationInfo::from)
                     .collect(),
+                generation_hashes: vec![Sha256::digest([]).into()],
+                checksum: [0; 32],
             };
             persist_translog_manifest(&manifest_path, &manifest)?;
+            generation_hashes.insert(0, Sha256::new());
 
             (generations, 0, 1, active_file)
         };
@@ -1528,12 +1915,17 @@ impl HotTranslog {
                 active_generation_id,
                 active_file,
                 generations,
+                generation_hashes,
+                sequences,
+                manifest_path,
+                failure: failure.clone(),
+                #[cfg(test)]
+                sync_io_failure: None,
                 next_retention_pin_id: 1,
                 retention_pins: std::collections::BTreeMap::new(),
             })),
+            failure,
             data_dir: data_dir.to_path_buf(),
-            manifest_path,
-            seq_no_path,
             durability,
             #[cfg(test)]
             recovery_scan_barrier: Arc::new(Mutex::new(None)),
@@ -1541,7 +1933,14 @@ impl HotTranslog {
             append_frame_barrier: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             write_io_failure: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            partial_write_io_failure: Mutex::new(None),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_failure_state(&self) -> Arc<OnceLock<String>> {
+        self.failure.clone()
     }
 
     #[cfg(test)]
@@ -1562,38 +1961,74 @@ impl HotTranslog {
         &self,
         encode_frame: impl FnOnce(u64) -> Result<Vec<u8>>,
     ) -> Result<u64> {
-        #[cfg(test)]
-        self.maybe_fail_write_for_test()?;
-        let mut state = recover_lock(&self.state, "state");
-        let generation_index = state.active_generation_index()?;
+        let mut state = lock_translog_state(&self.state);
+        state.ensure_writable()?;
         let seq_no = state.next_seq_no;
         let next_seq_no = seq_no
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("WAL sequence space exhausted"))?;
         let frame = encode_frame(seq_no)?;
-        #[cfg(test)]
-        if let Some(barrier) =
-            recover_lock(self.append_frame_barrier.as_ref(), "append frame barrier").take()
-        {
-            let split = frame.len().min(20);
-            state.active_file.write_all(&frame[..split])?;
-            state.active_file.flush()?;
-            barrier.wait();
-            barrier.wait();
-            state.active_file.write_all(&frame[split..])?;
-        } else {
-            state.active_file.write_all(&frame)?;
-        }
-        #[cfg(not(test))]
-        state.active_file.write_all(&frame)?;
-        if matches!(self.durability, TranslogDurability::Request) {
-            state.active_file.sync_data()?;
-        }
-        let generation = &mut state.generations[generation_index];
-        generation.observe_seq(seq_no);
-        generation.size_bytes += frame.len() as u64;
-        state.next_seq_no = next_seq_no;
+        self.write_encoded_locked(&mut state, &frame, [seq_no], next_seq_no)?;
         Ok(seq_no)
+    }
+
+    fn write_encoded_locked(
+        &self,
+        state: &mut TranslogState,
+        encoded: &[u8],
+        seq_nos: impl IntoIterator<Item = u64>,
+        max_next_seq_no: u64,
+    ) -> Result<()> {
+        state.ensure_writable()?;
+        let generation_index = state.active_generation_index()?;
+        let generation_id = state.active_generation_id;
+        if !state.generation_hashes.contains_key(&generation_id) {
+            return Err(state.fail(wal_corruption("active generation has no running hash")));
+        }
+        let result = (|| {
+            #[cfg(test)]
+            self.maybe_fail_write_for_test()?;
+            #[cfg(test)]
+            if let Some((prefix_bytes, raw_os_error)) =
+                self.partial_write_io_failure.lock().unwrap().take()
+            {
+                state
+                    .active_file
+                    .write_all(&encoded[..prefix_bytes.min(encoded.len())])?;
+                return Err(std::io::Error::from_raw_os_error(raw_os_error).into());
+            }
+            #[cfg(test)]
+            if let Some(barrier) =
+                recover_lock(self.append_frame_barrier.as_ref(), "append frame barrier").take()
+            {
+                let split = encoded.len().min(20);
+                state.active_file.write_all(&encoded[..split])?;
+                state.active_file.flush()?;
+                barrier.wait();
+                barrier.wait();
+                state.active_file.write_all(&encoded[split..])?;
+            } else {
+                state.active_file.write_all(encoded)?;
+            }
+            #[cfg(not(test))]
+            state.active_file.write_all(encoded)?;
+            for seq_no in seq_nos {
+                state.generations[generation_index].observe_seq(seq_no);
+                state.sequences.insert(seq_no);
+            }
+            state.generations[generation_index].size_bytes += encoded.len() as u64;
+            state.next_seq_no = state.next_seq_no.max(max_next_seq_no);
+            state
+                .generation_hashes
+                .get_mut(&generation_id)
+                .ok_or_else(|| wal_corruption("active generation lost its running hash"))?
+                .update(encoded);
+            if matches!(self.durability, TranslogDurability::Request) {
+                state.sync_and_seal()?;
+            }
+            Ok(())
+        })();
+        result.map_err(|error| state.fail(error))
     }
 
     fn write_primary_bulk_by(
@@ -1604,10 +2039,8 @@ impl HotTranslog {
         if count == 0 {
             return Ok(None);
         }
-        #[cfg(test)]
-        self.maybe_fail_write_for_test()?;
-        let mut state = recover_lock(&self.state, "state");
-        let generation_index = state.active_generation_index()?;
+        let mut state = lock_translog_state(&self.state);
+        state.ensure_writable()?;
         let start_seq_no = state.next_seq_no;
         let next_seq_no = start_seq_no
             .checked_add(count as u64)
@@ -1616,15 +2049,7 @@ impl HotTranslog {
         for offset in 0..count {
             buf.extend_from_slice(&encode_frame(start_seq_no + offset as u64, offset)?);
         }
-        state.active_file.write_all(&buf)?;
-        if matches!(self.durability, TranslogDurability::Request) {
-            state.active_file.sync_data()?;
-        }
-        let generation = &mut state.generations[generation_index];
-        generation.observe_seq(start_seq_no);
-        generation.observe_seq(next_seq_no - 1);
-        generation.size_bytes += buf.len() as u64;
-        state.next_seq_no = next_seq_no;
+        self.write_encoded_locked(&mut state, &buf, start_seq_no..next_seq_no, next_seq_no)?;
         Ok(Some(start_seq_no))
     }
 
@@ -1634,24 +2059,13 @@ impl HotTranslog {
         seq_nos: impl IntoIterator<Item = u64>,
         max_next_seq_no: u64,
     ) -> Result<()> {
-        let mut state = recover_lock(&self.state, "state");
-        let generation_index = state.active_generation_index()?;
-        state.active_file.write_all(encoded)?;
-        if matches!(self.durability, TranslogDurability::Request) {
-            state.active_file.sync_data()?;
-        }
-        let generation = &mut state.generations[generation_index];
-        for seq_no in seq_nos {
-            generation.observe_seq(seq_no);
-        }
-        generation.size_bytes += encoded.len() as u64;
-        state.next_seq_no = state.next_seq_no.max(max_next_seq_no);
-        Ok(())
+        let mut state = lock_translog_state(&self.state);
+        self.write_encoded_locked(&mut state, encoded, seq_nos, max_next_seq_no)
     }
 
     /// Get the current (next) sequence number without incrementing.
     pub fn current_seq_no(&self) -> u64 {
-        recover_lock(&self.state, "state").next_seq_no
+        lock_translog_state(&self.state).next_seq_no
     }
 
     /// Initialize a freshly prepared shard directory with an empty translog
@@ -1663,7 +2077,7 @@ impl HotTranslog {
     ) -> Result<()> {
         let translog = Self::open_with_durability(data_dir, durability)?;
         {
-            let mut state = recover_lock(&translog.state, "state");
+            let mut state = lock_translog_state(&translog.state);
             if state.generations.len() != 1
                 || state.generations[0].min_seq_no.is_some()
                 || state.generations[0].max_seq_no.is_some()
@@ -1671,10 +2085,8 @@ impl HotTranslog {
                 anyhow::bail!("cannot initialize a non-empty translog at a recovery boundary");
             }
             state.next_seq_no = next_seq_no;
+            state.sync_and_seal()?;
         }
-        translog.persist_seq_no_high_watermark(next_seq_no)?;
-        let seq_file = File::open(&translog.seq_no_path)?;
-        seq_file.sync_all()?;
         Ok(())
     }
 
@@ -1989,12 +2401,16 @@ impl HotTranslog {
             }
             _ => return None,
         };
-        let state = self.state.clone();
+        let state = Arc::downgrade(&self.state);
         Some(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
-                if let Err(e) = sync_file_in_background(state.clone()).await {
+                let Some(state) = state.upgrade() else {
+                    break;
+                };
+                if let Err(e) = sync_file_in_background(state).await {
                     tracing::error!("Background translog fsync failed: {}", e);
+                    break;
                 }
             }
         }))
@@ -2002,9 +2418,7 @@ impl HotTranslog {
 
     /// Manually trigger an fsync (useful for testing or explicit flush).
     pub fn sync(&self) -> Result<()> {
-        let state = recover_lock(&self.state, "state");
-        state.active_file.sync_data()?;
-        Ok(())
+        lock_translog_state(&self.state).sync_and_seal()
     }
 
     /// Scan a translog file for the maximum seq_no without loading all entries into memory.
@@ -2021,21 +2435,20 @@ impl HotTranslog {
     }
 
     fn persist_manifest_locked(&self, state: &TranslogState) -> Result<()> {
-        persist_translog_manifest(&self.manifest_path, &TranslogManifest::from_state(state))
-    }
-
-    fn persist_seq_no_high_watermark(&self, next_seq_no: u64) -> Result<()> {
-        fs::write(&self.seq_no_path, next_seq_no.to_string())?;
-        Ok(())
+        persist_translog_manifest(&state.manifest_path, &TranslogManifest::from_state(state)?)
     }
 
     fn roll_generation_locked(&self, state: &mut TranslogState) -> Result<u64> {
+        state.ensure_writable()?;
+        state.active_file.sync_data()?;
         let generation_id = state.next_generation_id;
         let (generation, file) = create_empty_generation(&self.data_dir, generation_id)?;
+        file.sync_all()?;
         state.active_generation_id = generation_id;
         state.next_generation_id = generation_id.saturating_add(1);
         state.active_file = file;
         state.generations.push(generation);
+        state.generation_hashes.insert(generation_id, Sha256::new());
         Ok(generation_id)
     }
 
@@ -2103,7 +2516,7 @@ impl HotTranslog {
     }
 
     fn generations_snapshot(&self) -> Vec<GenerationInfo> {
-        recover_lock(&self.state, "state").generations_snapshot()
+        lock_translog_state(&self.state).generations_snapshot()
     }
 }
 
@@ -2152,7 +2565,7 @@ impl HotTranslog {
         seq_no: u64,
         primary_term: Option<u64>,
     ) -> Result<Option<(WalCursor, TranslogEntry)>> {
-        let generations = recover_lock(&self.state, "state").generations.clone();
+        let generations = lock_translog_state(&self.state).generations.clone();
         for generation in generations.into_iter().filter(|generation| {
             generation
                 .min_seq_no
@@ -2188,6 +2601,14 @@ impl HotTranslog {
 }
 
 impl WriteAheadLog for HotTranslog {
+    fn ensure_writable(&self) -> Result<()> {
+        lock_translog_state(&self.state).ensure_writable()
+    }
+
+    fn fail_write(&self, reason: &str) {
+        self.failure.get_or_init(|| reason.to_string());
+    }
+
     fn append(
         &self,
         primary_term: u64,
@@ -2218,22 +2639,11 @@ impl WriteAheadLog for HotTranslog {
         op: WalOperation,
         payload: serde_json::Value,
     ) -> Result<TranslogEntry> {
-        #[cfg(test)]
-        self.maybe_fail_write_for_test()?;
         let next_seq_no = seq_no
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("WAL sequence space exhausted"))?;
-        let mut state = recover_lock(&self.state, "state");
-        let generation_index = state.active_generation_index()?;
         let frame = encode_entry_borrowed(seq_no, primary_term, op, &payload)?;
-        state.active_file.write_all(&frame)?;
-        if matches!(self.durability, TranslogDurability::Request) {
-            state.active_file.sync_data()?;
-        }
-        let generation = &mut state.generations[generation_index];
-        generation.observe_seq(seq_no);
-        generation.size_bytes += frame.len() as u64;
-        state.next_seq_no = state.next_seq_no.max(next_seq_no);
+        self.write_encoded_batch_with_seq(&frame, [seq_no], next_seq_no)?;
 
         let entry = TranslogEntry {
             seq_no,
@@ -2250,43 +2660,23 @@ impl WriteAheadLog for HotTranslog {
         primary_term: u64,
         ops: &[(WalOperation, serde_json::Value)],
     ) -> Result<Vec<TranslogEntry>> {
-        #[cfg(test)]
-        self.maybe_fail_write_for_test()?;
-        let mut state = recover_lock(&self.state, "state");
-        let generation_index = state.active_generation_index()?;
-        let start_seq_no = state.next_seq_no;
-        let next_seq_no = start_seq_no
-            .checked_add(ops.len() as u64)
-            .ok_or_else(|| anyhow::anyhow!("WAL sequence space exhausted"))?;
-        let mut entries = Vec::with_capacity(ops.len());
-        let mut buf = Vec::with_capacity(ops.len() * 200);
-        let mut last_seq_no = None;
-
-        for (offset, (op, payload)) in ops.iter().enumerate() {
-            let seq_no = start_seq_no + offset as u64;
-            buf.extend_from_slice(&encode_entry_borrowed(seq_no, primary_term, *op, payload)?);
-            entries.push(TranslogEntry {
-                seq_no,
+        let Some(start_seq_no) = self.write_primary_bulk_by(ops.len(), |seq_no, offset| {
+            let (op, payload) = &ops[offset];
+            encode_entry_borrowed(seq_no, primary_term, *op, payload)
+        })?
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(ops
+            .iter()
+            .enumerate()
+            .map(|(offset, (op, payload))| TranslogEntry {
+                seq_no: start_seq_no + offset as u64,
                 primary_term,
                 op: *op,
                 payload: payload.clone(),
-            });
-            last_seq_no = Some(seq_no);
-        }
-
-        state.active_file.write_all(&buf)?;
-        if matches!(self.durability, TranslogDurability::Request) {
-            state.active_file.sync_data()?;
-        }
-        if let Some(last_seq_no) = last_seq_no {
-            let generation = &mut state.generations[generation_index];
-            generation.observe_seq(start_seq_no);
-            generation.observe_seq(last_seq_no);
-            generation.size_bytes += buf.len() as u64;
-            state.next_seq_no = next_seq_no;
-        }
-
-        Ok(entries)
+            })
+            .collect())
     }
 
     fn write_bulk_with_receipt(
@@ -2309,41 +2699,23 @@ impl WriteAheadLog for HotTranslog {
         let next_seq_no = start_seq_no
             .checked_add(ops.len() as u64)
             .ok_or_else(|| anyhow::anyhow!("replica WAL sequence range overflows"))?;
-        #[cfg(test)]
-        self.maybe_fail_write_for_test()?;
-        let mut state = recover_lock(&self.state, "state");
-        let generation_index = state.active_generation_index()?;
+        if ops.is_empty() {
+            return Ok(());
+        }
         let mut buf = Vec::with_capacity(ops.len() * 200);
-        let mut last_seq_no = None;
 
         for (offset, (op, payload)) in ops.iter().enumerate() {
             let seq_no = start_seq_no + offset as u64;
             buf.extend_from_slice(&encode_entry_borrowed(seq_no, primary_term, *op, payload)?);
-            last_seq_no = Some(seq_no);
         }
 
-        state.active_file.write_all(&buf)?;
-        if matches!(self.durability, TranslogDurability::Request) {
-            state.active_file.sync_data()?;
-        }
-        if let Some(last_seq_no) = last_seq_no {
-            let generation = &mut state.generations[generation_index];
-            generation.observe_seq(start_seq_no);
-            generation.observe_seq(last_seq_no);
-            generation.size_bytes += buf.len() as u64;
-            state.next_seq_no = state.next_seq_no.max(next_seq_no);
-        }
-
-        Ok(())
+        self.write_encoded_batch_with_seq(&buf, start_seq_no..next_seq_no, next_seq_no)
     }
 
     fn append_batch_with_seq(&self, entries: &[SequencedWalEntry]) -> Result<Vec<TranslogEntry>> {
         if entries.is_empty() {
             return Ok(Vec::new());
         }
-        #[cfg(test)]
-        self.maybe_fail_write_for_test()?;
-
         let mut encoded = Vec::with_capacity(entries.len() * 200);
         let mut max_next_seq_no = 0u64;
         for entry in entries {
@@ -2404,8 +2776,6 @@ impl WriteAheadLog for HotTranslog {
         if entries.is_empty() {
             return Ok(());
         }
-        #[cfg(test)]
-        self.maybe_fail_write_for_test()?;
         let mut encoded = Vec::with_capacity(entries.len() * 200);
         let mut max_next_seq_no = 0u64;
         for entry in entries {
@@ -2462,7 +2832,7 @@ impl WriteAheadLog for HotTranslog {
         if count == 0 {
             return Ok(Vec::new());
         }
-        let generation = recover_lock(&self.state, "state")
+        let generation = lock_translog_state(&self.state)
             .generations
             .iter()
             .find(|generation| generation.id == start.generation_id)
@@ -2496,7 +2866,7 @@ impl WriteAheadLog for HotTranslog {
     }
 
     fn read_entry_at(&self, position: WalCursor) -> Result<Option<TranslogEntry>> {
-        let generation = recover_lock(&self.state, "state")
+        let generation = lock_translog_state(&self.state)
             .generations
             .iter()
             .find(|generation| generation.id == position.generation_id)
@@ -2555,13 +2925,20 @@ impl WriteAheadLog for HotTranslog {
     }
 
     fn truncate(&self) -> Result<()> {
-        let mut state = recover_lock(&self.state, "state");
+        let mut state = lock_translog_state(&self.state);
+        state.ensure_writable()?;
         let preserved_seq = state.next_seq_no;
-        let rolled_generation = self.roll_generation_locked(&mut state)?;
-        let removed_generations = self.take_prunable_generations_locked(&mut state, None);
-        self.persist_manifest_locked(&state)?;
+        let result = (|| {
+            let rolled_generation = self.roll_generation_locked(&mut state)?;
+            let removed_generations = self.take_prunable_generations_locked(&mut state, None);
+            self.persist_manifest_locked(&state)?;
+            Ok((rolled_generation, removed_generations))
+        })();
+        let (rolled_generation, removed_generations) = result.map_err(|error| state.fail(error))?;
+        for generation in &removed_generations {
+            state.generation_hashes.remove(&generation.id);
+        }
         drop(state);
-        self.persist_seq_no_high_watermark(preserved_seq)?;
         let removed = self.delete_generation_files(removed_generations);
 
         tracing::info!(
@@ -2574,19 +2951,26 @@ impl WriteAheadLog for HotTranslog {
     }
 
     fn truncate_below(&self, global_checkpoint: u64) -> Result<()> {
-        let mut state = recover_lock(&self.state, "state");
+        let mut state = lock_translog_state(&self.state);
+        state.ensure_writable()?;
         let preserved_seq = state.next_seq_no;
-        let rolled_generation = self.roll_generation_locked(&mut state)?;
-        let removed_generations =
-            self.take_prunable_generations_locked(&mut state, Some(global_checkpoint));
+        let result = (|| {
+            let rolled_generation = self.roll_generation_locked(&mut state)?;
+            let removed_generations =
+                self.take_prunable_generations_locked(&mut state, Some(global_checkpoint));
+            self.persist_manifest_locked(&state)?;
+            Ok((rolled_generation, removed_generations))
+        })();
+        let (rolled_generation, removed_generations) = result.map_err(|error| state.fail(error))?;
         let retained = state
             .generations
             .iter()
             .filter(|generation| generation.id != state.active_generation_id)
             .count();
-        self.persist_manifest_locked(&state)?;
+        for generation in &removed_generations {
+            state.generation_hashes.remove(&generation.id);
+        }
         drop(state);
-        self.persist_seq_no_high_watermark(preserved_seq)?;
         let removed = self.delete_generation_files(removed_generations);
 
         tracing::info!(
@@ -2605,24 +2989,24 @@ impl WriteAheadLog for HotTranslog {
     }
 
     fn last_seq_no(&self) -> u64 {
-        let next_seq_no = recover_lock(&self.state, "state").next_seq_no;
+        let next_seq_no = lock_translog_state(&self.state).next_seq_no;
         if next_seq_no == 0 { 0 } else { next_seq_no - 1 }
     }
 
     fn next_seq_no(&self) -> u64 {
-        recover_lock(&self.state, "state").next_seq_no
+        lock_translog_state(&self.state).next_seq_no
     }
 
     fn min_seq_no(&self) -> Option<u64> {
-        recover_lock(&self.state, "state").min_seq_no()
+        lock_translog_state(&self.state).min_seq_no()
     }
 
     fn max_seq_no(&self) -> Option<u64> {
-        recover_lock(&self.state, "state").max_seq_no()
+        lock_translog_state(&self.state).max_seq_no()
     }
 
     fn size_bytes(&self) -> Result<u64> {
-        let state = recover_lock(&self.state, "state");
+        let state = lock_translog_state(&self.state);
         Ok(state
             .generations
             .iter()
@@ -2681,7 +3065,7 @@ impl WriteAheadLog for HotTranslog {
     }
 
     fn recovery_read_snapshot(&self) -> Result<TranslogReadSnapshot> {
-        let state = recover_lock(&self.state, "state");
+        let state = lock_translog_state(&self.state);
         let active_matches = state
             .generations
             .iter()
@@ -2727,7 +3111,7 @@ impl WriteAheadLog for HotTranslog {
     }
 
     fn register_retention_pin(&self, min_seq_no: u64) -> Result<u64> {
-        let mut state = recover_lock(&self.state, "state");
+        let mut state = lock_translog_state(&self.state);
         if min_seq_no > state.next_seq_no {
             anyhow::bail!(
                 "cannot pin translog at {} beyond next sequence {}",
@@ -2744,14 +3128,14 @@ impl WriteAheadLog for HotTranslog {
     }
 
     fn release_retention_pin(&self, pin_id: u64) -> Result<()> {
-        recover_lock(&self.state, "state")
+        lock_translog_state(&self.state)
             .retention_pins
             .remove(&pin_id);
         Ok(())
     }
 
     fn min_retention_pin(&self) -> Option<u64> {
-        recover_lock(&self.state, "state")
+        lock_translog_state(&self.state)
             .retention_pins
             .values()
             .copied()
@@ -2782,16 +3166,17 @@ mod tests {
     }
 
     fn encoded_frame_len(seq_no: u64, op: WalOperation, payload: &serde_json::Value) -> usize {
-        let wire = WireEntryV3 {
+        let wire = WireEntryV4 {
             format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
             seq_no,
             primary_term: 1,
             op: op.as_str().to_string(),
             payload_json: serde_json::to_string(payload).unwrap(),
         };
-        4 + bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG)
-            .unwrap()
-            .len()
+        4 + FRAME_CHECKSUM_BYTES
+            + bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG)
+                .unwrap()
+                .len()
     }
 
     fn document_source_for_frame_len(seq_no: u64, target: usize) -> serde_json::Value {
@@ -2812,9 +3197,11 @@ mod tests {
                 op: "index",
                 payload_json: &payload_json,
             };
-            let actual = 4 + bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG)
-                .unwrap()
-                .len();
+            let actual = 4
+                + FRAME_CHECKSUM_BYTES
+                + bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG)
+                    .unwrap()
+                    .len();
             if actual == target {
                 return source;
             }
@@ -3018,11 +3405,12 @@ mod tests {
     }
 
     fn encode_entry_without_write_limit(entry: &TranslogEntry) -> Vec<u8> {
-        let wire = WireEntryV3::from_translog(entry).unwrap();
+        let wire = WireEntryV4::from_translog(entry).unwrap();
         let encoded = bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG).unwrap();
-        let mut frame = Vec::with_capacity(4 + encoded.len());
-        frame.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+        let mut frame = Vec::with_capacity(4 + FRAME_CHECKSUM_BYTES + encoded.len());
+        frame.extend_from_slice(&((encoded.len() + FRAME_CHECKSUM_BYTES) as u32).to_le_bytes());
         frame.extend_from_slice(&encoded);
+        frame.extend_from_slice(&Sha256::digest(&encoded));
         frame
     }
 
@@ -3046,6 +3434,46 @@ mod tests {
 
     fn read_manifest(dir: &Path) -> TranslogManifest {
         serde_json::from_slice(&fs::read(manifest_path(dir)).unwrap()).unwrap()
+    }
+
+    fn protected_manifest_for_test(
+        dir: &Path,
+        active_generation_id: u64,
+        next_generation_id: u64,
+        generations: Vec<ManifestGenerationInfo>,
+    ) -> TranslogManifest {
+        let mut sequences = crate::engine::sequence::SeqNoIntervals::default();
+        for generation in &generations {
+            if let (Some(start), Some(end)) = (generation.min_seq_no, generation.max_seq_no) {
+                sequences.insert_range(start, end);
+            }
+        }
+        TranslogManifest {
+            version: TRANSLOG_MANIFEST_VERSION,
+            entry_format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
+            active_generation_id,
+            next_generation_id,
+            next_seq_no: generations
+                .iter()
+                .filter_map(|generation| generation.max_seq_no)
+                .max()
+                .map_or(0, |seq_no| seq_no + 1),
+            durable_sequences: sequences.ranges(),
+            generation_hashes: generations
+                .iter()
+                .map(|generation| {
+                    hash_generation_prefix(
+                        &generation_path(dir, generation.id),
+                        generation.size_bytes,
+                    )
+                    .unwrap()
+                    .finalize()
+                    .into()
+                })
+                .collect(),
+            generations,
+            checksum: [0; 32],
+        }
     }
 
     // ── append / read_all ───────────────────────────────────────────────
@@ -3225,18 +3653,17 @@ mod tests {
         let frame = encode_entry_without_write_limit(&pre_limit);
         assert!(frame.len() > MAX_WAL_FRAME_BYTES);
         fs::write(generation_path(dir.path(), 0), &frame).unwrap();
-        let manifest = TranslogManifest {
-            version: TRANSLOG_MANIFEST_VERSION,
-            entry_format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
-            active_generation_id: 0,
-            next_generation_id: 1,
-            generations: vec![ManifestGenerationInfo {
+        let manifest = protected_manifest_for_test(
+            dir.path(),
+            0,
+            1,
+            vec![ManifestGenerationInfo {
                 id: 0,
                 min_seq_no: Some(0),
                 max_seq_no: Some(0),
                 size_bytes: frame.len() as u64,
             }],
-        };
+        );
         persist_translog_manifest(&manifest_path(dir.path()), &manifest).unwrap();
         drop(frame);
         drop(pre_limit);
@@ -3423,12 +3850,11 @@ mod tests {
         fs::write(generation_path(dir.path(), 1), &second).unwrap();
         persist_translog_manifest(
             &manifest_path(dir.path()),
-            &TranslogManifest {
-                version: TRANSLOG_MANIFEST_VERSION,
-                entry_format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
-                active_generation_id: 1,
-                next_generation_id: 2,
-                generations: vec![
+            &protected_manifest_for_test(
+                dir.path(),
+                1,
+                2,
+                vec![
                     ManifestGenerationInfo {
                         id: 0,
                         min_seq_no: Some(10),
@@ -3442,7 +3868,7 @@ mod tests {
                         size_bytes: second.len() as u64,
                     },
                 ],
-            },
+            ),
         )
         .unwrap();
 
@@ -3621,17 +4047,14 @@ mod tests {
 
     #[test]
     fn unknown_entry_version_fails_with_typed_error() {
-        let wire = WireEntryV3 {
+        let wire = WireEntryV4 {
             format_version: TRANSLOG_ENTRY_FORMAT_VERSION + 1,
             seq_no: 0,
             primary_term: 1,
             op: "index".to_string(),
             payload_json: serde_json::to_string(&json!({"_doc_id": "doc", "_source": {}})).unwrap(),
         };
-        let encoded = bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG).unwrap();
-        let mut frame = Vec::with_capacity(encoded.len() + 4);
-        frame.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
-        frame.extend_from_slice(&encoded);
+        let frame = encode_wire_entry(&wire).unwrap();
 
         let error = decode_entries(&mut std::io::Cursor::new(frame)).unwrap_err();
         assert!(error.is::<crate::common::UnsupportedIndexFormatError>());
@@ -3866,14 +4289,8 @@ mod tests {
             None,
         )
         .unwrap_err();
-        let error_chain = format!("{error:#}");
-        assert!(
-            error_chain.contains("decode")
-                || error_chain.contains("unknown WAL operation")
-                || error_chain.contains("JSON")
-                || error_chain.contains("utf-8"),
-            "unexpected torn-frame error: {error:#}"
-        );
+        assert!(error.is::<WalCorruptionError>());
+        assert!(format!("{error:#}").contains("translog frame checksum mismatch"));
     }
 
     #[test]
@@ -4312,7 +4729,7 @@ mod tests {
     }
 
     #[test]
-    fn open_scans_only_active_generation_when_manifest_exists() {
+    fn open_validates_retained_generation_frames_even_with_a_matching_manifest_hash() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(generation_path(dir.path(), 0), b"corrupt old generation").unwrap();
 
@@ -4325,12 +4742,11 @@ mod tests {
         let active_frame = encode_entry(&active_entry).unwrap();
         fs::write(generation_path(dir.path(), 1), &active_frame).unwrap();
 
-        let manifest = TranslogManifest {
-            version: TRANSLOG_MANIFEST_VERSION,
-            entry_format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
-            active_generation_id: 1,
-            next_generation_id: 2,
-            generations: vec![
+        let manifest = protected_manifest_for_test(
+            dir.path(),
+            1,
+            2,
+            vec![
                 ManifestGenerationInfo {
                     id: 0,
                     min_seq_no: Some(0),
@@ -4344,41 +4760,36 @@ mod tests {
                     size_bytes: active_frame.len() as u64,
                 },
             ],
-        };
+        );
         persist_translog_manifest(&manifest_path(dir.path()), &manifest).unwrap();
 
-        let tl = HotTranslog::open(dir.path()).unwrap();
-        assert_eq!(tl.current_seq_no(), 8);
+        assert!(HotTranslog::open(dir.path()).is_err());
     }
 
     #[test]
     fn open_returns_error_for_unknown_active_generation_wal_operation() {
         let dir = tempfile::tempdir().unwrap();
-        let wire = WireEntryV3 {
+        let wire = WireEntryV4 {
             format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
             seq_no: 0,
             primary_term: 1,
             op: "bogus".to_string(),
             payload_json: serde_json::to_string(&json!({"doc": 1})).unwrap(),
         };
-        let encoded = bincode_next::serde::encode_to_vec(&wire, BINCODE_CONFIG).unwrap();
-        let mut frame = Vec::with_capacity(4 + encoded.len());
-        frame.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
-        frame.extend_from_slice(&encoded);
+        let frame = encode_wire_entry(&wire).unwrap();
         fs::write(generation_path(dir.path(), 0), &frame).unwrap();
 
-        let manifest = TranslogManifest {
-            version: TRANSLOG_MANIFEST_VERSION,
-            entry_format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
-            active_generation_id: 0,
-            next_generation_id: 1,
-            generations: vec![ManifestGenerationInfo {
+        let manifest = protected_manifest_for_test(
+            dir.path(),
+            0,
+            1,
+            vec![ManifestGenerationInfo {
                 id: 0,
                 min_seq_no: Some(0),
                 max_seq_no: Some(0),
                 size_bytes: frame.len() as u64,
             }],
-        };
+        );
         persist_translog_manifest(&manifest_path(dir.path()), &manifest).unwrap();
 
         let err = match HotTranslog::open(dir.path()) {
@@ -4442,18 +4853,14 @@ mod tests {
             payload: json!({"value": 0}),
         })
         .unwrap();
-        let corrupt_wire = WireEntryV3 {
+        let corrupt_wire = WireEntryV4 {
             format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
             seq_no: 1,
             primary_term: 1,
             op: "bogus".to_string(),
             payload_json: serde_json::to_string(&json!({"value": 1})).unwrap(),
         };
-        let corrupt_payload =
-            bincode_next::serde::encode_to_vec(&corrupt_wire, BINCODE_CONFIG).unwrap();
-        let mut corrupt = Vec::with_capacity(4 + corrupt_payload.len());
-        corrupt.extend_from_slice(&(corrupt_payload.len() as u32).to_le_bytes());
-        corrupt.extend_from_slice(&corrupt_payload);
+        let corrupt = encode_wire_entry(&corrupt_wire).unwrap();
         let last = encode_entry(&TranslogEntry {
             seq_no: 2,
             primary_term: 1,
@@ -4465,18 +4872,17 @@ mod tests {
         bytes.extend_from_slice(&corrupt);
         bytes.extend_from_slice(&last);
         fs::write(generation_path(dir.path(), 0), &bytes).unwrap();
-        let manifest = TranslogManifest {
-            version: TRANSLOG_MANIFEST_VERSION,
-            entry_format_version: TRANSLOG_ENTRY_FORMAT_VERSION,
-            active_generation_id: 0,
-            next_generation_id: 1,
-            generations: vec![ManifestGenerationInfo {
+        let manifest = protected_manifest_for_test(
+            dir.path(),
+            0,
+            1,
+            vec![ManifestGenerationInfo {
                 id: 0,
                 min_seq_no: Some(0),
                 max_seq_no: Some(2),
                 size_bytes: bytes.len() as u64,
             }],
-        };
+        );
         persist_translog_manifest(&manifest_path(dir.path()), &manifest).unwrap();
 
         let error = match HotTranslog::open(dir.path()) {
@@ -4751,7 +5157,7 @@ mod tests {
     }
 
     #[test]
-    fn poisoned_state_lock_is_recovered_for_reads_and_appends() {
+    fn poisoned_state_lock_preserves_reads_but_fail_stops_mutation_and_sync() {
         let (_dir, tl) = open_translog();
 
         let _ = catch_unwind(AssertUnwindSafe(|| {
@@ -4760,13 +5166,210 @@ mod tests {
         }));
 
         assert_eq!(tl.current_seq_no(), 0);
-        let entry = tl.append(WalOperation::Index, json!({"doc": 1})).unwrap();
-        assert_eq!(entry.seq_no, 0);
-        assert_eq!(tl.next_seq_no(), 1);
-        let entries = tl.read_all().unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].seq_no, 0);
-        assert_eq!(entries[0].payload["doc"], 1);
+        let error = tl
+            .append(WalOperation::Index, json!({"doc": 1}))
+            .unwrap_err();
+        assert!(error.is::<WalFailStoppedError>());
+        assert!(tl.sync().unwrap_err().is::<WalFailStoppedError>());
+        assert_eq!(tl.next_seq_no(), 0);
+        assert!(tl.read_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_append_revokes_every_mutation_path_and_cannot_be_healed_by_sync() {
+        let (directory, wal) = open_translog();
+        wal.append(WalOperation::Index, json!({"value": 0}))
+            .unwrap();
+        let protected = fs::read(manifest_path(directory.path())).unwrap();
+        wal.inject_write_io_failures_for_test(28, 1);
+        let error = wal
+            .append(WalOperation::Index, json!({"value": 1}))
+            .unwrap_err();
+        assert!(error.is::<WalFailStoppedError>());
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(28)
+        );
+
+        let operation = WalDocumentOperation::Delete {
+            doc_id: "later",
+            version: 1,
+            client_operation: None,
+        };
+        let later_errors = [
+            wal.append(WalOperation::Delete, json!({})).map(|_| ()),
+            wal.append_with_seq(9, WalOperation::Delete, json!({}))
+                .map(|_| ()),
+            wal.append_bulk(&[(WalOperation::Delete, json!({}))])
+                .map(|_| ()),
+            WriteAheadLog::write_document_with_receipt(&wal, 1, operation).map(|_| ()),
+            wal.truncate(),
+            wal.truncate_below(0),
+            wal.sync(),
+        ];
+        for result in later_errors {
+            assert!(result.unwrap_err().is::<WalFailStoppedError>());
+        }
+        assert_eq!(wal.next_seq_no(), 1);
+        assert_eq!(wal.read_all().unwrap().len(), 1);
+        assert_eq!(
+            fs::read(manifest_path(directory.path())).unwrap(),
+            protected
+        );
+    }
+
+    #[test]
+    fn partial_failed_append_stays_unsealed_and_only_its_terminal_tail_can_be_discarded() {
+        let (directory, wal) = open_translog();
+        wal.append(WalOperation::Index, json!({"value": 0}))
+            .unwrap();
+        let generation = generation_path(directory.path(), 0);
+        let protected_length = fs::metadata(&generation).unwrap().len();
+        *wal.partial_write_io_failure.lock().unwrap() = Some((11, 28));
+        assert!(
+            wal.append(WalOperation::Index, json!({"value": 1}))
+                .unwrap_err()
+                .is::<WalFailStoppedError>()
+        );
+        assert!(wal.sync().is_err());
+        assert_eq!(
+            fs::metadata(&generation).unwrap().len(),
+            protected_length + 11
+        );
+        drop(wal);
+
+        let reopened = HotTranslog::open(directory.path()).unwrap();
+        assert_eq!(fs::metadata(&generation).unwrap().len(), protected_length);
+        assert_eq!(reopened.next_seq_no(), 1);
+        assert_eq!(reopened.read_all().unwrap()[0].payload["value"], 0);
+    }
+
+    #[test]
+    fn one_shot_fsync_failure_cannot_seal_the_failed_attempt_on_a_later_sync() {
+        let (directory, wal) = open_translog();
+        let protected = fs::read(manifest_path(directory.path())).unwrap();
+        lock_translog_state(&wal.state).sync_io_failure = Some(5);
+        let error = wal
+            .append(WalOperation::Index, json!({"value": 1}))
+            .unwrap_err();
+        assert!(error.is::<WalFailStoppedError>());
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(5)
+        );
+        assert!(wal.sync().unwrap_err().is::<WalFailStoppedError>());
+        assert_eq!(
+            fs::read(manifest_path(directory.path())).unwrap(),
+            protected
+        );
+        assert_eq!(wal.read_all().unwrap().len(), 1);
+        drop(wal);
+
+        let reopened = HotTranslog::open(directory.path()).unwrap();
+        assert_eq!(reopened.read_all().unwrap()[0].payload["value"], 1);
+        assert!(read_manifest(directory.path()).durable_sequences.is_empty());
+    }
+
+    #[test]
+    fn manifest_publication_failure_keeps_the_old_frontier_and_fail_stops_the_copy() {
+        let (directory, wal) = open_translog();
+        wal.append(WalOperation::Index, json!({"value": 0}))
+            .unwrap();
+        let path = manifest_path(directory.path());
+        let protected = fs::read(&path).unwrap();
+        let temporary = path.with_extension("tmp");
+        fs::create_dir(&temporary).unwrap();
+        let error = wal
+            .append(WalOperation::Index, json!({"value": 1}))
+            .unwrap_err();
+        assert!(error.is::<WalFailStoppedError>());
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
+        fs::remove_dir(temporary).unwrap();
+        assert!(wal.sync().is_err());
+        assert_eq!(fs::read(path).unwrap(), protected);
+        drop(wal);
+
+        let reopened = HotTranslog::open(directory.path()).unwrap();
+        assert_eq!(reopened.read_all().unwrap().len(), 2);
+        assert_eq!(read_manifest(directory.path()).next_seq_no, 1);
+    }
+
+    #[test]
+    fn a_torn_protected_sparse_operation_is_never_reclassified_as_an_unsealed_tail() {
+        let (directory, wal) = open_translog();
+        wal.append(WalOperation::Index, json!({"value": 0}))
+            .unwrap();
+        wal.append_with_seq(5, WalOperation::Index, json!({"value": 5}))
+            .unwrap();
+        let generation = generation_path(directory.path(), 0);
+        let protected_length = fs::metadata(&generation).unwrap().len();
+        drop(wal);
+        OpenOptions::new()
+            .write(true)
+            .open(&generation)
+            .unwrap()
+            .set_len(protected_length - 1)
+            .unwrap();
+
+        let error = HotTranslog::open(directory.path()).err().unwrap();
+        assert!(error.is::<WalCorruptionError>());
+        assert!(error.to_string().contains("protected frontier"));
+        assert_eq!(
+            fs::metadata(generation).unwrap().len(),
+            protected_length - 1
+        );
+    }
+
+    #[test]
+    fn protected_manifest_checksum_rejects_plausible_but_changed_sequence_metadata() {
+        let (directory, wal) = open_translog();
+        wal.append(WalOperation::Index, json!({"value": 0}))
+            .unwrap();
+        drop(wal);
+        let mut manifest = read_manifest(directory.path());
+        manifest.next_seq_no = 50;
+        fs::write(
+            manifest_path(directory.path()),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let error = HotTranslog::open(directory.path()).err().unwrap();
+        assert!(error.is::<WalCorruptionError>());
+        assert!(format!("{error:#}").contains("manifest checksum mismatch"));
+    }
+
+    #[test]
+    fn protected_sequence_ranges_preserve_exact_above_gap_positions_across_restart() {
+        let (directory, wal) = open_translog();
+        for seq_no in [8, 0, 4] {
+            wal.append_with_seq(seq_no, WalOperation::Index, json!({"seq": seq_no}))
+                .unwrap();
+        }
+        let manifest = read_manifest(directory.path());
+        let ranges = manifest
+            .durable_sequences
+            .iter()
+            .map(|range| (range.start, range.end))
+            .collect::<Vec<_>>();
+        assert_eq!(ranges, [(0, 0), (4, 4), (8, 8)]);
+        assert_eq!(manifest.next_seq_no, 9);
+        drop(wal);
+        let reopened = HotTranslog::open(directory.path()).unwrap();
+        assert_eq!(
+            reopened
+                .read_all()
+                .unwrap()
+                .iter()
+                .map(|entry| entry.seq_no)
+                .collect::<Vec<_>>(),
+            [8, 0, 4]
+        );
     }
 
     // ── size_bytes ──────────────────────────────────────────────────

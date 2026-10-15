@@ -64,28 +64,30 @@ pub struct Node {
    identity matches; only an initial CreateIndex primary may be created empty
    before the shard's first activation
 4. Report corruption-class decode/validation failures immediately. Retry other
-   engine/filesystem/fence/apply I/O with operation-specific per-copy state and
+   ordinary open/filesystem/fence/marker I/O with operation-specific per-copy state and
    shared exponential backoff. Escalation requires at least three failed
    attempts spanning the configured window, 60 seconds by default. Replica
    reports remove the exact allocation; primary reports are promote-only and
    are submitted only with an in-sync candidate. Duplicate reports are
    throttled per allocation. Definitive/open-level quarantine occurs only
    after that throttle except for sequence/version collisions, which
-   persist allocation-bound collision quarantine immediately; Apply escalation
-   leaves the copy open for reads. Lifecycle reopen keeps rediscovering and
+   persist allocation-bound collision quarantine immediately. WAL/post-WAL
+   uncertainty immediately fail-stops permits and becomes reportable without
+   waiting for this retry window. Lifecycle reopen keeps rediscovering and
    reporting a collision marker until Raft removes the exact allocation.
 5. Proactively invoke the shared primary-activation path for each local primary
    after startup or promotion. The activation cache is keyed by
-   UUID/shard/allocation/term so lifecycle ticks and request handlers do not
-   issue repeated Raft term bumps. `primary_unavailable` alone does not bypass
-   the cache. Repaired quarantined storage requires fresh activation; a
-   successful write on an Apply-failed copy clears status at the same term.
+   UUID/shard/allocation and coalesces concurrent first writes with lifecycle
+   work. A restarted process cannot reuse cached ACTIVE metadata: reserve a
+   higher term, reconcile protected history, seal, finish ACTIVE, then install
+   an epoch. Fail-stopped epochs cannot heal; fresh activation clears
+   `primary_unavailable` only after that handshake.
 6. Allocate unassigned replicas only for shards with a live allocated primary.
    The current allocator may select the same faulty node again; bounded failed-
    allocation exclusion is deferred.
 7. When applied routing removes a local shard copy, remove its engine from the
    serving map without deleting its on-disk evidence. This closes copies removed
-   after Apply-level escalation instead of retaining an unreachable open engine.
+   after failure instead of retaining an unreachable open engine.
    Recheck live UUID/allocation under the shard lock; an older routing snapshot
    must not remove a newly allocated/recreated copy. Failure quarantine is also
    exact-allocation scoped and runs on the blocking pool.
@@ -216,26 +218,21 @@ pub struct Node {
 5. If any conditional routing update is rejected, do not remove that node from
    cluster state in the same tick; retry from fresh state.
 
-Promotion changes increment the state-machine-owned shard term. A promoted or
-restarted primary still activates once per process before its first write.
-Activation persists the durable fence, replays retained WAL state, fills every
-missing local sequence through the fenced maximum with durable current-term
-NoOps, and only then enables writes. Best-effort NoOp replication may leave a
-bounded replica gap for normal probe/removal handling; it must not weaken local
-activation. Lifecycle ticks retry failed promotion NoOp batches for the same
-active UUID/allocation/term only while the process-local pending entry remains.
-Restart or an activation failure after local NoOp application can lose that
-entry; current code does not rebuild it from the WAL. The replica then remains
-gapful until the fixed deadline removes the allocation and peer recovery
-rebuilds it.
-Activation and retry serialization is allocation-local, so a slow or
-unreachable replica for one shard does not delay client writes on another
-shard. Lifecycle ticks still activate shards one at a time: a retry that waits
-on an unreachable replica, for up to its 30 s timeout, delays activation of the
-shards after it in the same tick.
-These promotion NoOps fill gaps on the promoted copy only; they do not repair
-replicas that missed a real post-WAL primary operation. Such copies follow the
-gap deadline and peer-recovery path until D10 exists.
+Promotion invalidates prior ACTIVE authority while retaining its committed
+history anchor. Every promoted/restarted primary then acquires a higher-term
+PROMOTING reservation. Bounded frozen inventories preserve protected candidate
+operations, adopt unique verified peer records with original identities, and
+fill absent/conflicting unprotected gaps with NoOps. Compare each peer's whole
+range before appending and omit conflicting/unreachable copies from ACTIVE.
+Durably seal matching copies, conditionally finish ACTIVE, observe it, then
+install the process-local epoch. Activation and recovery remain possible below
+`minimum_durable_copies`; only writes require that floor.
+
+Canonical work has independent coordinator/job admission with two slots and a
+120-second enclosing deadline plus bounded substeps. Owned jobs survive waiter
+cancellation, retain history pins/guards until their work settles, and clean
+obsolete frozen sessions from applied authority. No mutation lock spans network
+work. This is bounded canonical adoption/resync, not unrestricted D10 rollback.
 
 Earlier shard schemas, committed boundaries, manifests, WAL entries, and copy
 identities never migrate in place. Every role fails closed through the same

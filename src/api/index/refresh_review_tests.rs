@@ -220,10 +220,20 @@ async fn refresh_review_slow_replica_uses_remaining_deadline_and_preserves_ack()
         "{report:?}"
     );
     let mut body = json!({"status": 201, "result": "created", "_seq_no": response.seq_no, "_primary_term": response.primary_term});
+    crate::transport::write_acknowledgement::add_write_acknowledgement_to_response(
+        &mut body,
+        INDEX,
+        0,
+        response.write_acknowledgement.as_ref().unwrap(),
+    );
     crate::transport::write_refresh::add_write_refresh_to_response(&mut body, INDEX, 0, &report);
     assert_eq!(body["status"], 201);
-    assert_eq!(body["_shards"]["failed"], 1);
-    assert_eq!(body["_shards"]["successful"], 2);
+    assert_eq!(body["_refresh"]["failed"], 1);
+    assert_eq!(body["_refresh"]["successful"], 2);
+    assert_eq!(
+        body["_shards"],
+        json!({"total": 3, "successful": 3, "failed": 0})
+    );
     assert_eq!(body["forced_refresh"], true);
     for node in 1..4 {
         let engine = harness.engines[&(node, 0)].clone();
@@ -292,15 +302,20 @@ async fn slow_http_copy(primary_copy: bool) {
     assert_eq!(status, StatusCode::CREATED, "{body}");
     assert_eq!(body["result"], "created", "{body}");
     assert_eq!(body["_seq_no"], 0, "{body}");
-    assert_eq!(body["_shards"]["total"], 3, "{body}");
-    assert_eq!(body["_shards"]["successful"], 2, "{body}");
-    assert_eq!(body["_shards"]["failed"], 1, "{body}");
+    assert_eq!(body["_refresh"]["total"], 3, "{body}");
+    assert_eq!(body["_refresh"]["successful"], 2, "{body}");
+    assert_eq!(body["_refresh"]["failed"], 1, "{body}");
     assert_eq!(
-        body["_shards"]["failures"][0]["node"],
+        body["_shards"],
+        json!({"total": 3, "successful": 3, "failed": 0}),
+        "{body}"
+    );
+    assert_eq!(
+        body["_refresh"]["failures"][0]["node"],
         harness.cluster.nodes[paused_copy].state.local_node_id
     );
     assert!(
-        body["_shards"]["failures"][0]["reason"]["reason"]
+        body["_refresh"]["failures"][0]["reason"]["reason"]
             .as_str()
             .unwrap()
             .contains("refresh timed out"),
@@ -362,6 +377,13 @@ async fn refresh_review_ordered_bulk_rpc_coalesces_acknowledged_items() {
     let report = items[0].write_refresh.as_ref().unwrap();
     assert_eq!(report, items[2].write_refresh.as_ref().unwrap());
     assert_eq!(report, items[3].write_refresh.as_ref().unwrap());
+    assert!(
+        report
+            .copies
+            .iter()
+            .all(|copy| matches!(copy.outcome, Some(Outcome::Refreshed(_)))),
+        "{report:?}"
+    );
     assert_eq!(refresh_rpcs(&harness), 2);
     assert_eq!(
         bulk_refresh_rounds(&harness),
@@ -487,10 +509,11 @@ async fn refresh_review_bulk_phase_rpc_failure_keeps_known_acknowledgements() {
         assert_eq!(item["status"], 201, "{item}");
         assert!(item["_seq_no"].is_u64(), "{item}");
         assert!(item["_primary_term"].as_u64().unwrap() > 0, "{item}");
-        assert_eq!(item["_shards"]["failed"], 1, "{item}");
-        assert_eq!(item["_shards"]["failures"][0]["node"], *primary, "{item}");
+        assert_eq!(item["_refresh"]["failed"], 1, "{item}");
+        assert_eq!(item["_shards"]["failed"], 0, "{item}");
+        assert_eq!(item["_refresh"]["failures"][0]["node"], *primary, "{item}");
         assert!(
-            item["_shards"]["failures"][0]["reason"]["reason"]
+            item["_refresh"]["failures"][0]["reason"]["reason"]
                 .as_str()
                 .unwrap()
                 .contains(&tonic::Status::unimplemented("").to_string()),
@@ -606,7 +629,8 @@ async fn refresh_review_primary_bulk_rpc_rejects_malformed_and_stale_fences() {
         report
             .copies
             .iter()
-            .all(|copy| matches!(copy.outcome, Some(Outcome::Refreshed(_))))
+            .all(|copy| matches!(copy.outcome, Some(Outcome::Refreshed(_)))),
+        "{report:?}"
     );
     assert_eq!(refresh_rpcs(&harness), 2);
     harness

@@ -120,28 +120,40 @@ fn incompatible_same_term_redelivery_fails_without_another_wal_entry() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_engine(dir.path());
     apply_index(&engine, "doc", json!({"value": 1}), 0, 1);
+    let wal_path = dir.path().join("translog-00000000000000000000.bin");
+    let wal_bytes = std::fs::read(&wal_path).unwrap();
+    let error = engine
+        .apply_replica_operation(ferrissearch::engine::SequencedOperation {
+            seq_no: 0,
+            primary_term: 1,
+            document_version: 1,
+            client_operation: None,
+            mutation: ferrissearch::engine::DocumentMutation::Index {
+                doc_id: "doc".into(),
+                source: json!({"value": 2}),
+            },
+        })
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("collision"), "{error:#}");
+    assert!(engine.ensure_write_health().is_err());
+    assert_eq!(std::fs::read(&wal_path).unwrap(), wal_bytes);
     assert!(
         engine
-            .apply_replica_operation(ferrissearch::engine::SequencedOperation {
-                seq_no: 0,
-                primary_term: 1,
-                document_version: 1,
-                client_operation: None,
-                mutation: ferrissearch::engine::DocumentMutation::Index {
-                    doc_id: "doc".into(),
-                    source: json!({"value": 2}),
-                },
-            })
-            .is_err()
+            .retained_recovery_ops(0, usize::MAX, usize::MAX)
+            .is_err(),
+        "a failed copy cannot provide recovery proof"
     );
+    drop(engine);
+    let reopened = open_engine(dir.path());
     assert_eq!(
-        engine
+        reopened
             .retained_recovery_ops(0, usize::MAX, usize::MAX)
             .unwrap()
             .operations
             .len(),
         1
     );
+    assert_eq!(reopened.get_document("doc").unwrap().unwrap()["value"], 1);
 }
 
 #[test]

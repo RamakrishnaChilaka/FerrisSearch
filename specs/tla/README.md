@@ -3,8 +3,9 @@
 This directory contains a bounded TLA+ model of one FerrisSearch
 `local_shards` shard plus a minimal two-shard control-plane isolation model.
 The model began at source baseline `8f17172` and now includes the allocation,
-fencing, empty-store, copy-failure, and pending-restart protocol refinements on
-this branch.
+fencing, empty-store, copy-failure, and pending-restart protocol refinements.
+The supplementary FS013 model checks journal/restart/authority control safety;
+it does not replace the older data-path models or trace relation.
 
 **Scope of the guarantee:** TLC exhaustively checks every behavior reachable
 within each configuration's stated finite bounds. A passing configuration is
@@ -80,6 +81,10 @@ Set `TLA_TRACE_JOBS=1` to reproduce the sequential schedule.
 `test_d1_protocol_trace.sh` runs the scripted three-node in-process gRPC fault
 scenario behind the `protocol-trace` Cargo feature. It captures a correct
 schema-v4 trace plus the `arrival-order` and `seq-only-redelivery` mutations.
+Its legacy no-Raft fixtures explicitly supply synthetic identity-anchor
+certificates and activation state so current wire/proof guards still run.
+Those anchors are not runtime canonical inventory/resync evidence; the separate
+FS013 authority witness and real-Raft stale-primary suite provide that scope.
 The independent invariant checker and TLC accept the 158-event correct trace
 and reject the mutations at `operation_processed` steps 27 and 117.
 The wrapper also checks a promotion-NoOp retry trace: dropped and successful
@@ -220,7 +225,8 @@ liveness configurations use neither symmetry nor a state constraint.
 | `MC_D1_TraceActions.tla` | Checked coverage for earlier captured-boundary persistence, trace truncation, restart replay, alive-copy replay, and failed-replay unavailability. |
 | `MC_D1_FailoverActions.tla` | One scripted three-copy action path covering promotion fencing, physical NoOp append/process/sync, post-activation send, apply/redelivery, sequence reuse, and fail-closed collision handling. |
 | `MC_D1_NoOpCollisionActions.tla` | One scripted path covering physical promotion NoOp fill, post-activation send, collision, NACK delivery, and exact in-sync removal. |
-| `MC_D2_WriteAck.tla` | Proposed operation-based acknowledgement/failure control policy over the owning D1 and Raft actions: conditional exclusion, sticky debt, minimum copies, outcome classes, and local permit invalidation. |
+| `MC_D2_WriteAck.tla` | Operation-based acknowledgement/failure policy over owning D1/Raft actions: historical baseline and selected conditional-exclusion, sticky-debt, copy-floor, and permit controls. |
+| `MC_FS013_WriteAuthority.tla` | Supplementary two-copy authority model: journal-before-proposal, observed conditional settlement, fail-stop, fresh restart epochs, canonical seal abstraction, and old-only rejection callbacks. |
 | `TraceD1.tla` | Existential schema-v4 witness search over real `MC_D1_SeqNoApply` actions, with evidence-directed hidden D1 actions and copy-state observations. |
 | `TraceD1Authority.tla` | Exact composition with Raft routing views, failover, durable fencing, activation, and primary write gating. |
 | `TraceD1Collision.tla` | Exact composition with the bounded B1 term/sequence collision and in-sync removal actions. |
@@ -308,7 +314,7 @@ liveness configurations use neither symmetry nor a state constraint.
 | Model action | Rust boundary represented |
 | --- | --- |
 | `ClientWrite` | Coordinator routing in `src/api/index/`. |
-| `PrimaryAccept`, `PrimaryReject`, `PrimaryAck`, `PrimaryFail` | `TransportService::{index_doc,bulk_index,delete_doc}`, including `ensure_primary_activated`, `peer_recovery_write_guard`, `validated_primary_write_state`, and all-in-sync acknowledgement. |
+| `PrimaryAccept`, `PrimaryReject`, `PrimaryAck`, `PrimaryFail` | `TransportService::{index_doc,bulk_index,delete_doc}`, including `ensure_primary_activated`, `peer_recovery_write_guard`, `validated_primary_write_state`, and exact-operation certification. Base-model all-in-sync failure behavior is historical; D2 adds conditional exclusion. |
 | `ReplicaApply`, `DeliverReplicaAck` | `TransportService::{replicate_doc,replicate_bulk}` and `replication::{replicate_write,replicate_bulk}`. |
 | `ReplicaReject`, `DeliverReplicaNack` | Pre-WAL identity/fence rejection in the same replica handlers and propagation as a synchronous replication failure. |
 | `ProposeActivate`, `ObserveActivation`, `CancelActivation` | `TransportService::ensure_primary_activated`. |
@@ -321,11 +327,11 @@ liveness configurations use neither symmetry nor a state constraint.
 | `AllocateAfterLifecycle`, `ObserveAllocationAccepted`, `ObserveAllocationRejected` | `IndexMetadata::allocate_unassigned_replicas` and the allocator phase of the leader lifecycle loop. |
 | `ReportShardCopyFailure` | `open_local_assigned_shards`, `TransportService::fail_shard_copy`, `TransportClient::forward_fail_shard_copy`, and leader-side live in-sync promotion-candidate selection with checkpoint preference when the leader has observations. |
 | `CorruptShardStorage`, `BeginPersistentStorageFailure`, `RedetectPersistentStorageFailure`, `EscalatePersistentStorageFailure` | Definitive storage decoding/validation failure and bounded persistent local I/O escalation while opening a copy or reading/persisting fence/marker state, including retry-budget reset and redetection after restart. |
-| `BeginPersistentApplyFailure`, `PrimaryApplyFailure`, `ReplicaApplyFailure`, `EscalatePersistentApplyFailure` | `ShardManager::{ensure_local_apply_allowed,record_local_apply_result,apply_replica_operation}` around primary and replica WAL/fsync/engine mutation; failed operations do not acknowledge or mutate the modeled logical history. |
+| `BeginPersistentApplyFailure`, `PrimaryApplyFailure`, `ReplicaApplyFailure`, `EscalatePersistentApplyFailure` | Historical apply-I/O retry/escalation abstraction. Current WAL/post-WAL failures immediately close `CopyWriteState`; the retry-budget model is retained as a regression, not the current mutation contract. |
 | `RepairPersistentStorageFault` | Operator/storage repair after an accepted exact-allocation failure; repair remains possible if fresh allocation races ahead of the repair action. |
 | `S1TimedOutReplicationFails` | `TransportClient` request timeout plus `replication::replicate_write` error propagation for a required replica that is down, has restarted past the request epoch, or whose request/response was dropped. |
-| `D1HistoricalReplicaApply` | Current `ShardManager::apply_replica_operation`, `append_with_seq`, and `write_bulk_with_start_seq`: WAL and engine mutation follow replica arrival order. |
-| `D1FixedReplicaProcess`, `D1FixedReplicaRedelivery` | Proposed D1 apply planner shared by replica apply, recovery, and replay: retain history, skip stale document mutations, and acknowledge processed sequence redelivery without another WAL append. |
+| `D1HistoricalReplicaApply` | Historical arrival-order WAL and engine mutation. |
+| `D1FixedReplicaProcess`, `D1FixedReplicaRedelivery` | Current D1 apply planner shared by replica apply, recovery, and replay: retain history, skip stale document mutations, and acknowledge processed sequence redelivery without another WAL append. |
 | `D1CommitReplica`, `D1RestartReplica`, `D1FixedReplayApply` | Persisted processed-checkpoint boundary, crash/restart, and replay above that boundary through the same D1 planner. |
 | `D1PruneTombstone`, `D1TruncateToProcessedCheckpoint` | Tombstone pruning only at/below the processed checkpoint and WAL truncation no farther than the persisted processed/global boundary abstraction. |
 | `B1SeqOnlyNewWrite`, `B1TermAwareNewWrite`, `B1RecoverR2` | Seq-only redelivery collision versus newer-term collision fail-out and exact recovery before promotion. |
@@ -675,31 +681,37 @@ candidate to cover acknowledged operations. Its retained trace documents the
 availability-scope correction: existing available in-sync copies are always
 checked, while the promotion candidate is checked only after activation.
 
-## Proposed write acknowledgement and failure contract
+## Operation-based write acknowledgement and failure contract
 
-`MC_D2_WriteAck.tla` is a **selected design target, not current Rust behavior**.
-Current synchronous replica failure still fails the request. The new module
+`MC_D2_WriteAck.tla` models the operation-based acknowledgement policy now
+implemented by FS013. Its stable `Current` profile name denotes the
+**historical fail-request baseline**; `Proposed` remains the profile name for
+the selected policy. Neither name changes a historical verdict. The module
 reuses D1 client/WAL/planner/checkpoint transitions and the allocation-aware
-Raft relation; it does not weaken or replace the existing model or schema-v4
-trace validator.
+Raft relation. It does not model the durable exclusion journal, restart
+authority, byte-level WAL protection, or canonical history protocol.
 
-The target retains operation-based durability: every required copy proves this
+The runtime retains operation-based durability: every required copy proves this
 exact operation or is observed committed out of the captured set. A sparse
 processed/persisted set can prove an operation above a lower contiguous prefix.
-The future minimum is one by default, with an explicit floor of two; it never
-permits skipping another in-sync copy. Unresolved authority-scoped exclusion
+The configured minimum is one by default and cannot exceed primary-plus-replica
+capacity; these profiles check floors one and two. It never permits skipping
+another in-sync copy. Unresolved authority-scoped exclusion
 debt closes new admission and blocks already-admitted later acknowledgements.
 Stale-authority rejection and abstract post-WAL local failure revoke the local
 permit. Returned indeterminate outcomes are never retroactively successful.
+An unresolved synchronous replication failure remains a request failure:
+success requires positive exact-operation proofs plus observed, settled
+conditional exclusions, not a catch-and-ignore fallback.
 
 | Model action | Source boundary or selected target |
 | --- | --- |
 | `D2Accept`, `D2ReplicaStep`, `D2AckReply` | Reuse owning D1 admission, WAL/apply, and reply actions mapped above to primary transport handlers and `ShardManager::apply_replica_operation`. |
-| `D2ProposeRemoval`, `D2CommitRemoval`, `D2ObserveRemoval` | Future FS-013 exact-allocation, source-primary/term-conditioned exclusion and observed settlement. The existing Raft allocation CAS is reused; the added authority checks are model-only. |
-| `D2Acknowledge` | Future D2 success-after-exclusion certificate, not current `replicate_write`/`replicate_bulk` failure handling. |
-| `D2Deadline`, `D2InvalidPermitReply`, `D2LoseClientResponse` | Selected D2/D14 permit and deadline policy remains model-only. Current mutation transport implements [D4 outcome classes and known failure receipts](../../docs/adr/0001-write-consistency-and-retry-contract.md#d4-outcome-classes), including `write_outcome_unknown`. |
+| `D2ProposeRemoval`, `D2CommitRemoval`, `D2ObserveRemoval` | `submit_failed_copy_exclusion`, `ClusterCommand::ExcludeFailedShardCopies`, `settle_failed_copy_exclusion`, and `settle_copy_exclusions`: exact source authority, failed allocations, captured version, and transition ID. The D2 abstraction omits durable journaling. |
+| `D2Acknowledge` | `TransportService::{acknowledge_replicated_write,certify_replicated_write}` preserve positive partial proofs and require proof or settled exclusion for every captured copy, the configured floor, and a valid permit. |
+| `D2Deadline`, `D2InvalidPermitReply`, `D2LoseClientResponse` | Owned mutation workers and `WriteFailure` implement [D4 outcome classes and known failure receipts](../../docs/adr/0001-write-consistency-and-retry-contract.md#d4-outcome-classes), including `write_outcome_unknown`; a lost reply is not evidence that the operation was absent. |
 | `D2NotExecuted`, `D2RejectBeforeWal` | Reuse the pre-WAL input rejection frame, not a proof of an HTTP/OCC predicate. |
-| `D2PostWalFailure` | Future D14 immediate local permit invalidation; not current `record_local_apply_result` retry-budget escalation or byte-level I/O. |
+| `D2PostWalFailure` | `CopyWriteState::fail` shares the WAL failure cell with issued permits and blocks later mutation in the process. The model abstracts the failure, not torn bytes or fsync. |
 
 Run the new checks:
 
@@ -754,7 +766,7 @@ October 5, 2026 results, Java 25 and pinned TLA+ tools 1.7.4:
 
 | Runner | Result | Generated / distinct | Depth |
 | --- | --- | ---: | ---: |
-| `d2-current` | Current fail-request baseline passes | 24,047 / 6,077 | 19 |
+| `d2-current` | Historical fail-request baseline passes | 24,047 / 6,077 | 19 |
 | `d2-smoke-one` | One-write, one-copy floor passes | 6,382 / 3,024 | 17 |
 | `d2-smoke-two` | One-write, two-copy floor passes | 6,238 / 2,912 | 16 |
 | `d2-proposed-one` | Local two-write, one-copy floor passes | 4,751,001 / 1,524,280 | 25 |
@@ -802,8 +814,66 @@ unsafe alternatives. The model has no byte-level torn-write/fsync semantics,
 dynamic minimum setting, client retry token, allocation re-admission/ABA,
 restart debt reconstruction, general promotion inventory, or D10 rollback.
 Healthy data-copy proof is not metadata quorum, and a model-only primary
-authority guard is not evidence that Rust already has the corresponding
-permit/response machinery.
+authority guard alone is not implementation evidence. Current Rust transport,
+WAL, copy-identity, handler, and process regressions provide separate evidence.
+
+## Supplementary FS013 authority checks
+
+`MC_FS013_WriteAuthority.tla` isolates control safety across two data copies,
+two operation identities, two authority epochs, one crash/restart, one missing
+replica proof/intent, one post-WAL failure, and one metadata-quorum
+outage/restoration. Epochs one/two are relative names, not the runtime's initial
+term values. Both minimum-copy floors are checked without constraining
+activation or recovery by the write floor. There is no symmetry, state
+constraint, or liveness/fairness claim.
+
+The model separates a queued proposal, its committed conditional decision, and
+local observation. Durable debt survives restart. A newer committed term may
+settle an old impossible conditional, but a queued or globally accepted command
+alone cannot certify exclusion to the old request. An old rejection revokes
+only its captured epoch. Restart verifies protected history and requires a
+fresh committed reservation, seal, and ACTIVE authority before admission.
+Healthy all-copy acknowledgement has no metadata-quorum guard.
+
+| Model action | Current source boundary or abstraction |
+| --- | --- |
+| `FS013BeginWrite`, `FS013Ack` | `WriteAuthorityEpoch::permit`, owned primary mutation, and `certify_replicated_write`; the model uses operation IDs, not sequence-prefix durability. |
+| `FS013MissingProof`, `FS013Journal`, `FS013Propose` | `close_exclusion_admission`, `persist_failed_copy_exclusion`, and `submit_failed_copy_exclusion`, in that order. |
+| `FS013Commit`, `FS013ObserveCommit`, `FS013Settle` | Conditional `ExcludeFailedShardCopies`, observed settlement, and durable `settle_copy_exclusions`. |
+| `FS013Reserve`, `FS013Seal`, `FS013Finish`, `FS013InstallEpoch` | `canonical_primary_activation`, `ActivatePrimary`, canonical sealing, `FinishPrimaryActivation`, and `install_primary_epoch`. Seal abstracts successful verified resync while retaining protected primary operations. |
+| `FS013FailAfterWal`, `FS013Crash`, `FS013Restart`, `FS013VerifyProtected` | Shared immediate fail-stop, process loss, durable WAL/journal reopen, and protected-history verification. Verification is an assumption here, not a byte-decoder proof. |
+| `FS013ReplaceReplica` | Atomic abstraction of removal, fresh allocation, verified recovery, and admission; C1/runtime checks separately exercise the actual handshake. |
+
+```bash
+./scripts/tla/check.sh fs013-one fs013-two
+./scripts/tla/check.sh fs013-no-journal fs013-cached-restart fs013-cross-epoch
+./scripts/tla/check.sh fs013-restart-witness
+```
+
+October 14, 2026, Java 25 and pinned TLA+ tools 1.7.4, one worker per profile:
+
+| Runner | Result | Generated / distinct | Depth |
+| --- | --- | ---: | ---: |
+| `fs013-one` | All safety invariants pass, floor one | 122,629 / 51,450 | 24 |
+| `fs013-two` | All safety invariants pass, floor two | 107,129 / 43,200 | 23 |
+| `fs013-no-journal` | Retains `FS013JournalBeforeProposal` | 39 / 36 | 4 |
+| `fs013-cached-restart` | Retains `FS013FreshRestartAuthority` | 3,355 / 1,890 | 8 |
+| `fs013-cross-epoch` | Retains `FS013OldRejectionScoped` | 22,943 / 11,007 | 12 |
+| `fs013-restart-witness` | Durable intent and unknown operation survive restart; a later operation ACKs under fresh authority | 64,318 / 27,764 | 15 |
+
+Negative controls and the positive witness stop at their named violation, not
+an exhaustive completed graph. The witness keeps every safety invariant and
+violates only the negation of the requested recovery behavior. Reproduce and
+retain full traces with `TLA_LOG_DIR`; witness counts may vary with scheduling.
+No old model configuration or expected verdict is removed.
+
+This module does **not** prove full Raft, protected byte encoding, torn-write
+recovery, peer-window comparison, unique peer-operation adoption, general D10,
+async durability, dynamic setting changes, or progress under permanent faults.
+The separately emitted `ferrissearch.write-authority.trace/v1` witness covers
+real serialized canonical/journal/settlement/certification boundaries; it is
+checked by `check_write_authority_trace.py`, not the D1 schema-v4 TLC relation,
+and is not a global concurrent linearization proof.
 
 ## Empty-store and copy-failure rules
 
@@ -840,6 +910,12 @@ G2 models `FailShardCopy(node, allocation_id)` as a conditional Raft command:
   peer recovery installs and admits the replacement.
 
 ## Persistent storage failures
+
+**Historical mutation policy:** the S1 apply-I/O retry/escalation transitions
+below are retained regression models. Current Rust immediately fail-stops an
+uncertain WAL/post-WAL copy; repairing the filesystem cannot heal that open
+copy or revive an old permit. Ordinary assigned-open/fence/marker I/O still
+uses its bounded retry/reporting policy. These are different failure classes.
 
 `FaultMode = "S1"` adds three live-copy failure classes:
 
@@ -905,15 +981,11 @@ that action and retains a temporal counterexample as evidence for the modeling
 assumption, not as evidence of a Rust defect.
 
 Rust additionally records an exact-allocation, Raft-replicated
-`primary_unavailable` health flag when no live promotion candidate exists.
-That status-only flag is outside the safety state modeled here. Apply-level
-failure leaves the activated copy open and does not bypass the activation
-cache; the first later successful local write conditionally clears the flag at
-the same allocation and term through `MarkPrimaryAvailable`. Definitive or
-open-level failure quarantines the copy after report throttling, invalidates
-its local activation cache, and clears the flag only after repaired storage
-successfully completes a fresh `ActivatePrimary`. Neither path changes
-authority merely by changing health status.
+`primary_unavailable` flag when no live promotion candidate exists. That flag
+closes write admission as well as reporting health; it does not itself choose
+a new primary. A successful fresh canonical activation clears it. There is no
+same-term successful-write clearing path. Promotion invalidates the prior
+ACTIVE authority while preserving its committed history anchor for resync.
 
 ## Pending-target restart and observation
 
@@ -953,22 +1025,29 @@ The combined Rust implementation must follow the model variant as one protocol:
 3. Source session state, snapshot metadata, target install metadata, the
    durable awaiting-membership marker, `MarkReplicaInSync`, and its forwarded
    RPC retain the same allocation ID. Admission performs an exact comparison.
-4. `ReplicateDocRequest` and every bulk replica operation carry index UUID,
-   sender primary term, and target allocation ID. Missing fields fail closed;
-   zero/default substitution is not permitted.
+4. Live single/bulk replica requests carry exact current source authority,
+   canonical history, index UUID, and target allocation ID. The operation's
+   original primary term/sequence remain distinct from the current sending
+   authority, including when resending an idempotent operation after promotion.
+   Missing fields fail closed; zero/default substitution is not permitted.
 5. Before any WAL append or engine mutation, the replica resolves the local
    copy and validates, in order: index UUID, allocation ID, recovery gate, and
-   `message_term >= max(applied_view_term, durable_replica_fence)`.
+   current ACTIVE source authority/certificate, and current sending term
+   against the applied view and durable replica fence. Original operation term
+   is not a substitute for current authority.
 6. If an accepted message raises the fence, persist the new fence before
    acknowledging the operation. For bulk, validate the common identity/term
    before the first item mutates and persist the raised fence once for the
    accepted batch.
-7. When an applied routing view makes a copy primary, durably raise its fence
-   to the promoted term before activation completes and before the first
-   primary write is permitted.
+7. Every new primary incarnation reserves a higher-term PROMOTING authority,
+   verifies and seals canonical history with its durable fence, and observes
+   exact committed ACTIVE completion before installing a local write epoch.
+   A cached certificate alone cannot authorize writes after restart.
 8. Restart loads and validates the persisted index UUID, allocation ID, and
    fence before accepting replica traffic. Missing or malformed identity/fence
-   state on an existing authoritative copy fails closed.
+   state, checksum failure, or incompatible protected WAL on an existing
+   authoritative copy fails closed. Prepared local certificates do not advance
+   retention until their matching canonical certificate commits.
 9. Pending-target observation first admits the same allocation when it is in
    sync, or admits the target after promotion. Otherwise it rejects a missing
    or different allocation, a strictly newer applied term, or a different
@@ -979,26 +1058,35 @@ The combined Rust implementation must follow the model variant as one protocol:
     the marker's UUID and allocation match the durable copy and current
     assignment. A matching marker blocks `StartRecovery` and destructive
     target preparation until authoritative admission or rejection clears it.
-11. Any rejection is returned through the existing synchronous replication
-    failure path; it must not be converted into a successful item or request.
+11. Every captured required copy must prove the exact operation or have an
+    observed, settled source-authority-conditioned exclusion. Missing proof
+    closes admission synchronously; the durable intent precedes proposal.
+    Unknown settlement remains sticky and returns a failure with its known
+    receipt. A later positive result cannot retroactively change that response.
+    A stale rejection revokes only the old captured epoch.
 12. CreateIndex routing starts with `initialized = false`. Rust may create an
     empty copy only for the initial primary allocation before first activation;
     all initial replicas remain out of sync until recovery. The model's broader
     initial-copy action is a safety over-approximation of this Rust rule.
-13. `ActivatePrimary` carries and conditionally checks the primary allocation
-    ID. Its first successful application sets `initialized = true`
-    monotonically. A missing or mismatched primary copy cannot activate.
+13. `ActivatePrimary` checks exact primary allocation/term and reserves
+    PROMOTING authority with a log-derived activation ID while monotonically
+    marking the copy initialized.
+    `FinishPrimaryActivation` checks that exact reservation/canonical
+    certificate and grants ACTIVE; initialization alone never permits writes.
+    A missing, mismatched, or fail-stopped copy cannot activate.
 14. After initialization, a missing, malformed, or mismatched authoritative
     copy never creates an empty engine and never serves. A fresh out-of-sync
     replica is populated only by verified peer-recovery install.
 15. Corruption-class storage decode or validation failures are definitive.
     Persistent local filesystem/storage I/O at assigned open, durable-fence
-    persistence, recovery-marker access, and primary or replica
-    WAL/fsync/engine apply consumes a shared per-copy retry/backoff budget.
+    persistence, and recovery-marker access consumes a shared per-copy
+    retry/backoff budget.
     Validation, identity/term rejection, frame-limit rejection, and network or
-    transfer errors do not consume that local-storage budget. Apply failure
-    leaves the copy open but fails every affected mutation; success clears the
-    corresponding retry state. Exhausting the bounded count/time budget makes
+    transfer errors do not consume that local-storage budget. WAL append/sync,
+    identity publication, or uncertain post-WAL engine failure immediately
+    fail-stops the copy and all its permits; later filesystem repair or writer
+    reconstruction cannot heal it in process. Expected pre-WAL rejections do
+    not poison a healthy copy. Exhausting the ordinary open-I/O budget makes
     the exact copy reportable with index name, UUID, shard ID, node ID, and
     allocation ID. The underlying fault survives restart, while process-local
     counters reset and must be redetected before escalation recurs.
@@ -1011,22 +1099,24 @@ The combined Rust implementation must follow the model variant as one protocol:
     that the candidate is still in sync before promotion and term bump. Without
     a candidate, promote-only
     `FailShardCopy` is rejected and cannot clear the primary allocation or
-    change authority. Rust may separately commit the exact-allocation,
-    Raft-replicated `primary_unavailable` flag; it is status-only. An exact
-    same-term `MarkPrimaryAvailable` clears an Apply-level flag after a
-    successful local write, while successful fresh activation clears an
-    open-level flag. Both are intentionally outside this safety model.
+    change authority. Promotion removes the old ACTIVE grant while preserving
+    its committed history anchor. Rust may separately commit the
+    exact-allocation, Raft-replicated `primary_unavailable` flag, which closes
+    admission. Only successful fresh canonical activation clears it.
 17. Allocation after copy failure uses a fresh ID and requires a surviving
     allocated primary. The replacement remains out of sync until recovery
     installs matching durable identity and admission commits.
 18. Node lifecycle proactively invokes primary activation after startup or
     promotion whenever the node's applied view names it as primary and the
-    current incarnation has not activated that term. Pending-target progress
+    current incarnation lacks a usable installed epoch. This includes cached
+    ACTIVE metadata on clean restart. Pending-target progress
     must not depend on a later client write or recovery request.
 19. Synchronous replication to a required target has a bounded transport
     request. A down target, a target that restarted past the request epoch, or
-    a dropped request/response eventually produces a request failure; healthy
-    targets are assumed to respond before that timeout.
+    a dropped request/response eventually produces a missing proof. That is
+    a request failure unless exact observed exclusions settle and the remaining
+    operation proofs satisfy the configured floor. Healthy targets are assumed
+    to respond before that timeout.
 
 The model updates fence and accepted operation atomically. Rust may persist the
 fence immediately before the WAL mutation; a crash in between is conservative
@@ -1360,24 +1450,21 @@ well below the CI budget.
 - The persistent-I/O retry count, elapsed-time threshold, and backoff duration
   are abstracted as one nondeterministic escalation step; their concrete
   numeric policy is not verified here.
-- Apply-I/O failure is modeled as a failed logical mutation with no
-  acknowledged operation effect. Rust keeps an Apply-failed copy open, but an
-  operation that reached the WAL and then failed engine apply has an unknown
-  outcome. In production this failure means the Tantivy writer was killed; the
-  next commit fails, and rebuild or restart replay applies the operation on
-  this copy. On a primary, replicas never receive it, and peer recovery from
-  this copy can ship the retained entry to a new copy.
-  Resulting cross-copy divergence and partial or torn WAL-frame persistence
-  remain outside the model.
+- Historical S1 apply-I/O models have no acknowledged logical effect for a
+  failed mutation. Current Rust gives a WAL-reaching uncertain operation an
+  unknown outcome and immediately fail-stops its copy. Verified restart and
+  canonical resync, not same-process retry, recover authority. Byte-level
+  protected frames, fsync outcomes, peer inventory, and general cross-copy
+  divergence remain outside these models.
 - The Rust implementation assumes `translog.committed` never advances beyond
   operations made durable by a successful Tantivy commit. Any commit failure
   invalidates the writer; before the next write or blocking
-  maintenance/snapshot commit, writer reconstruction replays and commits the
+  maintenance/snapshot commit, an otherwise healthy writer reconstruction replays and commits the
   retained WAL suffix from the persisted checkpoint. Replay validates
   `_doc_id`/`_source`, applies deletes as deletes, and holds the translog lock
   for the whole suffix. The model represents those operations as durable
   atomically and does not model Tantivy worker/channel reconstruction or replay
-  latency.
+  latency. Reconstruction never clears a shared WAL/post-WAL fail-stop.
 - At source baseline `8f17172`, startup replay could resurrect an acknowledged
   delete and a transient Tantivy commit failure could lose later acknowledged
   writes. Both are Rust defects fixed by the current implementation; neither is
@@ -1385,18 +1472,21 @@ well below the CI budget.
 - The allocator may assign a replacement back to the same faulty node. Retry is
   bounded per attempt by recovery backoff and the storage escalation window;
   excluding a node after a configured number of failed allocations is deferred.
-- With the default 60-second storage escalation window, a persistently
-  write-failing in-sync replica can synchronously fail every write to its shard
-  for at least 60 seconds before exact-allocation removal.
+- The historical S1 retry-budget liveness traces retain the former delayed
+  apply-failure removal policy. They are not evidence for the current immediate
+  fail-stop and conditional-exclusion path or its latency.
 - The leader's checkpoint preference uses `nextSeq` as the observation
   abstraction when observations exist and nondeterministically explores equal
   values. The unranked live in-sync fallback, checkpoint transport freshness,
   and tie-breaking order are not modeled as distinct implementation states.
-- The Raft-recorded `primary_unavailable` health flag is omitted because it
-  changes status and repair signaling, not copy authority or routing.
+- The older data-path models omit `primary_unavailable`; current Rust closes
+  admission when it is set. FS013's usable-authority guard abstracts
+  availability without modeling that status command separately.
 - D1 exact quiescent convergence excludes histories with failed or otherwise
   unacknowledged primary-WAL operations. Cross-copy cleanup of those histories
-  requires ADR D10 resync, trimming, and no-op gap closure.
+  requires canonical resync, trimming, and no-op gap closure. FS013's runtime
+  implements bounded canonical adoption/resync, but the supplementary control
+  model assumes successful verified seal; it is not a general D10 proof.
 - Applied Raft views are monotonic. Loss of a node's durable `raft.db` followed
   by same-name rejoin is outside the model and requires separate identity and
   bootstrap handling.

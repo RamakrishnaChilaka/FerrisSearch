@@ -13,6 +13,8 @@ use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
+pub mod authority;
+
 pub const SCHEMA: &str = "ferrissearch.d1.trace/v4";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

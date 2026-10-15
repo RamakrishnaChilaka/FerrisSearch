@@ -3,8 +3,9 @@
 use anyhow::{Context, Result};
 use ferrissearch::cluster::manager::ClusterManager;
 use ferrissearch::cluster::state::{
-    DynamicMapping, FieldMapping, FieldType, IndexMetadata, IndexSettings, IndexUuid,
-    NodeInfo as DomainNodeInfo, NodeRole, ShardRoutingEntry,
+    CanonicalHistory, ClusterState, DynamicMapping, FieldMapping, FieldType, IndexMetadata,
+    IndexSettings, IndexUuid, NodeInfo as DomainNodeInfo, NodeRole, PrimaryAuthorityPhase,
+    ShardRoutingEntry, WriteAuthorityIdentity,
 };
 use ferrissearch::consensus::state_machine::ClusterStateMachine;
 use ferrissearch::consensus::types::{ClusterCommand, ClusterResponse};
@@ -17,11 +18,13 @@ use ferrissearch::shard::{PeerRecoveryTargetState, ShardManager};
 use ferrissearch::transport::TransportClient;
 use ferrissearch::transport::proto::internal_transport_client::InternalTransportClient;
 use ferrissearch::transport::proto::{
-    ShardBulkRequest, ShardDeleteRequest, ShardDocRequest, ShardGetRequest, WriteFailureOutcome,
+    ShardBulkRequest, ShardDeleteRequest, ShardDocRequest, ShardGetRequest, WriteFailureDetails,
+    WriteFailureOutcome,
 };
 use ferrissearch::transport::server::{
     TransportService, create_transport_service_for_test_with_handle,
 };
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -136,10 +139,71 @@ fn initial_cluster_state(
             ..IndexSettings::default()
         },
     });
+    install_legacy_fixture_authority(&mut state, 1)
+        .expect("initial empty D1 fixture authority must be valid");
     state
 }
 
-fn install_empty_replica(
+// These no-Raft D1 fixtures supply only an identity anchor. They intentionally
+// exercise the older data relation, not canonical inventory/resync or FS013.
+fn install_legacy_fixture_authority(state: &mut ClusterState, activation_id: u64) -> Result<()> {
+    let metadata = &state.indices[INDEX];
+    let routing = &metadata.shard_routing[&SHARD];
+    let allocations = state
+        .shard_allocations
+        .get_mut(INDEX)
+        .and_then(|shards| shards.get_mut(&SHARD))
+        .context("legacy D1 fixture allocations are missing")?;
+    let authority = WriteAuthorityIdentity {
+        index_uuid: metadata.uuid.to_string(),
+        shard_id: SHARD,
+        primary_node_id: routing.primary.clone(),
+        primary_allocation_id: allocations
+            .primary
+            .context("primary allocation is missing")?,
+        primary_term: routing.primary_term,
+        activation_id,
+    };
+    let previous = allocations.primary_authority.history.as_ref();
+    anyhow::ensure!(
+        previous.is_none_or(|history| {
+            history.max_seq_no.is_none()
+                && history.primary_term < authority.primary_term
+                && history.activation_id < authority.activation_id
+        }),
+        "legacy D1 fixture must not replace a protected nonempty history"
+    );
+    let mut digest = Sha256::new();
+    digest.update(b"ferrissearch-canonical-history-v1\0");
+    digest.update(serde_json::to_vec(&authority)?);
+    digest.update(serde_json::to_vec(&previous)?);
+    allocations.primary_initialized = true;
+    allocations.primary_authority.finish(CanonicalHistory {
+        activation_id,
+        primary_term: authority.primary_term,
+        max_seq_no: None,
+        digest: digest.finalize().into(),
+    });
+    state.version += 1;
+    Ok(())
+}
+
+fn finish_legacy_fixture_activation(state_machine: &ClusterStateMachine) -> Result<ClusterState> {
+    let handle = state_machine.state_handle();
+    let mut state = handle.write().unwrap();
+    let authority = &state.shard_allocations[INDEX][&SHARD].primary_authority;
+    anyhow::ensure!(
+        authority.phase == PrimaryAuthorityPhase::Promoting,
+        "legacy D1 activation must follow its explicit reservation"
+    );
+    let activation_id = authority
+        .activation_id
+        .context("activation ID is missing")?;
+    install_legacy_fixture_authority(&mut state, activation_id)?;
+    Ok(state.clone())
+}
+
+fn install_empty_trace_copy(
     cluster_manager: &ClusterManager,
     shard_manager: &ShardManager,
 ) -> Result<()> {
@@ -155,6 +219,68 @@ fn install_empty_replica(
         &metadata.settings,
         metadata.uuid.as_str(),
     )?;
+    let allocations = &state.shard_allocations[INDEX][&SHARD];
+    let history = allocations.primary_authority.history.as_ref().unwrap();
+    shard_manager.persist_copy_canonical_history(
+        INDEX,
+        1,
+        &WriteAuthorityIdentity {
+            index_uuid: metadata.uuid.to_string(),
+            shard_id: SHARD,
+            primary_node_id: metadata.shard_routing[&SHARD].primary.clone(),
+            primary_allocation_id: allocations.primary.unwrap(),
+            primary_term: metadata.shard_routing[&SHARD].primary_term,
+            activation_id: history.activation_id,
+        },
+        history,
+    )?;
+    Ok(())
+}
+
+async fn prepare_legacy_fixture_copies(
+    copies: &[(&ClusterManager, &Arc<ShardManager>, &str)],
+) -> Result<()> {
+    for (manager, shards, node) in copies {
+        let state = manager.get_state();
+        let metadata = &state.indices[INDEX];
+        let routing = &metadata.shard_routing[&SHARD];
+        if (routing.primary != *node && !routing.is_replica_in_sync(node))
+            || shards.get_shard(INDEX, SHARD).is_none()
+        {
+            continue;
+        }
+        let allocation = state
+            .shard_allocation_id(INDEX, SHARD, node)
+            .context("open legacy fixture allocation is missing")?;
+        let allocations = &state.shard_allocations[INDEX][&SHARD];
+        let history = allocations
+            .primary_authority
+            .history
+            .as_ref()
+            .context("legacy fixture certificate is missing")?;
+        shards
+            .raise_copy_fence_blocking(
+                INDEX.to_string(),
+                SHARD,
+                metadata.uuid.to_string(),
+                allocation,
+                routing.primary_term,
+            )
+            .await?;
+        shards.persist_copy_canonical_history(
+            INDEX,
+            allocation,
+            &WriteAuthorityIdentity {
+                index_uuid: metadata.uuid.to_string(),
+                shard_id: SHARD,
+                primary_node_id: routing.primary.clone(),
+                primary_allocation_id: allocations.primary.unwrap(),
+                primary_term: routing.primary_term,
+                activation_id: history.activation_id,
+            },
+            history,
+        )?;
+    }
     Ok(())
 }
 
@@ -890,9 +1016,9 @@ impl RandomTraceCluster {
         for node in nodes.values() {
             node.cluster_manager.update_state(initial.clone());
         }
-        for node_id in ["q", "r"] {
+        for node_id in ["p", "q", "r"] {
             let node = &nodes[node_id];
-            install_empty_replica(&node.cluster_manager, &node.shard_manager)?;
+            install_empty_trace_copy(&node.cluster_manager, &node.shard_manager)?;
         }
         nodes["p"]
             .running
@@ -969,9 +1095,29 @@ impl RandomTraceCluster {
                 .apply_command_for_protocol_trace_test(&command, log_index),
             action,
         )?;
-        let state = self.authoritative_state();
+        let state = if matches!(command, ClusterCommand::ActivatePrimary { .. }) {
+            finish_legacy_fixture_activation(&self.state_machine)?
+        } else {
+            self.authoritative_state()
+        };
         self.publish_state(&state);
         Ok((state, log_index))
+    }
+
+    async fn prepare_fixture_authority(&self) -> Result<()> {
+        let copies = self
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.running.is_some())
+            .map(|(id, node)| {
+                (
+                    node.cluster_manager.as_ref(),
+                    &node.shard_manager,
+                    id.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        prepare_legacy_fixture_copies(&copies).await
     }
 
     fn record_initial_routing_views(&self) -> Result<()> {
@@ -1102,6 +1248,7 @@ impl RandomTraceCluster {
             self.current_primary = "q".to_string();
         }
 
+        self.prepare_fixture_authority().await?;
         self.service("q")?
             .protocol_trace_activate_primary_for_test(INDEX, SHARD)
             .await
@@ -1257,6 +1404,8 @@ struct ExecutedRequest {
     success: bool,
     error: String,
     start_seq_no: Option<u64>,
+    primary_term: Option<u64>,
+    failure: Option<WriteFailureDetails>,
     sequence_count: u64,
     acknowledged: Vec<AckedMutation>,
 }
@@ -1274,6 +1423,8 @@ async fn execute_planned_request(
                 success: response.success,
                 error: response.error,
                 start_seq_no: response.seq_no,
+                primary_term: response.primary_term,
+                failure: response.failure,
                 sequence_count,
                 acknowledged: response
                     .success
@@ -1304,6 +1455,8 @@ async fn execute_planned_request(
                 success: response.success,
                 error: response.error,
                 start_seq_no: response.seq_no,
+                primary_term: response.primary_term,
+                failure: response.failure,
                 sequence_count,
                 acknowledged: response
                     .success
@@ -1358,6 +1511,8 @@ async fn execute_planned_request(
                 success: response.success,
                 error: response.error,
                 start_seq_no: response.start_seq_no,
+                primary_term: response.primary_term,
+                failure: response.failure,
                 sequence_count,
                 acknowledged,
             })
@@ -1411,6 +1566,11 @@ fn collect_executed_requests(
             .start_seq_no
             .with_context(|| format!("request {} has no sequence", request.ordinal))?;
         if request.success {
+            anyhow::ensure!(
+                request.failure.is_none(),
+                "acknowledged request {} carries failure details",
+                request.ordinal
+            );
             acknowledged.extend(request.acknowledged.iter().cloned());
             continue;
         }
@@ -1427,8 +1587,25 @@ fn collect_executed_requests(
             start_seq_no,
             request.error
         );
+        let failure = request
+            .failure
+            .as_ref()
+            .with_context(|| format!("failed request {} has no typed outcome", request.ordinal))?;
         anyhow::ensure!(
-            request.error.starts_with("Replication failed:"),
+            failure.outcome == WriteFailureOutcome::Indeterminate as i32
+                && failure.status == 500
+                && failure.error_type == "write_outcome_unknown"
+                && failure.reason == request.error
+                && failure.seq_no == request.start_seq_no
+                && failure.primary_term == request.primary_term
+                && failure.primary_term.is_some_and(|term| term > 0)
+                && (if request.sequence_count > 1 {
+                    failure.last_seq_no == Some(end_seq_no - 1)
+                } else {
+                    failure.last_seq_no.is_none() || failure.last_seq_no == Some(start_seq_no)
+                })
+                && failure.reason.contains("replica failures:")
+                && failure.reason.contains("injected trace "),
             "request {} failed outside replication: {}",
             request.ordinal,
             request.error
@@ -1896,8 +2073,9 @@ async fn seeded_three_node_fault_trace() -> Result<()> {
     for manager in [&p_cm, &q_cm, &r_cm] {
         manager.update_state(initial.clone());
     }
-    install_empty_replica(&q_cm, &q_sm)?;
-    install_empty_replica(&r_cm, &r_sm)?;
+    install_empty_trace_copy(&p_cm, &p_sm)?;
+    install_empty_trace_copy(&q_cm, &q_sm)?;
+    install_empty_trace_copy(&r_cm, &r_sm)?;
     p.service
         .protocol_trace_activate_primary_for_test(INDEX, SHARD)
         .await
@@ -2105,11 +2283,12 @@ async fn seeded_three_node_fault_trace() -> Result<()> {
             ),
             "primary activation",
         )?;
-        let activated = current_authoritative_state(&state_machine);
+        let activated = finish_legacy_fixture_activation(&state_machine)?;
         q_cm.update_state(activated.clone());
         r_cm.update_state(activated);
     }
 
+    prepare_legacy_fixture_copies(&[(&q_cm, &q_sm, "q"), (&r_cm, &r_sm, "r")]).await?;
     {
         let _operation = operation_gate.read().await;
         q.service
@@ -2215,10 +2394,11 @@ async fn seeded_three_node_fault_trace() -> Result<()> {
             ),
             "post-restart primary activation",
         )?;
-        let reactivated = current_authoritative_state(&state_machine);
+        let reactivated = finish_legacy_fixture_activation(&state_machine)?;
         q_cm.update_state(reactivated.clone());
         r_cm.update_state(reactivated);
     }
+    prepare_legacy_fixture_copies(&[(&q_cm, &q_sm, "q"), (&r_cm, &r_sm, "r")]).await?;
     {
         let _operation = operation_gate.read().await;
         q.service
@@ -2361,6 +2541,7 @@ async fn promotion_noop_retry_emits_every_transport_attempt() -> Result<()> {
             cluster.current_primary = "q".to_string();
         }
 
+        cluster.prepare_fixture_authority().await?;
         let service = cluster.service("q")?;
         for (expected_pending, expected_checkpoint) in [(true, Some(0)), (false, Some(2))] {
             let _operation = cluster.operation_gate.read().await;
@@ -2492,8 +2673,9 @@ async fn delayed_old_primary_replication_is_rejected_after_promotion() -> Result
     for manager in [&p_cm, &q_cm, &r_cm] {
         manager.update_state(initial.clone());
     }
-    install_empty_replica(&q_cm, &q_sm)?;
-    install_empty_replica(&r_cm, &r_sm)?;
+    install_empty_trace_copy(&p_cm, &p_sm)?;
+    install_empty_trace_copy(&q_cm, &q_sm)?;
+    install_empty_trace_copy(&r_cm, &r_sm)?;
     p.service
         .protocol_trace_activate_primary_for_test(INDEX, SHARD)
         .await
@@ -2595,10 +2777,11 @@ async fn delayed_old_primary_replication_is_rejected_after_promotion() -> Result
         ),
         "primary activation",
     )?;
-    let activated = current_authoritative_state(&state_machine);
+    let activated = finish_legacy_fixture_activation(&state_machine)?;
     for manager in [&p_cm, &q_cm, &r_cm] {
         manager.update_state(activated.clone());
     }
+    prepare_legacy_fixture_copies(&[(&q_cm, &q_sm, "q"), (&r_cm, &r_sm, "r")]).await?;
     q.service
         .protocol_trace_activate_primary_for_test(INDEX, SHARD)
         .await
@@ -2614,10 +2797,22 @@ async fn delayed_old_primary_replication_is_rejected_after_promotion() -> Result
     assert_eq!(stale_response.seq_no, Some(0));
     assert_eq!(stale_response.primary_term, Some(1));
     assert!(
-        stale_response.error.contains("Replication failed"),
+        stale_response.error.contains("q:")
+            && stale_response.error.contains("r:")
+            && stale_response
+                .error
+                .contains("write authority no longer matches"),
         "unexpected stale-primary response: {}",
         stale_response.error
     );
+    let failure = stale_response.failure.as_ref().unwrap();
+    assert_eq!(failure.outcome, WriteFailureOutcome::Indeterminate as i32);
+    assert_eq!(failure.status, 500);
+    assert_eq!(failure.error_type, "write_outcome_unknown");
+    assert_eq!(failure.seq_no, stale_response.seq_no);
+    assert_eq!(failure.primary_term, stale_response.primary_term);
+    assert_eq!(failure.reason, stale_response.error);
+    assert!(stale_response.write_acknowledgement.is_none());
 
     for (node, manager) in [("q", &q_sm), ("r", &r_sm)] {
         let snapshot = manager.capture_protocol_trace_copy_state(INDEX, SHARD)?;
@@ -2649,7 +2844,7 @@ async fn delayed_old_primary_replication_is_rejected_after_promotion() -> Result
         .filter(|event| {
             event["event"] == "replica_rejected"
                 && event["term"] == 1
-                && event["reason"] == "term_fence"
+                && event["reason"] == "identity_mismatch"
         })
         .filter_map(|event| event["node"].as_str())
         .collect::<BTreeSet<_>>();
@@ -2697,8 +2892,9 @@ async fn one_replica_apply_failure_is_indeterminate_without_local_mutation() -> 
     for manager in [&p_cm, &q_cm, &r_cm] {
         manager.update_state(initial.clone());
     }
-    install_empty_replica(&q_cm, &q_sm)?;
-    install_empty_replica(&r_cm, &r_sm)?;
+    install_empty_trace_copy(&p_cm, &p_sm)?;
+    install_empty_trace_copy(&q_cm, &q_sm)?;
+    install_empty_trace_copy(&r_cm, &r_sm)?;
     p.service
         .protocol_trace_activate_primary_for_test(INDEX, SHARD)
         .await

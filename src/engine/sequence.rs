@@ -82,6 +82,11 @@ impl LocalCheckpointTracker {
         self.advance_persisted_checkpoint();
     }
 
+    pub(crate) fn mark_all_processed_persisted(&mut self) {
+        self.persisted_checkpoint = self.processed_checkpoint;
+        self.persisted_above = self.processed_above.clone();
+    }
+
     pub(crate) fn advance_max_seq_no(&mut self, seq_no: u64) {
         self.max_seq_no = Some(
             self.max_seq_no

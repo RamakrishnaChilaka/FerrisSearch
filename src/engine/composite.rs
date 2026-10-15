@@ -82,35 +82,10 @@ impl CompositeEngine {
             durability,
             column_cache.clone(),
         )?;
-        let has_vector_mappings = mappings.values().any(|mapping| {
-            matches!(
-                mapping.field_type,
-                crate::cluster::state::FieldType::KnnVector
-            )
-        });
-
-        // Load existing vector index if present.
-        let vector_path = data_dir.join(VECTOR_INDEX_FILE);
-        let vector = if vector_path.exists() {
-            // We don't know the dimensions yet — we'll discover on first vector field.
-            // For now, skip loading; rebuild_vectors will handle it.
-            None
-        } else {
-            None
-        };
-
-        Ok(Self {
-            text,
-            vector: RwLock::new(vector),
-            data_dir,
-            global_cp: Mutex::new(None),
-            replica_persisted_cp: Mutex::new(None),
-            vector_recovery: Mutex::new(()),
-            has_vector_mappings,
-            column_cache,
-        })
+        Ok(Self::from_text(data_dir, text, mappings, column_cache))
     }
 
+    #[cfg(test)]
     pub(crate) fn open_existing_with_mappings(
         data_dir: impl AsRef<Path>,
         refresh_interval: Duration,
@@ -126,6 +101,37 @@ impl CompositeEngine {
             durability,
             column_cache.clone(),
         )?;
+        Ok(Self::from_text(data_dir, text, mappings, column_cache))
+    }
+
+    pub(crate) fn open_with_copy_state(
+        data_dir: impl AsRef<Path>,
+        refresh_interval: Duration,
+        mappings: &std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
+        durability: TranslogDurability,
+        column_cache: Arc<super::column_cache::ColumnCache>,
+        write_state: Arc<super::write_authority::CopyWriteState>,
+        existing_only: bool,
+    ) -> Result<Self> {
+        let data_dir = data_dir.as_ref().to_path_buf();
+        let text = HotEngine::open_with_copy_state(
+            &data_dir,
+            refresh_interval,
+            mappings,
+            durability,
+            column_cache.clone(),
+            write_state,
+            existing_only,
+        )?;
+        Ok(Self::from_text(data_dir, text, mappings, column_cache))
+    }
+
+    fn from_text(
+        data_dir: std::path::PathBuf,
+        text: HotEngine,
+        mappings: &std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
+        column_cache: Arc<super::column_cache::ColumnCache>,
+    ) -> Self {
         let has_vector_mappings = mappings.values().any(|mapping| {
             matches!(
                 mapping.field_type,
@@ -133,7 +139,7 @@ impl CompositeEngine {
             )
         });
 
-        Ok(Self {
+        Self {
             text,
             vector: RwLock::new(None),
             data_dir,
@@ -142,7 +148,7 @@ impl CompositeEngine {
             vector_recovery: Mutex::new(()),
             has_vector_mappings,
             column_cache,
-        })
+        }
     }
 
     /// Get a reference to the underlying HotEngine (for refresh loop).
@@ -272,7 +278,7 @@ impl CompositeEngine {
             return Ok(false);
         }
 
-        let Some(truncation_checkpoint) = self.safe_truncation_checkpoint() else {
+        let Some(truncation_checkpoint) = self.safe_truncation_checkpoint()? else {
             tracing::debug!(
                 "Skipping auto-flush with translog size {} bytes because no safe truncation checkpoint is available",
                 tl_size
@@ -322,13 +328,23 @@ impl CompositeEngine {
         *current = Some(current.map_or(checkpoint, |value| value.max(checkpoint)));
     }
 
-    fn safe_truncation_checkpoint(&self) -> Option<u64> {
-        self.global_checkpoint().or_else(|| {
+    fn safe_truncation_checkpoint(&self) -> Result<Option<u64>> {
+        let copy = self.text.copy_write_state();
+        if copy.enforces_primary_authority() {
+            return Ok(self
+                .global_checkpoint()
+                .zip(
+                    copy.canonical_history()?
+                        .and_then(|history| history.max_seq_no),
+                )
+                .map(|(global, canonical)| global.min(canonical)));
+        }
+        Ok(self.global_checkpoint().or_else(|| {
             *self
                 .replica_persisted_cp
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-        })
+        }))
     }
 
     fn vector_index_path(&self) -> std::path::PathBuf {
@@ -455,6 +471,26 @@ impl CompositeEngine {
                 }
             }
         }
+    }
+
+    fn run_primary_mutation<T>(
+        &self,
+        primary_term: u64,
+        operation: impl FnOnce(&mut super::write_failure::WriteMutationState) -> Result<T>,
+    ) -> Result<T> {
+        let result = super::write_failure::WriteMutationState::run(primary_term, |mutation| {
+            self.ensure_write_health()?;
+            operation(mutation)
+        });
+        if let Err(error) = &result {
+            let attempted = error
+                .downcast_ref::<super::write_failure::WriteMutationError>()
+                .is_some_and(|error| error.mutation.wal_attempted);
+            if attempted || !super::write_failure::is_expected_pre_wal_rejection(error) {
+                self.fail_stop_writes(&format!("primary mutation failed: {error:#}"));
+            }
+        }
+        result
     }
 
     /// Ensure a vector index exists with the given dimensions.
@@ -744,6 +780,18 @@ impl CompositeEngine {
 }
 
 impl SearchEngine for CompositeEngine {
+    fn copy_write_state(&self) -> Arc<super::write_authority::CopyWriteState> {
+        self.text.copy_write_state()
+    }
+
+    fn write_failure_reason(&self) -> Option<String> {
+        self.text.write_failure_reason()
+    }
+
+    fn fail_stop_writes(&self, reason: &str) {
+        self.text.fail_stop_writes(reason);
+    }
+
     #[cfg(test)]
     fn inject_wal_write_failures_for_test(&self, raw_os_error: i32, attempts: usize) {
         self.text
@@ -760,6 +808,11 @@ impl SearchEngine for CompositeEngine {
     fn inject_engine_apply_failures_for_test(&self, raw_os_error: i32, attempts: usize) {
         self.text
             .inject_engine_apply_failures_for_test(raw_os_error, attempts);
+    }
+
+    #[cfg(test)]
+    fn inject_refresh_commit_failures_for_test(&self, attempts: usize) {
+        self.text.inject_refresh_commit_failures_for_test(attempts);
     }
 
     #[cfg(test)]
@@ -794,7 +847,7 @@ impl SearchEngine for CompositeEngine {
         primary_term: u64,
         condition: super::WriteCondition,
     ) -> Result<super::IndexWriteReceipt> {
-        super::write_failure::WriteMutationState::run(primary_term, |mutation| {
+        self.run_primary_mutation(primary_term, |mutation| {
             crate::common::validate_document_source(&payload)?;
             let _vector_recovery = self
                 .vector_recovery
@@ -843,7 +896,7 @@ impl SearchEngine for CompositeEngine {
         condition: super::WriteCondition,
         client_operation: Option<super::ClientOperationIntent>,
     ) -> Result<super::IndexWriteReceipt> {
-        super::write_failure::WriteMutationState::run(primary_term, |mutation| {
+        self.run_primary_mutation(primary_term, |mutation| {
             crate::common::validate_document_source(&payload)?;
             let _vector_recovery = self
                 .vector_recovery
@@ -851,14 +904,22 @@ impl SearchEngine for CompositeEngine {
                 .unwrap_or_else(|error| error.into_inner());
             let prepared = self.prepare_vector_mutation(&payload)?;
             let rebuild_vectors = self.prepare_vector_rebuild(false)?;
-            let receipt = self.text.add_primary_index_with_operation_and_side_effect(
+            let receipt = match self.text.add_primary_index_with_operation_and_side_effect(
                 doc_id,
                 payload,
                 primary_term,
                 condition,
                 client_operation,
                 |operation| self.apply_prepared_vector_mutation(operation, &prepared),
-            )?;
+            ) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    return Err(self.record_vector_staleness_after_text_failure(
+                        "primary document indexing",
+                        error,
+                    ));
+                }
+            };
             mutation.wal_attempted = !receipt.deduplicated;
             mutation.seq_no = Some(receipt.seq_no);
             if rebuild_vectors {
@@ -883,7 +944,7 @@ impl SearchEngine for CompositeEngine {
         docs: Vec<(String, serde_json::Value)>,
         primary_term: u64,
     ) -> Result<super::BulkWriteReceipt> {
-        super::write_failure::WriteMutationState::run(primary_term, |mutation| {
+        self.run_primary_mutation(primary_term, |mutation| {
             for (_, payload) in &docs {
                 crate::common::validate_document_source(payload)?;
             }
@@ -959,7 +1020,17 @@ impl SearchEngine for CompositeEngine {
         primary_term: u64,
         condition: super::WriteCondition,
     ) -> Result<super::DeleteWriteReceipt> {
-        super::write_failure::WriteMutationState::run(primary_term, |mutation| {
+        self.delete_document_with_operation_at_term(doc_id, primary_term, condition, None)
+    }
+
+    fn delete_document_with_operation_at_term(
+        &self,
+        doc_id: &str,
+        primary_term: u64,
+        condition: super::WriteCondition,
+        client_operation: Option<super::ClientOperationIntent>,
+    ) -> Result<super::DeleteWriteReceipt> {
+        self.run_primary_mutation(primary_term, |mutation| {
             let _vector_recovery = self
                 .vector_recovery
                 .lock()
@@ -969,7 +1040,7 @@ impl SearchEngine for CompositeEngine {
                 doc_id,
                 primary_term,
                 condition,
-                None,
+                client_operation,
                 |operation| {
                     self.apply_prepared_vector_mutation(operation, &PreparedVectorMutation::Delete)
                 },
@@ -982,41 +1053,23 @@ impl SearchEngine for CompositeEngine {
                     ));
                 }
             };
-            mutation.wal_attempted = true;
+            mutation.wal_attempted = !receipt.deduplicated;
             mutation.seq_no = Some(receipt.seq_no);
             if rebuild_vectors {
                 self.rebuild_vectors_locked()?;
-                self.apply_vector_mutation_after_rebuild(
-                    WalOperation::Delete,
-                    Some(doc_id),
-                    receipt.seq_no,
-                    receipt.primary_term,
-                    &PreparedVectorMutation::Delete,
-                )?;
+                if !receipt.deduplicated {
+                    self.apply_vector_mutation_after_rebuild(
+                        WalOperation::Delete,
+                        Some(doc_id),
+                        receipt.seq_no,
+                        receipt.primary_term,
+                        &PreparedVectorMutation::Delete,
+                    )?;
+                }
             }
             self.update_local_checkpoint(receipt.seq_no);
             Ok(receipt)
         })
-    }
-
-    fn delete_document_with_operation_at_term(
-        &self,
-        doc_id: &str,
-        primary_term: u64,
-        condition: super::WriteCondition,
-        client_operation: Option<super::ClientOperationIntent>,
-    ) -> Result<super::DeleteWriteReceipt> {
-        let receipt = self.text.delete_primary_with_operation_and_side_effect(
-            doc_id,
-            primary_term,
-            condition,
-            client_operation,
-            |operation| {
-                self.apply_prepared_vector_mutation(operation, &PreparedVectorMutation::Delete)
-            },
-        )?;
-        self.update_local_checkpoint(receipt.seq_no);
-        Ok(receipt)
     }
 
     fn record_client_noop_at_term(
@@ -1027,15 +1080,17 @@ impl SearchEngine for CompositeEngine {
         result_primary_term: u64,
         version: u64,
     ) -> Result<super::ClientNoOpWriteReceipt> {
-        let receipt = self.text.record_primary_client_noop(
-            primary_term,
-            client_operation,
-            seq_no,
-            result_primary_term,
-            version,
-        )?;
-        self.update_local_checkpoint(receipt.operation_seq_no);
-        Ok(receipt)
+        self.run_primary_mutation(primary_term, |_| {
+            let receipt = self.text.record_primary_client_noop(
+                primary_term,
+                client_operation,
+                seq_no,
+                result_primary_term,
+                version,
+            )?;
+            self.update_local_checkpoint(receipt.operation_seq_no);
+            Ok(receipt)
+        })
     }
 
     fn apply_replica_operation(
@@ -1209,6 +1264,9 @@ impl SearchEngine for CompositeEngine {
     }
 
     fn flush(&self) -> Result<()> {
+        if self.text.copy_write_state().enforces_primary_authority() {
+            return self.flush_with_global_checkpoint();
+        }
         let _vector_recovery = self
             .vector_recovery
             .lock()
@@ -1230,7 +1288,7 @@ impl SearchEngine for CompositeEngine {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let rebuild_vectors = self.prepare_vector_rebuild(false)?;
-        let result = if let Some(truncation_checkpoint) = self.safe_truncation_checkpoint() {
+        let result = if let Some(truncation_checkpoint) = self.safe_truncation_checkpoint()? {
             self.text
                 .flush_with_global_checkpoint(truncation_checkpoint)
         } else {
@@ -1559,6 +1617,56 @@ impl SearchEngine for CompositeEngine {
             self.rebuild_vectors_locked()?;
         }
         Ok(operations)
+    }
+
+    fn retained_client_operation(
+        &self,
+        seq_no: u64,
+        primary_term: u64,
+        record: &super::ClientOperationRecord,
+    ) -> Result<super::SequencedOperation> {
+        self.text
+            .retained_client_operation(seq_no, primary_term, record)
+    }
+
+    fn freeze_canonical_history(&self) -> Result<super::canonical::FrozenEngineHistory> {
+        let _vector_recovery = self
+            .vector_recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.prepare_vector_rebuild(true)?;
+        let frozen = self.text.freeze_canonical_history()?;
+        self.rebuild_vectors_locked()?;
+        Ok(frozen)
+    }
+
+    fn canonical_inventory(
+        &self,
+        end_cursor: crate::wal::WalCursor,
+        start_seq_no: u64,
+        end_seq_no: u64,
+    ) -> Result<super::canonical::HistoryInventory> {
+        self.text
+            .canonical_inventory(end_cursor, start_seq_no, end_seq_no)
+    }
+
+    fn canonical_operation_at(
+        &self,
+        cursor: crate::wal::WalCursor,
+        end_cursor: crate::wal::WalCursor,
+    ) -> Result<super::SequencedOperation> {
+        self.text.canonical_operation_at(cursor, end_cursor)
+    }
+
+    fn append_canonical_operations(
+        &self,
+        operations: &[super::SequencedOperation],
+    ) -> Result<super::ReplicaBulkApplyReceipt> {
+        self.text.validate_canonical_append(operations)?;
+        let mut receipt = self.apply_replica_batch(operations.to_vec())?;
+        receipt.sequence = self.text.seal_processed_history()?;
+        receipt.all_operations_persisted = receipt.all_operations_processed;
+        Ok(receipt)
     }
 
     fn peer_recovery_commit_files(&self) -> Result<Vec<String>> {
@@ -2335,7 +2443,7 @@ mod tests {
     }
 
     #[test]
-    fn vector_rebuild_gapped_replica_writer_failure_recovers_applied_vectors() {
+    fn vector_rebuild_gapped_replica_writer_failure_requires_verified_restart() {
         let directory = tempfile::tempdir().unwrap();
         let engine = vector_engine(directory.path());
         for (seq_no, doc_id) in [(0, "a"), (2, "c")] {
@@ -2350,6 +2458,14 @@ mod tests {
                 .is_err()
         );
         assert!(engine.vectors_are_stale().unwrap());
+        assert!(
+            engine
+                .apply_replica_operation(gapped_vector_operation(4, "e"))
+                .is_err()
+        );
+        assert_eq!(engine.sequence_stats().max_seq_no, Some(3));
+        drop(engine);
+        let engine = vector_engine(directory.path());
         engine
             .apply_replica_operation(gapped_vector_operation(4, "e"))
             .unwrap();
@@ -2520,6 +2636,10 @@ mod tests {
             Some(5)
         );
         assert!(engine.vectors_are_stale().unwrap());
+        assert!(engine.refresh().is_err());
+        assert_eq!(engine.sequence_stats().max_seq_no, Some(1));
+        drop(engine);
+        let engine = vector_engine(directory.path());
         engine.refresh().unwrap();
         let document = engine
             .get_document_with_metadata("doc", true)
@@ -2546,8 +2666,17 @@ mod tests {
                 .is_err()
         );
         between(&engine);
+        assert!(
+            engine
+                .add_document_with_receipt_at_term("trigger", json!({"emb": [0.0, 0.0, 1.0]}), 1,)
+                .is_err()
+        );
+        assert_eq!(engine.sequence_stats().max_seq_no, Some(1));
+        drop(engine);
+        let engine = vector_engine(dir.path());
+        engine.prepare_primary_activation(2).unwrap();
         engine
-            .add_document_with_receipt_at_term("trigger", json!({"emb": [0.0, 0.0, 1.0]}), 1)
+            .add_document_with_receipt_at_term("trigger", json!({"emb": [0.0, 0.0, 1.0]}), 2)
             .unwrap();
 
         let vector_version = engine
@@ -2562,18 +2691,18 @@ mod tests {
     }
 
     #[test]
-    fn refresh_rebuild_recovers_vector_state_before_next_write() {
+    fn refresh_cannot_heal_fail_stopped_vectors_without_verified_restart() {
         let (vector_version, source) =
-            vector_state_after_failed_write(|engine| engine.refresh().unwrap());
+            vector_state_after_failed_write(|engine| assert!(engine.refresh().is_err()));
 
         assert_eq!(vector_version, Some(1));
         assert_eq!(source, json!([0.0, 1.0, 0.0]));
     }
 
     #[test]
-    fn primary_activation_replay_recovers_vector_state_before_next_write() {
+    fn primary_activation_cannot_heal_fail_stopped_vectors_without_verified_restart() {
         let (vector_version, source) = vector_state_after_failed_write(|engine| {
-            engine.prepare_primary_activation(1).unwrap();
+            assert!(engine.prepare_primary_activation(1).is_err());
         });
 
         assert_eq!(vector_version, Some(1));
@@ -2686,48 +2815,12 @@ mod tests {
     }
 
     #[test]
-    fn writer_rebuild_replays_vector_state_before_next_write() {
-        use crate::cluster::state::{FieldMapping, FieldType};
-        let dir = tempfile::tempdir().unwrap();
-        let engine = CompositeEngine::new_with_mappings(
-            dir.path(),
-            Duration::from_secs(60),
-            &std::collections::HashMap::from([(
-                "emb".into(),
-                FieldMapping {
-                    field_type: FieldType::KnnVector,
-                    dimension: Some(3),
-                },
-            )]),
-            TranslogDurability::Request,
-            Arc::new(super::super::column_cache::ColumnCache::new(0, 0)),
-        )
-        .unwrap();
-        engine
-            .add_document_with_receipt_at_term("doc", json!({"emb": [1.0, 0.0, 0.0]}), 1)
-            .unwrap();
-        engine.refresh().unwrap();
-        engine.inject_engine_apply_failures_for_test(5, 1);
-        assert!(
-            engine
-                .add_document_with_receipt_at_term("doc", json!({"emb": [0.0, 1.0, 0.0]}), 1)
-                .is_err()
-        );
-        engine
-            .add_document_with_receipt_at_term("trigger", json!({"emb": [0.0, 0.0, 1.0]}), 1)
-            .unwrap();
-
-        let vector_version = engine
-            .vector
-            .read()
-            .unwrap()
-            .as_ref()
-            .and_then(|index| index.version_for_test("doc"));
-        assert_eq!(vector_version.map(|version| version.seq_no), Some(1));
-        assert_eq!(
-            engine.get_document("doc").unwrap().unwrap()["emb"],
-            json!([0.0, 1.0, 0.0])
-        );
+    fn verified_restart_replays_vector_state_before_next_write() {
+        let (vector_version, source) = vector_state_after_failed_write(|engine| {
+            assert!(engine.ensure_write_health().is_err());
+        });
+        assert_eq!(vector_version, Some(1));
+        assert_eq!(source, json!([0.0, 1.0, 0.0]));
     }
 
     // ── Edge cases ──────────────────────────────────────────────────────

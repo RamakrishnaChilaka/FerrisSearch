@@ -27,6 +27,47 @@ fn apply_index(
         .unwrap();
 }
 
+pub(super) async fn finish_empty_primary(
+    raft: &crate::consensus::types::RaftInstance,
+    state: &crate::cluster::state::ClusterState,
+    index: &str,
+    shard: u32,
+) -> (
+    crate::cluster::state::WriteAuthorityIdentity,
+    crate::cluster::state::CanonicalHistory,
+) {
+    let metadata = &state.indices[index];
+    let routing = &metadata.shard_routing[&shard];
+    let allocations = state.shard_allocation_ids(index, shard).unwrap();
+    let authority = crate::cluster::state::WriteAuthorityIdentity {
+        index_uuid: metadata.uuid.to_string(),
+        shard_id: shard,
+        primary_node_id: routing.primary.clone(),
+        primary_allocation_id: allocations.primary.unwrap(),
+        primary_term: routing.primary_term,
+        activation_id: allocations.primary_authority.activation_id.unwrap(),
+    };
+    let history = crate::engine::canonical::CanonicalHistoryAccumulator::new(&authority, None)
+        .unwrap()
+        .finish(None)
+        .unwrap();
+    assert_eq!(
+        raft.client_write(ClusterCommand::FinishPrimaryActivation {
+            index_name: index.into(),
+            activation: crate::cluster::state::PrimaryActivationFinish {
+                authority: authority.clone(),
+                history: history.clone(),
+                eligible_replicas: Vec::new(),
+            },
+        })
+        .await
+        .unwrap()
+        .data,
+        ClusterResponse::Ok
+    );
+    (authority, history)
+}
+
 #[tokio::test]
 async fn node_rejects_excessive_peer_recovery_concurrency() {
     let config = crate::config::AppConfig {
@@ -216,9 +257,12 @@ async fn review_followup_n2_blocked_retirement_does_not_block_unrelated_assigned
         assert!(format!("{:#}", failure.error).contains("peer recovery admission is active"));
     }
     tokio::task::spawn_blocking(move || {
-        engine
-            .add_document_with_receipt_at_term("new", serde_json::json!({"value": 3}), 1)
-            .unwrap();
+        assert!(
+            engine
+                .add_document_with_receipt_at_term("not-active", serde_json::json!({"value": 0}), 1)
+                .is_err()
+        );
+        apply_index(&engine, "new", serde_json::json!({"value": 3}), 0, 1);
         assert_eq!(
             engine
                 .get_document_with_metadata("new", true)
@@ -624,6 +668,8 @@ async fn collision_quarantine_keeps_lifecycle_failure_reportable_until_removal()
         .data,
         ClusterResponse::Ok
     );
+    let promoting = state_handle.read().unwrap().clone();
+    let (authority, history) = finish_empty_primary(&raft, &promoting, "idx", 0).await;
     assert_eq!(
         raft.client_write(ClusterCommand::MarkReplicaInSync {
             index_name: "idx".into(),
@@ -652,7 +698,7 @@ async fn collision_quarantine_keeps_lifecycle_failure_reportable_until_removal()
             "idx-uuid",
             crate::shard::AssignedShardOpen {
                 allocation_id,
-                primary_term: 2,
+                primary_term: 1,
                 allow_empty_creation: true,
             },
         )
@@ -661,12 +707,19 @@ async fn collision_quarantine_keeps_lifecycle_failure_reportable_until_removal()
         apply_index(
             &engine,
             &format!("doc-{seq_no}"),
-            serde_json::json!({"term": 2, "seq": seq_no}),
+            serde_json::json!({"term": 1, "seq": seq_no}),
             seq_no,
-            2,
+            1,
         );
     }
     engine.refresh().unwrap();
+    shard_manager
+        .raise_copy_fence_blocking("idx".into(), 0, "idx-uuid".into(), allocation_id, 2)
+        .await
+        .unwrap();
+    shard_manager
+        .persist_copy_canonical_history("idx", allocation_id, &authority, &history)
+        .unwrap();
 
     let cluster_manager = Arc::new(ClusterManager::with_shared_state(state_handle.clone()));
     let remote_store_resources = crate::transport::server::RemoteStoreTransportResources {
@@ -675,12 +728,16 @@ async fn collision_quarantine_keeps_lifecycle_failure_reportable_until_removal()
             crate::engine::remote_store::RemoteSplitReaderCache::default(),
         ),
     };
+    let (replica_raft, _) =
+        crate::consensus::create_raft_instance_mem(2, "collision-replica".into())
+            .await
+            .unwrap();
     let (_transport_server, transport_service) =
         crate::transport::server::create_transport_service_with_raft_and_storage_handle(
             cluster_manager.clone(),
             shard_manager.clone(),
             TransportClient::new(),
-            raft.clone(),
+            replica_raft,
             Arc::new(crate::tasks::TaskManager::new()),
             remote_store_resources,
             "node-2".into(),
@@ -688,6 +745,14 @@ async fn collision_quarantine_keeps_lifecycle_failure_reportable_until_removal()
     let collision = transport_service
         .replicate_doc(tonic::Request::new(
             crate::transport::proto::ReplicateDocRequest {
+                authority: Some(
+                    crate::replication::capture_replica_authority(
+                        &cluster_manager.get_state(),
+                        "idx",
+                        0,
+                    )
+                    .unwrap(),
+                ),
                 index_name: "idx".into(),
                 shard_id: 0,
                 doc_id: "doc-5".into(),
@@ -699,7 +764,7 @@ async fn collision_quarantine_keeps_lifecycle_failure_reportable_until_removal()
                 op: "index".into(),
                 seq_no: 5,
                 index_uuid: "idx-uuid".into(),
-                primary_term: Some(3),
+                primary_term: Some(2),
                 target_allocation_id: Some(allocation_id),
                 document_version: Some(1),
                 client_operation: None,
@@ -1957,6 +2022,8 @@ async fn corrupt_in_sync_replica_is_failed_and_replication_resumes() {
         .data,
         ClusterResponse::Ok
     );
+    let promoting = state_handle.read().unwrap().clone();
+    finish_empty_primary(&raft, &promoting, "idx", 0).await;
     assert_eq!(
         raft.client_write(ClusterCommand::MarkReplicaInSync {
             index_name: "idx".into(),
@@ -2126,6 +2193,8 @@ async fn corrupt_primary_with_in_sync_replica_is_promoted() {
         .data,
         ClusterResponse::Ok
     );
+    let promoting = state_handle.read().unwrap().clone();
+    finish_empty_primary(&raft, &promoting, "idx", 0).await;
     assert_eq!(
         raft.client_write(ClusterCommand::MarkReplicaInSync {
             index_name: "idx".into(),
@@ -2736,6 +2805,8 @@ async fn failed_lifecycle_report_keeps_unpersisted_collision_quarantine() {
         .data,
         ClusterResponse::Ok
     );
+    let promoting = state_handle.read().unwrap().clone();
+    let (authority, history) = finish_empty_primary(&raft, &promoting, "idx", 0).await;
     assert_eq!(
         raft.client_write(ClusterCommand::MarkReplicaInSync {
             index_name: "idx".into(),
@@ -2764,7 +2835,7 @@ async fn failed_lifecycle_report_keeps_unpersisted_collision_quarantine() {
             "idx-uuid",
             crate::shard::AssignedShardOpen {
                 allocation_id,
-                primary_term: 2,
+                primary_term: 1,
                 allow_empty_creation: true,
             },
         )
@@ -2773,12 +2844,19 @@ async fn failed_lifecycle_report_keeps_unpersisted_collision_quarantine() {
         apply_index(
             &engine,
             &format!("doc-{seq_no}"),
-            serde_json::json!({"term": 2, "seq": seq_no}),
+            serde_json::json!({"term": 1, "seq": seq_no}),
             seq_no,
-            2,
+            1,
         );
     }
     engine.refresh().unwrap();
+    shard_manager
+        .raise_copy_fence_blocking("idx".into(), 0, "idx-uuid".into(), allocation_id, 2)
+        .await
+        .unwrap();
+    shard_manager
+        .persist_copy_canonical_history("idx", allocation_id, &authority, &history)
+        .unwrap();
     drop(engine);
 
     let cluster_manager = Arc::new(ClusterManager::with_shared_state(state_handle.clone()));
@@ -2788,17 +2866,25 @@ async fn failed_lifecycle_report_keeps_unpersisted_collision_quarantine() {
             crate::engine::remote_store::RemoteSplitReaderCache::default(),
         ),
     };
+    let (replica_raft, _) =
+        crate::consensus::create_raft_instance_mem(2, "collision-replica".into())
+            .await
+            .unwrap();
     let (_transport_server, transport_service) =
         crate::transport::server::create_transport_service_with_raft_and_storage_handle(
             cluster_manager.clone(),
             shard_manager.clone(),
             TransportClient::new(),
-            raft.clone(),
+            replica_raft.clone(),
             Arc::new(crate::tasks::TaskManager::new()),
             remote_store_resources,
             "node-2".into(),
         );
     let replicate = |doc_id: &str, seq_no: u64| crate::transport::proto::ReplicateDocRequest {
+        authority: Some(
+            crate::replication::capture_replica_authority(&cluster_manager.get_state(), "idx", 0)
+                .unwrap(),
+        ),
         index_name: "idx".into(),
         shard_id: 0,
         doc_id: doc_id.into(),
@@ -2806,7 +2892,7 @@ async fn failed_lifecycle_report_keeps_unpersisted_collision_quarantine() {
         op: "index".into(),
         seq_no,
         index_uuid: "idx-uuid".into(),
-        primary_term: Some(3),
+        primary_term: Some(2),
         target_allocation_id: Some(allocation_id),
         document_version: Some(seq_no + 1),
         client_operation: None,
@@ -2838,7 +2924,7 @@ async fn failed_lifecycle_report_keeps_unpersisted_collision_quarantine() {
     assert!(shard_manager.get_shard("idx", 0).is_none());
     assert!(
         state_handle.read().unwrap().indices["idx"].shard_routing[&0].is_replica_in_sync("node-2"),
-        "the replica's lagging-view transport report is skipped, so the copy is still in sync"
+        "the leaderless replica cannot submit its failure report, so the copy is still in sync"
     );
 
     // First lifecycle tick: open is rejected by the cached marker and the
@@ -2866,10 +2952,7 @@ async fn failed_lifecycle_report_keeps_unpersisted_collision_quarantine() {
     leaderless_state.master_node = None;
     let leaderless_manager =
         ClusterManager::with_shared_state(Arc::new(std::sync::RwLock::new(leaderless_state)));
-    let (follower_raft, _) =
-        crate::consensus::create_raft_instance_mem(2, "collision-quarantine-follower".into())
-            .await
-            .unwrap();
+    let follower_raft = replica_raft;
     assert!(!follower_raft.is_leader());
     let mut recent_reports = HashMap::new();
     report_failed_shard_copies(

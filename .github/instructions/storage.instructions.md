@@ -63,6 +63,10 @@ best-effort fallbacks.
   an "unsupported" success entry.
 - Publish immutable data before the mutable pointer. A failed pointer update
   may leave unreachable immutable objects; it must not expose a partial split.
+- Immutable split bundles exclude all mutable WAL state, including
+  `translog.committed`, the manifest, and generation files. Cleanup failure
+  aborts publication; never upload a dangling checkpoint or initialize a
+  reader's WAL from it to hide missing protected history.
 - Never use `unwrap_or_default()` when decoding a pointer, manifest, summary, or
   checksum-bearing payload.
 - Never overwrite a manifest generation with different content.

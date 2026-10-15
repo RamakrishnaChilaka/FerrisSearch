@@ -19,6 +19,7 @@ async fn rest_retry_after_ambiguous_commit_returns_original_receipt() {
         1,
     )
     .await;
+    harness.set_minimum_durable_copies(2).await;
     let primary = primary(&harness);
     let replica = harness.replica(0);
     harness.cluster.nodes[replica]
@@ -38,6 +39,12 @@ async fn rest_retry_after_ambiguous_commit_returns_original_receipt() {
     let seq_no = failed["_seq_no"].as_u64().unwrap();
     let primary_term = failed["_primary_term"].as_u64().unwrap();
     let before_retry = harness.engines[&(primary, 0)].sequence_stats();
+    assert!(
+        harness.engines[&(replica, 0)]
+            .ensure_write_health()
+            .is_err()
+    );
+    harness.set_minimum_durable_copies(1).await;
 
     let (status, retried) = harness
         .cluster
@@ -52,7 +59,12 @@ async fn rest_retry_after_ambiguous_commit_returns_original_receipt() {
     );
     assert_eq!(
         harness.engines[&(replica, 0)].sequence_stats().max_seq_no,
-        Some(seq_no)
+        None,
+        "a retry cannot heal or write to the failed, excluded replica"
+    );
+    assert_eq!(
+        retried["_shards"],
+        json!({"total": 1, "successful": 1, "failed": 0})
     );
 }
 

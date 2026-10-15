@@ -6,32 +6,11 @@ applyTo: "src/replication/**"
 # Replication Module — src/replication/mod.rs
 
 ## Replication Functions
-```rust
-pub async fn replicate_write(
-    transport_client: &TransportClient,
-    cluster_state: &ClusterState,
-    index_name: &str,
-    shard_id: u32,
-    doc_id: &str,
-    payload: &Value,
-    op: &str,          // "index" or "delete"
-    seq_no: u64,       // from primary's WAL
-    document_version: u64,
-    primary_term: u64,
-) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>>
-// Err: list of error messages
-
-pub async fn replicate_bulk(
-    transport_client: &TransportClient,
-    cluster_state: &ClusterState,
-    index_name: &str,
-    shard_id: u32,
-    docs: &[(String, Value)],
-    start_seq_no: u64,
-    versions: &[u64],
-    primary_term: u64,
-) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>>
-```
+`replicate_write()` and `replicate_bulk()` return `ReplicationResult`.
+Failures retain both typed per-target causes and positive proofs from other
+targets. Never discard those proofs or convert missing proofs into success.
+Inputs preserve operation-owned sequences/versions/client records separately
+from the current canonical sending authority and captured configuration.
 
 ## Replication Flow (Primary → Replicas)
 1. Client writes to primary shard
@@ -43,9 +22,11 @@ pub async fn replicate_bulk(
 5. gRPC sends only to replicas in the Raft-authoritative
    `ShardRoutingEntry.in_sync_replicas` set, concurrently via `tokio::spawn` +
    `join_all` (fan-out)
-6. Each request carries index UUID, sender primary term, and the target's exact
-   allocation ID. The replica validates UUID, allocation, recovery gate, and
-   `term >= max(applied_view_term, durable_fence)` before mutation.
+6. Each request carries exact current ACTIVE source authority/certificate,
+   index UUID, and target allocation. The operation's original primary term
+   may be older after an idempotent resend. Validate current sending authority,
+   durable certificate/fence, target allocation, and recovery gate before apply
+   and again before returning the exact-operation proof.
 7. A higher accepted term is atomically persisted in the local copy identity
    before the WAL/engine operation. Bulk validates the common envelope first
    and advances the fence once.
@@ -57,7 +38,9 @@ pub async fn replicate_bulk(
 10. Primary samples its persisted checkpoint after replication, before taking
     the tracker lock. It then updates observations and computes the minimum
     with every current authoritative in-sync replica under one tracker lock
-11. Write acknowledged to client **only after every in-sync replica confirms**
+11. The primary certifies every captured copy's exact-operation proof or
+    observed, settled conditional exclusion, the configured copy floor, and
+    its still-valid permit. Prefixes govern retention, not above-gap ACKs.
 
 ## Post-Write Visibility
 
@@ -225,17 +208,15 @@ A no-op alongside a mutation shares that bulk shard's report. See
   per-copy count/time retry state and exponential backoff. Persistent replica
   I/O eventually fails the allocation; persistent primary I/O can only request
   promote-only failover when an in-sync replacement exists.
-- Apply-level escalation leaves search and non-realtime reads open and does
-  not itself trigger runtime WAL replay. Realtime reads fail closed after a
-  post-WAL apply failure or a partial replay failure until a successful replay.
-  A single-copy primary is marked unavailable without
-  changing authority; the first later successful local write conditionally
-  clears that status at the same term. Definitive and open-level failures may
-  quarantine and require fresh activation after repair.
+- WAL/post-WAL failures immediately fail-stop the copy and its permits.
+  `primary_unavailable` blocks admission; only fresh canonical activation can
+  clear it. A later successful write is not a same-term healing mechanism.
 - Failed replication returns typed per-replica failures retaining node,
   allocation, message, and definitive status. A primary receiving a definitive
-  `DATA_LOSS` failure conditionally removes that exact allocation at the
-  captured term before returning the write failure. The replica persists an
+  failure synchronously closes exclusion admission, durably journals exact
+  source/target authority, and proposes conditional Raft exclusion. An unresolved
+  or stale result remains a request failure; only observed settlement can
+  contribute to certification. The replica persists an
   allocation-bound collision marker before closing; lifecycle failure reports
   retry until the exact allocation is removed.
 - Request durability requires every replica response to prove the exact
@@ -245,25 +226,28 @@ A no-op alongside a mutation shares that bulk shard's report. See
   the primary's global checkpoint. After idle async writes, the global
   checkpoint can lag the true persisted minimum until another write reports
   progress. Checkpoint tracking does not add background synchronization.
-- Replica background auto-flush uses its own contiguous persisted prefix when
-  no primary global checkpoint exists. It may prune through that committed
-  prefix but never through a gap; promotion clears the replica-only bound.
+- Replica background auto-flush may use its own contiguous persisted prefix,
+  but retention is additionally capped by the matching committed canonical
+  certificate. Preserve all post-certificate history; promotion clears the
+  replica-only bound. Prepared, uncommitted certificates never advance GC.
 - `ShardManager.isr_tracker` stores checkpoint proofs, not membership. The
   primary uses identity- and term-scoped persisted proofs for WAL retention.
   It can rank authoritative candidates only when the reporting leader hosts the primary;
   otherwise candidate selection falls back to a live in-sync cluster member.
   Checkpoint observations cannot grant membership.
-- Single writes and index-only shard batches return `success: false` when
-  replication fails. Mixed bulk returns a failed item, never a successful
-  result for that mutation. The RPC envelope does not override item errors.
+- Uncertified single/batch writes return typed failures; mixed bulk preserves
+  per-item outcomes. Successful per-copy reports can contain explicit failed
+  excluded replicas, never an unresolved missing proof. The RPC envelope does
+  not override item errors.
 - **Primary owns seq numbers**: replica WAL entries must preserve the seq_no assigned by the primary; never allocate replica-local seq_nos for replicated or recovered operations
 - Never derive an operation's sequence from `last_seq_no()` or a checkpoint after
   releasing the primary write lock. Concurrent writes can advance both before
   replication begins.
 - Processed and persisted checkpoints are gap-aware contiguous prefixes.
   Internal redelivery is term/sequence aware, promotion fills local gaps with
-  NoOps, and sustained gaps are probed before exact-allocation removal. This is
-  still not general D10 rollback/resync.
+  NoOps, and sustained gaps are probed before exact-allocation removal.
+  Bounded canonical activation adopts/resyncs verified history; general D10
+  rollback and unrestricted divergent-history recovery remain outside it.
 - Replicated and recovered operations preserve the primary's client-operation
   record exactly. Replica apply rejects reuse of one client ID with a different
   fingerprint and never allocates replacement metadata.
@@ -274,22 +258,14 @@ A no-op alongside a mutation shares that bulk shard's report. See
   them to the empty target WAL. Do not replace the original mutation with a
   synthetic NoOp; later same-sequence delivery must compare against the exact
   operation.
-- Promotion NoOps are replicated in bounded homogeneous bulk batches, preserving
-  each explicit non-contiguous sequence number. A batch transport failure
-  remains best-effort, creates the same replica gap observation as the former
-  single-operation path, and does not advance the global checkpoint from its
-  unknown persistence reports. It retains that failed batch in process memory for
-  redelivery on the next activation attempt at the same
-  UUID/allocation/term. Restart or an activation failure after local NoOp
-  application can lose the pending batch; the WAL does not reconstruct the
-  replica fan-out intent. The fixed gap deadline and peer recovery are the
-  fallback.
-- A primary engine failure after WAL append but before replication leaves an
-  operation that no replica received. After local rebuild/replay advances the
-  primary prefix, later replica responses expose the permanent gap; each
-  affected replica is normally removed after the approximately 60-second gap
-  deadline and peer-recovered. Promotion NoOps do not repair this live-primary
-  divergence; targeted gap repair is deferred to D10.
+- Production canonical activation freezes authoritative histories under a fresh
+  PROMOTING reservation, seals matching copies, and conditionally finishes
+  ACTIVE before admission. Peer conflicts/unavailability cannot be hidden by
+  best-effort NoOp fan-out. Legacy no-Raft D1 trace helpers remain a separate
+  historical relation, not an alternate production activation path.
+- A primary failure after WAL append can retain an unknown operation. Its copy
+  stops immediately; a verified restart/promotion canonicalizes protected
+  history before new writes. Failed responses promise no rollback.
 
 ## Recovery Protocol Work
 

@@ -6,7 +6,12 @@ use std::time::Instant;
 pub type NodeId = String;
 /// Monotonic identity of one routed shard-copy assignment.
 pub type AllocationId = u64;
-pub const CLUSTER_STATE_FORMAT_VERSION: u32 = 1;
+pub const CLUSTER_STATE_FORMAT_VERSION: u32 = 2;
+
+pub use super::write_authority::{
+    CanonicalHistory, FailedCopyExclusion, PrimaryActivationFinish, PrimaryAuthority,
+    PrimaryAuthorityPhase, ShardCopyAllocation, WriteAuthorityIdentity,
+};
 
 /// The role a node plays in the OpenSearch cluster
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -126,6 +131,7 @@ pub struct ShardAllocationIds {
     /// Status-only flag: the assigned primary could not serve from local
     /// storage and no in-sync promotion candidate was available.
     pub primary_unavailable: bool,
+    pub primary_authority: PrimaryAuthority,
 }
 
 impl ShardAllocationIds {
@@ -147,6 +153,7 @@ impl ShardAllocationIds {
             initial_allocation_id: allocation_id,
             primary_initialized: false,
             primary_unavailable: false,
+            primary_authority: PrimaryAuthority::default(),
         })
     }
 
@@ -165,6 +172,12 @@ impl ShardAllocationIds {
     }
 
     pub fn validate_for_routing(&self, routing: &ShardRoutingEntry) -> Result<(), String> {
+        self.primary_authority
+            .validate(routing.primary_term, self.primary_initialized)?;
+        if self.primary.is_none() && self.primary_authority.phase != PrimaryAuthorityPhase::Inactive
+        {
+            return Err("unallocated primary cannot retain active or promoting authority".into());
+        }
         if self.initial_allocation_id == 0 {
             return Err("initial allocation ID must be greater than zero".to_string());
         }
@@ -478,7 +491,7 @@ impl RemoteStoreSettings {
 /// `number_of_shards` and `number_of_replicas` remain on `IndexMetadata`
 /// because they define `local_shards` topology. A `remote_store` index sets
 /// both to zero and keeps `shard_routing` empty.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IndexSettings {
     /// Immutable engine selector chosen at index creation time.
     pub engine: IndexEngine,
@@ -491,12 +504,34 @@ pub struct IndexSettings {
     /// the background refresh tick. `None` = use default (512 MB).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flush_threshold_bytes: Option<u64>,
+    /// Minimum acknowledged copies, including the primary. Request durability
+    /// requires persisted operation proofs; async durability retains its crash window.
+    pub minimum_durable_copies: u32,
     // ── Remote-store engine settings ───────────────────────────────
     /// Optional `remote_store` configuration preserved in cluster state and
     /// transport snapshots. Only fields consumed by the current read path have
     /// runtime effects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_store: Option<RemoteStoreSettings>,
+}
+
+impl Default for IndexSettings {
+    fn default() -> Self {
+        Self {
+            engine: IndexEngine::default(),
+            refresh_interval_ms: None,
+            flush_threshold_bytes: None,
+            minimum_durable_copies: 1,
+            remote_store: None,
+        }
+    }
+}
+
+fn parse_u32_setting(value: &serde_json::Value, name: &str) -> Result<u32, String> {
+    value
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| format!("{name} must be an unsigned 32-bit integer"))
 }
 
 /// Validated wrapper for index UUIDs.
@@ -601,6 +636,63 @@ pub struct IndexMetadata {
 }
 
 impl IndexMetadata {
+    pub fn validate_write_policy(&self) -> Result<(), String> {
+        let minimum = self.settings.minimum_durable_copies;
+        if minimum == 0 || u64::from(minimum) > u64::from(self.number_of_replicas) + 1 {
+            return Err(format!(
+                "minimum_durable_copies must be between 1 and configured primary-plus-replica capacity {}; got {minimum}",
+                u64::from(self.number_of_replicas) + 1,
+            ));
+        }
+        if !self.settings.engine.uses_local_shards() && minimum != 1 {
+            return Err("minimum_durable_copies applies only to local_shards indices".into());
+        }
+        Ok(())
+    }
+
+    pub fn apply_settings_update(&mut self, body: &serde_json::Value) -> Result<bool, String> {
+        for name in ["number_of_shards", "engine"] {
+            if body.pointer(&format!("/index/{name}")).is_some() {
+                return Err(format!(
+                    "index.{name} is immutable and cannot be changed after index creation"
+                ));
+            }
+        }
+        let mut updated = self.clone();
+        if let Some(value) = body.pointer("/index/number_of_replicas") {
+            let replicas = parse_u32_setting(value, "index.number_of_replicas")?;
+            if replicas != updated.number_of_replicas {
+                updated.update_number_of_replicas(replicas);
+            }
+        }
+        if let Some(value) = body.pointer("/index/minimum_durable_copies") {
+            if !self.settings.engine.uses_local_shards() {
+                return Err("minimum_durable_copies applies only to local_shards indices".into());
+            }
+            updated.settings.minimum_durable_copies =
+                parse_u32_setting(value, "index.minimum_durable_copies")?;
+        }
+        if let Some(value) = body.pointer("/index/refresh_interval_ms") {
+            if value.is_null() {
+                updated.settings.refresh_interval_ms = None;
+            } else if let Some(value) = value.as_u64() {
+                updated.settings.refresh_interval_ms = Some(value);
+            }
+        }
+        if let Some(value) = body.pointer("/index/flush_threshold_bytes") {
+            if value.is_null() {
+                updated.settings.flush_threshold_bytes = None;
+            } else if let Some(value) = value.as_u64() {
+                updated.settings.flush_threshold_bytes = Some(value);
+            }
+        }
+        updated.validate_write_policy()?;
+        let changed = self.number_of_replicas != updated.number_of_replicas
+            || self.settings != updated.settings;
+        *self = updated;
+        Ok(changed)
+    }
+
     /// Parse a create-index body into authoritative cluster metadata.
     ///
     /// This is shared by the HTTP handler and the forwarded gRPC leader path so
@@ -636,8 +728,10 @@ impl IndexMetadata {
                 .unwrap_or(1) as u32;
             let num_replicas = body
                 .pointer("/settings/number_of_replicas")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1) as u32;
+                .map(|value| parse_u32_setting(value, "settings.number_of_replicas"))
+                .transpose()
+                .map_err(CreateIndexMetadataError::InvalidArgument)?
+                .unwrap_or(1);
 
             Self::build_shard_routing(index_name, num_shards, num_replicas, data_nodes)
         } else {
@@ -657,6 +751,19 @@ impl IndexMetadata {
         metadata.settings.refresh_interval_ms = refresh_interval_ms;
         metadata.settings.flush_threshold_bytes = flush_threshold_bytes;
         metadata.settings.remote_store = remote_store_settings;
+        if let Some(value) = body.pointer("/settings/minimum_durable_copies") {
+            if !metadata.settings.engine.uses_local_shards() {
+                return Err(CreateIndexMetadataError::InvalidArgument(
+                    "minimum_durable_copies applies only to local_shards indices".into(),
+                ));
+            }
+            metadata.settings.minimum_durable_copies =
+                parse_u32_setting(value, "settings.minimum_durable_copies")
+                    .map_err(CreateIndexMetadataError::InvalidArgument)?;
+        }
+        metadata
+            .validate_write_policy()
+            .map_err(CreateIndexMetadataError::InvalidArgument)?;
 
         let dynamic_str = body
             .pointer("/mappings/dynamic")
@@ -1146,6 +1253,40 @@ impl ClusterState {
     pub fn primary_unavailable(&self, index_name: &str, shard_id: u32) -> bool {
         self.shard_allocation_ids(index_name, shard_id)
             .is_some_and(|allocation| allocation.primary_unavailable)
+    }
+
+    pub fn validate_write_authority(
+        &self,
+        index_name: &str,
+        authority: &WriteAuthorityIdentity,
+        phase: PrimaryAuthorityPhase,
+    ) -> Result<(), String> {
+        authority.validate()?;
+        let metadata = self
+            .indices
+            .get(index_name)
+            .ok_or_else(|| format!("index '{index_name}' does not exist"))?;
+        let routing = metadata
+            .shard_routing
+            .get(&authority.shard_id)
+            .ok_or_else(|| format!("index '{index_name}' has no shard {}", authority.shard_id))?;
+        let allocations = self
+            .shard_allocation_ids(index_name, authority.shard_id)
+            .ok_or_else(|| "shard authority has no allocation metadata".to_string())?;
+        allocations.validate_for_routing(routing)?;
+        if metadata.uuid.as_str() != authority.index_uuid
+            || routing.primary != authority.primary_node_id
+            || routing.primary_term != authority.primary_term
+            || allocations.primary != Some(authority.primary_allocation_id)
+            || allocations.primary_authority.phase != phase
+            || allocations.primary_authority.activation_id != Some(authority.activation_id)
+        {
+            return Err(format!(
+                "write authority no longer matches UUID, primary, allocation, term, activation, and {phase:?} phase for [{index_name}][{}]",
+                authority.shard_id,
+            ));
+        }
+        Ok(())
     }
 
     pub fn may_create_initial_empty_copy(
@@ -2302,6 +2443,103 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         let back: IndexSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.refresh_interval_ms, Some(2000));
+    }
+
+    #[test]
+    fn minimum_durable_copies_defaults_and_create_capacity_are_validated() {
+        let create = |settings| {
+            IndexMetadata::from_create_request_body(
+                "idx",
+                &serde_json::json!({ "settings": settings }),
+                &["node-1".into()],
+            )
+        };
+        assert_eq!(
+            create(serde_json::json!({"number_of_replicas": 0}))
+                .unwrap()
+                .settings
+                .minimum_durable_copies,
+            1
+        );
+        assert_eq!(
+            create(serde_json::json!({
+                "number_of_replicas": 1, "minimum_durable_copies": 2
+            }))
+            .unwrap()
+            .settings
+            .minimum_durable_copies,
+            2
+        );
+        for value in [
+            serde_json::json!(0),
+            serde_json::json!(3),
+            serde_json::json!(-1),
+            serde_json::json!("2"),
+            serde_json::json!(null),
+            serde_json::json!(u64::from(u32::MAX) + 1),
+        ] {
+            let error = create(serde_json::json!({
+                "number_of_replicas": 1, "minimum_durable_copies": value
+            }))
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("minimum_durable_copies"),
+                "{error}"
+            );
+        }
+        assert!(
+            IndexMetadata::from_create_request_body(
+                "remote",
+                &serde_json::json!({
+                    "engine": "remote_store",
+                    "settings": {"minimum_durable_copies": 1}
+                }),
+                &[],
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("only to local_shards")
+        );
+    }
+
+    #[test]
+    fn minimum_durable_copies_updates_validate_combined_capacity_atomically() {
+        let mut metadata = IndexMetadata::build_shard_routing("idx", 1, 0, &["node-1".into()]);
+        assert!(
+            metadata
+                .apply_settings_update(&serde_json::json!({
+                    "index": {"number_of_replicas": 1, "minimum_durable_copies": 2}
+                }))
+                .unwrap()
+        );
+        assert_eq!(metadata.settings.minimum_durable_copies, 2);
+        assert_eq!(metadata.number_of_replicas, 1);
+        let before = serde_json::to_value(&metadata).unwrap();
+        for body in [
+            serde_json::json!({"index": {"number_of_replicas": 0}}),
+            serde_json::json!({"index": {"minimum_durable_copies": 0}}),
+            serde_json::json!({"index": {"minimum_durable_copies": 3}}),
+            serde_json::json!({"index": {"minimum_durable_copies": "2"}}),
+            serde_json::json!({"index": {"number_of_replicas": u64::from(u32::MAX) + 1}}),
+        ] {
+            assert!(metadata.apply_settings_update(&body).is_err(), "{body}");
+            assert_eq!(serde_json::to_value(&metadata).unwrap(), before);
+        }
+        assert!(
+            !metadata
+                .apply_settings_update(&serde_json::json!({
+                    "index": {"minimum_durable_copies": 2}
+                }))
+                .unwrap()
+        );
+        metadata
+            .apply_settings_update(&serde_json::json!({
+                "index": {"number_of_replicas": 0, "minimum_durable_copies": 1}
+            }))
+            .unwrap();
+        assert_eq!(metadata.number_of_replicas, 0);
+        assert_eq!(metadata.settings.minimum_durable_copies, 1);
+        assert!(serde_json::from_str::<IndexSettings>(r#"{"engine":"local_shards"}"#).is_err());
     }
 
     #[test]

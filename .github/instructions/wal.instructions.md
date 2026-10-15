@@ -58,10 +58,10 @@ pub trait WriteAheadLog: Send + Sync {
 
 ## HotTranslog (Generation-Based Binary Implementation)
 ### Wire Format
-`[u32 LE: payload_len][bincode(WireEntryV3 { format_version, seq_no, primary_term, op, payload_json })]`
-- Length-prefixed frames for efficient sequential reading
-- On open, truncates only an incomplete active-generation tail; replay and
-  retained-generation reads reject incomplete frames elsewhere
+`[u32 LE: payload_len][bincode(WireEntryV4 { format_version, seq_no, primary_term, op, payload_json })][SHA-256 of encoded entry]`
+- The length includes the checksum; the 32 MiB ceiling includes the prefix.
+- On open, truncates only an incomplete, unprotected active-generation tail.
+  Protected-range loss/mismatch and incomplete retained frames fail closed.
 - Primary allocation is contiguous, but explicit replica/recovery entries may
   arrive out of numeric order; generation metadata stores min/max ranges
 - Index/delete payloads require the primary-assigned nonzero `_version`; NoOp
@@ -70,8 +70,9 @@ pub trait WriteAheadLog: Send + Sync {
 
 ### Files on Disk (per shard)
 - `{data_dir}/{index_uuid}/shard_{id}/translog-<generation>.bin` — ordered WAL generation files (`00000000000000000000`, `00000000000000000001`, ...)
-- `{data_dir}/{index_uuid}/shard_{id}/translog.manifest` — authoritative generation metadata (active generation, next generation id, seq ranges, sizes)
-- `{data_dir}/{index_uuid}/shard_{id}/translog.seqno` — last assigned sequence number
+- `{data_dir}/{index_uuid}/shard_{id}/translog.manifest` — checksummed v3
+  protected descriptor: generations/ranges/physical lengths/hashes, exclusive
+  next sequence, and exact durable intervals. No sequence sidecar is written.
 - `{data_dir}/{index_uuid}/shard_{id}/translog.committed` — versioned JSON
   committed boundary with processed/persisted checkpoints, max sequence, term,
   and current-term interval state
@@ -84,6 +85,11 @@ pub trait WriteAheadLog: Send + Sync {
   convenience wrapper.
 - Primary sequence exhaustion and overflowing explicit bulk ranges must fail
   before any bytes are written; never wrap or reuse a saturated allocator value.
+- Request-durable receipts follow WAL sync and atomic protected-manifest
+  publication including directory fsync. A WAL write/sync or publication error
+  closes the shared failure cell immediately. Issued permits and later WAL,
+  replay, mutation, and recovery operations observe the same first failure.
+  Do not infer durability from read-back or a later successful sync.
 - `MAX_WAL_FRAME_BYTES` is 32 MiB including the four-byte length prefix. Every
   single, delete, primary-bulk item, and explicit-sequence replica/recovery item
   is fully encoded and checked before any WAL bytes or sequence state change.
@@ -152,9 +158,9 @@ pub trait WriteAheadLog: Send + Sync {
   a new operation, or before blocking maintenance/snapshot commit continues,
   writer reconstruction replays `[translog.committed, next_seq_no)` with the
   same idempotent replay logic used at startup. Best-effort try-flush may defer
-  instead. Persistent rebuild/replay I/O reaches the Apply retry budget only
-  when a write triggers the rebuild; maintenance-triggered failures log and
-  retry on the next tick without escalating.
+  instead. Reconstruction is permitted only while the shared copy state is
+  healthy; it cannot clear WAL/post-WAL fail-stop. A failed write-triggered
+  reconstruction fail-stops the copy instead of consuming an Apply retry budget.
 - WAL document interpretation is shared by startup/runtime replay and peer
   recovery. Every operation requires `_doc_id`;
   index operations additionally require `_source`. Missing fields are typed
@@ -172,12 +178,13 @@ pub trait WriteAheadLog: Send + Sync {
   append can race recovery. This blocks writes to that shard and may scan a
   large suffix when refresh is disabled.
 - Async durability: background task fsyncs every `sync_interval_ms` via Tokio's blocking pool — never call `File::sync_data()` inline on an async worker
-- Reopen requires `translog.manifest`; it trusts persisted metadata for old
-  generations, removes stray generation files not listed in the manifest,
-  ignores unrelated non-generation side files, and scans only the active
-  generation file to recover the allocator maximum.
+- Reopen requires a valid protected `translog.manifest` for existing data and
+  verifies every protected generation's physical bytes/hash and durable
+  sequence evidence. Missing descriptor/generation or protected data loss fails
+  closed; never reinterpret an existing copy as a fresh WAL.
 - On open, an incomplete trailing frame in the active generation is truncated
-  to the last complete, fully decoded boundary. The generation file and parent
+  wholly beyond the protected frontier is truncated to the last complete,
+  fully decoded boundary. The generation file and parent
   directory are fsynced before opening the append writer, and the discarded
   byte count is logged. Complete malformed frames, corrupt middle frames, and
   incomplete frames in retained non-active generations fail closed.
@@ -189,7 +196,8 @@ pub trait WriteAheadLog: Send + Sync {
 - Manifest, frame, operation-tag, payload, sequence-state, and other
   persisted WAL decode/validation failures carry a typed corruption cause so
   shard lifecycle can fail the exact allocation immediately. Ordinary I/O
-  errors retain their source and enter bounded retry/backoff instead.
+  errors retain their source. Ordinary assigned-open I/O may use bounded
+  retry/backoff; live WAL/post-WAL mutation uncertainty fails immediately.
 - Persist the manifest before deleting obsolete generation files during `truncate()` / `truncate_below()` so crashes never leave startup without authoritative generation metadata
 - `translog.committed` should be persisted after each intermediate replay batch commit so replay remains idempotent across repeated crash recovery
 
@@ -203,10 +211,11 @@ pub trait WriteAheadLog: Send + Sync {
   Reading the allocator/checkpoint again after releasing the write lock cannot
   recover the identity of an earlier operation.
 
-## Known Write-Failure Limitation
+## Write-Failure And Restart Boundary
 
-A failed `write_all` or `sync_data` does not yet fail-stop the shard. If the
-process continues writing after a partial WAL append, later frames can turn the
-incomplete tail into middle corruption that restart must reject. Do not weaken
-that rejection or claim this failure mode is repaired by startup tail
-truncation; durable fail-stop write handling remains separate work.
+A failed `write_all`, `sync_data`, or protected-descriptor publication prevents
+later mutation in that process. Restart verifies retained protected bytes;
+unsealed valid records remain evidence for fresh canonical reconciliation.
+Only a proven unprotected torn tail may be discarded. Tail repair cannot
+restore an old primary epoch, and an acknowledged above-gap operation is not
+discardable merely because a contiguous checkpoint lags.

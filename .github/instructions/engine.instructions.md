@@ -132,6 +132,19 @@ pub trait SearchEngine: Send + Sync {
   A mid-batch delete's tombstone can return immediately before acknowledgement.
 
 ## CompositeEngine (src/engine/composite.rs)
+
+`CopyWriteState` is shared with the WAL, primary epoch, and every issued permit.
+WAL write/sync, authority-publication, or uncertain post-WAL engine failures
+immediately fail-stop it. Rebuild, vector repair, successful later I/O, or
+same-allocation reopen cannot clear that failure. Expected pre-WAL conflicts
+and validation failures do not poison healthy state. Bound primary mutations
+require exact installed ACTIVE authority; retain owned permits/recovery guards
+through worker completion even when the caller cancels.
+
+Canonical history methods are bounded by captured physical cursors, operation
+count, and byte budget. Preserve original operation/client identities during
+adoption; do not substitute the new authority term as an operation's origin.
+
 ```rust
 pub struct CompositeEngine {
     text: HotEngine,
@@ -347,9 +360,9 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
 - If force merge cannot replace the drained writer, the next document write
   attempts one writer rebuild before appending a new WAL operation, using the
   normal writer heap budget and automatic merge policy. A transient replacement
-  failure can therefore heal on that write. Rebuild I/O failures retain typed
-  causes, and primary/replica handlers account persistent failures under the
-  shard Apply retry key.
+  failure can therefore heal on that write only while shared copy state remains
+  healthy. A failed write-triggered rebuild fail-stops the copy and retains the
+  typed cause; it does not wait for an Apply retry budget.
 - Every production Tantivy commit boundary—refresh, flush, checkpoint-aware
   flush, vector rebuild, recovery snapshot, replay batches, and pre-force-merge
   commit—must fail the `WriterState` on error. No later write may reuse that
@@ -358,8 +371,8 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
   flush, force-merge preparation, or peer-snapshot commit proceeds, a failed
   writer is rebuilt and the retained suffix
   `[translog.committed, WAL next_seq)` is replayed and committed with the
-  normal automatic merge policy. Persistent rebuild or replay I/O is an Apply
-  failure only on the write path; a rebuild triggered by refresh, flush, or
+  normal automatic merge policy, provided the shared copy is still healthy.
+  Reconstruction cannot clear WAL/post-WAL fail-stop. A rebuild triggered by refresh, flush, or
   snapshot preparation logs and retries on the next maintenance tick without
   escalating. Best-effort `try_flush_with_global_checkpoint()` may return
   `Ok(false)` instead of rebuilding.

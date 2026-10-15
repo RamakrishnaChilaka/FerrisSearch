@@ -139,6 +139,9 @@ impl ClusterStateMachine {
                         index_name: metadata.name.clone(),
                     };
                 }
+                if let Err(error) = metadata.validate_write_policy() {
+                    return ClusterResponse::Error(error);
+                }
                 if metadata.shard_routing.len() != metadata.number_of_shards as usize {
                     return ClusterResponse::Error(format!(
                         "index '{}' has {} shard routing entries but declares {} shards",
@@ -187,6 +190,9 @@ impl ClusterStateMachine {
                 ClusterResponse::Ok
             }
             ClusterCommand::UpdateIndex { metadata } => {
+                if let Err(error) = metadata.validate_write_policy() {
+                    return ClusterResponse::Error(error);
+                }
                 let Some(current) = state.indices.get(&metadata.name).cloned() else {
                     return ClusterResponse::Error(format!(
                         "index '{}' does not exist",
@@ -298,6 +304,13 @@ impl ClusterStateMachine {
                         } else {
                             current_ids.primary_unavailable
                         },
+                        primary_authority: {
+                            let mut authority = current_ids.primary_authority.clone();
+                            if primary_changed {
+                                authority.invalidate();
+                            }
+                            authority
+                        },
                     };
 
                     if let Err(reason) = next_routing.validate_membership() {
@@ -351,6 +364,18 @@ impl ClusterStateMachine {
                     return ClusterResponse::Error(format!(
                         "cannot admit a replica without an allocated primary for index '{index_name}' shard {shard_id}"
                     ));
+                }
+                if allocation_state.primary_authority.phase
+                    != crate::cluster::state::PrimaryAuthorityPhase::Active
+                {
+                    return ClusterResponse::Error(
+                        "replica admission requires canonically active primary authority".into(),
+                    );
+                }
+                if allocation_state.primary_unavailable {
+                    return ClusterResponse::Error(
+                        "replica admission requires an available canonical primary".into(),
+                    );
                 }
                 if state.shard_allocation_id(index_name, *shard_id, replica) != Some(*allocation_id)
                 {
@@ -457,9 +482,163 @@ impl ClusterStateMachine {
                     ));
                 };
                 allocations.primary_initialized = true;
-                allocations.primary_unavailable = false;
+                allocations.primary_authority.reserve(raft_log_index);
                 state.version += 1;
                 ClusterResponse::Ok
+            }
+            ClusterCommand::FinishPrimaryActivation {
+                index_name,
+                activation,
+            } => {
+                if let Err(reason) = activation.validate() {
+                    return ClusterResponse::Error(reason);
+                }
+                if let Err(reason) = state.validate_write_authority(
+                    index_name,
+                    &activation.authority,
+                    crate::cluster::state::PrimaryAuthorityPhase::Promoting,
+                ) {
+                    return ClusterResponse::WriteAuthorityRejected { reason };
+                }
+                let shard_id = activation.authority.shard_id;
+                let mut metadata = state.indices[index_name].clone();
+                let mut allocations = state.shard_allocations[index_name][&shard_id].clone();
+                let routing = metadata
+                    .shard_routing
+                    .get_mut(&shard_id)
+                    .expect("reserved authority validated its shard routing");
+                for copy in &activation.eligible_replicas {
+                    if !routing.is_replica_in_sync(&copy.node_id)
+                        || allocations.replicas.get(&copy.node_id) != Some(&copy.allocation_id)
+                    {
+                        return ClusterResponse::Error(format!(
+                            "activation cannot retain unproven allocation {} on node '{}'",
+                            copy.allocation_id, copy.node_id,
+                        ));
+                    }
+                }
+                let eligible: std::collections::HashSet<_> = activation
+                    .eligible_replicas
+                    .iter()
+                    .map(|copy| copy.node_id.as_str())
+                    .collect();
+                let excluded: std::collections::HashSet<_> = routing
+                    .in_sync_replicas
+                    .iter()
+                    .filter(|node| !eligible.contains(node.as_str()))
+                    .cloned()
+                    .collect();
+                let removed_count = match u32::try_from(excluded.len()) {
+                    Ok(count) => count,
+                    Err(_) => {
+                        return ClusterResponse::Error(
+                            "activation excluded-copy count overflows".into(),
+                        );
+                    }
+                };
+                let Some(unassigned) = routing.unassigned_replicas.checked_add(removed_count)
+                else {
+                    return ClusterResponse::Error(
+                        "activation unassigned-copy count overflows".into(),
+                    );
+                };
+                routing.unassigned_replicas = unassigned;
+                routing.replicas.retain(|node| !excluded.contains(node));
+                routing
+                    .in_sync_replicas
+                    .retain(|node| eligible.contains(node.as_str()));
+                allocations
+                    .replicas
+                    .retain(|node, _| !excluded.contains(node));
+                allocations
+                    .primary_authority
+                    .finish(activation.history.clone());
+                allocations.primary_unavailable = false;
+                if let Err(reason) = routing
+                    .validate_membership()
+                    .and_then(|()| allocations.validate_for_routing(routing))
+                {
+                    return ClusterResponse::Error(reason);
+                }
+                state.indices.insert(index_name.clone(), metadata);
+                state
+                    .shard_allocations
+                    .get_mut(index_name)
+                    .expect("reserved authority validated its allocation map")
+                    .insert(shard_id, allocations);
+                state.version += 1;
+                ClusterResponse::Ok
+            }
+            ClusterCommand::ExcludeFailedShardCopies {
+                index_name,
+                exclusion,
+            } => {
+                if let Err(reason) = exclusion.validate() {
+                    return ClusterResponse::Error(reason);
+                }
+                if state.version < exclusion.captured_state_version {
+                    return ClusterResponse::Error(
+                        "failed-copy exclusion is ahead of applied metadata".into(),
+                    );
+                }
+                if let Err(reason) = state.validate_write_authority(
+                    index_name,
+                    &exclusion.authority,
+                    crate::cluster::state::PrimaryAuthorityPhase::Active,
+                ) {
+                    return ClusterResponse::WriteAuthorityRejected { reason };
+                }
+                let shard_id = exclusion.authority.shard_id;
+                let mut metadata = state.indices[index_name].clone();
+                let mut allocations = state.shard_allocations[index_name][&shard_id].clone();
+                let routing = metadata
+                    .shard_routing
+                    .get_mut(&shard_id)
+                    .expect("active authority validated its shard routing");
+                let removed: std::collections::HashSet<_> = exclusion
+                    .failed_copies
+                    .iter()
+                    .filter(|copy| {
+                        allocations.replicas.get(&copy.node_id) == Some(&copy.allocation_id)
+                    })
+                    .map(|copy| copy.node_id.clone())
+                    .collect();
+                let removed_count = match u32::try_from(removed.len()) {
+                    Ok(count) => count,
+                    Err(_) => {
+                        return ClusterResponse::Error(
+                            "failed-copy exclusion count overflows".into(),
+                        );
+                    }
+                };
+                let Some(unassigned) = routing.unassigned_replicas.checked_add(removed_count)
+                else {
+                    return ClusterResponse::Error("failed-copy unassigned count overflows".into());
+                };
+                routing.unassigned_replicas = unassigned;
+                routing.replicas.retain(|node| !removed.contains(node));
+                routing
+                    .in_sync_replicas
+                    .retain(|node| !removed.contains(node));
+                allocations
+                    .replicas
+                    .retain(|node, _| !removed.contains(node));
+                if let Err(reason) = routing
+                    .validate_membership()
+                    .and_then(|()| allocations.validate_for_routing(routing))
+                {
+                    return ClusterResponse::Error(reason);
+                }
+                state.indices.insert(index_name.clone(), metadata);
+                state
+                    .shard_allocations
+                    .get_mut(index_name)
+                    .expect("active authority validated its allocation map")
+                    .insert(shard_id, allocations);
+                state.version += 1;
+                ClusterResponse::ExclusionApplied {
+                    transition_id: exclusion.transition_id.clone(),
+                }
             }
             ClusterCommand::MarkPrimaryUnavailable {
                 index_name,
@@ -509,59 +688,6 @@ impl ClusterStateMachine {
                     ));
                 }
                 allocations.primary_unavailable = true;
-                state.version += 1;
-                ClusterResponse::Ok
-            }
-            ClusterCommand::MarkPrimaryAvailable {
-                index_name,
-                index_uuid,
-                shard_id,
-                primary,
-                allocation_id,
-                primary_term,
-            } => {
-                let Some(metadata) = state.indices.get(index_name) else {
-                    return ClusterResponse::Error(format!("index '{index_name}' does not exist"));
-                };
-                if metadata.uuid.as_str() != index_uuid {
-                    return ClusterResponse::Error(format!("index '{index_name}' UUID mismatch"));
-                }
-                let Some(routing) = metadata.shard_routing.get(shard_id) else {
-                    return ClusterResponse::Error(format!(
-                        "index '{index_name}' has no shard {shard_id}"
-                    ));
-                };
-                if &routing.primary != primary {
-                    return ClusterResponse::Error(format!(
-                        "primary mismatch for index '{index_name}' shard {shard_id}"
-                    ));
-                }
-                if routing.primary_term != *primary_term {
-                    return ClusterResponse::Error(format!(
-                        "primary term mismatch for index '{index_name}' shard {shard_id}: expected {}, got {}",
-                        routing.primary_term, primary_term
-                    ));
-                }
-                let Some(allocations) = state
-                    .shard_allocations
-                    .get_mut(index_name)
-                    .and_then(|shards| shards.get_mut(shard_id))
-                else {
-                    return ClusterResponse::Error(format!(
-                        "index '{index_name}' shard {shard_id} has no allocation identity metadata"
-                    ));
-                };
-                if allocations.primary != Some(*allocation_id) {
-                    return ClusterResponse::Error(format!(
-                        "primary allocation mismatch for index '{index_name}' shard {shard_id}"
-                    ));
-                }
-                if !allocations.primary_unavailable {
-                    return ClusterResponse::Error(format!(
-                        "primary is not marked unavailable for index '{index_name}' shard {shard_id}"
-                    ));
-                }
-                allocations.primary_unavailable = false;
                 state.version += 1;
                 ClusterResponse::Ok
             }
@@ -660,6 +786,7 @@ impl ClusterStateMachine {
                         allocations.replicas.remove(&candidate);
                         allocations.primary = Some(candidate_allocation);
                         allocations.primary_unavailable = false;
+                        allocations.primary_authority.invalidate();
                         let routing = metadata
                             .shard_routing
                             .get_mut(shard_id)
@@ -1007,6 +1134,40 @@ mod tests {
         }
     }
 
+    fn finish_empty_primary(sm: &ClusterStateMachine, index: &str, shard: u32) {
+        use crate::cluster::state::{
+            CanonicalHistory, PrimaryActivationFinish, WriteAuthorityIdentity,
+        };
+        let state = sm.state_handle().read().unwrap().clone();
+        let metadata = &state.indices[index];
+        let routing = &metadata.shard_routing[&shard];
+        let ids = state.shard_allocation_ids(index, shard).unwrap();
+        let activation_id = ids.primary_authority.activation_id.unwrap();
+        assert_eq!(
+            sm.apply_command(&ClusterCommand::FinishPrimaryActivation {
+                index_name: index.into(),
+                activation: PrimaryActivationFinish {
+                    authority: WriteAuthorityIdentity {
+                        index_uuid: metadata.uuid.to_string(),
+                        shard_id: shard,
+                        primary_node_id: routing.primary.clone(),
+                        primary_allocation_id: ids.primary.unwrap(),
+                        primary_term: routing.primary_term,
+                        activation_id,
+                    },
+                    history: CanonicalHistory {
+                        activation_id,
+                        primary_term: routing.primary_term,
+                        max_seq_no: None,
+                        digest: [1; 32],
+                    },
+                    eligible_replicas: Vec::new(),
+                },
+            }),
+            ClusterResponse::Ok
+        );
+    }
+
     #[test]
     fn new_state_machine_has_empty_state() {
         let sm = ClusterStateMachine::new("test-cluster".into());
@@ -1016,6 +1177,48 @@ mod tests {
         assert!(state.nodes.is_empty());
         assert!(state.indices.is_empty());
         assert_eq!(state.version, 0);
+    }
+
+    #[test]
+    fn minimum_durable_copies_raft_rejects_invalid_create_and_capacity_decrease_atomically() {
+        let sm = ClusterStateMachine::new("minimum-copies".into());
+        let mut metadata = make_index("idx");
+        metadata.settings.minimum_durable_copies = 2;
+        assert!(matches!(
+            sm.apply_command(&ClusterCommand::CreateIndex {
+                metadata: metadata.clone()
+            }),
+            ClusterResponse::Error(_)
+        ));
+        assert_eq!(sm.state_handle().read().unwrap().version, 0);
+        assert!(sm.state_handle().read().unwrap().indices.is_empty());
+        metadata.number_of_replicas = 1;
+        metadata
+            .shard_routing
+            .get_mut(&0)
+            .unwrap()
+            .unassigned_replicas = 1;
+        assert_eq!(
+            sm.apply_command(&ClusterCommand::CreateIndex {
+                metadata: metadata.clone()
+            }),
+            ClusterResponse::Ok
+        );
+        let before = serde_json::to_value(&*sm.state_handle().read().unwrap()).unwrap();
+        metadata.number_of_replicas = 0;
+        metadata
+            .shard_routing
+            .get_mut(&0)
+            .unwrap()
+            .unassigned_replicas = 0;
+        assert!(matches!(
+            sm.apply_command(&ClusterCommand::UpdateIndex { metadata }),
+            ClusterResponse::Error(_)
+        ));
+        assert_eq!(
+            serde_json::to_value(&*sm.state_handle().read().unwrap()).unwrap(),
+            before
+        );
     }
 
     #[test]
@@ -1399,6 +1602,7 @@ mod tests {
             }),
             ClusterResponse::Ok
         );
+        finish_empty_primary(&sm, "idx", 0);
         let version_before = sm.state_handle().read().unwrap().version;
 
         for command in [
@@ -1500,6 +1704,16 @@ mod tests {
             .get_mut(&0)
             .unwrap()
             .primary = None;
+        sm.state_handle()
+            .write()
+            .unwrap()
+            .shard_allocations
+            .get_mut("red-admission")
+            .unwrap()
+            .get_mut(&0)
+            .unwrap()
+            .primary_authority
+            .invalidate();
         assert!(matches!(
             sm.apply_command_at(
                 &ClusterCommand::MarkReplicaInSync {
@@ -1907,7 +2121,7 @@ mod tests {
         {
             let routing = metadata.shard_routing.get_mut(&0).unwrap();
             routing.replicas = vec!["node-2".into()];
-            routing.in_sync_replicas = vec!["node-2".into()];
+            routing.in_sync_replicas = Vec::new();
         }
         let promote_uuid = metadata.uuid.to_string();
         assert_eq!(
@@ -1928,6 +2142,31 @@ mod tests {
             ),
             ClusterResponse::Ok
         );
+        finish_empty_primary(&sm, "promote", 0);
+        assert_eq!(
+            sm.apply_command_at(
+                &ClusterCommand::MarkReplicaInSync {
+                    index_name: "promote".into(),
+                    index_uuid: promote_uuid.clone(),
+                    shard_id: 0,
+                    replica: "node-2".into(),
+                    allocation_id: 10,
+                    primary: "node-1".into(),
+                    primary_term: 2,
+                },
+                12,
+            ),
+            ClusterResponse::Ok
+        );
+        let previous_history = sm
+            .state_handle()
+            .read()
+            .unwrap()
+            .shard_allocation_ids("promote", 0)
+            .unwrap()
+            .primary_authority
+            .history
+            .clone();
         assert_eq!(
             sm.apply_command_at(
                 &ClusterCommand::FailShardCopy {
@@ -1952,6 +2191,17 @@ mod tests {
             assert_eq!(routing.primary_term, 3);
             assert_eq!(routing.unassigned_replicas, 1);
             assert_eq!(state.primary_allocation_id("promote", 0), Some(10));
+            let authority = &state
+                .shard_allocation_ids("promote", 0)
+                .unwrap()
+                .primary_authority;
+            assert_eq!(
+                authority.phase,
+                crate::cluster::state::PrimaryAuthorityPhase::Inactive
+            );
+            assert_eq!(authority.activation_id, None);
+            assert_eq!(authority.history, previous_history);
+            assert!(authority.validate(3, true).is_ok());
         }
     }
 
@@ -2023,10 +2273,35 @@ mod tests {
     }
 
     #[test]
-    fn primary_availability_is_conditional_and_never_changes_term() {
+    fn primary_unavailability_requires_fresh_canonical_finish() {
+        use crate::cluster::state::{
+            CanonicalHistory, PrimaryActivationFinish, PrimaryAuthorityPhase,
+            WriteAuthorityIdentity,
+        };
+
         let sm = ClusterStateMachine::new("test".into());
         let metadata = make_index("unavailable");
         let index_uuid = metadata.uuid.to_string();
+        let finish = |primary_term, activation_id| ClusterCommand::FinishPrimaryActivation {
+            index_name: "unavailable".into(),
+            activation: PrimaryActivationFinish {
+                authority: WriteAuthorityIdentity {
+                    index_uuid: index_uuid.clone(),
+                    shard_id: 0,
+                    primary_node_id: "node-1".into(),
+                    primary_allocation_id: 10,
+                    primary_term,
+                    activation_id,
+                },
+                history: CanonicalHistory {
+                    activation_id,
+                    primary_term,
+                    max_seq_no: None,
+                    digest: [1; 32],
+                },
+                eligible_replicas: Vec::new(),
+            },
+        };
         assert_eq!(
             sm.apply_command_at(&ClusterCommand::CreateIndex { metadata }, 10),
             ClusterResponse::Ok
@@ -2045,6 +2320,7 @@ mod tests {
             ),
             ClusterResponse::Ok
         );
+        assert_eq!(sm.apply_command_at(&finish(2, 11), 12), ClusterResponse::Ok);
         assert_eq!(
             sm.apply_command_at(
                 &ClusterCommand::MarkPrimaryUnavailable {
@@ -2102,32 +2378,8 @@ mod tests {
         }
         let unavailable_version = sm.state_handle().read().unwrap().version;
         assert!(matches!(
-            sm.apply_command_at(
-                &ClusterCommand::MarkPrimaryAvailable {
-                    index_name: "unavailable".into(),
-                    index_uuid: index_uuid.clone(),
-                    shard_id: 0,
-                    primary: "node-1".into(),
-                    allocation_id: 9,
-                    primary_term: 2,
-                },
-                15,
-            ),
-            ClusterResponse::Error(error) if error.contains("allocation mismatch")
-        ));
-        assert!(matches!(
-            sm.apply_command_at(
-                &ClusterCommand::MarkPrimaryAvailable {
-                    index_name: "unavailable".into(),
-                    index_uuid: index_uuid.clone(),
-                    shard_id: 0,
-                    primary: "node-1".into(),
-                    allocation_id: 10,
-                    primary_term: 3,
-                },
-                16,
-            ),
-            ClusterResponse::Error(error) if error.contains("term mismatch")
+            sm.apply_command_at(&finish(2, 11), 15),
+            ClusterResponse::WriteAuthorityRejected { .. }
         ));
         assert_eq!(
             sm.state_handle().read().unwrap().version,
@@ -2135,60 +2387,9 @@ mod tests {
         );
         assert_eq!(
             sm.apply_command_at(
-                &ClusterCommand::MarkPrimaryAvailable {
-                    index_name: "unavailable".into(),
-                    index_uuid: index_uuid.clone(),
-                    shard_id: 0,
-                    primary: "node-1".into(),
-                    allocation_id: 10,
-                    primary_term: 2,
-                },
-                17,
-            ),
-            ClusterResponse::Ok
-        );
-        {
-            let state = sm.state_handle();
-            let state = state.read().unwrap();
-            assert!(!state.primary_unavailable("unavailable", 0));
-            assert_eq!(
-                state.indices["unavailable"].shard_routing[&0].primary_term,
-                2
-            );
-            assert_eq!(state.version, unavailable_version + 1);
-        }
-        assert!(matches!(
-            sm.apply_command_at(
-                &ClusterCommand::MarkPrimaryAvailable {
-                    index_name: "unavailable".into(),
-                    index_uuid: index_uuid.clone(),
-                    shard_id: 0,
-                    primary: "node-1".into(),
-                    allocation_id: 10,
-                    primary_term: 2,
-                },
-                18,
-            ),
-            ClusterResponse::Error(error) if error.contains("not marked unavailable")
-        ));
-        assert_eq!(
-            sm.apply_command_at(
-                &ClusterCommand::MarkPrimaryUnavailable {
-                    index_name: "unavailable".into(),
-                    index_uuid: index_uuid.clone(),
-                    shard_id: 0,
-                    primary: "node-1".into(),
-                    allocation_id: 10,
-                },
-                19,
-            ),
-            ClusterResponse::Ok
-        );
-        assert_eq!(
-            sm.apply_command_at(
                 &ClusterCommand::ActivatePrimary {
                     index_name: "unavailable".into(),
-                    index_uuid,
+                    index_uuid: index_uuid.clone(),
                     shard_id: 0,
                     primary: "node-1".into(),
                     allocation_id: 10,
@@ -2198,9 +2399,29 @@ mod tests {
             ),
             ClusterResponse::Ok
         );
+        {
+            let handle = sm.state_handle();
+            let state = handle.read().unwrap();
+            assert!(state.primary_unavailable("unavailable", 0));
+            assert_eq!(
+                state
+                    .shard_allocation_ids("unavailable", 0)
+                    .unwrap()
+                    .primary_authority
+                    .phase,
+                PrimaryAuthorityPhase::Promoting
+            );
+            assert_eq!(state.version, unavailable_version + 1);
+        }
+        assert!(matches!(
+            sm.apply_command_at(&finish(2, 11), 21),
+            ClusterResponse::WriteAuthorityRejected { .. }
+        ));
+        assert_eq!(sm.apply_command_at(&finish(3, 20), 22), ClusterResponse::Ok);
         let state = sm.state_handle();
         let state = state.read().unwrap();
         assert!(!state.primary_unavailable("unavailable", 0));
+        assert_eq!(state.version, unavailable_version + 2);
         assert_eq!(
             state.indices["unavailable"].shard_routing[&0].primary_term,
             3
@@ -2328,6 +2549,7 @@ mod tests {
                 ),
                 ClusterResponse::Ok
             );
+            finish_empty_primary(&sm, "idx", shard_id);
         }
         assert_eq!(
             sm.apply_command_at(
@@ -2354,6 +2576,14 @@ mod tests {
                 .get_mut(&0)
                 .unwrap()
                 .primary = None;
+            state
+                .shard_allocations
+                .get_mut("idx")
+                .unwrap()
+                .get_mut(&0)
+                .unwrap()
+                .primary_authority
+                .invalidate();
             state
                 .indices
                 .get_mut("idx")

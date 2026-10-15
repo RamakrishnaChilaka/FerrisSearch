@@ -1376,6 +1376,24 @@ pub(crate) async fn search(
     })
 }
 
+fn strip_split_wal(staging_dir: &std::path::Path) -> anyhow::Result<()> {
+    for name in ["translog.manifest", "translog.committed"] {
+        let path = staging_dir.join(name);
+        if path.try_exists()? {
+            std::fs::remove_file(path)?;
+        }
+    }
+    for entry in std::fs::read_dir(staging_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("translog-") && name.ends_with(".bin") {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 /// Publish a batch of JSON documents as a new split on this index.
 ///
 /// Flow (matches Quickwit's build-then-publish pattern):
@@ -1391,10 +1409,9 @@ pub(crate) async fn search(
 ///    via `StorageManager::append_split_and_publish` (serialized by the
 ///    per-storage publish lock).
 ///
-/// Failure handling: on any failure before successful upload, the staging
-/// dir is removed. After upload, the object-store bundle is left in place —
-/// a future janitor PR will reap splits not referenced by any live manifest
-/// generation.
+/// Failures never publish a partial split. Build cleanup is best-effort; later
+/// failures may leave staging files or an uploaded unreferenced bundle for a
+/// future janitor.
 pub(crate) async fn publish_docs(
     state: &AppState,
     index_name: &str,
@@ -1528,41 +1545,27 @@ pub(crate) async fn publish_docs(
         ));
     }
 
-    // Strip out the translog generation files from the staging tree before
-    // packing: they're WAL state for crash recovery on a live engine, not
-    // queryable data. `HotEngine::flush` empties the translog but the file
-    // itself stays on disk; we want the bundle contents to be exactly the
-    // Tantivy `index/` subtree plus the vector index payload.
+    // Immutable bundles cannot retain mutable WAL checkpoints without their WAL.
     let staging_for_strip = staging_dir.clone();
     let strip_result = state
         .worker_pools
-        .spawn_write(move || -> anyhow::Result<()> {
-            let translog = staging_for_strip.join("translog.manifest");
-            if translog.exists() {
-                std::fs::remove_file(&translog)?;
-            }
-            for entry in std::fs::read_dir(&staging_for_strip)? {
-                let entry = entry?;
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                if name_str.starts_with("translog-") && name_str.ends_with(".bin") {
-                    std::fs::remove_file(entry.path())?;
-                }
-            }
-            Ok(())
-        })
+        .spawn_write(move || strip_split_wal(&staging_for_strip))
         .await;
     if let Err(e) = match strip_result {
         Ok(inner) => inner,
         Err(join_err) => Err(anyhow::anyhow!(join_err)),
     } {
-        tracing::warn!(
-            "remote_store: failed to strip translog from staging for split {} of {}: {} \
-             (continuing with upload; translog files will be bundled)",
+        tracing::error!(
+            "remote_store: failed to strip mutable WAL state from split {} of {}: {:#}",
             split_id,
             index_name,
             e
         );
+        return Err(crate::api::error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "remote_store_build_exception",
+            format!("failed to remove mutable WAL state before split publication: {e:#}"),
+        ));
     }
 
     // Pack + upload the bundle. `upload_split_bundle` is uniform across local
@@ -1790,6 +1793,32 @@ mod tests {
     use std::sync::mpsc;
     use tempfile::TempDir;
 
+    #[test]
+    fn immutable_split_strips_mutable_wal_metadata_without_removing_index_files() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("index")).unwrap();
+        let index = directory.path().join("index/meta.json");
+        std::fs::write(&index, b"index files").unwrap();
+        for name in [
+            "translog.manifest",
+            "translog.committed",
+            "translog-00000000000000000000.bin",
+        ] {
+            std::fs::write(directory.path().join(name), b"mutable WAL state").unwrap();
+        }
+        strip_split_wal(directory.path()).unwrap();
+        assert_eq!(std::fs::read(index).unwrap(), b"index files");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn immutable_split_wal_cleanup_failure_is_not_success_shaped() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("translog.committed")).unwrap();
+        let error = strip_split_wal(directory.path()).unwrap_err();
+        assert!(error.to_string().contains("Is a directory"), "{error:#}");
+    }
+
     fn test_leaf(node_id: &str) -> NodeInfo {
         NodeInfo {
             id: node_id.to_string(),
@@ -1840,6 +1869,7 @@ mod tests {
                 engine: IndexEngine::RemoteStore,
                 refresh_interval_ms: None,
                 flush_threshold_bytes: None,
+                minimum_durable_copies: 1,
                 remote_store: Some(RemoteStoreSettings {
                     split_cache_bytes,
                     ..Default::default()

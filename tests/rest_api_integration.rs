@@ -9,7 +9,7 @@ use ferrissearch::security::{SecurityApiKeyConfig, SecurityConfig};
 use ferrissearch::shard::ShardManager;
 use ferrissearch::transport::TransportClient;
 use ferrissearch::transport::proto::{
-    PingRequest, internal_transport_client::InternalTransportClient,
+    PingRequest, ShardDocRequest, internal_transport_client::InternalTransportClient,
 };
 use ferrissearch::transport::server::{
     create_transport_service_with_raft, create_transport_service_with_raft_and_storage,
@@ -817,20 +817,19 @@ async fn create_distributed_stories_index_and_docs(harness: &MultiNodeRestHarnes
         settings: IndexSettings::default(),
     };
 
+    harness.nodes[0]
+        .app_state
+        .raft
+        .client_write(ferrissearch::consensus::types::ClusterCommand::CreateIndex { metadata })
+        .await?
+        .data
+        .into_result()?;
+    let version = harness.nodes[0].app_state.cluster_manager.version();
     for node in &harness.nodes {
-        let mut cluster_state = node.app_state.cluster_manager.get_state();
-        cluster_state.add_index(metadata.clone());
-        node.app_state.cluster_manager.update_state(cluster_state);
-    }
-
-    for (shard_id, node) in harness.nodes.iter().enumerate() {
-        node.app_state.shard_manager.open_shard_with_settings(
-            "stories",
-            shard_id as u32,
-            &metadata.mappings,
-            &metadata.settings,
-            &metadata.uuid,
-        )?;
+        node.app_state
+            .cluster_manager
+            .wait_for_version(version)
+            .await?;
     }
 
     let shard_docs = [
@@ -840,21 +839,35 @@ async fn create_distributed_stories_index_and_docs(harness: &MultiNodeRestHarnes
     ];
 
     for (shard_id, docs) in shard_docs.into_iter().enumerate() {
-        let engine = harness.nodes[shard_id]
+        let node = &harness.nodes[shard_id];
+        let mut client =
+            InternalTransportClient::connect(format!("http://{}", node.transport_addr)).await?;
+        for (doc_index, (value, author)) in docs.into_iter().enumerate() {
+            let response = client
+                .index_doc(forwarding_request(ShardDocRequest {
+                    index_name: "stories".into(),
+                    shard_id: shard_id as u32,
+                    doc_id: format!("doc-{shard_id}-{doc_index}"),
+                    payload_json: serde_json::to_vec(&json!({
+                        "title": format!("story-{shard_id}-{doc_index}"),
+                        "upvotes": value,
+                        "author": author,
+                    }))?,
+                    ..Default::default()
+                }))
+                .await?
+                .into_inner();
+            anyhow::ensure!(
+                response.success,
+                "seed stories shard {shard_id}: {}",
+                response.error
+            );
+        }
+        let engine = node
             .app_state
             .shard_manager
             .get_shard("stories", shard_id as u32)
-            .expect("shard should be open");
-        for (doc_index, (value, author)) in docs.into_iter().enumerate() {
-            engine.add_document(
-                &format!("doc-{shard_id}-{doc_index}"),
-                json!({
-                    "title": format!("story-{shard_id}-{doc_index}"),
-                    "upvotes": value,
-                    "author": author,
-                }),
-            )?;
-        }
+            .expect("the certified primary must be open");
         engine.refresh()?;
     }
 

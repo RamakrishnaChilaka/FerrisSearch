@@ -4,5 +4,6 @@
 pub mod manager;
 pub mod settings;
 pub mod state;
+pub mod write_authority;
 
 pub use manager::ClusterManager;

@@ -3,7 +3,7 @@
 use crate::transport::proto::*;
 use tonic::Status;
 
-const CLUSTER_STATE_WIRE_FORMAT_VERSION: u32 = 1;
+const CLUSTER_STATE_WIRE_FORMAT_VERSION: u32 = 2;
 
 pub(super) fn node_info_to_proto(n: &crate::cluster::state::NodeInfo) -> NodeInfo {
     NodeInfo {
@@ -89,6 +89,7 @@ pub(super) fn index_settings_to_proto(
         engine: settings.engine.to_string(),
         refresh_interval_ms: settings.refresh_interval_ms,
         flush_threshold_bytes: settings.flush_threshold_bytes,
+        minimum_durable_copies: Some(settings.minimum_durable_copies),
         remote_store: settings.remote_store.as_ref().map(|remote_store| {
             crate::transport::proto::RemoteStoreSettings {
                 object_store_uri: remote_store.object_store_uri.clone(),
@@ -148,6 +149,11 @@ pub(super) fn proto_to_index_settings(
         engine,
         refresh_interval_ms: settings.refresh_interval_ms,
         flush_threshold_bytes: settings.flush_threshold_bytes,
+        minimum_durable_copies: settings.minimum_durable_copies.filter(|value| *value > 0).ok_or_else(|| {
+            Status::invalid_argument(
+                "unsupported cluster-state wire format: minimum_durable_copies is missing or zero; recreate the index",
+            )
+        })?,
         remote_store: proto_to_remote_store_settings(settings.remote_store.as_ref()),
     })
 }
@@ -199,6 +205,68 @@ pub(super) fn validate_join_identity(
     Ok(())
 }
 
+fn primary_authority_to_proto(
+    authority: &crate::cluster::state::PrimaryAuthority,
+) -> ShardPrimaryAuthority {
+    use crate::cluster::state::PrimaryAuthorityPhase as Phase;
+    ShardPrimaryAuthority {
+        phase: match authority.phase {
+            Phase::Inactive => ShardPrimaryAuthorityPhase::Inactive,
+            Phase::Promoting => ShardPrimaryAuthorityPhase::Promoting,
+            Phase::Active => ShardPrimaryAuthorityPhase::Active,
+        } as i32,
+        activation_id: authority.activation_id,
+        history: authority
+            .history
+            .as_ref()
+            .map(|history| CanonicalHistoryCertificate {
+                activation_id: history.activation_id,
+                primary_term: history.primary_term,
+                max_seq_no: history.max_seq_no,
+                digest: history.digest.to_vec(),
+            }),
+    }
+}
+
+fn primary_authority_from_proto(
+    wire: &ShardPrimaryAuthority,
+) -> Result<crate::cluster::state::PrimaryAuthority, Status> {
+    use crate::cluster::state::PrimaryAuthorityPhase as Phase;
+    let phase = match ShardPrimaryAuthorityPhase::try_from(wire.phase) {
+        Ok(ShardPrimaryAuthorityPhase::Inactive) => Phase::Inactive,
+        Ok(ShardPrimaryAuthorityPhase::Promoting) => Phase::Promoting,
+        Ok(ShardPrimaryAuthorityPhase::Active) => Phase::Active,
+        _ => {
+            return Err(Status::invalid_argument(
+                "unknown or missing shard primary authority phase",
+            ));
+        }
+    };
+    let history = wire
+        .history
+        .as_ref()
+        .map(|history| {
+            let decoded = crate::cluster::state::CanonicalHistory {
+                activation_id: history.activation_id,
+                primary_term: history.primary_term,
+                max_seq_no: history.max_seq_no,
+                digest: history.digest.as_slice().try_into().map_err(|_| {
+                    Status::invalid_argument(
+                        "canonical history digest must contain exactly 32 bytes",
+                    )
+                })?,
+            };
+            decoded.validate().map_err(Status::invalid_argument)?;
+            Ok::<_, Status>(decoded)
+        })
+        .transpose()?;
+    Ok(crate::cluster::state::PrimaryAuthority {
+        phase,
+        activation_id: wire.activation_id,
+        history,
+    })
+}
+
 pub fn cluster_state_to_proto(s: &crate::cluster::state::ClusterState) -> ClusterState {
     ClusterState {
         cluster_name: s.cluster_name.clone(),
@@ -239,6 +307,11 @@ pub fn cluster_state_to_proto(s: &crate::cluster::state::ClusterState) -> Cluste
                         primary_unavailable: s
                             .shard_allocation_ids(&idx.name, *sid)
                             .is_some_and(|allocations| allocations.primary_unavailable),
+                        primary_authority: s.shard_allocation_ids(&idx.name, *sid).map(
+                            |allocations| {
+                                primary_authority_to_proto(&allocations.primary_authority)
+                            },
+                        ),
                         shard_id: *sid,
                         node_id: routing.primary.clone(),
                         primary_term: routing.primary_term,
@@ -350,6 +423,13 @@ pub fn proto_to_cluster_state(
                 initial_allocation_id,
                 primary_initialized: sa.primary_initialized,
                 primary_unavailable: sa.primary_unavailable,
+                primary_authority: primary_authority_from_proto(
+                    sa.primary_authority.as_ref().ok_or_else(|| {
+                        Status::invalid_argument(
+                            "shard snapshot is missing primary authority metadata",
+                        )
+                    })?,
+                )?,
             };
             allocations
                 .validate_for_routing(&routing)
@@ -386,19 +466,20 @@ pub fn proto_to_cluster_state(
         } else {
             crate::cluster::state::IndexUuid::new(idx.uuid.clone())
         };
-        state.indices.insert(
-            idx.name.clone(),
-            crate::cluster::state::IndexMetadata {
-                name: idx.name.clone(),
-                uuid: index_uuid,
-                number_of_shards: idx.number_of_shards,
-                number_of_replicas: idx.number_of_replicas,
-                shard_routing,
-                mappings,
-                dynamic: proto_to_dynamic_mapping(&idx.dynamic)?,
-                settings: proto_to_index_settings(idx.settings.as_ref())?,
-            },
-        );
+        let metadata = crate::cluster::state::IndexMetadata {
+            name: idx.name.clone(),
+            uuid: index_uuid,
+            number_of_shards: idx.number_of_shards,
+            number_of_replicas: idx.number_of_replicas,
+            shard_routing,
+            mappings,
+            dynamic: proto_to_dynamic_mapping(&idx.dynamic)?,
+            settings: proto_to_index_settings(idx.settings.as_ref())?,
+        };
+        metadata
+            .validate_write_policy()
+            .map_err(Status::invalid_argument)?;
+        state.indices.insert(idx.name.clone(), metadata);
         state
             .shard_allocations
             .insert(idx.name.clone(), shard_allocations);

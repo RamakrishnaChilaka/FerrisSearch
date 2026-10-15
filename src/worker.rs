@@ -71,6 +71,8 @@ pub struct WorkerPools {
     write_pool: Arc<rayon::ThreadPool>,
     search_size: usize,
     write_size: usize,
+    #[cfg(test)]
+    write_submissions: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl WorkerPools {
@@ -101,6 +103,8 @@ impl WorkerPools {
             write_pool: Arc::new(write_pool),
             search_size: search_pool_size,
             write_size: write_pool_size,
+            #[cfg(test)]
+            write_submissions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -161,8 +165,17 @@ impl WorkerPools {
             };
             let _ = tx.send(result);
         });
+        #[cfg(test)]
+        self.write_submissions
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         rx.await
             .map_err(|_| anyhow::anyhow!("write task was cancelled"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_submissions_for_test(&self) -> usize {
+        self.write_submissions
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn search_pool_size(&self) -> usize {

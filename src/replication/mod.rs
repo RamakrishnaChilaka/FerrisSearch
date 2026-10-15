@@ -7,7 +7,7 @@
 use crate::cluster::state::ClusterState;
 use crate::shard::ReplicaCheckpointUpdate;
 use crate::transport::TransportClient;
-use crate::transport::proto::{ReplicateBulkRequest, ReplicateDocRequest};
+use crate::transport::proto::{ReplicaWriteAuthority, ReplicateBulkRequest, ReplicateDocRequest};
 use crate::wal::TranslogDurability;
 use std::sync::Arc;
 use tracing::error;
@@ -100,8 +100,34 @@ impl std::fmt::Display for ReplicaReplicationFailure {
 }
 
 #[derive(Debug, Clone)]
+pub struct ReplicaReplicationErrors {
+    pub acknowledged: Vec<ReplicaCheckpointUpdate>,
+    pub failures: Vec<ReplicaReplicationFailure>,
+}
+
+impl From<Vec<ReplicaReplicationFailure>> for ReplicaReplicationErrors {
+    fn from(failures: Vec<ReplicaReplicationFailure>) -> Self {
+        Self {
+            acknowledged: Vec::new(),
+            failures,
+        }
+    }
+}
+
+impl std::ops::Deref for ReplicaReplicationErrors {
+    type Target = [ReplicaReplicationFailure];
+
+    fn deref(&self) -> &Self::Target {
+        &self.failures
+    }
+}
+
+pub type ReplicationResult = Result<Vec<ReplicaCheckpointUpdate>, ReplicaReplicationErrors>;
+
+#[derive(Debug, Clone)]
 struct ReplicaWireOperation {
     seq_no: u64,
+    primary_term: u64,
     op: String,
     doc_id: String,
     payload_json: Vec<u8>,
@@ -111,9 +137,67 @@ struct ReplicaWireOperation {
 
 struct ReplicaBatchRoute {
     index_uuid: String,
+    authority: ReplicaWriteAuthority,
     #[cfg(feature = "protocol-trace")]
     primary_node: String,
     replica_node_ids: Vec<String>,
+}
+
+pub(crate) fn capture_replica_authority(
+    state: &ClusterState,
+    index_name: &str,
+    shard_id: u32,
+) -> Result<ReplicaWriteAuthority, Vec<ReplicaReplicationFailure>> {
+    let capture = || -> anyhow::Result<ReplicaWriteAuthority> {
+        let metadata = state
+            .indices
+            .get(index_name)
+            .ok_or_else(|| anyhow::anyhow!("replication index [{index_name}] is missing"))?;
+        let routing = metadata.shard_routing.get(&shard_id).ok_or_else(|| {
+            anyhow::anyhow!("replication shard [{index_name}][{shard_id}] is missing")
+        })?;
+        let allocations = state
+            .shard_allocation_ids(index_name, shard_id)
+            .ok_or_else(|| anyhow::anyhow!("replication requires current allocation metadata"))?;
+        let authority = crate::cluster::state::WriteAuthorityIdentity {
+            index_uuid: metadata.uuid.to_string(),
+            shard_id,
+            primary_node_id: routing.primary.clone(),
+            primary_allocation_id: allocations
+                .primary
+                .ok_or_else(|| anyhow::anyhow!("replication requires a primary allocation ID"))?,
+            primary_term: routing.primary_term,
+            activation_id: allocations
+                .primary_authority
+                .activation_id
+                .ok_or_else(|| anyhow::anyhow!("replication requires a canonical activation ID"))?,
+        };
+        state
+            .validate_write_authority(
+                index_name,
+                &authority,
+                crate::cluster::state::PrimaryAuthorityPhase::Active,
+            )
+            .map_err(anyhow::Error::msg)?;
+        if state.version == 0 || allocations.primary_unavailable {
+            anyhow::bail!("replication requires available committed ACTIVE primary authority");
+        }
+        Ok(ReplicaWriteAuthority {
+            primary_node_id: authority.primary_node_id,
+            primary_allocation_id: authority.primary_allocation_id,
+            primary_term: authority.primary_term,
+            activation_id: authority.activation_id,
+            captured_state_version: state.version,
+            safe_global_checkpoint: None,
+        })
+    };
+    capture().map_err(|error| {
+        vec![ReplicaReplicationFailure::message(
+            "<authority>",
+            None,
+            format!("cannot capture live replication authority: {error:#}"),
+        )]
+    })
 }
 
 fn resolve_replica_batch_route(
@@ -125,17 +209,27 @@ fn resolve_replica_batch_route(
 ) -> Result<Option<ReplicaBatchRoute>, Vec<ReplicaReplicationFailure>> {
     let metadata = match cluster_state.indices.get(index_name) {
         Some(metadata) => metadata,
-        None => return Ok(None),
+        None => {
+            return Err(vec![ReplicaReplicationFailure::message(
+                "<authority>",
+                None,
+                format!("replication index [{index_name}] is missing"),
+            )]);
+        }
     };
     let Some(routing) = metadata.shard_routing.get(&shard_id) else {
-        return Ok(None);
+        return Err(vec![ReplicaReplicationFailure::message(
+            "<authority>",
+            None,
+            format!("replication shard [{index_name}][{shard_id}] is missing"),
+        )]);
     };
-    if routing.primary_term != primary_term {
+    if primary_term == 0 || primary_term > routing.primary_term {
         return Err(vec![ReplicaReplicationFailure::message(
             "<routing>",
             None,
             format!(
-                "{operation_label} replication term {primary_term} does not match captured routing term {}",
+                "{operation_label} operation term {primary_term} exceeds captured routing term {}",
                 routing.primary_term
             ),
         )]);
@@ -145,8 +239,13 @@ fn resolve_replica_batch_route(
         .into_iter()
         .cloned()
         .collect::<Vec<_>>();
+    if replica_node_ids.is_empty() {
+        return Ok(None);
+    }
+    let authority = capture_replica_authority(cluster_state, index_name, shard_id)?;
     Ok(Some(ReplicaBatchRoute {
         index_uuid: metadata.uuid.to_string(),
+        authority,
         #[cfg(feature = "protocol-trace")]
         primary_node: routing.primary.clone(),
         replica_node_ids,
@@ -169,7 +268,7 @@ pub async fn replicate_write(
     document_version: u64,
     client_operation: Option<&crate::engine::ClientOperationRecord>,
     primary_term: u64,
-) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>> {
+) -> ReplicationResult {
     replicate_write_with_durability(
         transport_client,
         cluster_state,
@@ -183,6 +282,7 @@ pub async fn replicate_write(
         client_operation,
         primary_term,
         TranslogDurability::Request,
+        None,
     )
     .await
 }
@@ -201,31 +301,49 @@ pub async fn replicate_write_with_durability(
     client_operation: Option<&crate::engine::ClientOperationRecord>,
     primary_term: u64,
     durability: TranslogDurability,
-) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>> {
+    safe_global_checkpoint: Option<u64>,
+) -> ReplicationResult {
     let metadata = match cluster_state.indices.get(index_name) {
         Some(m) => m,
-        None => return Ok(vec![]), // no index metadata, nothing to replicate
+        None => {
+            return Err(vec![ReplicaReplicationFailure::message(
+                "<authority>",
+                None,
+                format!("replication index [{index_name}] is missing"),
+            )]
+            .into());
+        }
     };
     let Some(routing) = metadata.shard_routing.get(&shard_id) else {
-        return Ok(vec![]);
+        return Err(vec![ReplicaReplicationFailure::message(
+            "<authority>",
+            None,
+            format!("replication shard [{index_name}][{shard_id}] is missing"),
+        )]
+        .into());
     };
     let index_uuid = metadata.uuid.to_string();
-    if !matches!(op, "index" | "delete") || document_version == 0 {
+    if !matches!(
+        (op, document_version),
+        ("index" | "delete", 1..) | ("noop", 0)
+    ) {
         return Err(vec![ReplicaReplicationFailure::message(
             "<routing>",
             None,
             "replicated document mutation has an invalid operation kind or version".to_string(),
-        )]);
+        )]
+        .into());
     }
-    if routing.primary_term != primary_term {
+    if primary_term == 0 || primary_term > routing.primary_term {
         return Err(vec![ReplicaReplicationFailure::message(
             "<routing>",
             None,
             format!(
-                "replication term {primary_term} does not match captured routing term {}",
+                "replication operation term {primary_term} exceeds captured routing term {}",
                 routing.primary_term
             ),
-        )]);
+        )]
+        .into());
     }
 
     #[cfg(feature = "protocol-trace")]
@@ -256,12 +374,26 @@ pub async fn replicate_write_with_durability(
             "delete" => crate::engine::DocumentMutation::Delete {
                 doc_id: doc_id.to_string(),
             },
+            "noop" => crate::engine::DocumentMutation::NoOp {
+                reason: payload
+                    .get("_reason")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        trace_replication_failure(
+                            routing.primary.clone(),
+                            None,
+                            "replicated NoOp has no _reason",
+                        )
+                    })?
+                    .to_string(),
+            },
             other => {
                 return Err(trace_replication_failure(
                     routing.primary.clone(),
                     None,
                     format!("unsupported traced replication operation '{other}'"),
-                ));
+                )
+                .into());
             }
         },
     };
@@ -286,6 +418,8 @@ pub async fn replicate_write_with_durability(
     if replica_node_ids.is_empty() {
         return Ok(vec![]);
     }
+    let mut authority = capture_replica_authority(cluster_state, index_name, shard_id)?;
+    authority.safe_global_checkpoint = safe_global_checkpoint;
 
     // Build futures for concurrent replication to all in-sync replicas
     let mut futures = Vec::with_capacity(replica_node_ids.len());
@@ -337,6 +471,8 @@ pub async fn replicate_write_with_durability(
             Arc::new(serde_json::to_vec(payload).map_err(|error| error.to_string()))
         }));
         let uuid = index_uuid.clone();
+        let authority = authority.clone();
+        let wire_document_version = (op != "noop").then_some(document_version);
         let client_operation =
             client_operation.map(crate::transport::client_operation::record_to_proto);
         #[cfg(feature = "protocol-trace")]
@@ -395,8 +531,9 @@ pub async fn replicate_write_with_durability(
                         index_uuid: uuid,
                         primary_term: Some(primary_term),
                         target_allocation_id: Some(target_allocation_id),
-                        document_version: Some(document_version),
+                        document_version: wire_document_version,
                         client_operation,
+                        authority: Some(authority),
                     },
                     matches!(durability, TranslogDurability::Request),
                 )
@@ -489,8 +626,50 @@ pub async fn replicate_write_with_durability(
     if errors.is_empty() {
         Ok(checkpoints)
     } else {
-        Err(errors)
+        Err(ReplicaReplicationErrors {
+            acknowledged: checkpoints,
+            failures: errors,
+        })
     }
+}
+
+pub async fn replicate_operation_with_durability(
+    transport_client: &TransportClient,
+    cluster_state: &ClusterState,
+    index_name: &str,
+    shard_id: u32,
+    operation: &crate::engine::SequencedOperation,
+    durability: TranslogDurability,
+    safe_global_checkpoint: Option<u64>,
+) -> ReplicationResult {
+    let empty = serde_json::json!({});
+    let noop;
+    let (doc_id, payload, op) = match &operation.mutation {
+        crate::engine::DocumentMutation::Index { doc_id, source } => {
+            (doc_id.as_str(), source, "index")
+        }
+        crate::engine::DocumentMutation::Delete { doc_id } => (doc_id.as_str(), &empty, "delete"),
+        crate::engine::DocumentMutation::NoOp { reason } => {
+            noop = serde_json::json!({ "_reason": reason });
+            ("", &noop, "noop")
+        }
+    };
+    replicate_write_with_durability(
+        transport_client,
+        cluster_state,
+        index_name,
+        shard_id,
+        doc_id,
+        payload,
+        op,
+        operation.seq_no,
+        operation.document_version,
+        operation.client_operation.as_ref(),
+        operation.primary_term,
+        durability,
+        safe_global_checkpoint,
+    )
+    .await
 }
 
 /// Replicate a bulk set of writes to all in-sync replica nodes for a shard.
@@ -505,7 +684,7 @@ pub async fn replicate_bulk(
     start_seq_no: u64,
     versions: &[u64],
     primary_term: u64,
-) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>> {
+) -> ReplicationResult {
     replicate_bulk_with_durability(
         transport_client,
         cluster_state,
@@ -516,6 +695,7 @@ pub async fn replicate_bulk(
         versions,
         primary_term,
         TranslogDurability::Request,
+        None,
     )
     .await
 }
@@ -531,18 +711,21 @@ pub async fn replicate_bulk_with_durability(
     versions: &[u64],
     primary_term: u64,
     durability: TranslogDurability,
-) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>> {
-    let Some(route) =
+    safe_global_checkpoint: Option<u64>,
+) -> ReplicationResult {
+    let Some(mut route) =
         resolve_replica_batch_route(cluster_state, index_name, shard_id, primary_term, "bulk")?
     else {
         return Ok(Vec::new());
     };
+    route.authority.safe_global_checkpoint = safe_global_checkpoint;
     if versions.len() != docs.len() || versions.contains(&0) {
         return Err(vec![ReplicaReplicationFailure::message(
             "<bulk>",
             None,
             "bulk replication has inconsistent document versions".to_string(),
-        )]);
+        )]
+        .into());
     }
     #[cfg(feature = "protocol-trace")]
     if !docs.is_empty() {
@@ -618,6 +801,7 @@ pub async fn replicate_bulk_with_durability(
             })?;
             Ok(ReplicaWireOperation {
                 seq_no,
+                primary_term,
                 op: "index".to_string(),
                 doc_id: doc_id.clone(),
                 payload_json,
@@ -634,7 +818,6 @@ pub async fn replicate_bulk_with_durability(
         index_name,
         shard_id,
         Arc::from(operations),
-        primary_term,
         durability,
         "bulk",
     )
@@ -650,17 +833,17 @@ pub async fn replicate_noop_batch_with_durability(
     operations: &[crate::engine::SequencedOperation],
     primary_term: u64,
     durability: TranslogDurability,
-) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>> {
+) -> ReplicationResult {
     let mut previous_seq_no = None;
     let operations = operations
         .iter()
         .map(|operation| {
-            if operation.primary_term != primary_term {
+            if operation.primary_term == 0 || operation.primary_term > primary_term {
                 return Err(ReplicaReplicationFailure::message(
                     "<promotion>",
                     None,
                     format!(
-                        "promotion NoOp term {} does not match activated term {primary_term}",
+                        "NoOp operation term {} exceeds activated term {primary_term}",
                         operation.primary_term
                     ),
                 ));
@@ -690,6 +873,7 @@ pub async fn replicate_noop_batch_with_durability(
                 })?;
             Ok(ReplicaWireOperation {
                 seq_no: operation.seq_no,
+                primary_term: operation.primary_term,
                 op: "noop".to_string(),
                 doc_id: String::new(),
                 payload_json,
@@ -719,7 +903,6 @@ pub async fn replicate_noop_batch_with_durability(
         index_name,
         shard_id,
         Arc::from(operations),
-        primary_term,
         durability,
         "promotion NoOp",
     )
@@ -734,10 +917,9 @@ async fn replicate_explicit_batch_with_durability(
     index_name: &str,
     shard_id: u32,
     operations: Arc<[ReplicaWireOperation]>,
-    primary_term: u64,
     durability: TranslogDurability,
     operation_label: &'static str,
-) -> Result<Vec<ReplicaCheckpointUpdate>, Vec<ReplicaReplicationFailure>> {
+) -> ReplicationResult {
     #[cfg(feature = "protocol-trace")]
     let trace_operations = operations
         .iter()
@@ -789,7 +971,7 @@ async fn replicate_explicit_batch_with_durability(
             };
             Ok(crate::engine::SequencedOperation {
                 seq_no: operation.seq_no,
-                primary_term,
+                primary_term: operation.primary_term,
                 document_version: operation.document_version.unwrap_or(0),
                 client_operation: operation.client_operation.clone(),
                 mutation,
@@ -858,6 +1040,7 @@ async fn replicate_explicit_batch_with_durability(
             continue;
         };
         let uuid = route.index_uuid.clone();
+        let authority = route.authority.clone();
         #[cfg(feature = "protocol-trace")]
         let trace_target_messages = trace_messages
             .iter()
@@ -900,13 +1083,14 @@ async fn replicate_explicit_batch_with_durability(
                     op: operation.op.clone(),
                     seq_no: operation.seq_no,
                     index_uuid: uuid.clone(),
-                    primary_term: Some(primary_term),
+                    primary_term: Some(operation.primary_term),
                     target_allocation_id: Some(target_allocation_id),
                     document_version: operation.document_version,
                     client_operation: operation
                         .client_operation
                         .as_ref()
                         .map(crate::transport::client_operation::record_to_proto),
+                    authority: Some(authority.clone()),
                 })
                 .collect();
             match client
@@ -917,8 +1101,9 @@ async fn replicate_explicit_batch_with_durability(
                         shard_id,
                         ops,
                         index_uuid: uuid,
-                        primary_term: Some(primary_term),
+                        primary_term: Some(authority.primary_term),
                         target_allocation_id: Some(target_allocation_id),
+                        authority: Some(authority),
                     },
                     matches!(durability, TranslogDurability::Request),
                 )
@@ -1014,7 +1199,10 @@ async fn replicate_explicit_batch_with_durability(
     if errors.is_empty() {
         Ok(checkpoints)
     } else {
-        Err(errors)
+        Err(ReplicaReplicationErrors {
+            acknowledged: checkpoints,
+            failures: errors,
+        })
     }
 }
 
@@ -1079,12 +1267,27 @@ mod tests {
             dynamic: Default::default(),
             settings: crate::cluster::state::IndexSettings::default(),
         });
+        let allocations = cs
+            .shard_allocations
+            .get_mut(name)
+            .unwrap()
+            .get_mut(&0)
+            .unwrap();
+        allocations.primary_initialized = true;
+        allocations
+            .primary_authority
+            .finish(crate::cluster::state::CanonicalHistory {
+                activation_id: 1,
+                primary_term: 1,
+                max_seq_no: None,
+                digest: [1; 32],
+            });
     }
 
     // ── replicate_write ─────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn write_noop_when_index_missing() {
+    async fn write_rejects_missing_index_without_fabricating_empty_proof() {
         let client = TransportClient::new();
         let cs = make_cluster_state_with_nodes();
         let result = replicate_write(
@@ -1101,7 +1304,7 @@ mod tests {
             1,
         )
         .await;
-        assert!(result.is_ok());
+        assert!(result.unwrap_err()[0].contains("index [nonexistent] is missing"));
     }
 
     #[tokio::test]
@@ -1150,11 +1353,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_noop_when_shard_not_in_routing() {
+    async fn write_rejects_missing_shard_without_fabricating_empty_proof() {
         let client = TransportClient::new();
         let mut cs = make_cluster_state_with_nodes();
         add_index_with_routing(&mut cs, "test-idx", vec!["node-2".into()]);
-        // Shard 99 doesn't exist in routing table → no replicas → Ok
         let result = replicate_write(
             &client,
             &cs,
@@ -1169,7 +1371,7 @@ mod tests {
             1,
         )
         .await;
-        assert!(result.is_ok());
+        assert!(result.unwrap_err()[0].contains("shard [test-idx][99] is missing"));
     }
 
     #[tokio::test]
@@ -1251,12 +1453,12 @@ mod tests {
     // ── replicate_bulk ──────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn bulk_noop_when_index_missing() {
+    async fn bulk_rejects_missing_index_without_fabricating_empty_proof() {
         let client = TransportClient::new();
         let cs = make_cluster_state_with_nodes();
         let docs = vec![("d1".into(), serde_json::json!({"a": 1}))];
         let result = replicate_bulk(&client, &cs, "nonexistent", 0, &docs, 0, &[1], 1).await;
-        assert!(result.is_ok());
+        assert!(result.unwrap_err()[0].contains("index [nonexistent] is missing"));
     }
 
     #[tokio::test]
@@ -1319,11 +1521,12 @@ mod tests {
     #[tokio::test]
     async fn write_noop_returns_empty_checkpoints() {
         let client = TransportClient::new();
-        let cs = make_cluster_state_with_nodes();
+        let mut cs = make_cluster_state_with_nodes();
+        add_index_with_routing(&mut cs, "test-idx", Vec::new());
         let checkpoints = replicate_write(
             &client,
             &cs,
-            "nonexistent",
+            "test-idx",
             0,
             "doc1",
             &serde_json::json!({"f": 1}),
@@ -1341,9 +1544,10 @@ mod tests {
     #[tokio::test]
     async fn bulk_noop_returns_empty_checkpoints() {
         let client = TransportClient::new();
-        let cs = make_cluster_state_with_nodes();
+        let mut cs = make_cluster_state_with_nodes();
+        add_index_with_routing(&mut cs, "test-idx", Vec::new());
         let docs = vec![("d1".into(), serde_json::json!({"a": 1}))];
-        let checkpoints = replicate_bulk(&client, &cs, "nonexistent", 0, &docs, 0, &[1], 1)
+        let checkpoints = replicate_bulk(&client, &cs, "test-idx", 0, &docs, 0, &[1], 1)
             .await
             .unwrap();
         assert!(checkpoints.is_empty());

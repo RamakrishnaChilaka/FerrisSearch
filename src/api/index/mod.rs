@@ -1794,7 +1794,7 @@ async fn execute_update(
                 .unwrap_or(true)
                 && !changed
             {
-                let (seq_no, primary_term, version, result, status) =
+                let (seq_no, primary_term, version, result, status, acknowledgement) =
                     if let Some(operation) = client_operation.as_ref() {
                         match state
                             .transport_client
@@ -1810,7 +1810,7 @@ async fn execute_update(
                             )
                             .await
                         {
-                            Ok(receipt) => {
+                            Ok((receipt, acknowledgement)) => {
                                 let (result, status) = match receipt.client_operation.result {
                                     crate::engine::ClientOperationResult::Index {
                                         created: true,
@@ -1837,6 +1837,7 @@ async fn execute_update(
                                     receipt.version,
                                     result,
                                     status,
+                                    Some(acknowledgement),
                                 )
                             }
                             Err(error) => return document_write_error_response("Update", error),
@@ -1848,18 +1849,25 @@ async fn execute_update(
                             existing.version,
                             "noop",
                             StatusCode::OK,
+                            None,
                         )
                     };
-                return (
-                    status,
-                    Json(serde_json::json!({
-                        "_index": index_name, "_id": doc_id,
-                        "_seq_no": seq_no, "_primary_term": primary_term,
-                        "_version": version,
-                        "result": result,
-                        "_shards": {"total": 0, "successful": 0, "failed": 0}
-                    })),
-                );
+                let mut response = serde_json::json!({
+                    "_index": index_name, "_id": doc_id,
+                    "_seq_no": seq_no, "_primary_term": primary_term,
+                    "_version": version,
+                    "result": result,
+                    "_shards": {"total": 0, "successful": 0, "failed": 0}
+                });
+                if let Some(acknowledgement) = &acknowledgement {
+                    crate::transport::write_acknowledgement::add_write_acknowledgement_to_response(
+                        &mut response,
+                        index_name,
+                        shard_id,
+                        acknowledgement,
+                    );
+                }
+                return (status, Json(response));
             }
             (
                 merged,
@@ -2068,6 +2076,7 @@ pub async fn get_index_settings(
                     "index": {
                         "number_of_shards": metadata.number_of_shards,
                         "number_of_replicas": metadata.number_of_replicas,
+                        "minimum_durable_copies": metadata.settings.minimum_durable_copies,
                         "engine": metadata.settings.engine.to_string(),
                         "refresh_interval_ms": metadata.settings.refresh_interval_ms,
                         "flush_threshold_bytes": metadata.settings.flush_threshold_bytes,
@@ -2206,6 +2215,7 @@ pub async fn verify_remote_store_splits(
 ///
 /// Supported dynamic settings:
 /// - `index.number_of_replicas` (u32) — adjusts replica count
+/// - `index.minimum_durable_copies` (positive u32) — required acknowledged copies
 /// - `index.refresh_interval_ms` (u64 | null) — per-index refresh interval
 /// - `index.flush_threshold_bytes` (u64 | null) — auto-flush threshold for the WAL
 ///
@@ -2230,22 +2240,6 @@ pub async fn update_index_settings(
 ) -> (StatusCode, Json<Value>) {
     // IndexName is validated at extraction time
 
-    // Reject static settings
-    if body.pointer("/index/number_of_shards").is_some() {
-        return crate::api::error_response(
-            StatusCode::BAD_REQUEST,
-            "illegal_argument_exception",
-            "index.number_of_shards is immutable and cannot be changed after index creation",
-        );
-    }
-    if body.pointer("/index/engine").is_some() {
-        return crate::api::error_response(
-            StatusCode::BAD_REQUEST,
-            "illegal_argument_exception",
-            "index.engine is immutable and cannot be changed after index creation",
-        );
-    }
-
     let cluster_state = state.cluster_manager.get_state();
     let mut metadata = match cluster_state.indices.get(index_name.as_str()) {
         Some(m) => m.clone(),
@@ -2258,49 +2252,16 @@ pub async fn update_index_settings(
         }
     };
 
-    let mut changed = false;
-
-    // Update number_of_replicas
-    if let Some(new_replicas) = body
-        .pointer("/index/number_of_replicas")
-        .and_then(|v| v.as_u64())
-    {
-        let new_replicas = new_replicas as u32;
-        if new_replicas != metadata.number_of_replicas {
-            metadata.update_number_of_replicas(new_replicas);
-            changed = true;
+    let changed = match metadata.apply_settings_update(&body) {
+        Ok(changed) => changed,
+        Err(error) => {
+            return crate::api::error_response(
+                StatusCode::BAD_REQUEST,
+                "illegal_argument_exception",
+                error,
+            );
         }
-    }
-
-    // Update refresh_interval_ms
-    if let Some(val) = body.pointer("/index/refresh_interval_ms") {
-        if val.is_null() {
-            if metadata.settings.refresh_interval_ms.is_some() {
-                metadata.settings.refresh_interval_ms = None;
-                changed = true;
-            }
-        } else if let Some(ms) = val.as_u64()
-            && metadata.settings.refresh_interval_ms != Some(ms)
-        {
-            metadata.settings.refresh_interval_ms = Some(ms);
-            changed = true;
-        }
-    }
-
-    // Update flush_threshold_bytes
-    if let Some(val) = body.pointer("/index/flush_threshold_bytes") {
-        if val.is_null() {
-            if metadata.settings.flush_threshold_bytes.is_some() {
-                metadata.settings.flush_threshold_bytes = None;
-                changed = true;
-            }
-        } else if let Some(bytes) = val.as_u64()
-            && metadata.settings.flush_threshold_bytes != Some(bytes)
-        {
-            metadata.settings.flush_threshold_bytes = Some(bytes);
-            changed = true;
-        }
-    }
+    };
 
     if !changed {
         return (

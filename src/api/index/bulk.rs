@@ -136,7 +136,14 @@ fn wire_item_json(index: &str, shard: u32, item: ShardBulkItemResponse) -> Value
         serde_json::json!({"_index": index, "_id": item.doc_id, "status": item.status});
     if item.error.is_empty() {
         result["result"] = serde_json::json!(item.result);
-        result["_shards"] = serde_json::json!({"total": 1, "successful": 1, "failed": 0});
+        crate::transport::write_acknowledgement::add_write_acknowledgement_to_response(
+            &mut result,
+            index,
+            shard,
+            item.write_acknowledgement
+                .as_ref()
+                .expect("successful bulk items have validated data-copy acknowledgement reports"),
+        );
     } else {
         result["error"] = serde_json::json!({"type": item.error_type, "reason": item.error});
     }
