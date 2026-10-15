@@ -33,6 +33,7 @@ cargo test --test replication_integration --features transport-tls  # Replicatio
 cargo test --test rest_api_integration          # REST API integration tests
 cargo test --test restart_regression            # Real restart/rejoin regression
 cargo test --features protocol-trace --test stale_primary_failover  # Live old-primary partition
+cargo test --features protocol-trace --lib fs014  # Bulk copy/floor/cancellation boundaries
 cargo test --lib write_failure                  # Typed mutation outcomes and owned failure receipts
 cargo test -- test_name                         # Single test by name
 ./scripts/tla/check.sh                           # Fast bounded TLA+ matrix
@@ -308,6 +309,20 @@ cargo test -- test_name                         # Single test by name
 - Use `tempfile::TempDir` for isolated data directories
 - Test every code path: happy path, edge cases, error conditions, empty inputs
 - For large bulk-ingest changes, add a router-level regression proving `POST /_bulk` accepts a body larger than Axum's default 2MB limit and reaches the handler instead of failing with `413` at the framework layer.
+- FS014 regressions must cross both coordinator and shard-unit boundaries,
+  preserve late malformed-action rejection before auto-create/write, retain
+  source errors/oversized-source positions, and verify ordered OCC/retry-ID
+  receipts plus one final refresh on every copy. Exercise a >10 MiB pretty
+  response so middleware buffering cannot hide behind small results.
+  Cancellation-after-WAL tests must distinguish file cleanup from issued-RPC
+  ownership: all spool reservations can be gone while admission is still
+  retained. Release the RPC and check exact per-copy history and absent later
+  units. Inject a real WAL failure; aborting a listener alone does not kill
+  cached HTTP/2 connections. Preserve private spool checksum/order/nonce and
+  exact-boundary truncation controls, post-mutation quota ambiguity, and exact
+  operation-ID retry. `scripts/bulk_memory_probe.py` supplies Linux process-backed
+  multi-gigabyte RSS/correctness evidence; record profile/source/binary/hardware
+  and never report its workload-specific bound as a total-node memory ceiling.
 - For in-process REST integration harnesses, wait for both the HTTP listener and the gRPC transport listener before issuing the first request; Raft-backed index/settings handlers may still forward through transport before the harness is usable, and any readiness `Ping` must use a registered `source_node_id` because transport rejects unknown nodes.
 - Multi-node REST harnesses that claim coordinator coverage must preserve real `raft_node_id` values in cluster state and route at least one request through a non-master node; otherwise follower-forwarding regressions can hide behind leader-only traffic.
 - Multi-node `remote_store` tests must use a shared object-store root across nodes plus per-node local workdirs/caches; otherwise a coordinator-local read path can masquerade as distributed execution.

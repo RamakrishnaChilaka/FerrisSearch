@@ -268,7 +268,11 @@ values return `400 illegal_argument_exception` without enqueueing work.
 | POST | `/_bulk` | `bulk_index_global()` |
 | POST | `/{index}/_bulk` | `bulk_index()` |
 
-Bulk routes intentionally disable Axum's default buffered request-body limit so benchmark-sized NDJSON payloads reach the handler. When changing router composition or middleware layering, preserve large-body support on `POST /_bulk` and `POST /{index}/_bulk` or benchmark loaders will fail with `413 Failed to buffer the request body` before any item-level handling occurs.
+Bulk routes use raw `Body` streams and disable Axum's buffered 2 MiB limit.
+Admission and byte limits are owned by the bulk pipeline; preserve large-body
+support without adding a whole-body extractor. Streamed bulk responses format
+`pretty` themselves and carry `BulkStreamingResponse`; the generic pretty
+middleware must not collect them.
 `bulk_index_global()` must validate raw action `_index` values with `IndexName::new()`, reject `.ferris_security`, and enforce the authenticated principal's index permissions per item before metadata lookup or auto-create.
 
 Successful index, update, delete, and bulk item responses expose the actual
@@ -536,8 +540,8 @@ tests or added to this shared rejection helper. Do not use
 unchanged.
 
 ## Bulk Index Parsing
-`parse_bulk_ndjson(text)` returns a result and validates the entire action
-structure before any write. Each action line has exactly one supported key
+`BulkDecoder` validates the entire action structure in a bounded staging pass
+before any metadata or document write. Each action line has exactly one supported key
 (`index`, `create`, `update`, `delete`) with object metadata. Malformed
 actions or missing sources reject the request with a line-numbered
 400 `illegal_argument_exception`. Delete consumes no source; other actions
@@ -553,8 +557,25 @@ Updates use `execute_update`; other consecutive actions use the typed shard
 bulk RPC. Finalize results by position, not ID. Key each item by its action;
 `errors` depends only on `error` objects, not delete's 404 status. Honor and
 authorize action `_index` overrides on both bulk routes. Keep empty requests
-as no-write successes without auto-creating an index. Parsing is still
-materialized, not FS-014 streaming.
+as no-write successes without auto-creating an index.
+
+`BulkRuntime` is shared by AppState clones. Intake and ordered outcomes use
+anonymous files on the node data volume; blocking jobs own files and leases,
+including when their async waiter is cancelled. Protected frames bind a private
+file nonce, monotonic counter, length, and SHA-256 payload checksum. Verify
+before replay/emission and check expected frame/item counts; no default,
+truncated success, or cross-file substitution is allowed.
+The decoder bounds lines at 32 MiB; oversized sources remain attributable item
+400s, while oversized actions reject the request. Coordinator rounds are
+bounded by 256 items/4 MiB plus the last bounded item, shard units by 64 items,
+and fan-out by eight jobs. Track at most 128 valid indices and 4,096 refresh
+targets. Spool response storage instead of retaining all item results.
+Owned coordinator tasks retain admission until issued RPCs settle. Cancellation
+checks stop later metadata work, shard units, update CAS retries, and batch
+reads; never abort an issued mutation to make admission appear released.
+Preserve exactly one final primary-owned refresh per mutated shard across
+all rounds. Post-dispatch spool failures are explicit `write_outcome_unknown`;
+post-header read failures abort the body. See `docs/bulk-ingestion.md`.
 
 ## Auto-Create Index (Coordinator Pattern)
 Document and bulk handlers auto-create missing indices via `auto_create_index()`. This helper:

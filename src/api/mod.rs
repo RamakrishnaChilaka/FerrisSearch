@@ -64,6 +64,7 @@ pub struct AppState {
     pub security_manager: Arc<crate::security::SecurityManager>,
     /// Process-local cache of open remote_store split readers.
     pub remote_store_reader_cache: Arc<crate::engine::remote_store::RemoteSplitReaderCache>,
+    pub bulk_runtime: Arc<index::BulkRuntime>,
     /// Max docs to scan for GROUP BY queries on the fast-fields fallback path.
     /// 0 = unlimited.
     pub sql_group_by_scan_limit: usize,
@@ -169,18 +170,29 @@ pub(crate) fn raft_write_error_response(
     )
 }
 
-/// Middleware that pretty-prints JSON responses when `?pretty` is in the query string.
-async fn pretty_json_middleware(req: Request<Body>, next: Next) -> Response {
-    let wants_pretty = req.uri().query().is_some_and(|q| {
+fn wants_pretty(query: Option<&str>) -> bool {
+    query.is_some_and(|q| {
         q.split('&').any(|param| {
             let key = param.split('=').next().unwrap_or("");
             key == "pretty"
         })
-    });
+    })
+}
 
+#[derive(Clone)]
+struct BulkStreamingResponse;
+
+/// Middleware that pretty-prints JSON responses when `?pretty` is in the query string.
+async fn pretty_json_middleware(req: Request<Body>, next: Next) -> Response {
+    let wants_pretty = wants_pretty(req.uri().query());
     let response = next.run(req).await;
 
-    if !wants_pretty {
+    if !wants_pretty
+        || response
+            .extensions()
+            .get::<BulkStreamingResponse>()
+            .is_some()
+    {
         return response;
     }
 
@@ -299,9 +311,7 @@ pub fn create_router(mut state: AppState) -> Router {
     let bulk_router = Router::new()
         .route("/_bulk", post(index::bulk_index_global))
         .route("/{index}/_bulk", post(index::bulk_index))
-        // Bulk ingestion intentionally accepts large NDJSON bodies.
-        // The default Axum buffered-body limit rejects benchmark-sized requests
-        // before they ever reach the handler.
+        // The streaming handler applies admission and byte limits before buffering.
         .layer(DefaultBodyLimit::disable());
 
     Router::new()
@@ -497,6 +507,7 @@ mod tests {
                 remote_store_reader_cache: std::sync::Arc::new(
                     crate::engine::remote_store::RemoteSplitReaderCache::default(),
                 ),
+                bulk_runtime: std::sync::Arc::new(index::BulkRuntime::default()),
                 sql_group_by_scan_limit: 1_000_000,
                 sql_approximate_top_k: false,
             },

@@ -191,6 +191,7 @@ async fn make_test_app_state(index_name: &str) -> (tempfile::TempDir, AppState) 
         remote_store_reader_cache: Arc::new(
             crate::engine::remote_store::RemoteSplitReaderCache::default(),
         ),
+        bulk_runtime: Arc::new(crate::api::index::BulkRuntime::default()),
         sql_group_by_scan_limit: 1_000_000,
         sql_approximate_top_k: false,
     };
@@ -1262,6 +1263,7 @@ async fn group_by_text_field_returns_error() {
         remote_store_reader_cache: Arc::new(
             crate::engine::remote_store::RemoteSplitReaderCache::default(),
         ),
+        bulk_runtime: Arc::new(crate::api::index::BulkRuntime::default()),
         sql_group_by_scan_limit: 1_000_000,
         sql_approximate_top_k: false,
     };

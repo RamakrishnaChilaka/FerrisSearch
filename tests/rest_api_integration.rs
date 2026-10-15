@@ -23,6 +23,9 @@ use tempfile::TempDir;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 
+#[path = "rest_api/bulk_streaming.rs"]
+mod bulk_streaming;
+
 fn forwarding_request<T>(message: T) -> tonic::Request<T> {
     ferrissearch::transport::request_with_cluster_state_version(message, 0)
 }
@@ -216,6 +219,23 @@ impl RestTestHarness {
         roles: Vec<NodeRole>,
         security_config: Option<SecurityConfig>,
     ) -> Result<Self> {
+        Self::start_internal_with_bulk(
+            column_cache_bytes,
+            populate_threshold_percent,
+            roles,
+            security_config,
+            ferrissearch::config::AppConfig::default(),
+        )
+        .await
+    }
+
+    async fn start_internal_with_bulk(
+        column_cache_bytes: u64,
+        populate_threshold_percent: u8,
+        roles: Vec<NodeRole>,
+        security_config: Option<SecurityConfig>,
+        bulk_config: ferrissearch::config::AppConfig,
+    ) -> Result<Self> {
         let temp_dir = tempfile::tempdir()?;
         let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let http_addr = http_listener.local_addr()?;
@@ -282,6 +302,10 @@ impl RestTestHarness {
             }),
             remote_store_reader_cache: Arc::new(
                 ferrissearch::engine::remote_store::RemoteSplitReaderCache::default(),
+            ),
+            bulk_runtime: Arc::new(
+                ferrissearch::api::index::BulkRuntime::new(&bulk_config)
+                    .map_err(anyhow::Error::msg)?,
             ),
             sql_group_by_scan_limit: 1_000_000,
             sql_approximate_top_k: false,
@@ -626,6 +650,7 @@ impl MultiNodeRestHarness {
                 storage_manager: storage_manager.clone(),
                 security_manager: Arc::new(ferrissearch::security::SecurityManager::disabled()),
                 remote_store_reader_cache: remote_store_reader_cache.clone(),
+                bulk_runtime: Arc::new(ferrissearch::api::index::BulkRuntime::default()),
                 sql_group_by_scan_limit: 1_000_000,
                 sql_approximate_top_k: false,
             };

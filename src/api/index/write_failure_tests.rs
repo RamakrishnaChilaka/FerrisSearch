@@ -13,7 +13,7 @@ fn primary_node(harness: &RefreshCluster) -> usize {
         .unwrap()
 }
 
-fn fail_replica_once(harness: &RefreshCluster) {
+pub(super) fn fail_replica_once(harness: &RefreshCluster) {
     let replica = harness.replica(0);
     harness.cluster.nodes[replica]
         .state

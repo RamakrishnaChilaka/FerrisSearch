@@ -48,6 +48,14 @@ pub struct AppConfig {
     pub http_port: u16,
     pub transport_port: u16,
     pub data_dir: String,
+    #[serde(default = "default_bulk_max_concurrent_requests")]
+    pub bulk_max_concurrent_requests: usize,
+    #[serde(default = "default_bulk_max_request_bytes")]
+    pub bulk_max_request_bytes: u64,
+    #[serde(default = "default_bulk_max_spool_bytes")]
+    pub bulk_max_spool_bytes: u64,
+    #[serde(default = "default_bulk_idle_timeout_ms")]
+    pub bulk_idle_timeout_ms: u64,
     #[serde(deserialize_with = "deserialize_seed_hosts")]
     pub seed_hosts: Vec<String>,
     /// Unique numeric node ID for Raft consensus (must be unique across cluster).
@@ -141,6 +149,22 @@ pub struct AppConfig {
     pub security: SecurityConfig,
 }
 
+fn default_bulk_max_concurrent_requests() -> usize {
+    2
+}
+
+fn default_bulk_max_request_bytes() -> u64 {
+    8 * 1024 * 1024 * 1024
+}
+
+fn default_bulk_max_spool_bytes() -> u64 {
+    16 * 1024 * 1024 * 1024
+}
+
+fn default_bulk_idle_timeout_ms() -> u64 {
+    30_000
+}
+
 fn default_raft_node_id() -> u64 {
     1
 }
@@ -185,6 +209,10 @@ impl Default for AppConfig {
             http_port: 9200,
             transport_port: 9300,
             data_dir: "./data".into(),
+            bulk_max_concurrent_requests: default_bulk_max_concurrent_requests(),
+            bulk_max_request_bytes: default_bulk_max_request_bytes(),
+            bulk_max_spool_bytes: default_bulk_max_spool_bytes(),
+            bulk_idle_timeout_ms: default_bulk_idle_timeout_ms(),
             seed_hosts: vec!["127.0.0.1:9300".into()],
             raft_node_id: 1,
             translog_durability: "request".to_string(),
@@ -220,6 +248,13 @@ impl AppConfig {
             .set_default("http_port", default.http_port)?
             .set_default("transport_port", default.transport_port)?
             .set_default("data_dir", default.data_dir)?
+            .set_default(
+                "bulk_max_concurrent_requests",
+                default.bulk_max_concurrent_requests as u64,
+            )?
+            .set_default("bulk_max_request_bytes", default.bulk_max_request_bytes)?
+            .set_default("bulk_max_spool_bytes", default.bulk_max_spool_bytes)?
+            .set_default("bulk_idle_timeout_ms", default.bulk_idle_timeout_ms)?
             .set_default("seed_hosts", default.seed_hosts)?
             .set_default("raft_node_id", default.raft_node_id)?
             .set_default("translog_durability", default.translog_durability)?
@@ -245,6 +280,28 @@ impl AppConfig {
     }
 
     pub fn validate_operational_limits(&self) -> Result<(), String> {
+        if !(1..=64).contains(&self.bulk_max_concurrent_requests) {
+            return Err("bulk_max_concurrent_requests must be between 1 and 64".into());
+        }
+        for (name, value) in [
+            ("bulk_max_request_bytes", self.bulk_max_request_bytes),
+            ("bulk_max_spool_bytes", self.bulk_max_spool_bytes),
+            ("bulk_idle_timeout_ms", self.bulk_idle_timeout_ms),
+        ] {
+            if value == 0 || value > i64::MAX as u64 {
+                return Err(format!("{name} must be between 1 and {}", i64::MAX));
+            }
+            if self
+                .bulk_max_spool_bytes
+                .checked_mul(self.bulk_max_concurrent_requests as u64)
+                .is_none_or(|total| total > i64::MAX as u64)
+            {
+                return Err(
+                    "bulk_max_spool_bytes times bulk_max_concurrent_requests exceeds i64::MAX"
+                        .into(),
+                );
+            }
+        }
         if self.max_concurrent_peer_recoveries > 64 {
             return Err("max_concurrent_peer_recoveries must be between 0 and 64".to_string());
         }
@@ -494,6 +551,99 @@ mod tests {
         }"#;
         let config: AppConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.max_concurrent_peer_recoveries, 0);
+    }
+
+    #[test]
+    fn bulk_limits_default_when_omitted_and_reject_unbounded_values() {
+        let mut value = serde_json::to_value(AppConfig::default()).unwrap();
+        for field in [
+            "bulk_max_concurrent_requests",
+            "bulk_max_request_bytes",
+            "bulk_max_spool_bytes",
+            "bulk_idle_timeout_ms",
+        ] {
+            value.as_object_mut().unwrap().remove(field);
+        }
+        let config: AppConfig = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(config.bulk_max_concurrent_requests, 2);
+        assert_eq!(config.bulk_max_request_bytes, 8 * 1024 * 1024 * 1024);
+        assert_eq!(config.bulk_max_spool_bytes, 16 * 1024 * 1024 * 1024);
+        assert_eq!(config.bulk_idle_timeout_ms, 30_000);
+        config.validate_operational_limits().unwrap();
+        for field in [
+            "bulk_max_concurrent_requests",
+            "bulk_max_request_bytes",
+            "bulk_max_spool_bytes",
+            "bulk_idle_timeout_ms",
+        ] {
+            let mut invalid = value.clone();
+            invalid[field] = serde_json::json!(0);
+            let config: AppConfig = serde_json::from_value(invalid).unwrap();
+            assert!(
+                config
+                    .validate_operational_limits()
+                    .unwrap_err()
+                    .contains(field)
+            );
+        }
+        let config = AppConfig {
+            bulk_max_concurrent_requests: 65,
+            ..Default::default()
+        };
+        assert!(
+            config
+                .validate_operational_limits()
+                .unwrap_err()
+                .contains("concurrent")
+        );
+        let config = AppConfig {
+            bulk_max_spool_bytes: i64::MAX as u64,
+            ..Default::default()
+        };
+        assert!(
+            config
+                .validate_operational_limits()
+                .unwrap_err()
+                .contains("times")
+        );
+    }
+
+    #[test]
+    fn bulk_limits_load_from_yaml_then_controlled_environment_overrides() {
+        let yaml = serde_yaml::to_string(&AppConfig {
+            bulk_max_concurrent_requests: 3,
+            bulk_max_request_bytes: 4096,
+            bulk_max_spool_bytes: 8192,
+            bulk_idle_timeout_ms: 1000,
+            ..Default::default()
+        })
+        .unwrap();
+        let yaml_config: AppConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(yaml_config.bulk_max_concurrent_requests, 3);
+        assert_eq!(yaml_config.bulk_max_request_bytes, 4096);
+        assert_eq!(yaml_config.bulk_max_spool_bytes, 8192);
+        assert_eq!(yaml_config.bulk_idle_timeout_ms, 1000);
+        let source = std::collections::HashMap::from([
+            (
+                "FERRISSEARCH_BULK_MAX_CONCURRENT_REQUESTS".into(),
+                "4".into(),
+            ),
+            ("FERRISSEARCH_BULK_MAX_REQUEST_BYTES".into(), "16384".into()),
+            ("FERRISSEARCH_BULK_MAX_SPOOL_BYTES".into(), "32768".into()),
+            ("FERRISSEARCH_BULK_IDLE_TIMEOUT_MS".into(), "2000".into()),
+        ]);
+        let config: AppConfig = Config::builder()
+            .add_source(File::from_str(&yaml, config::FileFormat::Yaml))
+            .add_source(Environment::with_prefix("FERRISSEARCH").source(Some(source)))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        assert_eq!(config.bulk_max_concurrent_requests, 4);
+        assert_eq!(config.bulk_max_request_bytes, 16384);
+        assert_eq!(config.bulk_max_spool_bytes, 32768);
+        assert_eq!(config.bulk_idle_timeout_ms, 2000);
+        config.validate_operational_limits().unwrap();
     }
 
     #[test]

@@ -542,6 +542,9 @@ impl Node {
             storage_manager: self.storage_manager.clone(),
             security_manager: self.security_manager.clone(),
             remote_store_reader_cache: self.remote_store_reader_cache.clone(),
+            bulk_runtime: Arc::new(
+                crate::api::index::BulkRuntime::new(&self.config).map_err(anyhow::Error::msg)?,
+            ),
             sql_group_by_scan_limit: self.config.sql_group_by_scan_limit,
             sql_approximate_top_k: self.config.sql_approximate_top_k,
         };

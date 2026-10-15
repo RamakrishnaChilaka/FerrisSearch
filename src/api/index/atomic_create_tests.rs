@@ -663,7 +663,11 @@ fn record_outcome(stats: &mut RaceStats, status: u16, body: &Value, failures: &m
 }
 
 async fn concurrent_first_writes(all_data: bool, coordinator: usize) {
-    let cluster = ForwardingCluster::start().await;
+    let cluster = ForwardingCluster::start_with_roles_and_bulk_limit(
+        &[vec![NodeRole::Master], vec![NodeRole::Data]],
+        WRITERS,
+    )
+    .await;
     if all_data {
         all_roles(&cluster).await;
     } else {

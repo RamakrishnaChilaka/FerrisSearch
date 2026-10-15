@@ -343,6 +343,7 @@ mod tests {
                 remote_store_reader_cache: std::sync::Arc::new(
                     crate::engine::remote_store::RemoteSplitReaderCache::default(),
                 ),
+                bulk_runtime: std::sync::Arc::new(crate::api::index::BulkRuntime::default()),
                 sql_group_by_scan_limit: 1_000_000,
                 sql_approximate_top_k: false,
             },

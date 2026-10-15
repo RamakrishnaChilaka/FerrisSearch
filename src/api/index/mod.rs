@@ -119,7 +119,7 @@ mod bulk;
 mod forwarding_tests;
 mod maintenance;
 
-pub use bulk::{bulk_index, bulk_index_global};
+pub use bulk::{BulkRuntime, bulk_index, bulk_index_global};
 pub use maintenance::{flush_index, force_merge_index, refresh_index};
 
 #[cfg(test)]
@@ -1687,8 +1687,33 @@ async fn execute_update(
     state: &AppState,
     index_name: &str,
     doc_id: &str,
+    body: Value,
+    params: &UpdateParams,
+) -> (StatusCode, Json<Value>) {
+    execute_update_cancellable(state, index_name, doc_id, body, params, None).await
+}
+
+fn cancelled_update(
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Option<(StatusCode, Json<Value>)> {
+    cancelled
+        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+        .then(|| {
+            crate::api::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "task_cancelled_exception",
+                "Bulk request cancelled before the next update operation was dispatched",
+            )
+        })
+}
+
+async fn execute_update_cancellable(
+    state: &AppState,
+    index_name: &str,
+    doc_id: &str,
     mut body: Value,
     params: &UpdateParams,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
 ) -> (StatusCode, Json<Value>) {
     if let Err(response) = params.validate() {
         return response;
@@ -1707,6 +1732,9 @@ async fn execute_update(
     let mut retries = params.retry_on_conflict;
     let mut index_uuid: Option<String> = None;
     loop {
+        if let Some(response) = cancelled_update(cancelled) {
+            return response;
+        }
         let (_, shard_id, target_node) =
             match resolve_document_primary(state, index_name, doc_id).await {
                 Ok(target) => target,
@@ -1796,6 +1824,9 @@ async fn execute_update(
             {
                 let (seq_no, primary_term, version, result, status, acknowledgement) =
                     if let Some(operation) = client_operation.as_ref() {
+                        if let Some(response) = cancelled_update(cancelled) {
+                            return response;
+                        }
                         match state
                             .transport_client
                             .forward_client_noop_to_shard(
@@ -1926,6 +1957,9 @@ async fn execute_update(
                 .as_ref()
                 .map(crate::transport::client_operation::intent_to_proto),
         };
+        if let Some(response) = cancelled_update(cancelled) {
+            return response;
+        }
         match state
             .transport_client
             .forward_index_request_to_shard(&target_node, request)

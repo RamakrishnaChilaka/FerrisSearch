@@ -592,6 +592,10 @@ production ready**. The most important limits are:
 - Replica bootstrap uses file snapshot plus physical-order WAL streaming, but
   source sessions and retention pins remain process-local and general D10
   rollback/resync is not implemented.
+- Bulk intake uses bounded, checksum-verified disk staging, bounded shard
+  units, and ordered streamed results. Late malformed action lines still
+  reject the request before writes. Admission, byte limits, cancellation,
+  and reproduction are documented in [bounded bulk ingestion](docs/bulk-ingestion.md).
 - Remote manifest publication is serialized only inside one process; there is
   no cross-process compare-and-set or writer fencing.
 - Remote-store ingest is manual, not near-real-time, and there is no unified
