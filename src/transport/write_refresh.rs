@@ -127,13 +127,13 @@ pub(crate) fn add_write_refresh_to_response(
             _ => None,
         })
         .collect::<Vec<_>>();
-    response["_shards"] = json!({
+    response["_refresh"] = json!({
         "total": result.copies.len(),
         "successful": result.copies.len() - failures.len(),
         "failed": failures.len()
     });
     if !failures.is_empty() {
-        response["_shards"]["failures"] = json!(failures);
+        response["_refresh"]["failures"] = json!(failures);
     }
     if result
         .copies
@@ -311,20 +311,24 @@ mod tests {
         let decoded = ShardWriteRefreshResult::decode(result.encode_to_vec().as_slice()).unwrap();
         assert_eq!(decoded, result);
         validate_write_refresh_response(Some(&decoded), true, "primary").unwrap();
-        let mut response =
-            json!({"status": 201, "result": "created", "_seq_no": 0, "_primary_term": 3});
+        let data_counts = json!({"total": 3, "successful": 2, "failed": 1});
+        let mut response = json!({
+            "status": 201, "result": "created", "_seq_no": 0, "_primary_term": 3,
+            "_shards": data_counts
+        });
         add_write_refresh_to_response(&mut response, "idx", 2, &decoded);
         assert_eq!(response["status"], 201);
         assert_eq!(response["result"], "created");
         assert_eq!(response["_seq_no"], 0);
         assert_eq!(response["_primary_term"], 3);
         assert!(response.get("error").is_none());
-        assert_eq!(response["_shards"]["total"], 2);
-        assert_eq!(response["_shards"]["successful"], 1);
-        assert_eq!(response["_shards"]["failed"], 1);
-        assert_eq!(response["_shards"]["failures"][0]["node"], "replica");
+        assert_eq!(response["_shards"], data_counts);
+        assert_eq!(response["_refresh"]["total"], 2);
+        assert_eq!(response["_refresh"]["successful"], 1);
+        assert_eq!(response["_refresh"]["failed"], 1);
+        assert_eq!(response["_refresh"]["failures"][0]["node"], "replica");
         assert_eq!(
-            response["_shards"]["failures"][0]["reason"]["reason"],
+            response["_refresh"]["failures"][0]["reason"]["reason"],
             "reader open failed: disk I/O"
         );
         assert_eq!(response["forced_refresh"], true);
@@ -344,8 +348,8 @@ mod tests {
         let mut response = json!({"result": "deleted", "_seq_no": 1, "_primary_term": 3});
         add_write_refresh_to_response(&mut response, "idx", 0, &result);
         assert_eq!(response["result"], "deleted");
-        assert_eq!(response["_shards"]["failed"], 1);
-        assert_eq!(response["_shards"]["failures"][0]["primary"], true);
+        assert_eq!(response["_refresh"]["failed"], 1);
+        assert_eq!(response["_refresh"]["failures"][0]["primary"], true);
         assert!(response.get("forced_refresh").is_none());
     }
 
@@ -361,10 +365,10 @@ mod tests {
         assert!(validate_refresh_copy_response(&failure, "replica", 9, false).is_err());
         let mut response = json!({"status": 201, "_seq_no": 0});
         add_write_refresh_to_response(&mut response, "idx", 0, &decoded);
-        assert_eq!(response["_shards"]["failed"], 1);
-        assert_eq!(response["_shards"]["failures"][0]["node"], "replica");
+        assert_eq!(response["_refresh"]["failed"], 1);
+        assert_eq!(response["_refresh"]["failures"][0]["node"], "replica");
         assert!(
-            response["_shards"]["failures"][0]
+            response["_refresh"]["failures"][0]
                 .get("allocation_id")
                 .is_none()
         );

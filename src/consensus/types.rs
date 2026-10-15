@@ -4,8 +4,8 @@ use openraft::BasicNode;
 use serde::{Deserialize, Serialize};
 
 use crate::cluster::state::{
-    DynamicMapping, FieldMapping, IndexMetadata, NodeInfo, SecurityApiKeyRecord,
-    SecurityRoleDefinition,
+    DynamicMapping, FailedCopyExclusion, FieldMapping, IndexMetadata, NodeInfo,
+    PrimaryActivationFinish, SecurityApiKeyRecord, SecurityRoleDefinition,
 };
 
 // ─── Raft Type Config ───────────────────────────────────────────────────────
@@ -66,6 +66,14 @@ pub enum ClusterCommand {
         allocation_id: u64,
         expected_term: u64,
     },
+    FinishPrimaryActivation {
+        index_name: String,
+        activation: PrimaryActivationFinish,
+    },
+    ExcludeFailedShardCopies {
+        index_name: String,
+        exclusion: FailedCopyExclusion,
+    },
     /// Mark an exact allocated primary unavailable without changing routing.
     MarkPrimaryUnavailable {
         index_name: String,
@@ -73,15 +81,6 @@ pub enum ClusterCommand {
         shard_id: u32,
         primary: String,
         allocation_id: u64,
-    },
-    /// Clear status-only unavailability after the exact primary serves a write.
-    MarkPrimaryAvailable {
-        index_name: String,
-        index_uuid: String,
-        shard_id: u32,
-        primary: String,
-        allocation_id: u64,
-        primary_term: u64,
     },
     /// Conditionally remove a failed replica or promote away from a failed primary.
     /// Primary reports must set `promote_only` and cannot clear the last primary.
@@ -142,6 +141,22 @@ impl std::fmt::Display for ClusterCommand {
                 primary,
                 ..
             } => write!(f, "ActivatePrimary({index_name}/{shard_id}, {primary})"),
+            ClusterCommand::FinishPrimaryActivation {
+                index_name,
+                activation,
+            } => write!(
+                f,
+                "FinishPrimaryActivation({index_name}/{}, term={})",
+                activation.authority.shard_id, activation.authority.primary_term,
+            ),
+            ClusterCommand::ExcludeFailedShardCopies {
+                index_name,
+                exclusion,
+            } => write!(
+                f,
+                "ExcludeFailedShardCopies({index_name}/{}, transition={})",
+                exclusion.authority.shard_id, exclusion.transition_id,
+            ),
             ClusterCommand::MarkPrimaryUnavailable {
                 index_name,
                 shard_id,
@@ -150,15 +165,6 @@ impl std::fmt::Display for ClusterCommand {
             } => write!(
                 f,
                 "MarkPrimaryUnavailable({index_name}/{shard_id}, {primary})"
-            ),
-            ClusterCommand::MarkPrimaryAvailable {
-                index_name,
-                shard_id,
-                primary,
-                ..
-            } => write!(
-                f,
-                "MarkPrimaryAvailable({index_name}/{shard_id}, {primary})"
             ),
             ClusterCommand::FailShardCopy {
                 index_name,
@@ -204,6 +210,14 @@ pub enum ClusterResponse {
     Ok,
     Error(String),
     IndexAlreadyExists { index_name: String },
+    WriteAuthorityRejected { reason: String },
+    ExclusionApplied { transition_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("write authority rejected: {reason}")]
+pub struct WriteAuthorityRejectedError {
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -220,6 +234,10 @@ impl ClusterResponse {
             Self::IndexAlreadyExists { index_name } => {
                 Err(IndexAlreadyExistsError { index_name }.into())
             }
+            Self::WriteAuthorityRejected { reason } => {
+                Err(WriteAuthorityRejectedError { reason }.into())
+            }
+            Self::ExclusionApplied { .. } => Ok(()),
         }
     }
 }
@@ -518,14 +536,6 @@ mod tests {
                 shard_id: 2,
                 primary: "node-1".into(),
                 allocation_id: 41,
-            },
-            ClusterCommand::MarkPrimaryAvailable {
-                index_name: "logs".into(),
-                index_uuid: "uuid-1".into(),
-                shard_id: 2,
-                primary: "node-1".into(),
-                allocation_id: 41,
-                primary_term: 7,
             },
         ];
 

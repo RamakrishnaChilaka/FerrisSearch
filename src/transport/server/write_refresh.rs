@@ -18,6 +18,7 @@ impl TransportService {
         index_name: &str,
         shard_id: u32,
         activated_primary: &ActivatedPrimary,
+        acknowledgement: Option<&ShardWriteAcknowledgement>,
         deadline: RefreshDeadline,
     ) -> ShardWriteRefreshResult {
         let primary_failure = |reason: String| ShardWriteRefreshResult {
@@ -47,7 +48,21 @@ impl TransportService {
             );
         }
         let budget = deadline.copy_budget(self.copy_refresh_limit());
-        let targets = std::iter::once(&routing.primary).chain(&routing.in_sync_replicas);
+        let targets = std::iter::once(&routing.primary).chain(
+            routing.in_sync_replicas.iter().filter(|node| {
+                acknowledgement.is_none_or(|report| {
+                    report.copies.iter().any(|copy| {
+                        &copy.node_id == *node
+                            && write_state.shard_allocation_id(index_name, shard_id, node)
+                                == Some(copy.allocation_id)
+                            && matches!(
+                                copy.outcome,
+                                Some(crate::transport::proto::shard_write_copy_result::Outcome::Acknowledged(true))
+                            )
+                    })
+                })
+            }),
+        );
         let copies = futures::future::join_all(targets.map(|node_id| async move {
             let primary = *node_id == routing.primary;
             let Some(allocation_id) = write_state
@@ -214,6 +229,7 @@ impl TransportService {
                     &request.index_name,
                     request.shard_id,
                     &activated,
+                    None,
                     deadline,
                 )
                 .await)
@@ -363,6 +379,7 @@ mod tests {
             index_uuid: metadata.uuid.to_string(),
             allocation_id: 9,
             primary_term: metadata.shard_routing[&0].primary_term,
+            permit: None,
         };
         let deadline = RefreshDeadline::from_request(&Request::new(())).unwrap();
         let empty = ClusterState::new("refresh-invariants".into());
@@ -380,7 +397,7 @@ mod tests {
             (&wrong_primary, "authority contradicts"),
         ] {
             let result = service
-                .refresh_acknowledged_write(state, "idx", 0, &activated, deadline)
+                .refresh_acknowledged_write(state, "idx", 0, &activated, None, deadline)
                 .await;
             crate::transport::write_refresh::validate_write_refresh_response(
                 Some(&result),
@@ -398,7 +415,7 @@ mod tests {
         let mut missing_allocations = empty;
         missing_allocations.indices.insert("idx".into(), metadata);
         let result = service
-            .refresh_acknowledged_write(&missing_allocations, "idx", 0, &activated, deadline)
+            .refresh_acknowledged_write(&missing_allocations, "idx", 0, &activated, None, deadline)
             .await;
         crate::transport::write_refresh::validate_write_refresh_response(
             Some(&result),

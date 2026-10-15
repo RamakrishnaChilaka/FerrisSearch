@@ -2299,6 +2299,7 @@ async fn handle_show_create_table(state: &AppState, index_name: &str) -> (Status
         "settings": {
             "number_of_shards": metadata.number_of_shards,
             "number_of_replicas": metadata.number_of_replicas,
+            "minimum_durable_copies": metadata.settings.minimum_durable_copies,
             "refresh_interval_ms": metadata.settings.refresh_interval_ms,
             "flush_threshold_bytes": metadata.settings.flush_threshold_bytes,
         },

@@ -112,6 +112,19 @@ Do not run the local operation inline before remote dispatch begins.
   logical payload bytes use
   `ferrissearch_object_store_transfer_bytes_total{direction}`. Keep labels
   bounded and do not reinterpret these counters as provider billing bytes.
+- Write data certification uses `ferrissearch_write_certifications_total`
+  with only `all_copies`, `after_exclusion`, and `failed` outcomes. This is the
+  data certification boundary, before optional visibility and final reply checks,
+  not a counter of client-received acknowledgements.
+- Exclusion settlement attempts use
+  `ferrissearch_write_exclusion_settlements_total{outcome="settled|failed"}`;
+  reconciliation can attempt one intent more than once. Canonical activation
+  counts only committed authority with an installed local epoch.
+- Local write gauges expose applied primary phases, tracked fail-stopped current
+  allocations, and durable pending intents in loaded current copy identities.
+  An `active` phase alone does not imply a usable permit; failure and exclusion
+  debt still fence it. Scrapes reset these aggregate gauges, and never label
+  them with UUIDs, allocations, terms, transition IDs, or error text.
 
 The roadmap requires request/query IDs across HTTP, gRPC, split assignment, and
 object-store work. When adding tracing, use bounded attributes and propagate
@@ -168,7 +181,8 @@ The Rust `test` job builds the `protocol-trace` library tests and integration
 targets `d1_protocol_trace` and `stale_primary_failover` without a tight timeout, then
 runs `scripts/tla/test_d1_protocol_trace_ci.sh` with a five-minute timeout.
 Keep compilation outside the timed validation step. The
-validation wrapper runs the primary-replication pause unit tests and the
+validation wrapper runs the primary-replication pause unit tests, the serialized
+FS013 canonical/exclusion authority witness and its strict checker, and the
 real-Raft live stale-primary regression, printing its named boundary ledger on
 failure. It also checks the scripted correct trace and two mutation traces,
 the conditional/mixed-bulk trace with pre-WAL rejections, and the fixed
@@ -185,13 +199,17 @@ historical order/replay counterexamples, fixed concurrent/replay variants, and
 no-durable-tombstone check in that matrix. Also retain the D1 term-collision
 historical/fixed pair, restart restoration pair, primary-gap detector pair,
 bounded gap-resolution check, and promotion replay/NoOp check.
-The separate D2 acknowledgement controls are proposed policy evidence only.
+The separate D2 acknowledgement controls are bounded policy evidence, not
+implementation tests; `Current` is historical and `Proposed` is the retained
+profile name for FS013's selected runtime policy.
 The fast matrix uses one-write safety profiles for both minimum-copy floors,
 two-write concurrent/progress controls, and focused reachability witnesses.
 The exhaustive two-write `d2-proposed-one` and `d2-proposed-two` profiles are
 local-only, isolated with a 2 GiB heap and parallel GC; smaller checks retain
-bounded single-worker batching. Preserve current fail-request behavior and
-every legacy verdict. A failed child must still write its batch status and
+bounded single-worker batching. The small supplementary FS013 matrix adds
+journal-before-proposal, fresh restart authority, old-only callback revocation,
+and durable-debt restart reachability; seal/verification are abstractions, not
+full Raft/byte/D10 proof. Preserve every legacy verdict. A failed child must still write its batch status and
 print its log, and batch-local loop variables must not overwrite the outer
 selected configuration; otherwise an isolated check can be silently skipped.
 

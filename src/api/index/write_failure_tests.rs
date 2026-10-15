@@ -2,7 +2,7 @@ use super::*;
 use crate::transport::proto::{ShardBulkOpKind, ShardBulkOperation, WriteFailureOutcome};
 use crate::transport::write_failure::WriteFailure;
 
-fn primary(harness: &RefreshCluster) -> usize {
+fn primary_node(harness: &RefreshCluster) -> usize {
     let state = harness.cluster.nodes[0].state.cluster_manager.get_state();
     let primary = &state.indices[INDEX].shard_routing[&0].primary;
     harness
@@ -22,6 +22,17 @@ fn fail_replica_once(harness: &RefreshCluster) {
     harness.engines[&(replica, 0)].inject_wal_write_failures_for_test(28, 1);
 }
 
+async fn failure_cluster() -> RefreshCluster {
+    let harness = RefreshCluster::start_with_topology(
+        1,
+        &["node-2".into(), "node-3".into(), "node-4".into()],
+        1,
+    )
+    .await;
+    harness.set_minimum_durable_copies(2).await;
+    harness
+}
+
 fn assert_unknown(body: &Value, seq_no: u64, term: u64) {
     assert_eq!(body["error"]["type"], "write_outcome_unknown", "{body}");
     assert_eq!(body["_seq_no"], seq_no, "{body}");
@@ -30,50 +41,51 @@ fn assert_unknown(body: &Value, seq_no: u64, term: u64) {
         body["error"]["reason"]
             .as_str()
             .unwrap()
-            .contains("Replication failed"),
+            .contains("minimum_durable_copies"),
         "{body}"
     );
+    assert!(
+        body["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("No space left"),
+        "{body}"
+    );
+    assert!(body.get("_shards").is_none(), "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn typed_write_failure_replication_receipts_survive_grpc_rest_and_ordered_bulk() {
-    let harness = RefreshCluster::start_with_topology(
-        1,
-        &["node-2".into(), "node-3".into(), "node-4".into()],
-        1,
-    )
-    .await;
-    let primary = primary(&harness);
-    let coordinator = &harness.cluster.nodes[0].state;
-    let state = coordinator.cluster_manager.get_state();
-    let node = state.nodes[&harness.cluster.nodes[primary].state.local_node_id].clone();
-
-    for (seq_no, method, path, payload) in [
+    for (method, path, payload) in [
         (
-            0,
             reqwest::Method::PUT,
             format!("/{INDEX}/_doc/doc"),
             Some(json!({"value": 1})),
         ),
         (
-            1,
             reqwest::Method::PUT,
             format!("/{INDEX}/_create/created"),
             Some(json!({"value": 2})),
         ),
         (
-            2,
             reqwest::Method::POST,
             format!("/{INDEX}/_update/doc?retry_on_conflict=3"),
             Some(json!({"doc": {"value": 3}})),
         ),
-        (
-            3,
-            reqwest::Method::DELETE,
-            format!("/{INDEX}/_doc/doc"),
-            None,
-        ),
+        (reqwest::Method::DELETE, format!("/{INDEX}/_doc/doc"), None),
     ] {
+        let harness = failure_cluster().await;
+        let primary = primary_node(&harness);
+        let (status, seeded) = harness
+            .cluster
+            .request(
+                0,
+                reqwest::Method::PUT,
+                &format!("/{INDEX}/_doc/doc"),
+                Some(json!({"value": 0})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{seeded}");
         fail_replica_once(&harness);
         let (status, body) = harness.cluster.request(0, method, &path, payload).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
@@ -83,60 +95,75 @@ async fn typed_write_failure_replication_receipts_survive_grpc_rest_and_ordered_
         let operation = retained
             .operations
             .iter()
-            .find(|operation| operation.seq_no == seq_no)
+            .find(|operation| operation.seq_no == 1)
             .unwrap();
-        assert_unknown(&body, seq_no, operation.primary_term);
+        assert_unknown(&body, 1, operation.primary_term);
         assert_eq!(
             harness.engines[&(primary, 0)].sequence_stats().max_seq_no,
-            Some(seq_no),
+            Some(1),
             "an indeterminate update must not consume automatic retry sequences"
         );
     }
-    let term = harness.cluster.nodes[primary]
+    for grpc in [true, false] {
+        let harness = failure_cluster().await;
+        let primary = primary_node(&harness);
+        let coordinator = &harness.cluster.nodes[0].state;
+        let state = coordinator.cluster_manager.get_state();
+        let node = state.nodes[&harness.cluster.nodes[primary].state.local_node_id].clone();
+        let term = state.indices[INDEX].shard_routing[&0].primary_term;
+        fail_replica_once(&harness);
+        if grpc {
+            let docs = vec![
+                ("duplicate".to_string(), json!({"value": 4})),
+                ("duplicate".to_string(), json!({"value": 5})),
+                ("other".to_string(), json!({"value": 6})),
+            ];
+            let error = coordinator
+                .transport_client
+                .forward_bulk_to_shard(&node, INDEX, 0, &docs)
+                .await
+                .unwrap_err();
+            let failure = error.downcast_ref::<WriteFailure>().unwrap();
+            assert_eq!(failure.outcome, WriteFailureOutcome::Indeterminate);
+            assert_eq!(failure.seq_no, Some(0));
+            assert_eq!(failure.last_seq_no, Some(2));
+            assert_eq!(failure.primary_term, Some(term));
+            assert!(failure.reason.contains("No space left"), "{failure:?}");
+        } else {
+            let body = harness
+                .bulk(
+                    0,
+                    false,
+                    "",
+                    "{\"index\":{\"_id\":\"duplicate\"}}\n{\"value\":7}\n\
+                 {\"index\":{\"_id\":\"duplicate\"}}\n{\"value\":8}\n\
+                 {\"index\":{\"_id\":\"other\"}}\n{\"value\":9}\n"
+                        .to_string(),
+                )
+                .await;
+            assert_eq!(body["errors"], true, "{body}");
+            for (offset, id) in ["duplicate", "duplicate", "other"].iter().enumerate() {
+                let item = &body["items"][offset]["index"];
+                assert_eq!(item["_id"], *id, "{body}");
+                assert_eq!(item["status"], 500, "{body}");
+                assert_unknown(item, offset as u64, term);
+            }
+        }
+        assert_eq!(
+            harness.engines[&(primary, 0)].sequence_stats().max_seq_no,
+            Some(2)
+        );
+    }
+
+    let harness = failure_cluster().await;
+    let primary = primary_node(&harness);
+    let term = harness.cluster.nodes[0]
         .state
         .cluster_manager
         .get_state()
         .indices[INDEX]
         .shard_routing[&0]
         .primary_term;
-
-    let docs = vec![
-        ("duplicate".to_string(), json!({"value": 4})),
-        ("duplicate".to_string(), json!({"value": 5})),
-        ("other".to_string(), json!({"value": 6})),
-    ];
-    fail_replica_once(&harness);
-    let error = coordinator
-        .transport_client
-        .forward_bulk_to_shard(&node, INDEX, 0, &docs)
-        .await
-        .unwrap_err();
-    let failure = error.downcast_ref::<WriteFailure>().unwrap();
-    assert_eq!(failure.outcome, WriteFailureOutcome::Indeterminate);
-    assert_eq!(failure.seq_no, Some(4));
-    assert_eq!(failure.last_seq_no, Some(6));
-    assert_eq!(failure.primary_term, Some(term));
-
-    fail_replica_once(&harness);
-    let body = harness
-        .bulk(
-            0,
-            false,
-            "",
-            "{\"index\":{\"_id\":\"duplicate\"}}\n{\"value\":7}\n\
-             {\"index\":{\"_id\":\"duplicate\"}}\n{\"value\":8}\n\
-             {\"index\":{\"_id\":\"other\"}}\n{\"value\":9}\n"
-                .to_string(),
-        )
-        .await;
-    assert_eq!(body["errors"], true, "{body}");
-    for (offset, id) in ["duplicate", "duplicate", "other"].iter().enumerate() {
-        let item = &body["items"][offset]["index"];
-        assert_eq!(item["_id"], *id, "{body}");
-        assert_eq!(item["status"], 500, "{body}");
-        assert_unknown(item, 7 + offset as u64, term);
-    }
-
     fail_replica_once(&harness);
     let body = harness
         .bulk(
@@ -150,19 +177,34 @@ async fn typed_write_failure_replication_receipts_survive_grpc_rest_and_ordered_
                 .to_string(),
         )
         .await;
-    assert_unknown(&body["items"][0]["index"], 10, term);
-    assert_eq!(body["items"][1]["create"]["status"], 201, "{body}");
-    assert_eq!(body["items"][1]["create"]["_seq_no"], 11, "{body}");
-    assert_eq!(body["items"][2]["delete"]["status"], 404, "{body}");
-    assert_eq!(body["items"][2]["delete"]["result"], "not_found", "{body}");
-    assert_eq!(body["items"][2]["delete"]["_seq_no"], 12, "{body}");
-    assert!(body["items"][2]["delete"].get("error").is_none(), "{body}");
-    assert_eq!(body["items"][3]["create"]["status"], 409, "{body}");
-    assert!(
-        body["items"][3]["create"].get("_seq_no").is_none(),
-        "{body}"
+    assert_unknown(&body["items"][0]["index"], 0, term);
+    for item in body["items"].as_array().unwrap().iter().skip(1) {
+        let item = item.as_object().unwrap().values().next().unwrap();
+        assert_eq!(item["status"], 503, "{body}");
+        assert_eq!(
+            item["error"]["type"], "shard_not_available_exception",
+            "{body}"
+        );
+        assert!(item.get("_seq_no").is_none(), "{body}");
+    }
+    assert_eq!(
+        harness.engines[&(primary, 0)].sequence_stats().max_seq_no,
+        Some(0)
     );
 
+    let harness = failure_cluster().await;
+    let primary = primary_node(&harness);
+    let (status, seeded) = harness
+        .cluster
+        .request(
+            0,
+            reqwest::Method::PUT,
+            &format!("/{INDEX}/_doc/mixed"),
+            Some(json!({"value": 0})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{seeded}");
+    let term = seeded["_primary_term"].as_u64().unwrap();
     fail_replica_once(&harness);
     let body = harness
         .bulk(
@@ -174,10 +216,114 @@ async fn typed_write_failure_replication_receipts_survive_grpc_rest_and_ordered_
                 .to_string(),
         )
         .await;
-    assert_unknown(&body["items"][0]["update"], 13, term);
+    assert_unknown(&body["items"][0]["update"], 1, term);
     assert_eq!(
         harness.engines[&(primary, 0)].sequence_stats().max_seq_no,
-        Some(13)
+        Some(1)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_acknowledgement_runtime_mixed_bulk_reports_each_captured_set_after_exclusion() {
+    let harness = RefreshCluster::start_with_topology(
+        1,
+        &["node-2".into(), "node-3".into(), "node-4".into()],
+        1,
+    )
+    .await;
+    let primary = primary_node(&harness);
+    let replica = harness.replica(0);
+    let replica_id = harness.cluster.nodes[replica].state.local_node_id.clone();
+    let (status, seed) = harness
+        .cluster
+        .request(
+            0,
+            reqwest::Method::PUT,
+            &format!("/{INDEX}/_doc/created"),
+            Some(json!({"value": 0})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{seed}");
+    fail_replica_once(&harness);
+    let body = harness
+        .bulk(
+            0,
+            false,
+            "?refresh=true",
+            "{\"index\":{\"_id\":\"mixed\"}}\n{\"value\":10}\n\
+         {\"create\":{\"_id\":\"neighbor\"}}\n{\"value\":11}\n\
+         {\"delete\":{\"_id\":\"never-existed\"}}\n\
+         {\"create\":{\"_id\":\"created\"}}\n{\"value\":12}\n"
+                .to_string(),
+        )
+        .await;
+    assert_eq!(body["errors"], true, "{body}");
+    let first = &body["items"][0]["index"];
+    assert_eq!(first["status"], 201, "{body}");
+    assert_eq!(first["_seq_no"], 1, "{body}");
+    assert_eq!(first["_shards"]["total"], 2, "{body}");
+    assert_eq!(first["_shards"]["successful"], 1, "{body}");
+    assert_eq!(first["_shards"]["failed"], 1, "{body}");
+    assert_eq!(
+        first["_shards"]["failures"][0]["node"], replica_id,
+        "{body}"
+    );
+    for (offset, action, status) in [(1, "create", 201), (2, "delete", 404)] {
+        let item = &body["items"][offset][action];
+        assert_eq!(item["status"], status, "{body}");
+        assert_eq!(item["_seq_no"], offset + 1, "{body}");
+        assert_eq!(
+            item["_shards"],
+            json!({"total": 1, "successful": 1, "failed": 0}),
+            "{body}"
+        );
+        assert!(item.get("error").is_none(), "{body}");
+    }
+    for (offset, action) in [(0, "index"), (1, "create"), (2, "delete")] {
+        assert_eq!(
+            body["items"][offset][action]["_refresh"],
+            json!({"total": 1, "successful": 1, "failed": 0}),
+            "{body}"
+        );
+    }
+    assert_eq!(body["items"][3]["create"]["status"], 409, "{body}");
+    assert!(
+        body["items"][3]["create"].get("_seq_no").is_none(),
+        "{body}"
+    );
+    assert!(
+        body["items"][3]["create"].get("_shards").is_none(),
+        "{body}"
+    );
+    assert_eq!(
+        harness.engines[&(primary, 0)].sequence_stats().max_seq_no,
+        Some(3)
+    );
+    assert!(
+        harness.engines[&(replica, 0)]
+            .ensure_write_health()
+            .is_err()
+    );
+    let (status, noop) = harness
+        .cluster
+        .request(
+            0,
+            reqwest::Method::POST,
+            &format!("/{INDEX}/_update/mixed?operation_id=noop-after-exclusion"),
+            Some(json!({"doc": {"value": 10}, "detect_noop": true})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{noop}");
+    assert_eq!(noop["result"], "noop", "{noop}");
+    assert_eq!(noop["_seq_no"], 1, "{noop}");
+    assert_eq!(
+        noop["_shards"],
+        json!({"total": 1, "successful": 1, "failed": 0}),
+        "{noop}"
+    );
+    assert_eq!(
+        harness.engines[&(primary, 0)].sequence_stats().max_seq_no,
+        Some(4)
     );
 }
 
@@ -189,7 +335,7 @@ async fn typed_write_failure_pre_wal_rejections_preserve_identity_and_neighbors(
         1,
     )
     .await;
-    let primary = primary(&harness);
+    let primary = primary_node(&harness);
     let coordinator = &harness.cluster.nodes[0].state;
     let state = coordinator.cluster_manager.get_state();
     let node = state.nodes[&harness.cluster.nodes[primary].state.local_node_id].clone();
@@ -296,14 +442,14 @@ async fn typed_write_failure_pre_wal_rejections_preserve_identity_and_neighbors(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn typed_write_failure_primary_post_wal_apply_survives_http_and_later_replay() {
+async fn typed_write_failure_primary_post_wal_apply_fails_closed_without_same_process_healing() {
     let harness = RefreshCluster::start_with_topology(
         1,
         &["node-2".into(), "node-3".into(), "node-4".into()],
         0,
     )
     .await;
-    let primary = primary(&harness);
+    let primary = primary_node(&harness);
     harness.engines[&(primary, 0)].inject_engine_apply_failures_for_test(28, 1);
     let (status, body) = harness
         .cluster
@@ -351,8 +497,33 @@ async fn typed_write_failure_primary_post_wal_apply_survives_http_and_later_repl
             None,
         )
         .await;
-    assert_eq!(status, StatusCode::OK, "{document}");
-    assert_eq!(document["_source"], json!({"value": 1}));
-    assert_eq!(document["_seq_no"], body["_seq_no"]);
-    assert_eq!(document["_primary_term"], body["_primary_term"]);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{document}");
+    assert_eq!(
+        document["error"]["type"], "shard_not_available_exception",
+        "{document}"
+    );
+    assert!(
+        document["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("fail-stopped"),
+        "{document}"
+    );
+    for method in [reqwest::Method::PUT, reqwest::Method::DELETE] {
+        let source = (method == reqwest::Method::PUT).then(|| json!({"value": 2}));
+        let (status, rejected) = harness
+            .cluster
+            .request(0, method, &format!("/{INDEX}/_doc/next"), source)
+            .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{rejected}");
+        assert_eq!(
+            rejected["error"]["type"], "shard_not_available_exception",
+            "{rejected}"
+        );
+        assert!(rejected.get("_seq_no").is_none(), "{rejected}");
+    }
+    assert_eq!(
+        harness.engines[&(primary, 0)].sequence_stats().max_seq_no,
+        Some(0)
+    );
 }

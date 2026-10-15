@@ -148,6 +148,12 @@ default_configs=(
     d2-quorum-loss-negative
     d2-exclusion-witness
     d2-fail-stop-witness
+    fs013-one
+    fs013-two
+    fs013-no-journal
+    fs013-cached-restart
+    fs013-cross-epoch
+    fs013-restart-witness
     trace-validator
     two-shard
 )
@@ -220,7 +226,7 @@ d2-smoke-one            pass: proposed one-write conditional exclusion, floor on
 d2-smoke-two            pass: proposed one-write conditional exclusion, floor two
 d2-proposed-one         local pass: exhaustive two-write exclusion, floor one
 d2-proposed-two         local pass: exhaustive two-write exclusion, floor two
-d2-current              pass: current fail-request acknowledgement baseline
+d2-current              pass: historical fail-request acknowledgement baseline
 d2-early-exclusion      expected D2ExclusionCommitted: uncommitted exclusion
 d2-no-sticky            expected D2NoAckWithDebt: unresolved exclusion forgotten
 d2-minimum-bypass       expected D2MinimumCopies: acknowledge below configured floor
@@ -233,6 +239,12 @@ d2-quorum-loss-witness  witness D2NoQuorumIndependentAck: healthy ACK without me
 d2-quorum-loss-negative pass: later outage cannot falsify the ACK-time witness
 d2-exclusion-witness    witness D2NoSingleCopyExclusionAck: ACK after both committed exclusions
 d2-fail-stop-witness    witness D2NoPostWalFenceOutcome: local failure closes write admission
+fs013-one              pass: bounded journal/restart/authority safety, floor one
+fs013-two              pass: bounded journal/restart/authority safety, floor two
+fs013-no-journal       expected FS013JournalBeforeProposal: unpublished intent
+fs013-cached-restart   expected FS013FreshRestartAuthority: cached ACTIVE reuse
+fs013-cross-epoch      expected FS013OldRejectionScoped: late callback revokes new epoch
+fs013-restart-witness  witness FS013NoDurableRestartWitness: durable debt survives restart
 trace-validator         pass: strict JSONL conversion and D1 trace acceptance/rejection
 trace-validator-round4  pass: slow restart, truncation, NoOp, and late-message traces
 two-shard               pass: red sibling does not block failover/allocation
@@ -629,6 +641,36 @@ run_config() {
             module="MC_D2_WriteAck.tla"
             cfg="MC_D2_AckFailStopWitness.cfg"
             expected="D2NoPostWalFenceOutcome"
+            ;;
+        fs013-one|MC_FS013_SafeOne)
+            module="MC_FS013_WriteAuthority.tla"
+            cfg="MC_FS013_SafeOne.cfg"
+            expected="pass"
+            ;;
+        fs013-two|MC_FS013_SafeTwo)
+            module="MC_FS013_WriteAuthority.tla"
+            cfg="MC_FS013_SafeTwo.cfg"
+            expected="pass"
+            ;;
+        fs013-no-journal|MC_FS013_NoJournal)
+            module="MC_FS013_WriteAuthority.tla"
+            cfg="MC_FS013_NoJournal.cfg"
+            expected="FS013JournalBeforeProposal"
+            ;;
+        fs013-cached-restart|MC_FS013_CachedRestart)
+            module="MC_FS013_WriteAuthority.tla"
+            cfg="MC_FS013_CachedRestart.cfg"
+            expected="FS013FreshRestartAuthority"
+            ;;
+        fs013-cross-epoch|MC_FS013_CrossEpochRevoke)
+            module="MC_FS013_WriteAuthority.tla"
+            cfg="MC_FS013_CrossEpochRevoke.cfg"
+            expected="FS013OldRejectionScoped"
+            ;;
+        fs013-restart-witness|MC_FS013_RestartWitness)
+            module="MC_FS013_WriteAuthority.tla"
+            cfg="MC_FS013_RestartWitness.cfg"
+            expected="FS013NoDurableRestartWitness"
             ;;
         two-shard|MC_TwoShardIsolation)
             module="MC_TwoShardIsolation.tla"

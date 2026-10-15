@@ -6,6 +6,42 @@ Versions 1 through 3 are retired. The converter rejects them. FerrisSearch is
 pre-1.0, so emitters and fixtures must move to version 4 without compatibility
 shims.
 
+## FS013 serialized authority witness
+
+`protocol_trace::authority::start_serialized_witness` enables a separate
+`ferrissearch.write-authority.trace/v1` JSON document with the explicit
+`serialized-authority-witness` profile. It does not change the D1 version-4
+event vocabulary or reinterpret historical D1 fixtures.
+
+The collector records actual committed `PROMOTING` observations, frozen copy
+identities and fences, durable canonical seals, installed `ACTIVE` epochs,
+admission-closing exclusion intents, durable journals, conditional proposals,
+accepted results, definitive applied settlement, old-epoch revocation, and
+data-copy certification. Captured and observed allocation IDs remain exact;
+observations of a replacement allocation do not remove that new copy.
+
+[`check_write_authority_trace.py`](../../../scripts/tla/check_write_authority_trace.py)
+requires a complete serialized prefix beginning before the first canonical
+reservation. It checks local and eligible-copy seals, journal-before-proposal,
+exact accepted or sufficiently new applied settlement evidence, old-epoch-only
+revocation, no certification with unresolved debt, and the eligible-copy floor.
+Malformed identities, unknown fields, and unsupported events fail loudly.
+
+The runtime witness reactivates two real gRPC copies, then loses a required
+copy and certifies the degraded write only after committed exclusion and
+durable settlement. The protocol-trace CI wrapper runs it, including the
+checker, and prints its evidence on failure. Python mutant cases retain the
+rejections for early proposal/settlement, stale absence, debt bypass, minimum
+bypass, unsealed copies, and incorrect allocation reuse.
+
+This is **not a global linearization oracle for concurrent observations**.
+Callers must externally serialize witness actions and wait for background
+settlement owners before the next action; concurrent emitter order need not
+equal a decision's linearization point. This profile does not prove WAL bytes,
+operation payload identity, arbitrary promotion inventory,
+or the complete D10 protocol. D1 operation traces and result-level runtime tests
+remain separate evidence with their own stated envelopes.
+
 ## What validation means
 
 `scripts/tla/trace_to_tla.py` validates the JSON Lines contract, derives finite
@@ -28,6 +64,14 @@ The converter infers one composition from the event vocabulary:
 Validation is existential. A pass means that this finite observed execution has
 a witness in the bounded model and satisfies that composition's invariants. It
 does not prove unlogged Rust executions correct.
+
+The D1 Rust fixtures use direct no-Raft control transitions and explicit
+synthetic identity-anchor certificates. They retain the legacy D1 data
+relation while running current wire/proof guards; they do not witness FS013's
+canonical inventory, sealing, or authority settlement protocol. Their empty
+history anchors also keep restored physical WAL order within the existing
+schema-v4 envelope. The separate authority witness and real-Raft stale-primary
+regression provide distinct current-runtime evidence.
 
 The current Rust fault harness covers runs with periodic refresh and automatic
 flush disabled (`refresh_interval_ms = 600000` and
@@ -384,7 +428,7 @@ without inventing a receive, fence, WAL append, or processing effect.
 | --- | --- | --- | --- |
 | `recovery_snapshot` | `source_node`, `target_node`, `index_uuid`, `shard`, `session_id`, `snapshot_next_seq_no`, sorted `processed_seqs`, sorted semantic `documents` | `HotEngine::prepare_peer_recovery_snapshot` copies the processed set and one refreshed reader snapshot while capturing the committed files; `TransportService::launch_source_setup` emits the immutable values when installing the ready source session. | Hold the engine maintenance/translog boundary while copying the values, then hold the source recovery registry mutex while publishing the session and event. The validator freezes the source's reconstructed primary-term sequence state at this event. |
 | `recovery_started` | `source_node`, `target_node`, `index_uuid`, `shard`, `allocation`, `session_id` | `ShardManager::prepare_peer_recovery_target_blocking_traced`, after the exact-allocation target install marker is fsynced and renamed. | Hold the target's per-shard `shard_open_lock`. |
-| `recovery_installed` | Same identities plus `snapshot_next_seq_no` and ordered `retained_wal` physical identities restored from snapshot bookkeeping | `ShardManager::finalize_peer_recovery_target_blocking_traced`, after verified snapshot installation, retained-WAL restoration, durable identity replacement, marker removal, and strict target open. | Hold the target's per-shard `shard_open_lock`. The target inherits the term-sequence state frozen by the matching `recovery_snapshot`; `retained_wal` is bookkeeping evidence for actual-state completeness and is not replayed as a new semantic apply. Legacy schema-v4 fixtures may omit it, meaning an empty restored WAL. |
+| `recovery_installed` | Same identities plus `snapshot_next_seq_no` and ordered `retained_wal` identities read from the actual installed WAL, including the dense canonical archive and retained version/client records | `ShardManager::finalize_peer_recovery_target_blocking_traced`, after verified snapshot installation, retained-WAL restoration, durable identity replacement, marker removal, and strict target open. | Hold the target's per-shard `shard_open_lock`. The target inherits the term-sequence state frozen by the matching `recovery_snapshot`; `retained_wal` is physical bookkeeping evidence for actual-state completeness and is not replayed as a new semantic apply. Legacy schema-v4 fixtures may omit it, meaning an empty restored WAL. |
 | `recovery_barrier` | Same identities plus `barrier_next_seq_no` and exact sorted `processed_seqs` | `node::peer_recovery::run_peer_recovery`, after suffix replay reaches the pinned source barrier and the target checkpoint matches the response. | Read the target processed set under its apply-state mutex while the source admission barrier remains held. |
 | `recovery_membership` | Same identities plus `outcome` | `TransportService::settle_peer_recovery` after observing admission, promotion, or rejection; `node::peer_recovery::run_peer_recovery` records `unknown` after its bounded completion wait. | Keep the source session in settlement state until a source verdict is emitted. The target emits `unknown` before releasing its pending target state. Allowed values are `admitted`, `promoted`, `rejected`, and `unknown`. |
 

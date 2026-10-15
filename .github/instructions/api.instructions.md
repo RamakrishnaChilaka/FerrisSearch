@@ -490,7 +490,8 @@ The primary captures its current Raft-authoritative in-sync set for that
 round; single writes use their captured acknowledgement set. Never refresh
 coordinator-local engines or select replicas from coordinator metadata.
 Bounded refresh-only failures retain acknowledged status/result/sequence/
-term and appear in `_shards.failed` and `failures`; a bulk phase dispatch
+term and appear separately in `_refresh`; data `_shards` comes from strict
+operation-certification reports. A bulk phase dispatch
 failure reports the known primary, not invented replica results. Emit
 `forced_refresh` only as true on successful primary publication, not on
 success of every replica. Refresh failures do not set bulk `errors` or
@@ -523,7 +524,10 @@ paired conditions and update retries. `_create` accepts only absent or
 Accept `wait_for_active_shards` only when absent or exactly `1`; bulk metadata
 may also use numeric `1`. Reject `all` even with zero replicas. Create-index waits for primary copies to open. Document and bulk writes do
 not add a replica-count pre-flight check; their existing activation and
-synchronous in-sync replication contracts remain unchanged.
+synchronous in-sync certification contracts still apply. This parameter is not
+`minimum_durable_copies`: the index setting defaults to one, must be a positive
+u32 within configured capacity, and gates both primary admission and ACK.
+Validate combined replica/floor updates atomically through Raft.
 Use `illegal_argument()` / `error_response()` and name the rejected key.
 New safety-relevant write parameters must be implemented with result-level
 tests or added to this shared rejection helper. Do not use

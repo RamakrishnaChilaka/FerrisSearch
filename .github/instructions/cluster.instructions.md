@@ -145,15 +145,18 @@ fn allocate_unassigned_replicas_for_shards(&mut self, data_nodes: &[String], eli
   replacing metadata, allocations, routing, or version. Only an applied delete
   permits a new incarnation. Local/test `add_index*` helpers are not the
   production existence authority; the Raft state-machine lock and guard are.
-- `MarkReplicaInSync`, `ActivatePrimary`, and `FailShardCopy` are
+- `MarkReplicaInSync`, `ActivatePrimary`, `FinishPrimaryActivation`,
+  `ExcludeFailedShardCopies`, and `FailShardCopy` are
   UUID/allocation-bound conditional Raft commands. Rejected commands perform no
   partial mutation and do not bump `ClusterState.version`.
 - `MarkReplicaInSync` also requires `primary_initialized = true` and a present
   primary allocation. An out-of-sync target cannot be admitted into a red or
   never-activated shard.
-- `primary_initialized` starts false and becomes true only through an exact
-  allocation-bound `ActivatePrimary`. Only the initial primary allocation may
-  be created empty before that transition; initial replicas recover from it.
+- `primary_initialized` starts false and becomes true through an exact
+  allocation-bound `ActivatePrimary` reservation. This protects existing data;
+  it does not authorize writes before `FinishPrimaryActivation` grants ACTIVE.
+  Only the initial primary allocation may be created empty before initialization;
+  initial replicas recover from it.
 - Node removal deletes that node from both replica collections while preserving
   per-shard lost-slot accounting. Replica-count decreases remove unassigned
   slots first, then assigned out-of-sync copies before in-sync copies.
@@ -163,6 +166,14 @@ fn allocate_unassigned_replicas_for_shards(&mut self, data_nodes: &[String], eli
   Replica `FailShardCopy` accounts for the removed copy as unassigned. Primary
   reports are promote-only: they promote an in-sync candidate or reject
   without clearing the primary allocation.
+- Allocation metadata owns INACTIVE/PROMOTING/ACTIVE phase, log-derived
+  activation ID, and committed canonical history. Promotion invalidates the
+  old ACTIVE grant without deleting its history anchor. Settings/routing
+  changes cannot synthesize a certificate or revive an old local epoch.
+- `minimum_durable_copies` is a positive u32, default one, at most configured
+  primary-plus-replica capacity. Validate combined replica/floor updates
+  atomically; reject explicit use on `remote_store`. Admission/certification
+  reads the applied metadata directly, independent of engine watch channels.
 
 ## ClusterManager (src/cluster/manager.rs)
 ```rust
@@ -241,5 +252,7 @@ and include a multi-node regression.
 ### Auto-Flush Setting
 - `flush_threshold_bytes` drives background WAL auto-flush in `CompositeEngine`
 - Default: 512 MB; `0` disables auto-flush
-- The consumer must skip auto-flush while `global_checkpoint == 0`, because `flush_with_global_checkpoint(0)` degrades to full WAL truncation and can discard replica recovery history
+- The consumer skips primary auto-flush while `global_checkpoint` is `None`;
+  sequence zero is valid. Bound retention by the matching committed canonical
+  certificate and preserve all post-certificate operations.
 - Background auto-flush should be best-effort: if the shard is already ingesting or persisting vectors, defer the tick instead of blocking foreground writes

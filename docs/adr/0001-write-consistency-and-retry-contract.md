@@ -1,10 +1,11 @@
 # ADR 0001: Write Consistency And Retry Contract
 
-- **Status:** Accepted. D1 is implemented; D2-D14 remain implementation work.
+- **Status:** Accepted. Implementation status and remaining limits are recorded
+  per decision below.
 - **Date:** 2026-09-27
 - **Accepted:** 2026-10-08
-- **Design revision:** 2026-10-05; acknowledgement/failure targets selected for
-  bounded modeling, not implemented in production.
+- **Implementation revision:** 2026-10-14; FS013 adds safe acknowledgement,
+  fail-stop, fresh authority, and bounded canonical promotion/restart.
 - **Backlog:** [FS-001](../next-50-tasks.md#fs-001--decide-the-write-consistency-and-retry-contract)
 - **Roadmap:** Gate 0 deliverable "accepted write acknowledgement, retry, OCC,
   and version semantics"; invariants 6.1.1-6.1.6 in
@@ -13,10 +14,10 @@
   bulk), and the reads writes depend on (GET by ID and refresh). Remote-store
   publication is FS-002.
 
-The complete decision is accepted. D1 is implemented; D2-D14 define required
-future behavior until their implementing tasks land. Acceptance does not claim
-that those behaviors exist in current source. Section 1.1 describes the code at
-6dbf9dc, before D1.
+The complete decision is accepted. Per-decision status distinguishes current
+source from remaining target behavior; acceptance alone is not implementation
+or production-readiness evidence. Section 1.1 is the historical code at
+6dbf9dc, before D1, not the current write contract.
 
 ## 1. Context
 
@@ -174,10 +175,10 @@ Known limitations of the implementation:
 
 ### D2. What an acknowledgement means
 
-**Status (2026-10-05):** Selected design target; not implemented. Rust still
-fails a request when any required synchronous replica fails, including after
-the primary has mutated. This revision reconciles D2 with D1's implemented
-operation-based acknowledgement; it does not change that runtime policy.
+**Status (2026-10-14):** Implemented for `local_shards` request durability:
+exact-operation certification, durable sticky exclusion debt, conditional
+observed settlement, configurable copy floor, and local authority permits.
+This is not production-readiness evidence or a proof of general D10 recovery.
 
 A 2xx write response means all of the following hold:
 
@@ -188,9 +189,10 @@ A 2xx write response means all of the following hold:
    it durably or been removed from the in-sync set by a committed Raft command
    before the response. The in-sync set is captured under the shared write
    guard that peer-recovery admission takes exclusively. The command is
-   conditional on the copy's exact allocation ID and the operation's primary
-   term.
-4. The remaining eligible copies satisfy `minimum_durable_copies`. Its future
+   conditional on exact failed allocations, the current source authority and
+   captured configuration, and a unique transition ID. Current authority is
+   distinct from an adopted/retried operation's original primary term.
+4. The remaining eligible copies satisfy `minimum_durable_copies`. Its
    default is **1**, preserving the single-node profile; **2** is an explicit
    redundancy requirement. The primary counts as one copy. This is a lower
    bound, not permission to ignore another in-sync allocation. Reject values
@@ -234,7 +236,9 @@ exclusion leaves enough eligible durable copies and every condition above holds.
   Observe the accepted committed result or the applied removal. A definitive
   stale-authority rejection revokes the old local permit instead of authorizing
   continued writes. Reconstruct unresolved state before activation after a
-  process restart; that cross-restart work remains a runtime prerequisite.
+  process restart from the durable copy-identity journal. A higher committed
+  reservation and verified canonical activation fence old conditions before
+  new permits are installed.
 - **A deadline is not rollback:** if the primary WAL may have changed, report
   D4's indeterminate outcome. A failed request may appear later through replay
   or recovery. An observed accepted exclusion can allow the original request
@@ -242,12 +246,13 @@ exclusion leaves enough eligible durable copies and every condition above holds.
   condition above holds. An already returned indeterminate result is not
   retroactively converted to success.
 
-Implementing D2 would replace the global rule that synchronous replication
-failures are request failures and amend items 11 and 19 of the "Required Rust
-contract" in `specs/tla/README.md`; item 19's bounded transport timeout stays.
-The [separate D2 model](../../specs/tla/README.md#proposed-write-acknowledgement-and-failure-contract)
-checks the selected target. The current shared model and Rust contract remain
-unchanged until FS-013 implements it.
+Unresolved synchronous replication failures remain request failures. Positive
+partial proofs are retained; an exact observed exclusion is required before a
+failed target can stop blocking certification. The
+[D2 policy model](../../specs/tla/README.md#operation-based-write-acknowledgement-and-failure-contract)
+retains its historical baseline and unsafe controls. The supplementary FS013
+authority model adds journal/restart controls; Rust handler and process
+regressions separately exercise actual I/O and distributed boundaries.
 
 ### D3. Durability modes
 
@@ -268,9 +273,9 @@ underlying causes and operation-owned term/sequence metadata when known; never
 infer a receipt from a later shared checkpoint. Metadata auto-creation and
 update preflight GET failures retain their separate error contracts.
 
-The response classification does not implement D2's exclusion/ACK refinements,
-D6 retry identity, or D14 fail-stop behavior. Required synchronous replica
-failures still fail the request after the primary may have applied it.
+Classification alone does not resolve an uncertain mutation. FS013 implements
+D2/D5/D14 separately: only certified proofs and observed settlement may produce
+success; an unresolved post-mutation failure remains indeterminate.
 
 Every write response is in exactly one class:
 
@@ -325,14 +330,14 @@ Supported single-document and bulk outcomes map to those classes as follows:
 
 ### D5. Stale primaries and missing leaders
 
-**Status (2026-10-05):** Existing replica fences are implemented; local
-self-fencing after a rejected old-primary exclusion remains a selected target.
+**Status (2026-10-14):** Exact canonical authority, issued-permit invalidation,
+and old-epoch self-fencing after rejected exclusion are implemented.
 
 - **Existing fences stay:** primary validation at admission; replica checks of
   UUID, allocation, and term against the durable fence; and conditional
   promotion.
 - **Removal is term-conditioned:** the D2 removal command is conditional on the
-  operation's term, so a stale primary's removal is rejected. The stale primary
+  current source authority, so a stale primary's removal is rejected. The stale primary
   then answers indeterminate and stops accepting writes for that allocation.
 - **No Raft leader:** a primary that sees no leader may still acknowledge a
   write, but only when every required in-sync allocation applied it durably,
@@ -395,7 +400,8 @@ indeterminate supported write while its operation record remains retained.
 **Status (2026-10-02):** Implemented for `local_shards`: search remains
 near-real-time, GET by ID is realtime by default, and `realtime=false` uses
 the search-visible reader. Explicit `refresh=true` (also an empty value or
-bare `?refresh`) covers the primary and every Raft-authoritative in-sync copy,
+bare `?refresh`) covers the primary and every data-acknowledged, still-eligible
+Raft-authoritative in-sync copy,
 including writes coordinated by shardless nodes or replicas and writes whose
 primary is a follower. Bulk performs one refresh round per touched shard,
 not per item or update attempt. Bounded refresh failures are reported without
@@ -405,8 +411,9 @@ Remaining: sequence-covering `refresh=wait_for`, which is still rejected with
 
 Single-document index/create/update/delete requests carry refresh intent to
 the primary. After synchronous replication acknowledges, the primary refreshes
-itself and fans out `RefreshShardCopy` concurrently to the same captured
-acknowledgement set, retaining the shared recovery write guard.
+itself and fans out `RefreshShardCopy` concurrently to the captured copies that
+proved the data operation. A data-failed copy excluded through D2 is not a
+refresh target. The primary retains the shared recovery write guard.
 REST bulk runs every mutation unit with refresh off, including ordered runs
 and update CAS attempts. After all units for a shard finish, one fenced
 `RefreshShardWrites` call asks the primary to activate, take the shared guard,
@@ -447,11 +454,21 @@ acknowledged mutation and reports visibility failure, without removing a copy
 solely for refresh failure. Reader publication is separate from the successful
 data acknowledgement; turning its failure into a failed write invites retries
 of an operation already applied, including create conflicts. Actual mutation
-or synchronous replication failures remain write failures.
+or unresolved synchronous replication failures remain write failures under D2.
 
-For a completed explicit refresh phase, `_shards.total` counts the primary
-plus its captured in-sync replicas; `successful` and `failed` describe refresh,
-not replication outcomes. Each failed copy has a `failures` entry with index,
+`_shards.total`, `_shards.successful`, and `_shards.failed` always describe the
+data acknowledgement, including committed data-copy exclusions, independently
+of requested refresh. Successful document, delete, and ID-bearing no-op
+responses carry the primary's actual per-copy data report. Homogeneous
+nonempty bulk carries a common report and the same report on each item;
+ordered mixed bulk retains each successful item's own report. Failed items
+carry no success report. A detected update no-op without an operation ID
+performs no mutation and keeps zero data-copy counts.
+
+For a completed explicit refresh phase, the separate `_refresh.total` counts
+the primary plus its captured eligible refresh targets; `_refresh.successful`
+and `_refresh.failed` describe visibility only. Each failed copy has an
+`_refresh.failures` entry with index,
 shard, node, allocation ID, primary role, and the underlying reason. An
 invariant failure with no allocation ID reports the cause and omits that ID,
 never fabricating one. `forced_refresh` is emitted only as `true` when the
@@ -476,11 +493,11 @@ Protocol-trace snapshot capture also uses an unpublished reader.
 - **Search:** an acknowledgement does not imply search visibility. Search sees
   a write after the next refresh.
 - **`refresh=true`:** attempts bounded refresh of the primary and every in-sync
-  copy before the response; inspect `_shards.failed` for incomplete visibility.
+  copy before the response; inspect `_refresh.failed` for incomplete visibility.
 - **`refresh=wait_for`:** proposed: return once a refresh covers the operation's
   `seq_no`. Currently rejected with 400.
 - **Refresh failure:** a refresh that fails after an acknowledged write keeps
-  the acknowledged status. It is reported as a shard failure entry in the
+  the acknowledged status. It is reported as a visibility failure entry in the
   response, not as a failed write.
 - **GET by ID:** realtime by default (D9). `realtime=false` reads the
   search-visible reader.
@@ -613,18 +630,27 @@ operator setting and add `_mget`. Neither is part of this implementation.
 
 ### D10. History convergence after failover
 
+**Status (2026-10-14):** Bounded canonical promotion/restart is implemented:
+PROMOTING reservation, protected candidate history, unique matching peer
+adoption, explicit NoOp resolution of unprotected absent/conflicting gaps,
+whole-range peer comparison, durable seal, and conditional ACTIVE completion.
+Conflicting/unreachable copies are excluded before repair. Full unrestricted
+divergence rollback, vector snapshot semantics, and general D10 proof remain out
+of scope. The [promotion protocol](../recovery-protocol.md#promotion-protocol)
+describes the current bounded path and broader target.
+
 In-sync copies must not keep divergent operations after a failover:
 
-1. **Persisted checkpoints:** replace the in-memory global checkpoint with
-   gap-aware local checkpoints that are persisted and reported to the primary.
+1. **Persisted checkpoints:** gap-aware local checkpoints are persisted and reported to the primary.
    The primary computes the global checkpoint from them and sends it to
    replicas, which persist it.
-2. **No-op entries:** the WAL gains a no-op entry type, used to fill a gap when
+2. **No-op entries:** the WAL has a no-op entry type, used to fill a gap when
    a `seq_no` was assigned but its operation cannot be completed.
 3. **Promotion resync:** on promotion, and on activation after a primary
-   restart, the primary fills gaps and resyncs operations above the global
-   checkpoint. The restart case matters because a sticky pending removal (D2)
-   lives only in the old process.
+   restart, the primary canonicalizes retained protected operations and peer
+   evidence rather than trimming at a lagging global checkpoint. Sticky pending
+   removals (D2) survive in the durable identity journal and must settle before
+   installing new authority.
 4. **Replica reconciliation:** compare older-term suffixes with the promoted
    canonical history. A lagging global checkpoint or an older term alone is
    not permission to discard an acknowledged above-gap operation. Preserve
@@ -633,7 +659,7 @@ In-sync copies must not keep divergent operations after a failover:
    already committed, so repair either replays from a verified safe commit or
    re-recovers the copy through peer recovery. The
    [promotion protocol](../recovery-protocol.md#promotion-protocol) owns this
-   unimplemented reconciliation.
+   bounded implemented reconciliation and remaining general repair work.
 
 ### D11. Concurrency control
 
@@ -745,9 +771,12 @@ remain unimplemented.
 
 ### D14. Engine and WAL failures on the write path
 
-**Status (2026-10-05):** Selected target; not implemented by the current
-bounded apply-I/O escalation policy. The model treats local permit invalidation
-abstractly and does not prove byte-level WAL/fsync failure detection.
+**Status (2026-10-14):** Immediate shared copy fail-stop is implemented for WAL
+append/sync, durable authority publication, and uncertain post-WAL engine
+failure. Protected WAL v4/checksummed manifest v3, verified restart, and fresh
+canonical activation replace same-process Apply retry healing. Ordinary
+assigned-open I/O retains its retry policy. Model permit invalidation remains
+abstract and is not a proof of byte-level storage correctness.
 
 - **Primary engine failure:** a post-WAL engine failure makes the operation
   indeterminate and fails the copy. The copy is promote-only when an in-sync

@@ -26,9 +26,10 @@ type RaftInstance = openraft::Raft<TypeConfig, ClusterStateMachine>;
 - `SetMaster { node_id: String }` — set cluster master
 - `UpdateIndex { metadata: IndexMetadata }` — update shard routing (failover, replicas, settings)
 - `MarkReplicaInSync { index_name, index_uuid, shard_id, replica, allocation_id, primary, primary_term }` — conditionally admit the exact recovered assignment
-- `ActivatePrimary { index_name, index_uuid, shard_id, primary, allocation_id, expected_term }` — conditionally bump the term and monotonically mark the shard initialized
+- `ActivatePrimary { index_name, index_uuid, shard_id, primary, allocation_id, expected_term }` — conditionally bump the term, mark the shard initialized, and reserve a `PROMOTING` activation ID from the log position
+- `FinishPrimaryActivation { index_name, activation }` — conditionally certify installed canonical history, retain only proven eligible replicas, grant `ACTIVE`, and clear unavailability
+- `ExcludeFailedShardCopies { index_name, exclusion }` — conditionally exclude exact failed replica allocations under captured active authority, returning the accepted transition ID
 - `MarkPrimaryUnavailable { index_name, index_uuid, shard_id, primary, allocation_id }` — set status-only unavailability for the exact initialized primary allocation
-- `MarkPrimaryAvailable { index_name, index_uuid, shard_id, primary, allocation_id, primary_term }` — clear status-only unavailability only for the exact current primary allocation and term, without changing the term
 - `FailShardCopy { index_name, index_uuid, shard_id, node, allocation_id, expected_primary_term, promote_only, promotion_candidate }` — conditionally remove an unopenable replica or promote the leader-selected in-sync survivor; primary reports must be promote-only and the expected term must be nonzero.
 - `AddMappings { index_name, new_fields, dynamic }` — merge auto-detected field mappings into an existing index (dynamic mapping)
 - `PutApiKey { record: SecurityApiKeyRecord }` — upsert a dynamic API key (stores only the hash) into `ClusterState.api_keys`
@@ -66,16 +67,22 @@ pub struct ClusterStateMachine {
 | `SetMaster` | set `state.master_node` |
 | `UpdateIndex` | preserve existing copy IDs (including an unchanged red shard's absent primary ID), assign the current log index to new copies, clear removed IDs, intersect in-sync membership, and reject out-of-sync promotion |
 | `MarkReplicaInSync` | add one assigned replica only when the shard is initialized, a primary allocation exists, and UUID, allocation ID, primary, and term match |
-| `ActivatePrimary` | increment the term and set `primary_initialized` only when UUID, allocation ID, primary, and expected term match |
+| `ActivatePrimary` | increment the term, set `primary_initialized`, and reserve `PROMOTING` authority only when UUID, allocation ID, primary, and expected term match; do not clear unavailability |
+| `FinishPrimaryActivation` | validate the reserved identity and canonical certificate, remove omitted in-sync allocations, grant `ACTIVE`, and clear unavailability |
+| `ExcludeFailedShardCopies` | validate captured active authority and exact target allocations before atomically removing them; return the transition ID |
 | `MarkPrimaryUnavailable` | set the status-only unavailable flag for the exact initialized primary allocation; reject an already-set flag |
-| `MarkPrimaryAvailable` | clear an already-set unavailable flag only when UUID, primary, allocation, and primary term match; never change the term |
 | `FailShardCopy` | after initialization, remove only an exact failed replica allocation whose nonzero `expected_primary_term` matches. A primary command must be promote-only and promotes an in-sync candidate with a term bump, otherwise it is rejected without clearing the primary allocation |
 | `AddMappings` | merge `new_fields` into `state.indices[name].mappings` via `.entry().or_insert()` |
 | `PutApiKey` / `DeleteApiKey` | `insert` / `remove` on `state.api_keys` |
 | `PutRole` / `DeleteRole` | `insert` / `remove` on `state.roles` |
 
 Successful apply arms bump `state.version += 1`; conditional-command rejection
-returns `ClusterResponse::Error` without partial mutation or a version bump.
+returns `ClusterResponse::Error` or typed `WriteAuthorityRejected` without
+partial mutation or a version bump. Only `FinishPrimaryActivation` clears
+unavailability; successful writes never propose a status-only restoration.
+Primary promotion through `FailShardCopy` invalidates the old write authority
+before validating the new routing, while retaining its committed history anchor.
+The new primary must complete canonical activation before admitting writes.
 Duplicate CreateIndex returns `ClusterResponse::IndexAlreadyExists` with the
 same no-mutation/no-version-bump contract, even for the same UUID or malformed
 replacement metadata. Only an applied DeleteIndex permits recreation. API and

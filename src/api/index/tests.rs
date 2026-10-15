@@ -611,12 +611,8 @@ async fn realtime_get_update_and_bulk_update_fail_closed_after_partial_replay() 
         suffix.push(("old".into(), serde_json::json!({"value": 2})));
         suffix.push(("fresh".into(), serde_json::json!({"value": 3})));
         failure_engine.bulk_add_documents(suffix).unwrap();
-        failure_engine.inject_engine_apply_failures_for_test(28, 1);
-        assert!(
-            failure_engine
-                .add_document("failed", serde_json::json!({"value": 4}))
-                .is_err()
-        );
+        failure_engine.inject_refresh_commit_failures_for_test(1);
+        assert!(failure_engine.refresh().is_err());
         failure_engine.inject_replay_commit_failure_for_test(28, 1);
         let error = failure_engine.refresh().unwrap_err();
         assert!(

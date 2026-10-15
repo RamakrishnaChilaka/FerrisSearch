@@ -779,11 +779,11 @@ async fn concurrent_first_writes(all_data: bool, coordinator: usize) {
         }
         catch_up(&cluster).await;
         let committed = cluster.nodes[0].state.cluster_manager.get_state();
-        if committed.version != before + 2 * (1 + BULK_INDICES) as u64 {
+        if committed.version != before + 3 * (1 + BULK_INDICES) as u64 {
             stats.excess_mutations += 1;
             if failures.len() < 12 {
                 failures.push(format!(
-                    "round {round}: version delta {}, expected one create/activation per index",
+                    "round {round}: version delta {}, expected one create/reservation/finish per index",
                     committed.version - before
                 ));
             }

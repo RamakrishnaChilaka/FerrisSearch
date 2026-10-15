@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use ferrissearch::engine::routing::calculate_shard;
+use ferrissearch::shard::{SHARD_COPY_IDENTITY_FILE, ShardCopyIdentity};
 use ferrissearch::transport::proto::internal_transport_client::InternalTransportClient;
 use ferrissearch::transport::proto::{
     GetShardSequenceStateRequest, GetShardSequenceStateResponse, ShardGetRequest, ShardGetResponse,
@@ -564,11 +565,29 @@ impl RestartClusterHarness {
     }
 
     async fn assert_document_copies(
-        &self,
+        &mut self,
         doc_id: &str,
         source: &Value,
         receipt: &Value,
     ) -> Result<()> {
+        let (_, state) = self
+            .request_json(Method::GET, "/_cluster/state", None)
+            .await?;
+        let configured = u32::try_from(
+            state["indices"][INDEX_NAME]["number_of_replicas"]
+                .as_u64()
+                .context("configured replica count is missing")?,
+        )?;
+        let expected = self
+            .nodes
+            .len()
+            .checked_sub(1)
+            .context("no primary process")?;
+        let unassigned = configured
+            .checked_sub(u32::try_from(expected)?)
+            .context("running data copies exceed configured capacity")?;
+        self.wait_for_in_sync_replicas_with_unassigned(expected, unassigned)
+            .await?;
         let (status, document) = self.get_document(doc_id).await?;
         assert_eq!(status, StatusCode::OK, "{document}");
         assert_eq!(&document["_source"], source);
@@ -763,6 +782,15 @@ impl RestartClusterHarness {
         &mut self,
         expected_replicas: usize,
     ) -> Result<(Value, RoutingSnapshot)> {
+        self.wait_for_in_sync_replicas_with_unassigned(expected_replicas, 0)
+            .await
+    }
+
+    async fn wait_for_in_sync_replicas_with_unassigned(
+        &mut self,
+        expected_replicas: usize,
+        expected_unassigned: u32,
+    ) -> Result<(Value, RoutingSnapshot)> {
         let deadline = tokio::time::Instant::now() + FAILOVER_TIMEOUT;
         loop {
             for node in &mut self.nodes {
@@ -780,19 +808,51 @@ impl RestartClusterHarness {
                     .replicas
                     .iter()
                     .all(|replica| shard.in_sync_replicas.contains(replica))
-                && shard.unassigned_replicas == 0
+                && shard.unassigned_replicas == expected_unassigned
+                && state["shard_allocations"][INDEX_NAME]["0"]["primary_authority"]["phase"]
+                    == "active"
+                && self.all_node_routing_views_applied(&state).await?
             {
                 return Ok((state, shard.clone()));
             }
 
             if tokio::time::Instant::now() >= deadline {
                 bail!(
-                    "replicas did not become in sync within {FAILOVER_TIMEOUT:?}\n{}",
+                    "replicas did not reach {expected_replicas} in-sync / \
+                     {expected_unassigned} unassigned within {FAILOVER_TIMEOUT:?}\n{}",
                     self.logs_summary()
                 );
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
+    }
+
+    async fn all_node_routing_views_applied(&self, state: &Value) -> Result<bool> {
+        let version = state["version"]
+            .as_u64()
+            .context("state version is missing")?;
+        for node in &self.nodes {
+            let response = self
+                .client
+                .get(format!("{}/_cluster/state", node.config.base_url()))
+                .send()
+                .await
+                .with_context(|| format!("read routing view on {}", node.config.name))?;
+            if response.status() != StatusCode::OK {
+                return Ok(false);
+            }
+            let view: Value = response.json().await?;
+            if !view["version"]
+                .as_u64()
+                .is_some_and(|applied| applied >= version)
+                || view["indices"][INDEX_NAME]["shard_routing"]
+                    != state["indices"][INDEX_NAME]["shard_routing"]
+                || view["shard_allocations"][INDEX_NAME] != state["shard_allocations"][INDEX_NAME]
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     async fn wait_for_primary_promotion(&mut self, old_primary: &str) -> Result<RoutingSnapshot> {
@@ -821,6 +881,45 @@ impl RestartClusterHarness {
                 );
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    async fn wait_for_active_write_authority(
+        &mut self,
+        after_term: u64,
+        excluded_primary: Option<&str>,
+    ) -> Result<Value> {
+        let deadline = tokio::time::Instant::now() + FAILOVER_TIMEOUT;
+        loop {
+            for node in &mut self.nodes {
+                node.ensure_running()?;
+            }
+            let (status, state) = self
+                .request_json(Method::GET, "/_cluster/state", None)
+                .await?;
+            let routing = &state["indices"][INDEX_NAME]["shard_routing"]["0"];
+            let authority = &state["shard_allocations"][INDEX_NAME]["0"]["primary_authority"];
+            if status == StatusCode::OK
+                && routing["primary"]
+                    .as_str()
+                    .is_some_and(|primary| Some(primary) != excluded_primary)
+                && routing["primary_term"]
+                    .as_u64()
+                    .is_some_and(|term| term > after_term)
+                && authority["phase"] == "active"
+                && authority["history"]["primary_term"] == routing["primary_term"]
+                && authority["activation_id"].as_u64().is_some()
+            {
+                return Ok(state);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "no fresh ACTIVE authority after term {after_term}, excluding \
+                     {excluded_primary:?}: {state}\n{}",
+                    self.logs_summary()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
@@ -1081,6 +1180,36 @@ fn allocation_id_for_node(
     Ok(None)
 }
 
+fn assert_copy_certificate(node: &NodeConfig, index_uuid: &str, state: &Value) -> Result<()> {
+    let path = node
+        .data_dir
+        .join(index_uuid)
+        .join("shard_0")
+        .join(SHARD_COPY_IDENTITY_FILE);
+    let identity: ShardCopyIdentity = serde_json::from_slice(&fs::read(&path)?)?;
+    assert_eq!(identity.index_uuid, index_uuid, "{}", node.name);
+    assert_eq!(
+        Some(identity.allocation_id),
+        allocation_id_for_node(state, INDEX_NAME, 0, &node.name)?,
+        "{}",
+        node.name
+    );
+    assert_eq!(
+        serde_json::to_value(&identity.canonical_history)?,
+        state["shard_allocations"][INDEX_NAME]["0"]["primary_authority"]["history"],
+        "{}",
+        node.name
+    );
+    assert_eq!(
+        Some(identity.replica_fence),
+        state["indices"][INDEX_NAME]["shard_routing"]["0"]["primary_term"].as_u64(),
+        "{}",
+        node.name
+    );
+    assert_ne!(identity.checksum, [0; 32], "{}", node.name);
+    Ok(())
+}
+
 fn expected_document(doc_id: usize) -> Value {
     json!({
         "title": format!("restart regression doc {doc_id}"),
@@ -1198,6 +1327,199 @@ async fn wait_for_single_node_bootstrap(client: &Client, node: &mut NodeProcess)
 }
 
 #[tokio::test]
+async fn fs013_clean_primary_restart_requires_fresh_canonical_authority() -> Result<()> {
+    let mut harness = RestartClusterHarness::start().await?;
+    let index_uuid = harness.create_index_with_shards(1, 0).await?;
+    let source = expected_document(0);
+    let before = harness
+        .put_document("before-restart", source.clone())
+        .await?;
+    let state = harness.wait_for_cluster_state(3, Some(INDEX_NAME)).await?;
+    let primary = routing_snapshot(&state, INDEX_NAME)?[&0].primary.clone();
+    let allocation = allocation_id_for_node(&state, INDEX_NAME, 0, &primary)?;
+    let old_term = before["_primary_term"].as_u64().context("missing term")?;
+    let old_activation =
+        state["shard_allocations"][INDEX_NAME]["0"]["primary_authority"]["activation_id"]
+            .as_u64()
+            .context("missing activation ID")?;
+    let stopped = harness.stop_node(&primary)?;
+    harness.restart_node(stopped).await?;
+    let restarted = harness
+        .wait_for_active_write_authority(old_term, None)
+        .await?;
+    assert_eq!(
+        routing_snapshot(&restarted, INDEX_NAME)?[&0].primary,
+        primary
+    );
+    assert_eq!(
+        allocation_id_for_node(&restarted, INDEX_NAME, 0, &primary)?,
+        allocation
+    );
+    assert!(
+        restarted["shard_allocations"][INDEX_NAME]["0"]["primary_authority"]["activation_id"]
+            .as_u64()
+            .is_some_and(|activation| activation > old_activation),
+        "{restarted}"
+    );
+    let primary_config = &harness
+        .nodes
+        .iter()
+        .find(|node| node.config.name == primary)
+        .context("restarted primary is missing")?
+        .config;
+    assert_copy_certificate(primary_config, &index_uuid, &restarted)?;
+    let local = get_local_document_response(primary_config, "before-restart").await?;
+    assert!(local.found);
+    assert_eq!(local.seq_no, before["_seq_no"].as_u64());
+    assert_eq!(local.primary_term, Some(old_term));
+    assert_eq!(serde_json::from_slice::<Value>(&local.source_json)?, source);
+    let after = harness
+        .put_document("after-restart", expected_document(1))
+        .await?;
+    assert_eq!(
+        after["_seq_no"].as_u64(),
+        before["_seq_no"].as_u64().map(|seq| seq + 1)
+    );
+    assert!(
+        after["_primary_term"]
+            .as_u64()
+            .is_some_and(|term| term > old_term)
+    );
+    assert_eq!(after["_shards"]["successful"], 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn fs013_post_wal_publication_failure_promotes_and_recovers_a_fresh_copy() -> Result<()> {
+    let mut harness = RestartClusterHarness::start().await?;
+    let index_uuid = harness.create_index_with_shards(1, 2).await?;
+    harness.wait_for_in_sync_replicas(2).await?;
+    let initial_source = expected_document(0);
+    let before = harness
+        .put_document("before-failure", initial_source.clone())
+        .await?;
+    assert_eq!(before["_shards"]["successful"], 3);
+    let state = harness.wait_for_cluster_state(3, Some(INDEX_NAME)).await?;
+    let primary = routing_snapshot(&state, INDEX_NAME)?[&0].primary.clone();
+    let old_allocation = allocation_id_for_node(&state, INDEX_NAME, 0, &primary)?
+        .context("primary allocation is missing")?;
+    let old_term = before["_primary_term"].as_u64().context("missing term")?;
+    let failed_config = harness
+        .nodes
+        .iter()
+        .find(|node| node.config.name == primary)
+        .context("primary process is missing")?
+        .config
+        .clone();
+    let temporary_identity = failed_config
+        .data_dir
+        .join(&index_uuid)
+        .join("shard_0")
+        .join(format!("{SHARD_COPY_IDENTITY_FILE}.tmp"));
+    fs::create_dir(&temporary_identity)?;
+    let unknown_source = expected_document(1);
+    let response = harness
+        .client
+        .put(format!(
+            "{}/{INDEX_NAME}/_doc/unknown-outcome",
+            failed_config.base_url()
+        ))
+        .json(&unknown_source)
+        .send()
+        .await?;
+    let status = response.status();
+    let unknown: Value = response.json().await?;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{unknown}");
+    assert_eq!(
+        unknown["error"]["type"], "write_outcome_unknown",
+        "{unknown}"
+    );
+    assert!(
+        unknown["error"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("Is a directory")),
+        "{unknown}"
+    );
+    assert_eq!(
+        unknown["_seq_no"].as_u64(),
+        before["_seq_no"].as_u64().map(|seq| seq + 1),
+        "{unknown}"
+    );
+    assert_eq!(
+        unknown["_primary_term"], before["_primary_term"],
+        "{unknown}"
+    );
+    assert!(unknown.get("_shards").is_none(), "{unknown}");
+    assert!(
+        get_local_document_response(&failed_config, "before-failure")
+            .await
+            .is_err(),
+        "the failed process must not serve its uncertain copy"
+    );
+    let promoted = harness
+        .wait_for_active_write_authority(old_term, Some(&primary))
+        .await?;
+    assert!(
+        !routing_snapshot(&promoted, INDEX_NAME)?[&0]
+            .in_sync_replicas
+            .contains(&primary),
+        "{promoted}"
+    );
+    let after_source = expected_document(2);
+    let after = harness
+        .put_document("after-promotion", after_source.clone())
+        .await?;
+    assert!(after["_seq_no"].as_u64() > unknown["_seq_no"].as_u64());
+    assert!(
+        after["_primary_term"]
+            .as_u64()
+            .is_some_and(|term| term > old_term)
+    );
+    let stopped = harness.stop_node(&primary)?;
+    fs::remove_dir(&temporary_identity)?;
+    harness.restart_node(stopped).await?;
+    let (recovered, routing) = harness.wait_for_in_sync_replicas(2).await?;
+    assert!(routing.in_sync_replicas.contains(&primary), "{routing:?}");
+    assert_ne!(
+        allocation_id_for_node(&recovered, INDEX_NAME, 0, &primary)?,
+        Some(old_allocation),
+        "a failed old primary must rejoin under fresh replica authority"
+    );
+    for node in &harness.nodes {
+        assert_copy_certificate(&node.config, &index_uuid, &recovered)?;
+    }
+    harness
+        .assert_document_copies("before-failure", &initial_source, &before)
+        .await?;
+    for node in &harness.nodes {
+        let copy = get_local_document_response(&node.config, "unknown-outcome").await?;
+        assert!(copy.found, "{}", node.config.name);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&copy.source_json)?,
+            unknown_source,
+            "{}",
+            node.config.name
+        );
+        assert_eq!(
+            copy.seq_no,
+            unknown["_seq_no"].as_u64(),
+            "{}",
+            node.config.name
+        );
+        assert_eq!(copy.primary_term, Some(old_term), "{}", node.config.name);
+        assert_eq!(copy.version, Some(1), "{}", node.config.name);
+    }
+    harness
+        .assert_document_copies("after-promotion", &after_source, &after)
+        .await?;
+    let final_receipt = harness
+        .put_document("after-recovery", expected_document(3))
+        .await?;
+    assert_eq!(final_receipt["_shards"]["successful"], 3, "{final_receipt}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn three_node_flush_restart_preserves_uuid_dirs_and_document_count() -> Result<()> {
     let mut harness = RestartClusterHarness::start().await?;
     let index_uuid = harness.create_index(0).await?;
@@ -1248,11 +1570,15 @@ async fn conditional_writes_preserve_occ_across_restart_and_primary_failover() -
     let initial = harness.put_document(DOC_ID, initial_source.clone()).await?;
     harness.flush_index_copies(3).await?;
     harness.restart_all().await?;
+    harness
+        .wait_for_active_write_authority(initial["_primary_term"].as_u64().unwrap(), None)
+        .await?;
     harness.wait_for_in_sync_replicas(2).await?;
     harness.wait_for_green().await?;
     harness
         .assert_document_copies(DOC_ID, &initial_source, &initial)
-        .await?;
+        .await
+        .context("verify copies after all-node restart")?;
 
     let (status, updated) = harness
         .request_json(
@@ -1266,6 +1592,22 @@ async fn conditional_writes_preserve_occ_across_restart_and_primary_failover() -
         .await?;
     assert_eq!(status, StatusCode::OK, "{updated}");
     assert_eq!(updated["result"], "updated");
+    let successful = updated["_shards"]["successful"].as_u64().unwrap();
+    let failed = updated["_shards"]["failed"].as_u64().unwrap();
+    assert!(successful >= 1, "{updated}");
+    assert_eq!(
+        successful + failed,
+        updated["_shards"]["total"].as_u64().unwrap(),
+        "{updated}"
+    );
+    if failed > 0 {
+        assert_eq!(
+            updated["_shards"]["failures"].as_array().unwrap().len() as u64,
+            failed,
+            "{updated}"
+        );
+        eprintln!("conditional update certified after exclusion: {updated}");
+    }
     assert_eq!(
         updated["_seq_no"].as_u64(),
         initial["_seq_no"].as_u64().map(|seq| seq + 1)
@@ -1275,7 +1617,13 @@ async fn conditional_writes_preserve_occ_across_restart_and_primary_failover() -
     updated_source["n"] = json!(1);
     harness
         .assert_document_copies(DOC_ID, &updated_source, &updated)
-        .await?;
+        .await
+        .with_context(|| {
+            format!(
+                "verify copies after the first conditional update: {updated}\n{}",
+                harness.logs_summary()
+            )
+        })?;
 
     let (_, before) = harness.wait_for_in_sync_replicas(2).await?;
     let old_primary = harness.stop_node(&before.primary)?;
@@ -1286,7 +1634,8 @@ async fn conditional_writes_preserve_occ_across_restart_and_primary_failover() -
         .await?;
     harness
         .assert_document_copies(DOC_ID, &updated_source, &updated)
-        .await?;
+        .await
+        .context("verify copies after primary promotion")?;
 
     let barrier = Arc::new(tokio::sync::Barrier::new(WRITERS));
     let query = condition_query(&updated)?;

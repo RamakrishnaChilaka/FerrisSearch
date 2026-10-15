@@ -17,10 +17,11 @@ Tantivy index.
 > (`PutApiKey` / `DeleteApiKey` / `PutRole` / `DeleteRole`) are the reference
 > implementations. Do not invent a new storage or replication path.
 
-Conditional shard-authority commands (`MarkReplicaInSync`, `ActivatePrimary`,
-`MarkPrimaryUnavailable`, `MarkPrimaryAvailable`, and `FailShardCopy`) return
-`ClusterResponse::Error` when their
-UUID/allocation/primary/term compare-and-set fails. Callers must inspect
+Conditional shard-authority commands validate exact UUID/allocation/primary/term
+identity. `FinishPrimaryActivation` and `ExcludeFailedShardCopies` return typed
+`WriteAuthorityRejected` results for stale authority; accepted exclusions return
+their exact transition ID. Other conditional commands return
+`ClusterResponse::Error` when their compare-and-set fails. Callers must inspect
 `client_write(...).data`; an
 OpenRaft transport success is not proof that the application command applied.
 Rejected conditional commands perform no partial mutation and do not bump the
@@ -41,14 +42,14 @@ must reject rather than clear the last primary allocation. Replica reports set
 Raft log entries missing it are unsupported and prevent startup with recreate
 guidance.
 
-`primary_unavailable` is status only. `MarkPrimaryUnavailable` sets it for the
-exact initialized allocation without changing authority. `MarkPrimaryAvailable`
-clears it only when UUID, primary, allocation, and primary term still match and
-the flag is set; it never bumps the term. A successful local write is the proof
-used to propose this clear for an Apply-level failure. That proposal is
-throttled, best-effort background work: leader discovery, forwarding, and Raft
-application must never delay the already-successful write response. Repaired
-open/fence failures require a fresh `ActivatePrimary`.
+`MarkPrimaryUnavailable` sets status-only unavailability for the exact
+initialized allocation without removing routing. It is not cleared by a
+successful local write. `ActivatePrimary` reserves a higher-term `PROMOTING`
+epoch; only conditional `FinishPrimaryActivation`, after canonical history
+installation, grants `ACTIVE` authority and clears unavailability. A post-WAL
+local failure is process-sticky: repairing the injected fault cannot restore
+that engine's write admission. Restart must verify protected history and obtain
+fresh canonical authority. There is no `MarkPrimaryAvailable` RPC or command.
 
 ## When to use this recipe (vs. the data path)
 

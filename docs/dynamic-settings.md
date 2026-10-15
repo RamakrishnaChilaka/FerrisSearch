@@ -50,6 +50,20 @@ Each locally opened index has a `SettingsManager` that holds
 | `index.refresh_interval_ms` | `u64 \| null` | `5000` | How often new documents become searchable (ms). Set to `null` to reset to default. |
 | `index.flush_threshold_bytes` | `u64 \| null` | `536870912` | WAL size threshold for background flush. `0` disables auto-flush; `null` restores the default. |
 | `index.number_of_replicas` | `u32` | — | Number of replica copies per shard. Increasing adds unassigned replicas; decreasing removes assigned ones. |
+| `index.minimum_durable_copies` | positive `u32` | `1` | `local_shards` write admission and acknowledgement floor, including the primary. Must not exceed configured primary-plus-replica capacity. |
+
+The copy floor is read from applied Raft metadata before mutation and
+certification; it does not depend on the engine-watch notification path
+described above. It never permits skipping another authoritative in-sync
+copy. A failed target must have an observed, settled conditional exclusion
+before the remaining proofs can satisfy a write. Activation and peer recovery
+can proceed below the floor so redundancy can be restored.
+
+Replica-count and floor changes are validated together and applied atomically.
+To reduce a two-copy requirement to a single-copy index, update both settings
+in one request. Zero, null, non-integers, and values above configured capacity
+are rejected without changing metadata. Explicit use of this setting on
+`remote_store` is rejected; it is not a publication-durability setting.
 
 **Immutable settings** (rejected with `400 Bad Request`):
 - `index.number_of_shards` — cannot be changed after index creation.
@@ -80,6 +94,7 @@ curl -s 'http://localhost:9200/movies/_settings' | python3 -m json.tool
             "index": {
                 "number_of_shards": 3,
                 "number_of_replicas": 1,
+                "minimum_durable_copies": 1,
                 "engine": "local_shards",
                 "refresh_interval_ms": null,
                 "flush_threshold_bytes": null,
@@ -137,6 +152,18 @@ curl -X PUT 'http://localhost:9200/movies/_settings' \
   -H 'Content-Type: application/json' \
   -d '{"index": {"refresh_interval_ms": null}}'
 ```
+
+**Example — require two durable eligible copies:**
+
+```bash
+curl -X PUT 'http://localhost:9200/movies/_settings' \
+  -H 'Content-Type: application/json' \
+  -d '{"index": {"number_of_replicas": 1, "minimum_durable_copies": 2}}'
+```
+
+The update can succeed before a replica is recovered. Writes then remain
+unavailable until two eligible copies exist; desired replica count alone is
+not proof that a copy is in sync.
 
 **Example — multiple settings at once:**
 

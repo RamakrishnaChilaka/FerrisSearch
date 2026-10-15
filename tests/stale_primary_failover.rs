@@ -367,6 +367,11 @@ fn assert_canonical(observed: &Observation, old_term: u64, new_term: u64) {
     );
     assert_eq!(observed.identity.index_uuid, UUID);
     assert_eq!(observed.identity.replica_fence, new_term);
+    let history = observed.identity.canonical_history.as_ref().unwrap();
+    assert_eq!(history.primary_term, new_term);
+    assert_eq!(history.max_seq_no, Some(2));
+    assert!(history.activation_id > 0);
+    assert_ne!(history.digest, [0; 32]);
     let identities = observed
         .snapshot
         .live_documents
@@ -684,7 +689,14 @@ async fn live_stale_primary_requests_fail_after_real_raft_promotion() -> Result<
             .iter()
             .map(|entry| (entry.seq_no, entry.term))
             .collect::<Vec<_>>(),
-        [(3, new_term), (4, new_term), (5, new_term)]
+        [
+            (0, old_term),
+            (1, old_term),
+            (2, old_term),
+            (3, new_term),
+            (4, new_term),
+            (5, new_term),
+        ]
     );
     assert_eq!(nodes[0].manager.version(), before.version);
     assert_eq!(
@@ -813,7 +825,21 @@ async fn live_stale_primary_requests_fail_after_real_raft_promotion() -> Result<
     let p_recovered = observe(&nodes[0]).await?;
     assert_canonical(&p_recovered, old_term, new_term);
     assert_eq!(p_recovered.identity.allocation_id, replacement);
-    assert!(p_recovered.snapshot.wal_entries.is_empty());
+    assert_eq!(
+        p_recovered.identity.canonical_history,
+        q_after.identity.canonical_history
+    );
+    assert_eq!(
+        p_recovered.snapshot.wal_entries,
+        q_after
+            .snapshot
+            .wal_entries
+            .iter()
+            .filter(|entry| entry.seq_no > 2)
+            .cloned()
+            .collect::<Vec<_>>(),
+        "recovery retains the complete post-certificate history"
+    );
     let mut recovered_documents = p_recovered.snapshot.live_documents.clone();
     let mut canonical_documents = q_after.snapshot.live_documents.clone();
     recovered_documents.sort();

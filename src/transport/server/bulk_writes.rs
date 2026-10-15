@@ -60,6 +60,7 @@ fn failed_response(
 pub(super) async fn execute_ordered_bulk(
     service: &TransportService,
     request: ShardBulkRequest,
+    write_deadline: crate::transport::refresh_deadline::RefreshDeadline,
     refresh_deadline: Option<crate::transport::refresh_deadline::RefreshDeadline>,
 ) -> Result<Response<ShardBulkResponse>, Status> {
     let index_uuid = if refresh_deadline.is_some() {
@@ -94,6 +95,13 @@ pub(super) async fn execute_ordered_bulk(
             continue;
         };
         let doc_id = doc_id.to_string();
+        if write_deadline.remaining().is_zero() {
+            results.push(
+                WriteFailure::not_executed("bulk response deadline expired before item dispatch")
+                    .bulk_item(doc_id),
+            );
+            continue;
+        }
         let kind = match ShardBulkOpKind::try_from(operation.kind) {
             Ok(kind) => kind,
             Err(error) => {
@@ -105,22 +113,21 @@ pub(super) async fn execute_ordered_bulk(
             }
         };
         let item = if kind == ShardBulkOpKind::Delete {
-            match service
-                .delete_doc(service.transport_client.forwarding_request(
-                    ShardDeleteRequest {
-                        index_name: request.index_name.clone(),
-                        shard_id: request.shard_id,
-                        doc_id: doc_id.clone(),
-                        if_seq_no: operation.if_seq_no,
-                        if_primary_term: operation.if_primary_term,
-                        refresh: false,
-                        client_operation: operation.client_operation.clone(),
-                    },
-                    &request.index_name,
-                    Some((request.shard_id, &service.local_node_id)),
-                ))
-                .await
-            {
+            let mut forwarded = service.transport_client.forwarding_request(
+                ShardDeleteRequest {
+                    index_name: request.index_name.clone(),
+                    shard_id: request.shard_id,
+                    doc_id: doc_id.clone(),
+                    if_seq_no: operation.if_seq_no,
+                    if_primary_term: operation.if_primary_term,
+                    refresh: false,
+                    client_operation: operation.client_operation.clone(),
+                },
+                &request.index_name,
+                Some((request.shard_id, &service.local_node_id)),
+            );
+            forwarded.set_timeout(write_deadline.remaining());
+            match service.delete_doc(forwarded).await {
                 Ok(response) => {
                     let response = response.into_inner();
                     if response.success {
@@ -137,6 +144,7 @@ pub(super) async fn execute_ordered_bulk(
                             primary_term: response.primary_term,
                             version: response.version,
                             write_refresh: response.write_refresh,
+                            write_acknowledgement: response.write_acknowledgement,
                             ..Default::default()
                         }
                     } else {
@@ -176,25 +184,24 @@ pub(super) async fn execute_ordered_bulk(
                     continue;
                 }
             };
-            match service
-                .index_doc(service.transport_client.forwarding_request(
-                    ShardDocRequest {
-                        index_name: request.index_name.clone(),
-                        shard_id: request.shard_id,
-                        doc_id: doc_id.clone(),
-                        payload_json,
-                        if_seq_no: operation.if_seq_no,
-                        if_primary_term: operation.if_primary_term,
-                        create_only: kind == ShardBulkOpKind::Create,
-                        index_uuid: None,
-                        refresh: false,
-                        client_operation: operation.client_operation.clone(),
-                    },
-                    &request.index_name,
-                    Some((request.shard_id, &service.local_node_id)),
-                ))
-                .await
-            {
+            let mut forwarded = service.transport_client.forwarding_request(
+                ShardDocRequest {
+                    index_name: request.index_name.clone(),
+                    shard_id: request.shard_id,
+                    doc_id: doc_id.clone(),
+                    payload_json,
+                    if_seq_no: operation.if_seq_no,
+                    if_primary_term: operation.if_primary_term,
+                    create_only: kind == ShardBulkOpKind::Create,
+                    index_uuid: None,
+                    refresh: false,
+                    client_operation: operation.client_operation.clone(),
+                },
+                &request.index_name,
+                Some((request.shard_id, &service.local_node_id)),
+            );
+            forwarded.set_timeout(write_deadline.remaining());
+            match service.index_doc(forwarded).await {
                 Ok(response) => {
                     let response = response.into_inner();
                     if response.success {
@@ -211,6 +218,7 @@ pub(super) async fn execute_ordered_bulk(
                             primary_term: response.primary_term,
                             version: response.version,
                             write_refresh: response.write_refresh,
+                            write_acknowledgement: response.write_acknowledgement,
                             ..Default::default()
                         }
                     } else {

@@ -59,9 +59,10 @@ pub struct ShardManager {
 - OCC/create conflicts are normal pre-WAL rejections, not storage failures.
   They must not consume Apply retry budget or quarantine the copy.
 - Every served assigned copy has `<data_dir>/<uuid>/shard_<id>/SHARD_COPY_IDENTITY.json`.
-- The versioned JSON contains index UUID, allocation ID, and durable replica
-  fence plus an allocation-bound collision-quarantine flag. Updates use temp
-  write, file fsync, rename, and directory fsync.
+- Checksummed v4 JSON contains index UUID, allocation ID, durable replica fence,
+  collision quarantine, canonical certificate, pending exclusion intents, and
+  safe global checkpoint. Publish with temp write, file fsync, rename, and
+  directory fsync before updating cached authority.
 - Assigned opens load and validate the file before publishing an engine.
   Missing, malformed, or mismatched identity fails closed.
 - Identity, marker, WAL, and Tantivy decode/validation failures are definitive.
@@ -69,30 +70,19 @@ pub struct ShardManager {
   identity fence maximum and the committed term-start maximum, is also
   definitive and must fail the exact copy instead of consuming the I/O retry
   window.
-  Other filesystem/engine I/O uses a shared per-copy retry budget: exponential
+  Ordinary assigned-open/fence/marker I/O uses a shared per-copy retry budget: exponential
   1–5 second backoff, at least three failed attempts, and a 60-second minimum
   window before persistent-I/O escalation.
-- Retry state is keyed by operation. Apply-level WAL/fsync/engine failures,
-  including a writer left unavailable by failed force-merge replacement, use
-  the Apply key. A write first attempts one failed-writer rebuild before adding
-  a new WAL entry; transient replacement failure can self-heal, while persistent
-  rebuild I/O consumes the same Apply budget. Successful Apply clears that key.
-  Apply escalation does not quarantine or reopen the copy; reads remain
-  available. A writer-invalidating commit failure rebuilds and replays the
-  retained WAL suffix before the next write or blocking maintenance/snapshot
-  commit. A separate engine-apply failure after WAL append has an unknown
-  outcome. In production it means the Tantivy writer was killed, so the next
-  commit fails and rebuild or restart replay applies the entry on this copy.
-  On a primary, replicas never receive it, so copies can diverge; peer
-  recovery from this copy can ship the retained entry to a new copy. When a
-  later write exposes that missing sequence, every affected replica normally
-  reaches the fixed gap deadline (about 60 seconds), is removed, and is
-  peer-recovered. This is intentionally conservative until D10 adds targeted
-  repair.
-  Preserve primary `WriteMutationError` context when wrapping an Apply error
-  for persistent-I/O escalation. Native error sources can hide anyhow context
-  from direct downcasts; reattach the current operation's context without
-  changing retry accounting, availability, or the underlying cause.
+- WAL append/sync, authority publication, and uncertain post-WAL engine errors
+  immediately fail-stop the copy. `CopyWriteState` shares first-failure state
+  with the WAL and all issued permits. Quarantine, same-allocation reopen,
+  writer rebuild, and successful later I/O cannot heal that process-local copy.
+  Realtime GET and recovery fail closed; a raw already-committed non-realtime
+  reader is not proof of write health.
+  Ordinary failed-writer reconstruction may recover a healthy copy after a
+  maintenance-only commit/replacement error; it never clears shared fail-stop.
+  Preserve the current operation's `WriteMutationError` receipt and underlying
+  cause through every wrapper; never substitute a shared checkpoint.
   Definitive and open-level failures may quarantine only after the report
   throttle admits the attempt, except sequence/version collisions, which
   atomically persist collision quarantine before the engine is evicted and are
@@ -119,6 +109,22 @@ pub struct ShardManager {
 - A stale exact `SHARD_COPY_IDENTITY.json.tmp` is removed before the
   initial-primary empty-directory check. Local/test helpers load and preserve
   an existing durable identity rather than overwriting it with allocation `1`.
+- `copy_authority.rs` owns atomic canonical/journal/global updates. Unsettled
+  exclusions are bound to exact source authority, captured version, transition
+  ID, and failed allocations. Only accepted observed settlement or applied
+  evidence proving that exact conditional impossible can remove an intent.
+- `promotion.rs` owns bounded frozen history sessions with retention pins.
+  Preserve candidate protected operations, adopt unique matching peer records
+  with original identity, and resolve absent/conflicting unprotected gaps with
+  explicit NoOps. Compare a peer's entire range before appending; leave
+  conflicting/unreachable copies out of committed ACTIVE eligibility.
+- Snapshot v3 carries the canonical certificate and dense retained post-
+  certificate history. Target install validates it, restores no source-safe
+  global checkpoint, and cannot use a prepared certificate as a retention bound.
+- The feature-only recovery-install trace observer reads the actual installed
+  physical WAL under the install lock, including canonical-archive entries.
+  Version/tombstone/client bookkeeping alone is not complete restored-WAL
+  evidence. Keep the strict final actual-state oracle enabled.
 
 ### UUID-Based Data Directories
 - On-disk path: `<data_dir>/<uuid>/shard_<id>` (NOT `<data_dir>/<index_name>/shard_<id>`)

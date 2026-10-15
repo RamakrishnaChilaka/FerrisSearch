@@ -18,6 +18,9 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, info, trace};
 
 mod bulk_writes;
+mod live_replication;
+mod promotion;
+mod write_acknowledgement;
 mod write_refresh;
 
 fn primary_write_condition(
@@ -92,17 +95,17 @@ struct PendingPromotionNoOps {
 struct PrimaryCopyActivationLocks {
     activation: Mutex<()>,
     noop_replication: Mutex<()>,
+    exclusion_settlement: Mutex<()>,
 }
 
 #[derive(Default)]
 struct PrimaryActivationState {
+    promotion_jobs: promotion::PromotionJobBudget,
+    promotion_coordinators: promotion::PromotionJobBudget,
     activated_terms: RwLock<HashMap<PrimaryActivationKey, u64>>,
     pending_noops: RwLock<HashMap<PrimaryActivationKey, PendingPromotionNoOps>>,
     copy_locks: std::sync::Mutex<HashMap<PrimaryActivationKey, Arc<PrimaryCopyActivationLocks>>>,
     failed_copy_reports: Mutex<HashMap<(String, u32, u64), std::time::Instant>>,
-    available_primary_reports: Mutex<HashMap<(String, u32, u64, u64), std::time::Instant>>,
-    #[cfg(test)]
-    available_report_tasks_spawned: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     promotion_noop_bulk_requests_received: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -155,6 +158,39 @@ struct ActivatedPrimary {
     index_uuid: String,
     allocation_id: u64,
     primary_term: u64,
+    permit: Option<crate::engine::write_authority::WritePermit>,
+}
+
+impl ActivatedPrimary {
+    fn from_permit(permit: crate::engine::write_authority::WritePermit) -> Self {
+        let identity = permit.identity();
+        Self {
+            index_uuid: identity.index_uuid.clone(),
+            allocation_id: identity.primary_allocation_id,
+            primary_term: identity.primary_term,
+            permit: Some(permit),
+        }
+    }
+}
+
+fn validate_worker_write_permit(
+    permit: &Option<crate::engine::write_authority::WritePermit>,
+    primary_term: u64,
+    deadline: crate::transport::refresh_deadline::RefreshDeadline,
+) -> anyhow::Result<()> {
+    if deadline.remaining().is_zero() {
+        return Err(
+            crate::engine::write_failure::WriteMutationState::new(primary_term).error(
+                anyhow::anyhow!("write response deadline expired before WAL mutation"),
+            ),
+        );
+    }
+    if let Some(permit) = permit {
+        permit.validate().map_err(|error| {
+            crate::engine::write_failure::WriteMutationState::new(primary_term).error(error)
+        })?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -259,6 +295,12 @@ pub(crate) fn enqueue_force_merge_task_on_assigned_shards(
 }
 
 #[allow(clippy::result_large_err)]
+fn pre_execution_copy_unavailable_status(error: &anyhow::Error) -> Option<Status> {
+    (error.is::<crate::wal::WalFailStoppedError>()
+        || error.is::<crate::engine::tantivy::TantivyWriterUnavailableError>())
+    .then(|| Status::aborted(format!("{error:#}")))
+}
+
 async fn get_or_open_read_shard(
     cluster_manager: &ClusterManager,
     shard_manager: &Arc<ShardManager>,
@@ -297,7 +339,10 @@ async fn get_or_open_read_shard(
                 metadata.uuid.as_str(),
                 allocation_id,
             )
-            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            .map_err(|error| {
+                pre_execution_copy_unavailable_status(&error)
+                    .unwrap_or_else(|| Status::failed_precondition(format!("{error:#}")))
+            })?;
         return Ok(engine);
     }
 
@@ -339,7 +384,10 @@ async fn get_or_open_read_shard(
             )
             .await
     };
-    result.map_err(|e| Status::internal(format!("Failed to open shard: {e}")))
+    result.map_err(|error| {
+        pre_execution_copy_unavailable_status(&error)
+            .unwrap_or_else(|| Status::internal(format!("Failed to open shard: {error:#}")))
+    })
 }
 
 pub(crate) async fn run_maintenance_on_assigned_shards_async(
@@ -716,12 +764,10 @@ impl InternalTransport for TransportService {
         &self,
         request: Request<ShardDocRequest>,
     ) -> Result<Response<ShardDocResponse>, Status> {
-        let refresh_deadline = request
-            .get_ref()
-            .refresh
-            .then(|| crate::transport::refresh_deadline::RefreshDeadline::from_request(&request))
-            .transpose()
-            .map_err(WriteFailure::before_mutation_status)?;
+        let write_deadline =
+            crate::transport::refresh_deadline::RefreshDeadline::from_request(&request)
+                .map_err(WriteFailure::before_mutation_status)?;
+        let refresh_deadline = request.get_ref().refresh.then_some(write_deadline);
         self.wait_for_forwarded_state(
             &request,
             Some(&request.get_ref().index_name),
@@ -918,12 +964,16 @@ impl InternalTransport for TransportService {
                 let index_name = req.index_name.clone();
                 let expected_uuid = req.index_uuid.clone();
                 let client_operation = client_operation.clone();
+                let permit = activated_primary.permit.clone();
+                let recovery_guard = _write_guard.clone();
                 #[cfg(feature = "protocol-trace")]
                 let trace_copy = trace_copy.clone();
                 #[cfg(feature = "protocol-trace")]
                 let trace_request = trace_request.clone();
                 self.worker_pools
                     .spawn_write(move || {
+                        let _recovery_guard = recovery_guard;
+                        validate_worker_write_permit(&permit, primary_term, write_deadline)?;
                         require_index_uuid(
                             &cluster_manager,
                             &index_name,
@@ -963,6 +1013,12 @@ impl InternalTransport for TransportService {
                     })
                     .await
                     .map_err(|error| {
+                        self.shard_manager.fail_local_write_copy(
+                            &activated_primary.index_uuid,
+                            req.shard_id,
+                            activated_primary.allocation_id,
+                            &format!("primary write worker failed: {error:#}"),
+                        );
                         WriteFailure::indeterminate(
                             format!("primary write worker failed: {error:#}"),
                             None,
@@ -1020,69 +1076,72 @@ impl InternalTransport for TransportService {
                     crate::failpoints::PRIMARY_AFTER_LOCAL_APPLY_BEFORE_REPLICATION,
                 )
                 .await;
-                self.spawn_primary_available_report_after_write(
-                    &req.index_name,
-                    req.shard_id,
-                    &activated_primary,
-                );
 
                 // Replicate to replica shards with seq_no
-                let replication_result =
-                    if deduplicated && primary_term != activated_primary.primary_term {
-                        Ok(Vec::new())
-                    } else {
-                        crate::replication::replicate_write_with_durability(
-                            &self.transport_client,
-                            &write_state,
-                            &req.index_name,
-                            req.shard_id,
-                            &id,
-                            &payload,
-                            "index",
-                            seq_no,
-                            version,
-                            client_operation_record.as_ref(),
-                            primary_term,
-                            self.shard_manager.durability(),
+                let replication_result = if deduplicated {
+                    let record = client_operation_record.clone().ok_or_else(|| {
+                        WriteFailure::indeterminate(
+                            "deduplicated index receipt has no original client operation",
+                            Some(seq_no),
+                            Some(primary_term),
+                            None,
                         )
-                        .await
-                    };
-                match replication_result {
-                    Ok(replica_checkpoints) => {
-                        self.record_replica_checkpoints(
-                            &engine,
-                            &req.index_name,
-                            req.shard_id,
-                            &activated_primary,
+                        .into_status()
+                    })?;
+                    let operation = self
+                        .original_client_operation(engine.clone(), seq_no, primary_term, record)
+                        .await?;
+                    crate::replication::replicate_operation_with_durability(
+                        &self.transport_client,
+                        &write_state,
+                        &req.index_name,
+                        req.shard_id,
+                        &operation,
+                        self.shard_manager.durability(),
+                        engine.global_checkpoint(),
+                    )
+                    .await
+                } else {
+                    crate::replication::replicate_write_with_durability(
+                        &self.transport_client,
+                        &write_state,
+                        &req.index_name,
+                        req.shard_id,
+                        &id,
+                        &payload,
+                        "index",
+                        seq_no,
+                        version,
+                        client_operation_record.as_ref(),
+                        primary_term,
+                        self.shard_manager.durability(),
+                        engine.global_checkpoint(),
+                    )
+                    .await
+                };
+                let write_acknowledgement = match self
+                    .acknowledge_replicated_write(
+                        write_acknowledgement::WriteAcknowledgementContext {
+                            index: &req.index_name,
+                            shard_id: req.shard_id,
+                            engine: &engine,
+                            primary: &activated_primary,
+                            captured: &write_state,
+                            guard: &_write_guard,
                             primary_sequence,
-                            &replica_checkpoints,
-                        );
-                        #[cfg(feature = "protocol-trace")]
-                        if let Some(trace_request) = trace_request.as_ref() {
-                            crate::protocol_trace::record_client_result(
-                                trace_request,
-                                &self.local_node_id,
-                                &activated_primary.index_uuid,
-                                req.shard_id,
-                                "acknowledged",
-                                None,
-                            );
-                        }
-                    }
-                    Err(errors) => {
-                        self.report_definitive_replica_failures(
-                            &write_state,
-                            &req.index_name,
-                            req.shard_id,
-                            primary_term,
-                            &errors,
-                        )
-                        .await;
+                            deadline: write_deadline,
+                        },
+                        replication_result,
+                    )
+                    .await
+                {
+                    Ok(report) => report,
+                    Err(error) => {
                         tracing::warn!(
-                            "Replication errors for {}/shard_{}: {:?}",
+                            "Write acknowledgement failed for {}/shard_{}: {}",
                             req.index_name,
                             req.shard_id,
-                            errors
+                            error
                         );
                         #[cfg(feature = "protocol-trace")]
                         if let Some(trace_request) = trace_request.as_ref() {
@@ -1097,10 +1156,7 @@ impl InternalTransport for TransportService {
                         }
                         return Ok(Response::new(
                             WriteFailure::indeterminate(
-                                format!(
-                                    "Replication failed: {}",
-                                    Self::replication_failure_message(&errors)
-                                ),
+                                format!("Write acknowledgement failed: {error}"),
                                 Some(seq_no),
                                 Some(primary_term),
                                 None,
@@ -1108,7 +1164,7 @@ impl InternalTransport for TransportService {
                             .index_response(id),
                         ));
                     }
-                }
+                };
                 let write_refresh = if let Some(deadline) = refresh_deadline {
                     Some(
                         self.refresh_acknowledged_write(
@@ -1116,6 +1172,7 @@ impl InternalTransport for TransportService {
                             &req.index_name,
                             req.shard_id,
                             &activated_primary,
+                            Some(&write_acknowledgement),
                             deadline,
                         )
                         .await,
@@ -1123,6 +1180,27 @@ impl InternalTransport for TransportService {
                 } else {
                     None
                 };
+                self.validate_primary_ack(
+                    &engine,
+                    &req.index_name,
+                    req.shard_id,
+                    &activated_primary,
+                )
+                .map_err(|error| {
+                    WriteFailure::indeterminate(error, Some(seq_no), Some(primary_term), None)
+                        .into_status()
+                })?;
+                #[cfg(feature = "protocol-trace")]
+                if let Some(trace_request) = trace_request.as_ref() {
+                    crate::protocol_trace::record_client_result(
+                        trace_request,
+                        &self.local_node_id,
+                        &activated_primary.index_uuid,
+                        req.shard_id,
+                        "acknowledged",
+                        None,
+                    );
+                }
                 crate::metrics::DOCS_INDEXED_TOTAL.inc();
                 Ok(Response::new(ShardDocResponse {
                     success: true,
@@ -1134,6 +1212,7 @@ impl InternalTransport for TransportService {
                     write_refresh,
                     failure: None,
                     version: Some(version),
+                    write_acknowledgement: Some(write_acknowledgement),
                 }))
             }
             Err(e)
@@ -1220,12 +1299,10 @@ impl InternalTransport for TransportService {
         &self,
         request: Request<ShardBulkRequest>,
     ) -> Result<Response<ShardBulkResponse>, Status> {
-        let refresh_deadline = request
-            .get_ref()
-            .refresh
-            .then(|| crate::transport::refresh_deadline::RefreshDeadline::from_request(&request))
-            .transpose()
-            .map_err(WriteFailure::before_mutation_status)?;
+        let write_deadline =
+            crate::transport::refresh_deadline::RefreshDeadline::from_request(&request)
+                .map_err(WriteFailure::before_mutation_status)?;
+        let refresh_deadline = request.get_ref().refresh.then_some(write_deadline);
         self.wait_for_forwarded_state(
             &request,
             Some(&request.get_ref().index_name),
@@ -1260,7 +1337,13 @@ impl InternalTransport for TransportService {
                     || operation.if_seq_no.is_some()
                     || operation.client_operation.is_some()
             }) {
-                return bulk_writes::execute_ordered_bulk(self, req, refresh_deadline).await;
+                return bulk_writes::execute_ordered_bulk(
+                    self,
+                    req,
+                    write_deadline,
+                    refresh_deadline,
+                )
+                .await;
             }
         }
 
@@ -1390,12 +1473,16 @@ impl InternalTransport for TransportService {
                 let engine = engine.clone();
                 let docs_for_write = docs.clone();
                 let primary_term = activated_primary.primary_term;
+                let permit = activated_primary.permit.clone();
+                let recovery_guard = _write_guard.clone();
                 #[cfg(feature = "protocol-trace")]
                 let trace_copy = trace_copy.clone();
                 #[cfg(feature = "protocol-trace")]
                 let trace_requests = trace_requests.clone();
                 self.worker_pools
                     .spawn_write(move || {
+                        let _recovery_guard = recovery_guard;
+                        validate_worker_write_permit(&permit, primary_term, write_deadline)?;
                         #[cfg(feature = "protocol-trace")]
                         {
                             crate::protocol_trace::with_open_copy(trace_copy, || {
@@ -1418,6 +1505,12 @@ impl InternalTransport for TransportService {
                     })
                     .await
                     .map_err(|error| {
+                        self.shard_manager.fail_local_write_copy(
+                            &activated_primary.index_uuid,
+                            req.shard_id,
+                            activated_primary.allocation_id,
+                            &format!("primary bulk worker failed: {error:#}"),
+                        );
                         WriteFailure::indeterminate(
                             format!("primary bulk worker failed: {error:#}"),
                             None,
@@ -1471,6 +1564,7 @@ impl InternalTransport for TransportService {
                         primary_term: Some(primary_term),
                         results,
                         failure: None,
+                        write_acknowledgement: None,
                     }));
                 };
                 last_seq_no.ok_or_else(|| {
@@ -1487,13 +1581,8 @@ impl InternalTransport for TransportService {
                     crate::failpoints::PRIMARY_AFTER_LOCAL_APPLY_BEFORE_REPLICATION,
                 )
                 .await;
-                self.spawn_primary_available_report_after_write(
-                    &req.index_name,
-                    req.shard_id,
-                    &activated_primary,
-                );
                 // Replicate to replica shards
-                match crate::replication::replicate_bulk_with_durability(
+                let replication_result = crate::replication::replicate_bulk_with_durability(
                     &self.transport_client,
                     &write_state,
                     &req.index_name,
@@ -1503,44 +1592,32 @@ impl InternalTransport for TransportService {
                     &receipt.versions,
                     primary_term,
                     self.shard_manager.durability(),
+                    engine.global_checkpoint(),
                 )
-                .await
-                {
-                    Ok(replica_checkpoints) => {
-                        self.record_replica_checkpoints(
-                            &engine,
-                            &req.index_name,
-                            req.shard_id,
-                            &activated_primary,
+                .await;
+                let write_acknowledgement = match self
+                    .acknowledge_replicated_write(
+                        write_acknowledgement::WriteAcknowledgementContext {
+                            index: &req.index_name,
+                            shard_id: req.shard_id,
+                            engine: &engine,
+                            primary: &activated_primary,
+                            captured: &write_state,
+                            guard: &_write_guard,
                             primary_sequence,
-                            &replica_checkpoints,
-                        );
-                        #[cfg(feature = "protocol-trace")]
-                        for trace_request in &trace_requests {
-                            crate::protocol_trace::record_client_result(
-                                trace_request,
-                                &self.local_node_id,
-                                &activated_primary.index_uuid,
-                                req.shard_id,
-                                "acknowledged",
-                                None,
-                            );
-                        }
-                    }
-                    Err(errors) => {
-                        self.report_definitive_replica_failures(
-                            &write_state,
-                            &req.index_name,
-                            req.shard_id,
-                            primary_term,
-                            &errors,
-                        )
-                        .await;
+                            deadline: write_deadline,
+                        },
+                        replication_result,
+                    )
+                    .await
+                {
+                    Ok(report) => report,
+                    Err(error) => {
                         tracing::warn!(
-                            "Bulk replication errors for {}/shard_{}: {:?}",
+                            "Bulk write acknowledgement failed for {}/shard_{}: {}",
                             req.index_name,
                             req.shard_id,
-                            errors
+                            error
                         );
                         #[cfg(feature = "protocol-trace")]
                         for trace_request in &trace_requests {
@@ -1555,10 +1632,7 @@ impl InternalTransport for TransportService {
                         }
                         return Ok(Response::new(
                             WriteFailure::indeterminate(
-                                format!(
-                                    "Replication failed: {}",
-                                    Self::replication_failure_message(&errors)
-                                ),
+                                format!("Write acknowledgement failed: {error}"),
                                 Some(start_seq_no),
                                 Some(primary_term),
                                 last_seq_no,
@@ -1566,6 +1640,9 @@ impl InternalTransport for TransportService {
                             .bulk_response(ids),
                         ));
                     }
+                };
+                for result in &mut results {
+                    result.write_acknowledgement = Some(write_acknowledgement.clone());
                 }
                 if let Some(deadline) = refresh_deadline {
                     let refresh = self
@@ -1574,12 +1651,39 @@ impl InternalTransport for TransportService {
                             &req.index_name,
                             req.shard_id,
                             &activated_primary,
+                            Some(&write_acknowledgement),
                             deadline,
                         )
                         .await;
                     for result in &mut results {
                         result.write_refresh = Some(refresh.clone());
                     }
+                }
+                self.validate_primary_ack(
+                    &engine,
+                    &req.index_name,
+                    req.shard_id,
+                    &activated_primary,
+                )
+                .map_err(|error| {
+                    WriteFailure::indeterminate(
+                        error,
+                        Some(start_seq_no),
+                        Some(primary_term),
+                        last_seq_no,
+                    )
+                    .into_status()
+                })?;
+                #[cfg(feature = "protocol-trace")]
+                for trace_request in &trace_requests {
+                    crate::protocol_trace::record_client_result(
+                        trace_request,
+                        &self.local_node_id,
+                        &activated_primary.index_uuid,
+                        req.shard_id,
+                        "acknowledged",
+                        None,
+                    );
                 }
                 let doc_count = ids.len() as u64;
                 crate::metrics::BULK_DOCS_TOTAL.inc_by(doc_count);
@@ -1591,6 +1695,7 @@ impl InternalTransport for TransportService {
                     primary_term: Some(primary_term),
                     results,
                     failure: None,
+                    write_acknowledgement: Some(write_acknowledgement),
                 }))
             }
             Err(e)
@@ -1659,12 +1764,10 @@ impl InternalTransport for TransportService {
         &self,
         request: Request<ShardDeleteRequest>,
     ) -> Result<Response<ShardDeleteResponse>, Status> {
-        let refresh_deadline = request
-            .get_ref()
-            .refresh
-            .then(|| crate::transport::refresh_deadline::RefreshDeadline::from_request(&request))
-            .transpose()
-            .map_err(WriteFailure::before_mutation_status)?;
+        let write_deadline =
+            crate::transport::refresh_deadline::RefreshDeadline::from_request(&request)
+                .map_err(WriteFailure::before_mutation_status)?;
+        let refresh_deadline = request.get_ref().refresh.then_some(write_deadline);
         self.wait_for_forwarded_state(
             &request,
             Some(&request.get_ref().index_name),
@@ -1752,12 +1855,16 @@ impl InternalTransport for TransportService {
                 let doc_id = req.doc_id.clone();
                 let primary_term = activated_primary.primary_term;
                 let client_operation = client_operation.clone();
+                let permit = activated_primary.permit.clone();
+                let recovery_guard = _write_guard.clone();
                 #[cfg(feature = "protocol-trace")]
                 let trace_copy = trace_copy.clone();
                 #[cfg(feature = "protocol-trace")]
                 let trace_request = trace_request.clone();
                 self.worker_pools
                     .spawn_write(move || {
+                        let _recovery_guard = recovery_guard;
+                        validate_worker_write_permit(&permit, primary_term, write_deadline)?;
                         #[cfg(feature = "protocol-trace")]
                         {
                             crate::protocol_trace::with_open_copy(trace_copy, || {
@@ -1790,6 +1897,12 @@ impl InternalTransport for TransportService {
                     })
                     .await
                     .map_err(|error| {
+                        self.shard_manager.fail_local_write_copy(
+                            &activated_primary.index_uuid,
+                            req.shard_id,
+                            activated_primary.allocation_id,
+                            &format!("primary delete worker failed: {error:#}"),
+                        );
                         WriteFailure::indeterminate(
                             format!("primary delete worker failed: {error:#}"),
                             None,
@@ -1825,69 +1938,71 @@ impl InternalTransport for TransportService {
                     crate::failpoints::PRIMARY_AFTER_LOCAL_APPLY_BEFORE_REPLICATION,
                 )
                 .await;
-                self.spawn_primary_available_report_after_write(
-                    &req.index_name,
-                    req.shard_id,
-                    &activated_primary,
-                );
                 // Replicate delete to replica shards
-                let replication_result =
-                    if deduplicated && primary_term != activated_primary.primary_term {
-                        Ok(Vec::new())
-                    } else {
-                        crate::replication::replicate_write_with_durability(
-                            &self.transport_client,
-                            &write_state,
-                            &req.index_name,
-                            req.shard_id,
-                            &req.doc_id,
-                            &serde_json::json!({}),
-                            "delete",
-                            seq_no,
-                            version,
-                            client_operation_record.as_ref(),
-                            primary_term,
-                            self.shard_manager.durability(),
+                let replication_result = if deduplicated {
+                    let record = client_operation_record.clone().ok_or_else(|| {
+                        WriteFailure::indeterminate(
+                            "deduplicated delete receipt has no original client operation",
+                            Some(seq_no),
+                            Some(primary_term),
+                            None,
                         )
-                        .await
-                    };
-                match replication_result {
-                    Ok(replica_checkpoints) => {
-                        self.record_replica_checkpoints(
-                            &engine,
-                            &req.index_name,
-                            req.shard_id,
-                            &activated_primary,
+                        .into_status()
+                    })?;
+                    let operation = self
+                        .original_client_operation(engine.clone(), seq_no, primary_term, record)
+                        .await?;
+                    crate::replication::replicate_operation_with_durability(
+                        &self.transport_client,
+                        &write_state,
+                        &req.index_name,
+                        req.shard_id,
+                        &operation,
+                        self.shard_manager.durability(),
+                        engine.global_checkpoint(),
+                    )
+                    .await
+                } else {
+                    crate::replication::replicate_write_with_durability(
+                        &self.transport_client,
+                        &write_state,
+                        &req.index_name,
+                        req.shard_id,
+                        &req.doc_id,
+                        &serde_json::json!({}),
+                        "delete",
+                        seq_no,
+                        version,
+                        client_operation_record.as_ref(),
+                        primary_term,
+                        self.shard_manager.durability(),
+                        engine.global_checkpoint(),
+                    )
+                    .await
+                };
+                let write_acknowledgement = match self
+                    .acknowledge_replicated_write(
+                        write_acknowledgement::WriteAcknowledgementContext {
+                            index: &req.index_name,
+                            shard_id: req.shard_id,
+                            engine: &engine,
+                            primary: &activated_primary,
+                            captured: &write_state,
+                            guard: &_write_guard,
                             primary_sequence,
-                            &replica_checkpoints,
-                        );
-                        #[cfg(feature = "protocol-trace")]
-                        if let Some(trace_request) = trace_request.as_ref() {
-                            crate::protocol_trace::record_client_result(
-                                trace_request,
-                                &self.local_node_id,
-                                &activated_primary.index_uuid,
-                                req.shard_id,
-                                "acknowledged",
-                                None,
-                            );
-                        }
-                    }
-
-                    Err(errors) => {
-                        self.report_definitive_replica_failures(
-                            &write_state,
-                            &req.index_name,
-                            req.shard_id,
-                            primary_term,
-                            &errors,
-                        )
-                        .await;
+                            deadline: write_deadline,
+                        },
+                        replication_result,
+                    )
+                    .await
+                {
+                    Ok(report) => report,
+                    Err(error) => {
                         tracing::warn!(
-                            "Delete replication errors for {}/shard_{}: {:?}",
+                            "Delete write acknowledgement failed for {}/shard_{}: {}",
                             req.index_name,
                             req.shard_id,
-                            errors
+                            error
                         );
                         #[cfg(feature = "protocol-trace")]
                         if let Some(trace_request) = trace_request.as_ref() {
@@ -1902,10 +2017,7 @@ impl InternalTransport for TransportService {
                         }
                         return Ok(Response::new(
                             WriteFailure::indeterminate(
-                                format!(
-                                    "Replication failed: {}",
-                                    Self::replication_failure_message(&errors)
-                                ),
+                                format!("Write acknowledgement failed: {error}"),
                                 Some(seq_no),
                                 Some(primary_term),
                                 None,
@@ -1913,7 +2025,7 @@ impl InternalTransport for TransportService {
                             .delete_response(deleted),
                         ));
                     }
-                }
+                };
                 let write_refresh = if let Some(deadline) = refresh_deadline {
                     Some(
                         self.refresh_acknowledged_write(
@@ -1921,6 +2033,7 @@ impl InternalTransport for TransportService {
                             &req.index_name,
                             req.shard_id,
                             &activated_primary,
+                            Some(&write_acknowledgement),
                             deadline,
                         )
                         .await,
@@ -1928,6 +2041,27 @@ impl InternalTransport for TransportService {
                 } else {
                     None
                 };
+                self.validate_primary_ack(
+                    &engine,
+                    &req.index_name,
+                    req.shard_id,
+                    &activated_primary,
+                )
+                .map_err(|error| {
+                    WriteFailure::indeterminate(error, Some(seq_no), Some(primary_term), None)
+                        .into_status()
+                })?;
+                #[cfg(feature = "protocol-trace")]
+                if let Some(trace_request) = trace_request.as_ref() {
+                    crate::protocol_trace::record_client_result(
+                        trace_request,
+                        &self.local_node_id,
+                        &activated_primary.index_uuid,
+                        req.shard_id,
+                        "acknowledged",
+                        None,
+                    );
+                }
                 Ok(Response::new(ShardDeleteResponse {
                     success: true,
                     deleted,
@@ -1937,6 +2071,7 @@ impl InternalTransport for TransportService {
                     write_refresh,
                     failure: None,
                     version: Some(version),
+                    write_acknowledgement: Some(write_acknowledgement),
                 }))
             }
             Err(e)
@@ -2023,6 +2158,9 @@ impl InternalTransport for TransportService {
         &self,
         request: Request<ShardClientNoOpRequest>,
     ) -> Result<Response<ShardClientNoOpResponse>, Status> {
+        let write_deadline =
+            crate::transport::refresh_deadline::RefreshDeadline::from_request(&request)
+                .map_err(WriteFailure::before_mutation_status)?;
         self.wait_for_forwarded_state(
             &request,
             Some(&request.get_ref().index_name),
@@ -2083,9 +2221,13 @@ impl InternalTransport for TransportService {
         let result_seq_no = req.result_seq_no;
         let result_primary_term = req.result_primary_term;
         let result_version = req.result_version;
-        let receipt = self
+        let permit = activated_primary.permit.clone();
+        let recovery_guard = _write_guard.clone();
+        let result = self
             .worker_pools
             .spawn_write(move || {
+                let _recovery_guard = recovery_guard;
+                validate_worker_write_permit(&permit, primary_term, write_deadline)?;
                 engine_for_write.record_client_noop_at_term(
                     primary_term,
                     operation_for_write,
@@ -2096,6 +2238,12 @@ impl InternalTransport for TransportService {
             })
             .await
             .map_err(|error| {
+                self.shard_manager.fail_local_write_copy(
+                    &activated_primary.index_uuid,
+                    req.shard_id,
+                    activated_primary.allocation_id,
+                    &format!("client operation no-op worker failed: {error:#}"),
+                );
                 WriteFailure::indeterminate(
                     format!("client operation no-op worker failed: {error:#}"),
                     None,
@@ -2103,15 +2251,37 @@ impl InternalTransport for TransportService {
                     None,
                 )
                 .into_status()
-            })?
-            .map_err(|error| WriteFailure::from_engine(&error, primary_term).into_status())?;
-        let replica_checkpoints = if matches!(
-            receipt.client_operation.result,
-            crate::engine::ClientOperationResult::UpdateNoOp { .. }
-        ) && receipt.operation_primary_term
-            == activated_primary.primary_term
-        {
-            let operation = crate::engine::SequencedOperation {
+            })?;
+        let receipt = match self.shard_manager.record_local_apply_result(
+            &activated_primary.index_uuid,
+            req.shard_id,
+            activated_primary.allocation_id,
+            result,
+        ) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.report_local_copy_failure(
+                    &req.index_name,
+                    &activated_primary.index_uuid,
+                    req.shard_id,
+                    activated_primary.allocation_id,
+                    primary_term,
+                    &error,
+                )
+                .await;
+                return Err(WriteFailure::from_engine(&error, primary_term).into_status());
+            }
+        };
+        let operation = if receipt.deduplicated {
+            self.original_client_operation(
+                engine.clone(),
+                receipt.operation_seq_no,
+                receipt.operation_primary_term,
+                receipt.client_operation.clone(),
+            )
+            .await?
+        } else {
+            crate::engine::SequencedOperation {
                 seq_no: receipt.operation_seq_no,
                 primary_term: receipt.operation_primary_term,
                 document_version: 0,
@@ -2119,40 +2289,43 @@ impl InternalTransport for TransportService {
                 mutation: crate::engine::DocumentMutation::NoOp {
                     reason: format!("client operation [{}] update no-op", client_operation.id),
                 },
-            };
-            crate::replication::replicate_noop_batch_with_durability(
-                &self.transport_client,
-                &write_state,
-                &req.index_name,
-                req.shard_id,
-                std::slice::from_ref(&operation),
-                activated_primary.primary_term,
-                self.shard_manager.durability(),
+            }
+        };
+        let primary_sequence = engine.sequence_stats();
+        let replication_result = crate::replication::replicate_operation_with_durability(
+            &self.transport_client,
+            &write_state,
+            &req.index_name,
+            req.shard_id,
+            &operation,
+            self.shard_manager.durability(),
+            engine.global_checkpoint(),
+        )
+        .await;
+        let write_acknowledgement = self
+            .acknowledge_replicated_write(
+                write_acknowledgement::WriteAcknowledgementContext {
+                    index: &req.index_name,
+                    shard_id: req.shard_id,
+                    engine: &engine,
+                    primary: &activated_primary,
+                    captured: &write_state,
+                    guard: &_write_guard,
+                    primary_sequence,
+                    deadline: write_deadline,
+                },
+                replication_result,
             )
             .await
-            .map_err(|errors| {
+            .map_err(|error| {
                 WriteFailure::indeterminate(
-                    format!(
-                        "Replication failed: {}",
-                        Self::replication_failure_message(&errors)
-                    ),
+                    error,
                     Some(receipt.operation_seq_no),
                     Some(receipt.operation_primary_term),
                     None,
                 )
                 .into_status()
-            })?
-        } else {
-            Vec::new()
-        };
-        self.record_replica_checkpoints(
-            &engine,
-            &req.index_name,
-            req.shard_id,
-            &activated_primary,
-            engine.sequence_stats(),
-            &replica_checkpoints,
-        );
+            })?;
         Ok(Response::new(ShardClientNoOpResponse {
             success: true,
             error: String::new(),
@@ -2166,6 +2339,7 @@ impl InternalTransport for TransportService {
                 &receipt.client_operation,
             )),
             deduplicated: receipt.deduplicated,
+            write_acknowledgement: Some(write_acknowledgement),
         }))
     }
 
@@ -2193,6 +2367,7 @@ impl InternalTransport for TransportService {
             .await
         {
             Ok(engine) => engine,
+            Err(status) if status.code() == tonic::Code::Aborted => return Err(status),
             Err(status) => {
                 return Ok(Response::new(ShardGetResponse {
                     found: false,
@@ -2236,15 +2411,15 @@ impl InternalTransport for TransportService {
                 index_uuid,
                 ..Default::default()
             })),
-            Err(error) if error.is::<crate::engine::tantivy::TantivyWriterUnavailableError>() => {
-                Err(Status::aborted(format!("{error:#}")))
-            }
-            Err(e) => Ok(Response::new(ShardGetResponse {
-                found: false,
-                source_json: vec![],
-                error: format!("{e:#}"),
-                ..Default::default()
-            })),
+            Err(error) => match pre_execution_copy_unavailable_status(&error) {
+                Some(status) => Err(status),
+                None => Ok(Response::new(ShardGetResponse {
+                    found: false,
+                    source_json: vec![],
+                    error: format!("{error:#}"),
+                    ..Default::default()
+                })),
+            },
         }
     }
 
@@ -2770,6 +2945,27 @@ impl InternalTransport for TransportService {
             .ok_or_else(|| {
                 Status::invalid_argument("replication requires a target allocation ID")
             })?;
+        let authority = live_replication::decode_authority(
+            req.authority.as_ref(),
+            &req.index_uuid,
+            req.shard_id,
+        )?;
+        if primary_term > authority.primary_term {
+            return Err(Status::invalid_argument(
+                "replication operation term exceeds current primary authority",
+            ));
+        }
+        self.wait_for_replica_authority(
+            &req.index_name,
+            req.shard_id,
+            allocation_id,
+            &authority,
+            req.authority
+                .as_ref()
+                .expect("decoded authority")
+                .captured_state_version,
+        )
+        .await?;
         #[cfg(feature = "protocol-trace")]
         let trace_seq_nos = [req.seq_no];
         let index_source = if req.op == "index" {
@@ -2785,6 +2981,7 @@ impl InternalTransport for TransportService {
             req.shard_id,
             &req.index_uuid,
             allocation_id,
+            &authority,
         ) {
             Ok(assigned) => assigned,
             Err(error) => {
@@ -2952,6 +3149,7 @@ impl InternalTransport for TransportService {
             client_operation,
             mutation: operation,
         };
+        let apply_authority = authority.clone();
         #[cfg(feature = "protocol-trace")]
         let trace_seq_nos = trace_seq_nos.to_vec();
         let result = self
@@ -2962,6 +3160,7 @@ impl InternalTransport for TransportService {
                     shard_id,
                     &index_uuid,
                     allocation_id,
+                    &apply_authority,
                 ) {
                     Ok(current) => current,
                     Err(error) => {
@@ -2977,6 +3176,13 @@ impl InternalTransport for TransportService {
                         return Err(anyhow::Error::msg(error));
                     }
                 };
+                service.validate_replica_write_proof(
+                    &index_name,
+                    shard_id,
+                    allocation_id,
+                    &apply_authority,
+                    false,
+                )?;
                 #[cfg(feature = "protocol-trace")]
                 {
                     let result = crate::protocol_trace::with_apply_scope(
@@ -2990,7 +3196,8 @@ impl InternalTransport for TransportService {
                                     index_uuid: &index_uuid,
                                     allocation_id,
                                     applied_view_term: current.primary_term,
-                                    message_term: primary_term,
+                                    message_term: apply_authority.primary_term,
+                                    authority: Some(&apply_authority),
                                 },
                                 |engine| engine.apply_replica_operation(sequenced_operation),
                             )
@@ -3016,7 +3223,8 @@ impl InternalTransport for TransportService {
                         index_uuid: &index_uuid,
                         allocation_id,
                         applied_view_term: current.primary_term,
-                        message_term: primary_term,
+                        message_term: apply_authority.primary_term,
+                        authority: Some(&apply_authority),
                     },
                     |engine| engine.apply_replica_operation(sequenced_operation),
                 )
@@ -3025,14 +3233,33 @@ impl InternalTransport for TransportService {
             .map_err(|e| Status::internal(e.to_string()))?;
 
         match result {
-            Ok(receipt) => Ok(Response::new(ReplicateDocResponse {
-                success: true,
-                error: String::new(),
-                processed_checkpoint: receipt.sequence.processed_checkpoint,
-                persisted_checkpoint: receipt.sequence.persisted_checkpoint,
-                operation_processed: receipt.operation_processed,
-                operation_persisted: receipt.operation_persisted,
-            })),
+            Ok(receipt) => {
+                self.publish_replica_global_checkpoint(
+                    &req.index_name,
+                    allocation_id,
+                    &authority,
+                    req.authority
+                        .as_ref()
+                        .and_then(|value| value.safe_global_checkpoint),
+                )
+                .await?;
+                self.validate_replica_write_proof(
+                    &req.index_name,
+                    req.shard_id,
+                    allocation_id,
+                    &authority,
+                    true,
+                )
+                .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;
+                Ok(Response::new(ReplicateDocResponse {
+                    success: true,
+                    error: String::new(),
+                    processed_checkpoint: receipt.sequence.processed_checkpoint,
+                    persisted_checkpoint: receipt.sequence.persisted_checkpoint,
+                    operation_processed: receipt.operation_processed,
+                    operation_persisted: receipt.operation_persisted,
+                }))
+            }
             Err(e) if crate::engine::is_write_validation_error(&e) => {
                 Err(Status::invalid_argument(e.to_string()))
             }
@@ -3044,7 +3271,7 @@ impl InternalTransport for TransportService {
                         &assigned_uuid,
                         req.shard_id,
                         allocation_id,
-                        primary_term,
+                        authority.primary_term,
                         &e,
                     )
                     .await;
@@ -3098,6 +3325,27 @@ impl InternalTransport for TransportService {
             .ok_or_else(|| {
                 Status::invalid_argument("bulk replication requires a target allocation ID")
             })?;
+        let authority = live_replication::decode_authority(
+            req.authority.as_ref(),
+            &req.index_uuid,
+            req.shard_id,
+        )?;
+        if primary_term != authority.primary_term {
+            return Err(Status::invalid_argument(
+                "bulk replication term does not match current primary authority",
+            ));
+        }
+        self.wait_for_replica_authority(
+            &req.index_name,
+            req.shard_id,
+            allocation_id,
+            &authority,
+            req.authority
+                .as_ref()
+                .expect("decoded authority")
+                .captured_state_version,
+        )
+        .await?;
         #[cfg(feature = "protocol-trace")]
         let trace_seq_nos = req
             .ops
@@ -3124,6 +3372,7 @@ impl InternalTransport for TransportService {
             req.shard_id,
             &req.index_uuid,
             allocation_id,
+            &authority,
         ) {
             Ok(assigned) => assigned,
             Err(error) => {
@@ -3237,8 +3486,11 @@ impl InternalTransport for TransportService {
             if op.index_name != req.index_name
                 || op.shard_id != req.shard_id
                 || op.index_uuid != req.index_uuid
-                || op.primary_term != Some(primary_term)
+                || op
+                    .primary_term
+                    .is_none_or(|term| term == 0 || term > authority.primary_term)
                 || op.target_allocation_id != Some(allocation_id)
+                || op.authority != req.authority
             {
                 return Err(Status::invalid_argument(
                     "bulk replication operation identity does not match the envelope",
@@ -3323,7 +3575,7 @@ impl InternalTransport for TransportService {
             previous_seq_no = Some(op.seq_no);
             operations.push(crate::engine::SequencedOperation {
                 seq_no: op.seq_no,
-                primary_term,
+                primary_term: op.primary_term.expect("validated original operation term"),
                 document_version,
                 client_operation,
                 mutation,
@@ -3334,6 +3586,7 @@ impl InternalTransport for TransportService {
         let index_name = req.index_name.clone();
         let index_uuid = req.index_uuid.clone();
         let shard_id = req.shard_id;
+        let apply_authority = authority.clone();
         #[cfg(feature = "protocol-trace")]
         let trace_operations = operations.clone();
         let write_result = self
@@ -3344,6 +3597,7 @@ impl InternalTransport for TransportService {
                     shard_id,
                     &index_uuid,
                     allocation_id,
+                    &apply_authority,
                 ) {
                     Ok(current) => current,
                     Err(error) => {
@@ -3359,6 +3613,13 @@ impl InternalTransport for TransportService {
                         return Err(anyhow::Error::msg(error));
                     }
                 };
+                service.validate_replica_write_proof(
+                    &index_name,
+                    shard_id,
+                    allocation_id,
+                    &apply_authority,
+                    false,
+                )?;
                 #[cfg(feature = "protocol-trace")]
                 {
                     let result = crate::protocol_trace::with_apply_scope(
@@ -3373,6 +3634,7 @@ impl InternalTransport for TransportService {
                                     allocation_id,
                                     applied_view_term: current.primary_term,
                                     message_term: primary_term,
+                                    authority: Some(&apply_authority),
                                 },
                                 |engine| engine.apply_replica_batch(operations),
                             )
@@ -3399,6 +3661,7 @@ impl InternalTransport for TransportService {
                         allocation_id,
                         applied_view_term: current.primary_term,
                         message_term: primary_term,
+                        authority: Some(&apply_authority),
                     },
                     |engine| engine.apply_replica_batch(operations),
                 )
@@ -3407,14 +3670,33 @@ impl InternalTransport for TransportService {
             .map_err(|e| Status::internal(e.to_string()))?;
 
         match write_result {
-            Ok(receipt) => Ok(Response::new(ReplicateBulkResponse {
-                success: true,
-                error: String::new(),
-                processed_checkpoint: receipt.sequence.processed_checkpoint,
-                persisted_checkpoint: receipt.sequence.persisted_checkpoint,
-                all_operations_processed: receipt.all_operations_processed,
-                all_operations_persisted: receipt.all_operations_persisted,
-            })),
+            Ok(receipt) => {
+                self.publish_replica_global_checkpoint(
+                    &req.index_name,
+                    allocation_id,
+                    &authority,
+                    req.authority
+                        .as_ref()
+                        .and_then(|value| value.safe_global_checkpoint),
+                )
+                .await?;
+                self.validate_replica_write_proof(
+                    &req.index_name,
+                    req.shard_id,
+                    allocation_id,
+                    &authority,
+                    true,
+                )
+                .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;
+                Ok(Response::new(ReplicateBulkResponse {
+                    success: true,
+                    error: String::new(),
+                    processed_checkpoint: receipt.sequence.processed_checkpoint,
+                    persisted_checkpoint: receipt.sequence.persisted_checkpoint,
+                    all_operations_processed: receipt.all_operations_processed,
+                    all_operations_persisted: receipt.all_operations_persisted,
+                }))
+            }
             Err(e) if crate::engine::is_write_validation_error(&e) => {
                 Err(Status::invalid_argument(e.to_string()))
             }
@@ -3605,48 +3887,9 @@ impl InternalTransport for TransportService {
             .cloned()
             .ok_or_else(|| Status::not_found(format!("no such index [{index_name}]")))?;
 
-        let mut changed = false;
-
-        // Apply number_of_replicas
-        if let Some(new_replicas) = body
-            .pointer("/index/number_of_replicas")
-            .and_then(|v| v.as_u64())
-        {
-            let new_replicas = new_replicas as u32;
-            if new_replicas != metadata.number_of_replicas {
-                metadata.update_number_of_replicas(new_replicas);
-                changed = true;
-            }
-        }
-
-        // Apply refresh_interval_ms
-        if let Some(val) = body.pointer("/index/refresh_interval_ms") {
-            if val.is_null() {
-                if metadata.settings.refresh_interval_ms.is_some() {
-                    metadata.settings.refresh_interval_ms = None;
-                    changed = true;
-                }
-            } else if let Some(ms) = val.as_u64()
-                && metadata.settings.refresh_interval_ms != Some(ms)
-            {
-                metadata.settings.refresh_interval_ms = Some(ms);
-                changed = true;
-            }
-        }
-
-        if let Some(val) = body.pointer("/index/flush_threshold_bytes") {
-            if val.is_null() {
-                if metadata.settings.flush_threshold_bytes.is_some() {
-                    metadata.settings.flush_threshold_bytes = None;
-                    changed = true;
-                }
-            } else if let Some(bytes) = val.as_u64()
-                && metadata.settings.flush_threshold_bytes != Some(bytes)
-            {
-                metadata.settings.flush_threshold_bytes = Some(bytes);
-                changed = true;
-            }
-        }
+        let changed = metadata
+            .apply_settings_update(&body)
+            .map_err(Status::invalid_argument)?;
 
         if !changed {
             return Ok(
@@ -3791,6 +4034,78 @@ impl InternalTransport for TransportService {
         }
     }
 
+    async fn finish_primary_activation(
+        &self,
+        request: Request<ShardAuthorityMutationRequest>,
+    ) -> Result<Response<ShardAuthorityMutationResponse>, Status> {
+        let req = request.into_inner();
+        let activation: crate::cluster::state::PrimaryActivationFinish =
+            serde_json::from_slice(&req.record_json).map_err(|error| {
+                Status::invalid_argument(format!("invalid primary activation: {error}"))
+            })?;
+        activation.validate().map_err(Status::invalid_argument)?;
+        self.apply_shard_authority_command(
+            crate::consensus::types::ClusterCommand::FinishPrimaryActivation {
+                index_name: req.index_name,
+                activation,
+            },
+        )
+        .await
+    }
+
+    async fn reconcile_primary_history(
+        &self,
+        request: Request<ReconcilePrimaryHistoryRequest>,
+    ) -> Result<Response<ReconcilePrimaryHistoryResponse>, Status> {
+        let request = request.into_inner();
+        let limit = crate::engine::canonical::MAX_HISTORY_BATCH_BYTES + 64 * 1024;
+        if request.record_json.len() > limit {
+            return Err(Status::resource_exhausted(
+                "promotion request exceeds its encoded transfer budget",
+            ));
+        }
+        let admission = self
+            .primary_activation_state
+            .promotion_jobs
+            .acquire()
+            .await?;
+        let request = serde_json::from_slice(&request.record_json).map_err(|error| {
+            Status::invalid_argument(format!("invalid promotion request: {error}"))
+        })?;
+        let response = self
+            .execute_promotion_history_with_budget(request, admission)
+            .await?;
+        let result_json = serde_json::to_vec(&response)
+            .map_err(|error| Status::internal(format!("encode promotion result: {error}")))?;
+        if result_json.len() > limit {
+            return Err(Status::resource_exhausted(
+                "promotion response exceeds its encoded transfer budget",
+            ));
+        }
+        Ok(Response::new(ReconcilePrimaryHistoryResponse {
+            result_json,
+        }))
+    }
+
+    async fn exclude_failed_shard_copies(
+        &self,
+        request: Request<ShardAuthorityMutationRequest>,
+    ) -> Result<Response<ShardAuthorityMutationResponse>, Status> {
+        let req = request.into_inner();
+        let exclusion: crate::cluster::state::FailedCopyExclusion =
+            serde_json::from_slice(&req.record_json).map_err(|error| {
+                Status::invalid_argument(format!("invalid failed-copy exclusion: {error}"))
+            })?;
+        exclusion.validate().map_err(Status::invalid_argument)?;
+        self.apply_shard_authority_command(
+            crate::consensus::types::ClusterCommand::ExcludeFailedShardCopies {
+                index_name: req.index_name,
+                exclusion,
+            },
+        )
+        .await
+    }
+
     async fn mark_primary_unavailable(
         &self,
         request: Request<MarkPrimaryUnavailableRequest>,
@@ -3855,60 +4170,6 @@ impl InternalTransport for TransportService {
                 error: String::new(),
             })),
             Err(error) => Ok(Response::new(MarkPrimaryUnavailableResponse {
-                acknowledged: false,
-                error: error.to_string(),
-            })),
-        }
-    }
-
-    async fn mark_primary_available(
-        &self,
-        request: Request<MarkPrimaryAvailableRequest>,
-    ) -> Result<Response<MarkPrimaryAvailableResponse>, Status> {
-        let req = request.into_inner();
-        let raft = self
-            .raft
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("Raft not initialised on this node"))?;
-        if !raft.is_leader() {
-            return Err(Status::failed_precondition(
-                "This node is not the Raft leader — caller should forward",
-            ));
-        }
-        let allocation_id = req.allocation_id.ok_or_else(|| {
-            Status::invalid_argument("MarkPrimaryAvailable requires an allocation ID")
-        })?;
-        if allocation_id == 0 {
-            return Err(Status::invalid_argument(
-                "MarkPrimaryAvailable allocation ID must be greater than zero",
-            ));
-        }
-        if req.primary_term == 0 {
-            return Err(Status::invalid_argument(
-                "MarkPrimaryAvailable primary term must be greater than zero",
-            ));
-        }
-        let response = raft
-            .client_write(
-                crate::consensus::types::ClusterCommand::MarkPrimaryAvailable {
-                    index_name: req.index_name,
-                    index_uuid: req.index_uuid,
-                    shard_id: req.shard_id,
-                    primary: req.primary_node_id,
-                    allocation_id,
-                    primary_term: req.primary_term,
-                },
-            )
-            .await
-            .map_err(|error| {
-                Status::internal(format!("Raft MarkPrimaryAvailable failed: {error}"))
-            })?;
-        match response.data.into_result() {
-            Ok(()) => Ok(Response::new(MarkPrimaryAvailableResponse {
-                acknowledged: true,
-                error: String::new(),
-            })),
-            Err(error) => Ok(Response::new(MarkPrimaryAvailableResponse {
                 acknowledged: false,
                 error: error.to_string(),
             })),
@@ -4958,8 +5219,24 @@ impl TransportService {
         shard_id: u32,
         index_uuid: &str,
         allocation_id: u64,
+        authority: &crate::cluster::state::WriteAuthorityIdentity,
     ) -> Result<AssignedLocalShard, String> {
         let cluster_state = self.cluster_manager.get_state();
+        if authority.index_uuid != index_uuid || authority.shard_id != shard_id {
+            return Err("live replication authority does not match the operation envelope".into());
+        }
+        cluster_state.validate_write_authority(
+            index_name,
+            authority,
+            crate::cluster::state::PrimaryAuthorityPhase::Active,
+        )?;
+        if cluster_state.primary_unavailable(index_name, shard_id)
+            || authority.primary_node_id == self.local_node_id
+        {
+            return Err(
+                "live replication requires an available ACTIVE source and a replica target".into(),
+            );
+        }
         let metadata = cluster_state
             .indices
             .get(index_name)
@@ -5401,18 +5678,6 @@ impl TransportService {
         let repeated_unavailable = promote_only
             && promotion_candidate.is_none()
             && current.primary_unavailable(index_name, shard_id);
-        if promote_only && !current.primary_unavailable(index_name, shard_id) {
-            self.primary_activation_state
-                .available_primary_reports
-                .lock()
-                .await
-                .remove(&(
-                    index_uuid.to_string(),
-                    shard_id,
-                    allocation_id,
-                    routing.primary_term,
-                ));
-        }
         if !collision_failure && ShardManager::should_quarantine_copy_failure(error) {
             if promote_only {
                 let activation_key = (index_uuid.to_string(), shard_id, allocation_id);
@@ -5536,153 +5801,6 @@ impl TransportService {
         }
     }
 
-    fn spawn_primary_available_report_after_write(
-        &self,
-        index_name: &str,
-        shard_id: u32,
-        activated_primary: &ActivatedPrimary,
-    ) {
-        if !self
-            .cluster_manager
-            .primary_unavailable(index_name, shard_id)
-        {
-            return;
-        }
-        #[cfg(test)]
-        self.primary_activation_state
-            .available_report_tasks_spawned
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        let service = self.clone();
-        let index_name = index_name.to_string();
-        let activated_primary = activated_primary.clone();
-        tokio::spawn(async move {
-            service
-                .report_primary_available_after_write(&index_name, shard_id, &activated_primary)
-                .await;
-        });
-    }
-
-    async fn report_primary_available_after_write(
-        &self,
-        index_name: &str,
-        shard_id: u32,
-        activated_primary: &ActivatedPrimary,
-    ) {
-        let current = self.cluster_manager.get_state();
-        let Some(metadata) = current.indices.get(index_name) else {
-            return;
-        };
-        let Some(routing) = metadata.shard_routing.get(&shard_id) else {
-            return;
-        };
-        if metadata.uuid.as_str() != activated_primary.index_uuid
-            || routing.primary != self.local_node_id
-            || routing.primary_term != activated_primary.primary_term
-            || current.shard_allocation_id(index_name, shard_id, &self.local_node_id)
-                != Some(activated_primary.allocation_id)
-            || !current.primary_unavailable(index_name, shard_id)
-        {
-            return;
-        }
-
-        const REPORT_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-        let report_key = (
-            activated_primary.index_uuid.clone(),
-            shard_id,
-            activated_primary.allocation_id,
-            activated_primary.primary_term,
-        );
-        let now = std::time::Instant::now();
-        {
-            let mut reports = self
-                .primary_activation_state
-                .available_primary_reports
-                .lock()
-                .await;
-            if reports
-                .get(&report_key)
-                .is_some_and(|last| now.duration_since(*last) < REPORT_RETRY_INTERVAL)
-            {
-                return;
-            }
-            reports.insert(report_key, now);
-        }
-
-        let Some(raft) = self.raft.as_ref() else {
-            return;
-        };
-        let result = if raft.is_leader() {
-            crate::consensus::client_write_checked(
-                raft,
-                crate::consensus::types::ClusterCommand::MarkPrimaryAvailable {
-                    index_name: index_name.to_string(),
-                    index_uuid: activated_primary.index_uuid.clone(),
-                    shard_id,
-                    primary: self.local_node_id.clone(),
-                    allocation_id: activated_primary.allocation_id,
-                    primary_term: activated_primary.primary_term,
-                },
-            )
-            .await
-            .map_err(anyhow::Error::msg)
-        } else {
-            let Some(master_id) = current.master_node.as_ref() else {
-                tracing::warn!(
-                    index = index_name,
-                    shard_id,
-                    "Cannot clear primary-unavailable status because no Raft leader is known"
-                );
-                return;
-            };
-            let Some(master) = current.nodes.get(master_id) else {
-                tracing::warn!(
-                    index = index_name,
-                    shard_id,
-                    master = master_id,
-                    "Cannot clear primary-unavailable status because the Raft leader is absent"
-                );
-                return;
-            };
-            self.transport_client
-                .forward_mark_primary_available(
-                    master,
-                    MarkPrimaryAvailableRequest {
-                        index_name: index_name.to_string(),
-                        index_uuid: activated_primary.index_uuid.clone(),
-                        shard_id,
-                        primary_node_id: self.local_node_id.clone(),
-                        allocation_id: Some(activated_primary.allocation_id),
-                        primary_term: activated_primary.primary_term,
-                    },
-                )
-                .await
-        };
-
-        match result {
-            Ok(()) => {
-                self.primary_activation_state
-                    .failed_copy_reports
-                    .lock()
-                    .await
-                    .remove(&(
-                        activated_primary.index_uuid.clone(),
-                        shard_id,
-                        activated_primary.allocation_id,
-                    ));
-            }
-            Err(error) => {
-                tracing::warn!(
-                    index = index_name,
-                    shard_id,
-                    allocation_id = activated_primary.allocation_id,
-                    primary_term = activated_primary.primary_term,
-                    error = %error,
-                    "Failed to clear primary-unavailable status after a successful local write"
-                );
-            }
-        }
-    }
-
     fn primary_routing(
         &self,
         index_name: &str,
@@ -5752,6 +5870,14 @@ impl TransportService {
         index_name: &str,
         shard_id: u32,
     ) -> Result<ActivatedPrimary, String> {
+        if self.raft.is_some() {
+            return tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                self.ensure_canonical_primary_activated(index_name, shard_id),
+            )
+            .await
+            .map_err(|_| format!("canonical activation deadline expired for [{index_name}][{shard_id}]; primary remains write-closed"))?;
+        }
         let current = self.primary_routing(index_name, shard_id)?;
         let initial_key = (current.index_uuid.clone(), shard_id, current.allocation_id);
         if current.primary_unavailable
@@ -5829,243 +5955,17 @@ impl TransportService {
                 index_uuid: current.index_uuid,
                 allocation_id: current.allocation_id,
                 primary_term: current.primary_term,
+                permit: None,
             };
             self.retry_pending_promotion_noops(index_name, shard_id, &activated)
                 .await?;
             return Ok(activated);
-        }
-        if self.raft.is_none() {
-            let activated = ActivatedPrimary {
-                index_uuid: current.index_uuid,
-                allocation_id: current.allocation_id,
-                primary_term: current.primary_term,
-            };
-            self.prepare_local_primary_activation(index_name, shard_id, &activated)
-                .await?;
-            return Ok(activated);
-        }
-
-        let key = initial_key.clone();
-        if self
-            .primary_activation_state
-            .activated_terms
-            .read()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(&key)
-            .is_some_and(|term| *term == current.primary_term)
-        {
-            let activated = ActivatedPrimary {
-                index_uuid: current.index_uuid,
-                allocation_id: current.allocation_id,
-                primary_term: current.primary_term,
-            };
-            self.retry_pending_promotion_noops(index_name, shard_id, &activated)
-                .await?;
-            return Ok(activated);
-        }
-
-        let activation_locks = self.primary_activation_state.copy_locks(&initial_key);
-        let _activation_guard = activation_locks.activation.lock().await;
-        let current = self.primary_routing(index_name, shard_id)?;
-        let current_key = (current.index_uuid.clone(), shard_id, current.allocation_id);
-        if current_key != initial_key {
-            return Err(format!(
-                "primary allocation changed for shard [{index_name}][{shard_id}] while activation was waiting; retry the write"
-            ));
-        }
-        if let Err(error) = self
-            .shard_manager
-            .open_primary_assigned_shard_with_settings_blocking(
-                index_name.to_string(),
-                shard_id,
-                current.mappings.clone(),
-                current.settings.clone(),
-                current.index_uuid.clone(),
-                crate::shard::AssignedShardOpen {
-                    allocation_id: current.allocation_id,
-                    primary_term: current.primary_term,
-                    allow_empty_creation: current.allow_empty_creation,
-                },
-            )
-            .await
-        {
-            self.report_local_copy_failure(
-                index_name,
-                &current.index_uuid,
-                shard_id,
-                current.allocation_id,
-                current.primary_term,
-                &error,
-            )
-            .await;
-            return Err(format!("failed to open primary shard copy: {error}"));
-        }
-        if let Err(error) = self
-            .shard_manager
-            .raise_copy_fence_blocking(
-                index_name.to_string(),
-                shard_id,
-                current.index_uuid.clone(),
-                current.allocation_id,
-                current.primary_term,
-            )
-            .await
-        {
-            self.report_local_copy_failure(
-                index_name,
-                &current.index_uuid,
-                shard_id,
-                current.allocation_id,
-                current.primary_term,
-                &error,
-            )
-            .await;
-            return Err(format!("failed to persist primary fence: {error}"));
-        }
-        let expected_term = current.primary_term;
-        let index_uuid = current.index_uuid.clone();
-        let allocation_id = current.allocation_id;
-        let key = (index_uuid.clone(), shard_id, allocation_id);
-        if self
-            .primary_activation_state
-            .activated_terms
-            .read()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(&key)
-            .is_some_and(|term| *term == expected_term)
-        {
-            let activated = ActivatedPrimary {
-                index_uuid,
-                allocation_id,
-                primary_term: expected_term,
-            };
-            self.retry_pending_promotion_noops(index_name, shard_id, &activated)
-                .await?;
-            return Ok(activated);
-        }
-
-        let raft = self
-            .raft
-            .as_ref()
-            .expect("Raft presence checked before primary activation");
-        if raft.is_leader() {
-            let response = raft
-                .client_write(crate::consensus::types::ClusterCommand::ActivatePrimary {
-                    index_name: index_name.to_string(),
-                    index_uuid: index_uuid.clone(),
-                    shard_id,
-                    primary: self.local_node_id.clone(),
-                    allocation_id,
-                    expected_term,
-                })
-                .await
-                .map_err(|error| format!("primary activation Raft write failed: {error}"))?;
-            response
-                .data
-                .into_result()
-                .map_err(|error| format!("primary activation was rejected: {error}"))?;
-        } else {
-            let cluster_state = self.cluster_manager.get_state();
-            let master_id = cluster_state
-                .master_node
-                .as_ref()
-                .ok_or_else(|| "no Raft leader is known for primary activation".to_string())?;
-            let master = cluster_state.nodes.get(master_id).ok_or_else(|| {
-                format!("Raft leader '{master_id}' is absent from local cluster state")
-            })?;
-            self.transport_client
-                .forward_activate_primary(
-                    master,
-                    ActivatePrimaryRequest {
-                        index_name: index_name.to_string(),
-                        index_uuid: index_uuid.clone(),
-                        shard_id,
-                        primary_node_id: self.local_node_id.clone(),
-                        expected_term,
-                        allocation_id: Some(allocation_id),
-                    },
-                )
-                .await
-                .map_err(|error| format!("primary activation forward failed: {error}"))?;
-        }
-
-        let activated_term = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            async {
-                loop {
-                    let cluster_state = self.cluster_manager.get_state();
-                    let metadata = cluster_state.indices.get(index_name).ok_or_else(|| {
-                        format!("index [{index_name}] disappeared during primary activation")
-                    })?;
-                    if metadata.uuid.as_str() != index_uuid {
-                        return Err(format!(
-                            "index [{index_name}] was replaced during primary activation"
-                        ));
-                    }
-                    let routing = metadata.shard_routing.get(&shard_id).ok_or_else(|| {
-                        format!(
-                            "shard [{index_name}][{shard_id}] disappeared during primary activation"
-                        )
-                    })?;
-                    if routing.primary != self.local_node_id {
-                        return Err(format!(
-                            "node [{}] lost primary assignment for shard [{index_name}][{shard_id}] during activation",
-                            self.local_node_id
-                        ));
-                    }
-                    if cluster_state.shard_allocation_id(
-                        index_name,
-                        shard_id,
-                        &self.local_node_id,
-                    ) != Some(allocation_id)
-                    {
-                        return Err(format!(
-                            "node [{}] lost allocation {} for shard [{index_name}][{shard_id}] during activation",
-                            self.local_node_id, allocation_id
-                        ));
-                    }
-                    if routing.primary_term > expected_term {
-                        return Ok(routing.primary_term);
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-            },
-        )
-        .await
-        .map_err(|_| {
-            format!(
-                "timed out waiting for primary activation of shard [{index_name}][{shard_id}]"
-            )
-        })??;
-
-        if let Err(error) = self
-            .shard_manager
-            .raise_copy_fence_blocking(
-                index_name.to_string(),
-                shard_id,
-                index_uuid.clone(),
-                allocation_id,
-                activated_term,
-            )
-            .await
-        {
-            self.report_local_copy_failure(
-                index_name,
-                &index_uuid,
-                shard_id,
-                allocation_id,
-                activated_term,
-                &error,
-            )
-            .await;
-            return Err(format!(
-                "failed to persist activated primary fence: {error}"
-            ));
         }
         let activated = ActivatedPrimary {
-            index_uuid,
-            allocation_id,
-            primary_term: activated_term,
+            index_uuid: current.index_uuid,
+            allocation_id: current.allocation_id,
+            primary_term: current.primary_term,
+            permit: None,
         };
         self.prepare_local_primary_activation(index_name, shard_id, &activated)
             .await?;
@@ -6237,7 +6137,7 @@ impl TransportService {
                         activated_primary,
                         engine.sequence_stats(),
                         &replica_checkpoints,
-                    );
+                    )?;
                 }
                 Err(errors) => {
                     self.report_definitive_replica_failures(
@@ -6310,20 +6210,39 @@ impl TransportService {
         shard_id: u32,
         activated_primary: &ActivatedPrimary,
     ) -> Result<crate::cluster::state::ClusterState, String> {
+        match &activated_primary.permit {
+            Some(permit) => permit
+                .validate()
+                .map_err(|error| format!("primary write permit is unavailable: {error:#}"))?,
+            None if self.raft.is_some() => {
+                return Err(
+                    "production primary write has no operation-owned admission permit".into(),
+                );
+            }
+            None => {}
+        }
         let state = self.cluster_manager.get_state();
         let metadata = state
             .indices
             .get(index_name)
             .ok_or_else(|| format!("index [{index_name}] is not present in local cluster state"))?;
+        metadata.validate_write_policy()?;
+        let routing = metadata.shard_routing.get(&shard_id).ok_or_else(|| {
+            format!("shard [{index_name}][{shard_id}] is not present in local cluster state")
+        })?;
+        let available = routing.in_sync_replicas.len() + 1;
+        if (available as u64) < u64::from(metadata.settings.minimum_durable_copies) {
+            return Err(format!(
+                "minimum_durable_copies requires {} copies for [{index_name}][{shard_id}], but only {available} authoritative copies are available",
+                metadata.settings.minimum_durable_copies,
+            ));
+        }
         if metadata.uuid.as_str() != activated_primary.index_uuid {
             return Err(format!(
                 "index UUID changed for [{index_name}] from activated UUID [{}] to [{}]; retry the write",
                 activated_primary.index_uuid, metadata.uuid
             ));
         }
-        let routing = metadata.shard_routing.get(&shard_id).ok_or_else(|| {
-            format!("shard [{index_name}][{shard_id}] is not present in local cluster state")
-        })?;
         if routing.primary != self.local_node_id {
             return Err(format!(
                 "node [{}] is no longer the primary for shard [{index_name}][{shard_id}]; retry after refreshing shard routing",
@@ -6357,6 +6276,49 @@ impl TransportService {
                 )
             })?;
         Ok(state)
+    }
+
+    async fn apply_shard_authority_command(
+        &self,
+        command: crate::consensus::types::ClusterCommand,
+    ) -> Result<Response<ShardAuthorityMutationResponse>, Status> {
+        let raft = self
+            .raft
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("Raft not initialised on this node"))?;
+        if !raft.is_leader() {
+            return Err(Status::failed_precondition(
+                "shard authority mutation must be forwarded to the Raft leader",
+            ));
+        }
+        let response = raft.client_write(command).await.map_err(|error| {
+            Status::internal(format!("Raft shard authority mutation failed: {error}"))
+        })?;
+        let result_json = serde_json::to_vec(&response.data)
+            .map_err(|error| Status::internal(format!("encode shard authority result: {error}")))?;
+        Ok(Response::new(ShardAuthorityMutationResponse {
+            result_json,
+        }))
+    }
+
+    fn validate_primary_ack(
+        &self,
+        engine: &Arc<dyn crate::engine::SearchEngine>,
+        index_name: &str,
+        shard_id: u32,
+        activated_primary: &ActivatedPrimary,
+    ) -> Result<(), String> {
+        self.validated_primary_write_state(index_name, shard_id, activated_primary)?;
+        self.shard_manager
+            .ensure_local_apply_allowed(
+                &activated_primary.index_uuid,
+                shard_id,
+                activated_primary.allocation_id,
+            )
+            .map_err(|error| format!("primary acknowledgement authority failed: {error:#}"))?;
+        engine
+            .ensure_write_health()
+            .map_err(|error| format!("primary acknowledgement durability proof revoked: {error:#}"))
     }
 
     #[allow(clippy::result_large_err)]
@@ -6406,7 +6368,8 @@ impl TransportService {
                     &error,
                 )
                 .await;
-                return Err(Status::failed_precondition(error.to_string()));
+                return Err(pre_execution_copy_unavailable_status(&error)
+                    .unwrap_or_else(|| Status::failed_precondition(format!("{error:#}"))));
             }
             return Ok(engine);
         }
@@ -6457,7 +6420,11 @@ impl TransportService {
                         &error,
                     )
                     .await;
-                    Err(Status::internal(format!("Failed to open shard: {error}")))
+                    Err(
+                        pre_execution_copy_unavailable_status(&error).unwrap_or_else(|| {
+                            Status::internal(format!("Failed to open shard: {error:#}"))
+                        }),
+                    )
                 }
             };
         }
@@ -6502,7 +6469,11 @@ impl TransportService {
                     &error,
                 )
                 .await;
-                Err(Status::internal(format!("Failed to open shard: {error}")))
+                Err(
+                    pre_execution_copy_unavailable_status(&error).unwrap_or_else(|| {
+                        Status::internal(format!("Failed to open shard: {error:#}"))
+                    }),
+                )
             }
         }
     }
@@ -6523,34 +6494,27 @@ impl TransportService {
         .await
     }
 
-    /// Advance the replicated checkpoint only when every in-sync copy reports
-    /// a contiguous persisted prefix.
+    fn computed_global_checkpoint(
+        primary_checkpoint: Option<u64>,
+        replica_checkpoints: &[crate::shard::ReplicaCheckpointUpdate],
+    ) -> Option<u64> {
+        let mut checkpoint = primary_checkpoint?;
+        for replica in replica_checkpoints {
+            checkpoint = checkpoint.min(replica.persisted_checkpoint?);
+        }
+        Some(checkpoint)
+    }
+
+    #[cfg(test)]
     fn advance_global_checkpoint(
         engine: &Arc<dyn crate::engine::SearchEngine>,
         primary_checkpoint: Option<u64>,
         replica_checkpoints: &[crate::shard::ReplicaCheckpointUpdate],
     ) {
-        let Some(primary_checkpoint) = primary_checkpoint else {
-            return;
-        };
-        if replica_checkpoints.is_empty() {
-            engine.update_global_checkpoint(primary_checkpoint);
-            return;
-        }
-        let Some(min_replica) = replica_checkpoints
-            .iter()
-            .map(|checkpoint| checkpoint.persisted_checkpoint)
-            .collect::<Option<Vec<_>>>()
-            .and_then(|checkpoints| checkpoints.into_iter().min())
-        else {
-            return;
-        };
-        let global = std::cmp::min(primary_checkpoint, min_replica);
-        if engine
-            .global_checkpoint()
-            .is_none_or(|current| global > current)
+        if let Some(checkpoint) =
+            Self::computed_global_checkpoint(primary_checkpoint, replica_checkpoints)
         {
-            engine.update_global_checkpoint(global);
+            engine.update_global_checkpoint(checkpoint);
         }
     }
 
@@ -6562,20 +6526,8 @@ impl TransportService {
         activated_primary: &ActivatedPrimary,
         primary_sequence: crate::engine::SequenceStats,
         replica_checkpoints: &[crate::shard::ReplicaCheckpointUpdate],
-    ) {
-        let state =
-            match self.validated_primary_write_state(index_name, shard_id, activated_primary) {
-                Ok(state) => state,
-                Err(reason) => {
-                    tracing::debug!(
-                        index = index_name,
-                        shard_id,
-                        reason,
-                        "Skipping checkpoint reports from obsolete primary authority"
-                    );
-                    return;
-                }
-            };
+    ) -> Result<(), String> {
+        let state = self.validated_primary_write_state(index_name, shard_id, activated_primary)?;
         let metadata = &state.indices[index_name];
         let routing = &metadata.shard_routing[&shard_id];
         let current_reports = replica_checkpoints
@@ -6604,7 +6556,8 @@ impl TransportService {
         // Serialized tracker maxima then converge without holding the node-wide
         // tracker lock while waiting for the engine's apply-state mutex.
         let primary_persisted_checkpoint = engine.sequence_stats().persisted_checkpoint;
-        self.shard_manager
+        let checkpoint = self
+            .shard_manager
             .isr_tracker
             .with_updated_replica_checkpoints_at(
                 index_name,
@@ -6644,15 +6597,33 @@ impl TransportService {
                             shard_id,
                             "Waiting for checkpoint reports from every current in-sync copy"
                         );
-                        return;
+                        return None;
                     };
-                    Self::advance_global_checkpoint(
-                        engine,
-                        primary_persisted_checkpoint,
-                        &authoritative,
-                    );
+                    Self::computed_global_checkpoint(primary_persisted_checkpoint, &authoritative)
                 },
             );
+        if let Some(checkpoint) = checkpoint
+            && engine
+                .global_checkpoint()
+                .is_none_or(|current| checkpoint > current)
+        {
+            match &activated_primary.permit {
+                Some(permit) => self
+                    .shard_manager
+                    .persist_safe_global_checkpoint(
+                        index_name,
+                        activated_primary.allocation_id,
+                        permit.identity(),
+                        checkpoint,
+                    )
+                    .map_err(|error| {
+                        format!("safe global checkpoint publication failed: {error:#}")
+                    })?,
+                None if self.raft.is_none() => engine.update_global_checkpoint(checkpoint),
+                None => return Err("production global progress has no primary write permit".into()),
+            }
+        }
+        Ok(())
     }
 
     fn replication_failure_message(

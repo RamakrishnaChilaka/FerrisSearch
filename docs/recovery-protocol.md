@@ -2,13 +2,16 @@
 
 > **Status: Partially implemented.**
 >
-> **Updated:** October 5, 2026; the acknowledgement design is reconciled with D1.
+> **Updated:** October 14, 2026; FS013 implements protected WAL/fail-stop,
+> conditional acknowledgement, and bounded canonical promotion/restart.
 >
 > **Historical design baseline:** `e805f70ff5dba0be9077b9bc32fcd488e837e6d1`
 > (PR #141).
 >
 > D1 sequencing, fencing, checkpoint, and bounded peer-recovery foundations are
-> implemented. Later RP and D10 sections remain target design. This document
+> implemented, including durable exclusion journals and fresh canonical write
+> authority. General D10 rollback, full vector snapshot semantics, and later
+> recovery/resource packages remain target design. This document
 > does not establish production readiness or OpenSearch/Elasticsearch
 > compatibility. The [acceptance matrix](recovery-acceptance-matrix.md) defines
 > the evidence required before making broader claims.
@@ -44,27 +47,29 @@ to implement every package in one PR. See the
 
 ## 2. Implemented Baseline And Remaining Gaps
 
-The table reflects the implemented branch as of September 29, 2026. Later
+The table reflects the implemented branch as of October 14, 2026. Later
 sections still describe the broader target protocol; they are not all shipped.
 
 | Surface | Current behavior | Required change |
 |---|---|---|
-| [Node lifecycle](../src/node/mod.rs) | Promotes only Raft-authoritative in-sync copies, activates restarted/promoted primaries proactively, replays local WAL, and fills local sequence gaps with durable NoOps. | General rollback-to-global-checkpoint and full D10 resync remain unimplemented. |
+| [Node lifecycle](../src/node/mod.rs) | Promotes only Raft-authoritative in-sync copies; restarted/promoted primaries reserve higher-term PROMOTING, preserve/adopt verified history, seal matching copies, and finish ACTIVE before installing permits. | Unrestricted divergent-history rollback and full D10 proof remain outside the bounded canonical protocol. |
 | [Replica allocation](../src/node/mod.rs) | Accounts for primary and replica loss independently and conditionally removes exact failed allocations. | Failed-allocation exclusion and configurable allocation retry limits remain deferred. |
-| [Replication](../src/replication/mod.rs) | Synchronously sends exact operation identities only to Raft-authoritative in-sync replicas; any required replica failure fails the request after the primary may already have mutated. | Client retry identity and explicit ambiguous outcomes remain unimplemented. |
-| [Transport](../proto/transport.proto) | Carries term/sequence identity, exact allocation IDs, optional processed/persisted checkpoints, recovery sessions, and physical WAL cursors. | Client-facing idempotency and optimistic concurrency remain separate work. |
+| [Replication](../src/replication/mod.rs) | Preserves positive exact-operation proofs and typed failed targets. Certification requires every captured copy's proof or observed settled exclusion, a valid permit, and the copy floor. | Permanent quorum/data-copy loss can block writes; metadata quorum never substitutes for document copies. |
+| [Transport](../proto/transport.proto) | Carries exact current authority/certificates separately from original operation identity, strict copy reports, typed uncertain outcomes, bounded client-operation IDs, OCC, recovery sessions, and physical WAL cursors. | General end-to-end cancellation and request budgets remain separate work. |
 | [Checkpoint tracking](../src/engine/sequence.rs) | Persists contiguous processed/persisted prefixes plus above-gap intervals and maximum sequence identity. | Cross-copy rollback/trimming above the global checkpoint remains out of scope. |
 | [Automatic recovery](../src/node/mod.rs) | Every node reconciles assigned out-of-sync replicas through bounded file recovery and conditional admission. | Source sessions and pins are still process-local. |
-| [WAL suffix](../src/wal/mod.rs) | Streams retained generations in physical order with generation/byte cursors; sequence filtering never drives pagination. | Recovery compression and resumable file chunks are not implemented. |
+| [WAL suffix](../src/wal/mod.rs) | Checksummed v4 records and manifest v3 protect physical bytes and sparse durable positions; retained history streams by physical generation/byte cursor. Uncertain mutation immediately fail-stops the copy. | Recovery compression and resumable file chunks are not implemented. |
 | [Recovery apply](../src/node/peer_recovery.rs) | Decoding or apply failure stops the session; operations use the common term/sequence-aware planner and admission requires the exact processed barrier. | General divergence rollback and repair above the global checkpoint remain D10 work. |
 | [Vector rebuild](../src/engine/composite.rs) | A post-WAL text failure durably marks vectors stale. Rebuild scans every live Tantivy document in bounded batches, fsyncs a replacement vector index before swapping it into memory, and runs before startup, recovery, activation, or dynamic-mapping replacement publishes an engine. | Snapshotting vector state at the exact logical boundary remains future work; rebuild failures keep the copy unavailable. |
 
 Existing [promotion tests](../tests/consensus_integration.rs) exercise metadata
-changes. The [restart regression](../tests/restart_regression.rs) restarts the
-cluster and checks data preservation. These do not establish a complete
+changes. The [restart regression](../tests/restart_regression.rs) checks fresh
+canonical authority on clean process restart, actual post-WAL publication
+failure, live ISR promotion, and fresh-allocation recovery with exact retained
+operation identities. These do not establish a complete
 partition, stale-primary, divergent-history, and interrupted-recovery contract.
 
-> **Implementation note — October 6, 2026:** Primary document mutation failures
+> **Implementation note — October 14, 2026:** Primary document mutation failures
 > now implement [D4's typed outcome plumbing](adr/0001-write-consistency-and-retry-contract.md#d4-outcome-classes).
 > Proven pre-WAL rejection and non-execution remain distinct from 500
 > `write_outcome_unknown`. Valid known sequence/term receipts survive engine
@@ -72,9 +77,16 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > REST/bulk rendering. Failed batch ranges use actual submitted cardinality
 > and request-order offsets, including duplicate IDs. An ambiguous dispatched
 > RPC or a WAL failure without its receipt never borrows a shared checkpoint.
-> The September 29 baseline table predates this classification. Retry identity,
-> D2's success-after-committed-exclusion policy, and D14's immediate fail-stop
-> behavior remain unimplemented; required replica failures still fail requests.
+> FS013 adds D2's success-after-observed-exclusion policy and D14's immediate
+> fail-stop. Debt closes admission before durable journaling and proposal,
+> survives deadlines/restart, and cannot be cleared from an unobserved commit.
+> Stale callbacks revoke only their captured epoch. Existing bounded retry
+> identity retains original operations; a dedup hit still needs fresh proof.
+
+**Historical implementation notes:** the dated September notes below record
+earlier protocol stages. Their old WAL versions, best-effort activation,
+retry-escalation mutation policy, and status clearing are superseded by the
+current baseline above and the FS013 contracts below.
 
 > **Implementation note — September 29, 2026:** D1 now stores term-aware WAL v2
 > entries and versioned committed boundaries, distinguishes empty checkpoints
@@ -292,34 +304,14 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > is definitive. Replicas may auto-flush only through their own committed
 > persisted prefix and never across a gap.
 >
-> **Availability-status and Apply corrections — September 27, 2026:** a
-> write-only failure no longer bypasses the local activation cache or causes
-> periodic primary-term bumps. `primary_unavailable` remains set for the exact
-> allocation and term until the first successful local primary write commits a
-> conditional `MarkPrimaryAvailable`. Definitive and open-level failures are
-> quarantined only after report throttling; repaired storage then requires a
-> fresh `ActivatePrimary`, which clears the flag while advancing the term.
-> Apply-level escalation keeps the existing engine open for reads and does not
-> itself quarantine, reopen, or replay a WAL-appended but engine-failed
-> operation. Such an operation has an unknown outcome. In production this
-> failure means the Tantivy writer was killed, so the next commit fails, the
-> rebuilt writer replays the operation on this copy, and restart replay applies
-> it too. When the failure is on the primary, replicas never receive the
-> operation, so copies diverge. A force-merge
-> writer-replacement failure leaves a typed unavailable-writer state. The next
-> write or blocking maintenance/snapshot operation rebuilds the writer with the
-> normal heap budget and automatic merge policy, then replays the retained WAL
-> suffix before continuing. Transient failure can heal there. Persistent
-> rebuild or replay I/O consumes the Apply retry budget only when a write
-> triggers the rebuild; maintenance-triggered rebuilds log and retry on each
-> maintenance tick without escalating.
-> Status-only `MarkPrimaryAvailable` reporting runs in the background so leader
-> discovery or forwarding cannot delay an already-successful write response.
-> This status introduces an intentional health-semantics difference from
-> OpenSearch. FerrisSearch can report red for a write-only fault while the exact
-> primary allocation remains assigned, open, and readable; mutations are
-> unavailable until repair is proven. OpenSearch red denotes an unassigned
-> primary, so the affected shard serves neither reads nor writes.
+> **Current availability and Apply contract — October 14, 2026:**
+> `primary_unavailable` closes admission for its exact allocation/term.
+> Successful fresh canonical activation clears it; no successful-write
+> same-term healing command exists. WAL/post-WAL uncertainty immediately
+> fail-stops the shared copy, including issued permits, realtime reads, and
+> recovery. A raw committed non-realtime reader does not certify write health.
+> Healthy maintenance-only writer reconstruction remains distinct from
+> fail-stop and cannot clear it.
 >
 > Candidate selection requires a live, in-sync cluster member. A leader that
 > also hosts the primary prefers the highest replica checkpoint it has
@@ -331,9 +323,9 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 > advance `translog.committed` or authorize WAL truncation. The next write,
 > blocking maintenance operation, or peer-recovery snapshot rebuilds the writer
 > and replays the retained suffix with the same idempotent path used at
-> startup. Only a write-triggered rebuild enters the Apply retry budget; an
-> idle copy with a persistent fault logs and retries on each maintenance tick
-> until a write arrives. Replay holds the shard translog lock for the whole
+> startup while shared copy state remains healthy. A write-triggered failed
+> rebuild fail-stops the copy; maintenance cannot heal prior uncertainty.
+> Replay holds the shard translog lock for the whole
 > suffix, so blocked writes also occupy write-pool threads and can delay other
 > shards on the node.
 > Allocation can also return a replacement to the same faulty node; a
@@ -343,24 +335,19 @@ partition, stale-primary, divergent-history, and interrupted-recovery contract.
 
 The current maximum document operation size is defined by the encoded WAL
 frame, not the raw HTTP body: one operation must fit within 32 MiB including
-the four-byte frame header, sequence and operation fields, JSON serialization,
+the four-byte frame header, checksum, sequence and operation fields, JSON serialization,
 and the internal `_doc_id` / `_source` wrapper. The maximum usable `_source`
 therefore varies slightly with document ID and content. The same limit applies
 to restart, replay, and peer-recovery transfer.
 
-**Known write-failure limit:** synchronous WAL/fsync/engine failures now fail
-the request and enter bounded escalation, but a WAL entry whose later engine
-apply fails has an unknown outcome. In production this failure means the
-Tantivy writer was killed. The next commit then fails, and the rebuilt writer
-replays the entry on this copy, as does a restart. If the failure happened on
-the primary, replicas never receive the entry, because replication starts only
-after local success. In-sync copies can therefore diverge on up to one refresh
-interval of client-failed writes, or longer with refresh disabled, and peer
-recovery from this copy can ship the retained entry to a new copy. If a partial
-append is followed by later writes, the torn frame can become middle
-corruption; restart then fails closed rather than skipping acknowledged
-history. Startup tail truncation repairs only a trailing incomplete frame with
-no later data.
+**Current write-failure boundary:** a WAL-reaching failed operation has an
+unknown outcome and may survive verified restart/promotion. Its copy stops
+immediately; no later append can turn that failed process's torn tail into
+middle history. Protected frontier loss/corruption fails closed on reopen.
+Only an incomplete, proven unprotected active tail may be truncated. Ordinary
+assigned-open storage I/O retains bounded retries; this is not the mutation
+failure policy. Broader fault combinations and unrestricted D10 repair still
+need the acceptance matrix.
 
 ## 3. Reference Protocols And Intentional Differences
 
@@ -414,12 +401,12 @@ copies persist the operation before success. Existing asynchronous fsync mode
 has a weaker crash contract and must not be included in that claim, even when
 multiple machines are configured.
 
-### Proposed acknowledgement policy
+### Implemented acknowledgement policy
 
-**Selected target, not implemented:** this section follows
+**Implemented for `local_shards`:** this section follows
 [ADR 0001 D2](adr/0001-write-consistency-and-retry-contract.md#d2-what-an-acknowledgement-means).
-Current Rust still fails required-replica errors after a possible primary
-mutation. A model-only exclusion policy does not change that behavior.
+An unresolved required-copy error after mutation remains indeterminate;
+success requires positive proof and observed conditional settlement.
 
 For an active term/configuration, let `I` be its authoritative in-sync allocation
 set, including the primary. A successful write requires:
@@ -436,14 +423,15 @@ set, including the primary. A successful write requires:
 4. The configured minimum durable-copy requirement.
 5. No concurrent authority transition invalidating that operation's permit.
 
-Selected future setting: `minimum_durable_copies`, default `1` for the existing
+Index setting: `minimum_durable_copies`, default `1` for the existing
 single-node profile. A value of `2` blocks writes when fewer than two durable
 copies are eligible. The setting is a minimum, not permission to skip another
-member of `I`; all in-sync copies must respond. Reject impossible combinations
+member of `I`; every captured copy requires proof or settled exclusion. Reject impossible combinations
 at configuration time and validate changes through Raft.
 
-This default preserves the single-node profile; neither the setting nor D2's
-success-after-exclusion path exists in current Rust.
+This default preserves the single-node profile. Combined replica/floor updates
+are atomic; zero, non-integers, over-capacity values, and explicit remote-store
+use are rejected. See [dynamic settings](dynamic-settings.md).
 With one surviving eligible copy and a minimum of one, writes can continue after
 safe reconfiguration, but losing that last copy can lose data. With a minimum of
 two, availability is deliberately sacrificed until redundancy is restored.
@@ -551,20 +539,21 @@ failed write is now proven. Release request resources, report the underlying
 error, and make the allocation unavailable pending verified repair. Removal
 from authoritative eligibility still requires a conditional Raft transition.
 
-The durable format must distinguish a committed durability frontier from an
-unsealed trailing attempt. For the selected design, acknowledgement requires:
+The implemented v4 WAL/v3 manifest distinguish a protected durability frontier
+from an unsealed trailing attempt. Request-durable acknowledgement requires:
 
 1. The operation's complete, checksummed WAL record is fsynced at its physical
    generation/offset. This may cover a logical position above a sequence gap.
 2. A checksummed durability descriptor identifying generation, physical end,
-   contiguous prefix, verified above-gap positions, and history digest is
+   generation hashes and verified above-gap positions is
    atomically published and durably synced, including its directory entry.
 3. The engine has applied the exact operation. The descriptor proves its
    protected physical range even when the contiguous prefix is lower.
 
-Descriptor writes may be group-committed, but their durability cannot trail a
-successful response. An implementation can propose a different proven framing
-scheme in FS-005; it cannot omit the frontier distinction to obtain throughput.
+The descriptor's durability cannot trail a successful response. Canonical
+history/certificate and safe global progress are atomically stored in
+checksummed copy identity v4. A prepared certificate cannot advance retention;
+the exact matching canonical history must commit first.
 
 On restart, discard a torn final unsealed attempt only when a valid durability
 descriptor proves it lies wholly beyond the last acknowledged durability
@@ -576,16 +565,17 @@ records beyond the protected physical frontier are unacknowledged evidence
 for canonical reconciliation, not permission to resume the old writer.
 Do not classify a record as unacknowledged merely because its logical sequence
 is above a lagging contiguous/global prefix. Sparse acknowledged records inside
-the protected physical range must remain recoverable. FS-005 still owns the
-unimplemented descriptor/framing format; this is a design requirement, not a
-claim about current on-disk bytes.
+the protected physical range must remain recoverable. Existing data without
+the current descriptor/format fails closed; no sidecar or legacy fallback is
+used to infer a safe frontier.
 
 Do not rely solely on persisting a local `FAILED` flag to the same failing disk.
 Every restart must revalidate authority and storage; a former primary requires
 a new term before issuing permits. If eligibility cannot be proved, fail closed.
 A live fail-stopped process reports shard failure to the control plane so
-exclusion/promotion can proceed; it must not continue serving while that report
-is pending. Local failure state does not itself edit Raft membership. After a
+exclusion/promotion can proceed; it must not issue durability proofs or serve
+realtime/recovery success while that report is pending. Local failure state
+does not itself edit Raft membership. After a
 restart, a copy still in the authoritative in-sync set can be considered for
 promotion only if its complete protected frontier/history validates and a new
 authority handshake succeeds. If exclusion already committed, good local files
@@ -676,6 +666,12 @@ confirm the original mutation/receipt without allocating another sequence,
 while establishing fresh acknowledgement proof under the new authority.
 
 ### Promotion protocol
+
+**Implemented bounded path:** inventory windows are bounded to 1,024 operations
+and 32 MiB, with captured physical cursors, process-bound reports, retention
+pins, two independent coordinator/job slots, and a 120-second enclosing
+activation deadline plus substep budgets. This is not unrestricted rollback or
+a full D10 proof; vector snapshot semantics and broader recovery gates remain.
 
 1. **Reserve authority:** Raft conditionally commits a higher term and a
    `PROMOTING` candidate chosen from the committed in-sync allocations. A

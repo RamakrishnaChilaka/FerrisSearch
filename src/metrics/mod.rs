@@ -134,6 +134,97 @@ pub static INDEX_LATENCY_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
     histogram
 });
 
+pub(crate) static WRITE_CERTIFICATIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "ferrissearch_write_certifications_total",
+            "Data-copy certification outcomes before optional visibility and final reply checks",
+        ),
+        &["outcome"],
+    )
+    .expect("metric: write_certifications_total");
+    for outcome in ["all_copies", "after_exclusion", "failed"] {
+        let _ = counter.with_label_values(&[outcome]);
+    }
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: write_certifications_total");
+    counter
+});
+
+pub(crate) static WRITE_EXCLUSION_SETTLEMENTS_TOTAL: LazyLock<IntCounterVec> =
+    LazyLock::new(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "ferrissearch_write_exclusion_settlements_total",
+                "Failed-copy exclusion settlement attempts, including reconciliation",
+            ),
+            &["outcome"],
+        )
+        .expect("metric: write_exclusion_settlements_total");
+        for outcome in ["settled", "failed"] {
+            let _ = counter.with_label_values(&[outcome]);
+        }
+        REGISTRY
+            .register(Box::new(counter.clone()))
+            .expect("register: write_exclusion_settlements_total");
+        counter
+    });
+
+pub(crate) static CANONICAL_ACTIVATIONS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "ferrissearch_canonical_activations_total",
+        "Committed canonical primary activations whose local write epoch was installed",
+    )
+    .expect("metric: canonical_activations_total");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: canonical_activations_total");
+    counter
+});
+
+static LOCAL_PRIMARY_WRITE_AUTHORITIES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "ferrissearch_local_primary_write_authorities",
+            "Locally assigned primary authorities by applied Raft phase, not current permit readiness",
+        ),
+        &["phase"],
+    )
+    .expect("metric: local_primary_write_authorities");
+    for phase in ["inactive", "promoting", "active"] {
+        let _ = gauge.with_label_values(&[phase]);
+    }
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register: local_primary_write_authorities");
+    gauge
+});
+
+static LOCAL_WRITE_FAIL_STOPPED_COPIES: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "ferrissearch_local_write_fail_stopped_copies",
+        "Current local allocations with a tracked process-sticky write failure",
+    )
+    .expect("metric: local_write_fail_stopped_copies");
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register: local_write_fail_stopped_copies");
+    gauge
+});
+
+static LOCAL_WRITE_EXCLUSION_JOURNAL_PENDING: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "ferrissearch_local_write_exclusion_journal_pending",
+        "Unsettled durable exclusion intents in loaded current local copy identities",
+    )
+    .expect("metric: local_write_exclusion_journal_pending");
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register: local_write_exclusion_journal_pending");
+    gauge
+});
+
 // ── SQL metrics ─────────────────────────────────────────────────────
 
 pub static SQL_QUERIES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -374,6 +465,12 @@ fn initialize_metrics() {
     let _ = &*BULK_REQUESTS_TOTAL;
     let _ = &*BULK_DOCS_TOTAL;
     let _ = &*INDEX_LATENCY_SECONDS;
+    let _ = &*WRITE_CERTIFICATIONS_TOTAL;
+    let _ = &*WRITE_EXCLUSION_SETTLEMENTS_TOTAL;
+    let _ = &*CANONICAL_ACTIVATIONS_TOTAL;
+    let _ = &*LOCAL_PRIMARY_WRITE_AUTHORITIES;
+    let _ = &*LOCAL_WRITE_FAIL_STOPPED_COPIES;
+    let _ = &*LOCAL_WRITE_EXCLUSION_JOURNAL_PENDING;
     let _ = &*SQL_QUERIES_TOTAL;
     let _ = &*SQL_LATENCY_SECONDS;
     let _ = &*CLUSTER_NODES;
@@ -479,10 +576,46 @@ pub fn update_cluster_metrics(state: &crate::api::AppState) {
 
     let mut primary_count = 0i64;
     let mut replica_count = 0i64;
+    let mut authority_counts = [0i64; 3];
+    let mut fail_stopped_copies = 0i64;
+    let mut pending_exclusions = 0i64;
     for metadata in cs.indices.values() {
         primary_count += metadata.shard_routing.len() as i64;
         for routing in metadata.shard_routing.values() {
             replica_count += routing.replicas.len() as i64;
+        }
+        for (shard, routing) in &metadata.shard_routing {
+            let Some(allocation) =
+                cs.shard_allocation_id(&metadata.name, *shard, &state.local_node_id)
+            else {
+                continue;
+            };
+            if routing.primary == state.local_node_id
+                && let Some(ids) = cs.shard_allocation_ids(&metadata.name, *shard)
+            {
+                use crate::cluster::state::PrimaryAuthorityPhase;
+                let phase = match ids.primary_authority.phase {
+                    PrimaryAuthorityPhase::Inactive => 0,
+                    PrimaryAuthorityPhase::Promoting => 1,
+                    PrimaryAuthorityPhase::Active => 2,
+                };
+                authority_counts[phase] += 1;
+            }
+            if state.shard_manager.is_copy_write_fail_stopped(
+                metadata.uuid.as_str(),
+                *shard,
+                allocation,
+            ) {
+                fail_stopped_copies += 1;
+            }
+            if let Some(identity) = state.shard_manager.copy_identity(&metadata.name, *shard)
+                && identity.index_uuid == metadata.uuid.as_str()
+                && identity.allocation_id == allocation
+            {
+                pending_exclusions = pending_exclusions.saturating_add(
+                    i64::try_from(identity.pending_exclusions.len()).unwrap_or(i64::MAX),
+                );
+            }
         }
 
         // Per-index doc count from local shards
@@ -502,6 +635,16 @@ pub fn update_cluster_metrics(state: &crate::api::AppState) {
     CLUSTER_SHARDS
         .with_label_values(&["replica"])
         .set(replica_count);
+    for (phase, count) in ["inactive", "promoting", "active"]
+        .iter()
+        .zip(authority_counts)
+    {
+        LOCAL_PRIMARY_WRITE_AUTHORITIES
+            .with_label_values(&[phase])
+            .set(count);
+    }
+    LOCAL_WRITE_FAIL_STOPPED_COPIES.set(fail_stopped_copies);
+    LOCAL_WRITE_EXCLUSION_JOURNAL_PENDING.set(pending_exclusions);
 
     // Master status
     let is_master = state.raft.is_leader();
@@ -565,6 +708,12 @@ mod tests {
         assert!(output.contains("ferrissearch_bulk_requests_total"));
         assert!(output.contains("ferrissearch_bulk_docs_total"));
         assert!(output.contains("ferrissearch_index_latency_seconds"));
+        assert!(output.contains("ferrissearch_write_certifications_total"));
+        assert!(output.contains("ferrissearch_write_exclusion_settlements_total"));
+        assert!(output.contains("ferrissearch_canonical_activations_total"));
+        assert!(output.contains("ferrissearch_local_primary_write_authorities"));
+        assert!(output.contains("ferrissearch_local_write_fail_stopped_copies"));
+        assert!(output.contains("ferrissearch_local_write_exclusion_journal_pending"));
         assert!(output.contains("ferrissearch_sql_queries_total"));
         assert!(output.contains("ferrissearch_sql_latency_seconds"));
         assert!(output.contains("ferrissearch_cluster_nodes"));
@@ -588,6 +737,30 @@ mod tests {
                 .lines()
                 .any(|line| line.starts_with("ferrissearch_column_cache_budget_bytes "))
         );
+    }
+
+    #[test]
+    fn write_safety_metrics_have_only_bounded_labels() {
+        initialize_metrics();
+        for family in REGISTRY.gather() {
+            let allowed: &[&str] = match family.name() {
+                "ferrissearch_write_certifications_total" => {
+                    &["all_copies", "after_exclusion", "failed"]
+                }
+                "ferrissearch_write_exclusion_settlements_total" => &["settled", "failed"],
+                "ferrissearch_local_primary_write_authorities" => {
+                    &["inactive", "promoting", "active"]
+                }
+                _ => continue,
+            };
+            assert_eq!(family.get_metric().len(), allowed.len());
+            for metric in family.get_metric() {
+                assert_eq!(metric.get_label().len(), 1);
+                let label = &metric.get_label()[0];
+                assert!(matches!(label.name(), "outcome" | "phase"));
+                assert!(allowed.contains(&label.value()));
+            }
+        }
     }
 
     #[test]

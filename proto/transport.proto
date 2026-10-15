@@ -26,6 +26,27 @@ message ShardAssignment {
     optional uint64 initial_allocation_id = 9;
     bool primary_initialized = 10;
     bool primary_unavailable = 11;
+    ShardPrimaryAuthority primary_authority = 12;
+}
+
+enum ShardPrimaryAuthorityPhase {
+    SHARD_PRIMARY_AUTHORITY_PHASE_UNSPECIFIED = 0;
+    SHARD_PRIMARY_AUTHORITY_PHASE_INACTIVE = 1;
+    SHARD_PRIMARY_AUTHORITY_PHASE_PROMOTING = 2;
+    SHARD_PRIMARY_AUTHORITY_PHASE_ACTIVE = 3;
+}
+
+message CanonicalHistoryCertificate {
+    uint64 activation_id = 1;
+    uint64 primary_term = 2;
+    optional uint64 max_seq_no = 3;
+    bytes digest = 4;
+}
+
+message ShardPrimaryAuthority {
+    ShardPrimaryAuthorityPhase phase = 1;
+    optional uint64 activation_id = 2;
+    CanonicalHistoryCertificate history = 3;
 }
 
 message ReplicaAllocation {
@@ -44,6 +65,7 @@ message IndexSettings {
     optional uint64 refresh_interval_ms = 2;
     optional uint64 flush_threshold_bytes = 3;
     RemoteStoreSettings remote_store = 4;
+    optional uint32 minimum_durable_copies = 5;
 }
 
 message RemoteStoreSettings {
@@ -166,6 +188,7 @@ message ShardDocResponse {
     ShardWriteRefreshResult write_refresh = 7;
     WriteFailureDetails failure = 8;
     optional uint64 version = 9;
+    ShardWriteAcknowledgement write_acknowledgement = 10;
 }
 
 message ShardDeleteRequest {
@@ -187,6 +210,7 @@ message ShardDeleteResponse {
     ShardWriteRefreshResult write_refresh = 6;
     WriteFailureDetails failure = 7;
     optional uint64 version = 8;
+    ShardWriteAcknowledgement write_acknowledgement = 9;
 }
 
 message ShardGetRequest {
@@ -240,6 +264,7 @@ message ShardClientNoOpResponse {
     WriteFailureDetails failure = 8;
     ClientOperationMetadata client_operation = 9;
     bool deduplicated = 10;
+    ShardWriteAcknowledgement write_acknowledgement = 11;
 }
 
 message ShardBulkItemResponse {
@@ -253,6 +278,7 @@ message ShardBulkItemResponse {
     ShardWriteRefreshResult write_refresh = 8;
     WriteFailureDetails failure = 9;
     optional uint64 version = 10;
+    ShardWriteAcknowledgement write_acknowledgement = 11;
 }
 
 message ShardBulkRequest {
@@ -273,6 +299,7 @@ message ShardBulkResponse {
     optional uint64 primary_term = 5;
     repeated ShardBulkItemResponse results = 6;
     WriteFailureDetails failure = 7;
+    ShardWriteAcknowledgement write_acknowledgement = 8; // common non-empty index-only batch
 }
 
 message ShardCopyRefreshRequest {
@@ -372,6 +399,29 @@ message RemoteStoreSearchResponse {
 
 // ─── Replication ──────────────────────────────────────────────────────────────
 
+message ReplicaWriteAuthority {
+    string primary_node_id = 1;
+    uint64 primary_allocation_id = 2;
+    uint64 primary_term = 3;
+    uint64 activation_id = 4;
+    uint64 captured_state_version = 5;
+    optional uint64 safe_global_checkpoint = 6;
+}
+
+message ShardWriteCopyResult {
+    string node_id = 1;
+    uint64 allocation_id = 2;
+    bool primary = 3;
+    oneof outcome {
+        bool acknowledged = 4;
+        string error = 5;
+    }
+}
+
+message ShardWriteAcknowledgement {
+    repeated ShardWriteCopyResult copies = 1;
+}
+
 message ReplicateDocRequest {
     string index_name = 1;
     uint32 shard_id = 2;
@@ -380,10 +430,11 @@ message ReplicateDocRequest {
     string op = 5;            // "index" or "delete"
     uint64 seq_no = 6;        // monotonic sequence number from primary WAL
     string index_uuid = 7;
-    optional uint64 primary_term = 8;
+    optional uint64 primary_term = 8; // original operation term, not sender authority
     optional uint64 target_allocation_id = 9;
     optional uint64 document_version = 10; // required for index/delete; absent for NoOp
     ClientOperationMetadata client_operation = 11;
+    ReplicaWriteAuthority authority = 12;
 }
 
 message ReplicateDocResponse {
@@ -402,6 +453,7 @@ message ReplicateBulkRequest {
     string index_uuid = 4;
     optional uint64 primary_term = 5;
     optional uint64 target_allocation_id = 6;
+    ReplicaWriteAuthority authority = 7;
 }
 
 message ReplicateBulkResponse {
@@ -586,6 +638,23 @@ message ActivatePrimaryResponse {
     string error = 2;
 }
 
+message ShardAuthorityMutationRequest {
+    string index_name = 1;
+    bytes record_json = 2;
+}
+
+message ShardAuthorityMutationResponse {
+    bytes result_json = 1;
+}
+
+message ReconcilePrimaryHistoryRequest {
+    bytes record_json = 1;
+}
+
+message ReconcilePrimaryHistoryResponse {
+    bytes result_json = 1;
+}
+
 message FailShardCopyRequest {
     string index_name = 1;
     string index_uuid = 2;
@@ -610,20 +679,6 @@ message MarkPrimaryUnavailableRequest {
 }
 
 message MarkPrimaryUnavailableResponse {
-    bool acknowledged = 1;
-    string error = 2;
-}
-
-message MarkPrimaryAvailableRequest {
-    string index_name = 1;
-    string index_uuid = 2;
-    uint32 shard_id = 3;
-    string primary_node_id = 4;
-    optional uint64 allocation_id = 5;
-    uint64 primary_term = 6;
-}
-
-message MarkPrimaryAvailableResponse {
     bool acknowledged = 1;
     string error = 2;
 }
@@ -851,8 +906,10 @@ service InternalTransport {
     rpc UpdateSettings(UpdateSettingsRequest) returns (UpdateSettingsResponse);
     rpc MarkReplicaInSync(MarkReplicaInSyncRequest) returns (MarkReplicaInSyncResponse);
     rpc ActivatePrimary(ActivatePrimaryRequest) returns (ActivatePrimaryResponse);
+    rpc FinishPrimaryActivation(ShardAuthorityMutationRequest) returns (ShardAuthorityMutationResponse);
+    rpc ReconcilePrimaryHistory(ReconcilePrimaryHistoryRequest) returns (ReconcilePrimaryHistoryResponse);
+    rpc ExcludeFailedShardCopies(ShardAuthorityMutationRequest) returns (ShardAuthorityMutationResponse);
     rpc MarkPrimaryUnavailable(MarkPrimaryUnavailableRequest) returns (MarkPrimaryUnavailableResponse);
-    rpc MarkPrimaryAvailable(MarkPrimaryAvailableRequest) returns (MarkPrimaryAvailableResponse);
     rpc FailShardCopy(FailShardCopyRequest) returns (FailShardCopyResponse);
 
     // Index management (forwarded to leader)

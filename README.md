@@ -361,6 +361,10 @@ coordinator-side merge semantics are required.
   settings, and dynamic security metadata
 - Primary/replica shard routing over gRPC
 - Generation-based binary translog with request or asynchronous durability
+- Protected checksummed WAL/manifest, immediate WAL/post-WAL copy fail-stop,
+  and fresh canonical authority on primary restart or promotion
+- Operation-based in-sync certification with durable conditional exclusions
+  and a configurable `minimum_durable_copies` floor (default one)
 - Primary write receipts propagated to REST `_seq_no` responses, including bulk
   ranges and `_primary_term`, with replica WAL operation identity preservation
 - Realtime document GET, primary-side conditional index/delete and create,
@@ -528,26 +532,23 @@ Split inventories, query assignments, and cache state do not belong in Raft.
 FerrisSearch is a strong prototype and research platform. It is **not yet
 production ready**. The most important limits are:
 
-- A primary can mutate before replica acknowledgement fails; write retry and
-  acknowledgement semantics need a formal contract.
-- Synchronous WAL/fsync/engine failures fail the request and enter bounded
-  escalation. An operation that reached the WAL and then failed engine apply
-  has an unknown outcome. In production this failure means the Tantivy writer
-  was killed: the next commit fails, the rebuilt writer replays the operation
-  on this copy, and restart replay applies it too. When the failure is on the
-  primary, replicas never receive the operation, because replication starts
-  only after local success. In-sync copies can therefore diverge on up to one
-  refresh interval of client-failed writes, or longer with refresh disabled,
-  and peer recovery from this copy can ship the retained entry to a new copy.
-  A partial frame followed by later writes can still create middle corruption
-  that restart correctly rejects.
+- A primary can mutate before a request returns `write_outcome_unknown`; failed
+  responses promise no rollback. Acknowledgement requires exact-operation
+  proofs or observed, settled conditional exclusions and the configured copy
+  floor. The default floor of one cannot survive loss of the last data copy.
+- WAL/fsync, authority-publication, and uncertain post-WAL engine failures
+  immediately stop the copy and its issued permits. Later I/O or writer
+  reconstruction cannot heal it in process. Verified restart and bounded
+  canonical promotion preserve protected operations before granting fresh
+  authority. This is not general divergent-history rollback, a full D10 proof,
+  or production-readiness evidence.
 - A failed Tantivy commit invalidates the writer without advancing
   `translog.committed` or truncating the WAL. The next write, blocking
   maintenance operation, or peer-recovery snapshot rebuilds the writer and
   replays the retained suffix. Replay deletes each document ID first and adds
   content back only for index operations; malformed operation payloads fail
-  closed. Persistent rebuild or replay I/O enters the Apply escalation budget
-  only when a write triggers the rebuild. A rebuild triggered by refresh,
+  closed. Reconstruction is permitted only while shared copy state is healthy;
+  it cannot clear a WAL/post-WAL failure. A rebuild triggered by refresh,
   flush, or snapshot preparation logs an error and retries on the next
   maintenance tick without escalating, so an idle copy with a persistent fault
   retries until a write arrives. Replay holds the shard translog lock for the
@@ -566,8 +567,9 @@ production ready**. The most important limits are:
   to true. Upsert is create-only, and scripts are rejected.
 - Index/delete support paired `if_seq_no`/`if_primary_term`; create is
   available through `op_type=create` and `PUT`/`POST /{index}/_create/{id}`.
-  Single and bulk writes return real sequence/term identities and omit
-  `_version`. Client retry tokens and external versioning remain missing.
+  Single and bulk writes return real sequence/term/version identities.
+  Client-operation IDs provide a bounded shard-local retry window, not an
+  unbounded exactly-once ledger. External versioning remains unsupported.
 - Document writes, bulk, and index creation reject unsupported safety
   parameters with `400 illegal_argument_exception`, including `routing`, `pipeline`,
   `version`, `version_type`, `require_alias`, and `dynamic_templates`.

@@ -111,8 +111,21 @@ architecture decision.
   unresolved admission barrier by guessing whether membership committed.
   Idle/session reaping cannot release a settling barrier; only settlement may
   release it after observing admission/impossibility or fencing the old term.
-- **Synchronous replication failures are request failures.** Do not turn
-  partial replication into success-shaped responses.
+- **Write acknowledgements require exact-operation certification.** Every
+  captured in-sync allocation must prove the operation or have an observed,
+  settled conditional Raft exclusion. Honor `minimum_durable_copies` before
+  mutation and acknowledgement; a missing proof alone is never success.
+- **Exclusion debt is durable and authority-scoped.** Close admission before
+  journaling/proposing, retain unresolved debt across deadlines/restart, and
+  revoke only the captured old epoch on stale rejection.
+- **WAL/post-WAL uncertainty is immediate fail-stop.** A later successful
+  fsync, writer rebuild, filesystem repair, or same-allocation reopen cannot
+  heal the copy in process. Validate protected history before restart recovery.
+- **Primary incarnations acquire fresh canonical authority.** Reserve
+  higher-term PROMOTING, preserve protected operations, seal matching copies,
+  and observe exact committed ACTIVE before installing permits. Cached
+  certificates do not authorize a restarted primary; activation/recovery is
+  not gated by the write-copy floor.
 - **Remote publication is not multi-writer safe yet.** Do not claim otherwise
   or add unfenced read-modify-write manifest updates.
 - **Wire and storage decoding fails loudly.** Never replace malformed protocol,

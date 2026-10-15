@@ -2341,6 +2341,9 @@ mod tests {
             .data,
             ClusterResponse::Ok
         );
+        let promoting = source_state_handle.read().unwrap().clone();
+        let (authority, history) =
+            crate::node::tests::finish_empty_primary(&raft, &promoting, "pending", 0).await;
         let stale_target_state = source_state_handle.read().unwrap().clone();
         let allocation_id = stale_target_state
             .shard_allocation_id("pending", 0, "replica-node")
@@ -2381,6 +2384,9 @@ mod tests {
                     allow_empty_creation: true,
                 },
             )
+            .unwrap();
+        target_shards
+            .persist_copy_canonical_history("pending", allocation_id, &authority, &history)
             .unwrap();
         apply_index(
             &target_engine,
@@ -2462,6 +2468,14 @@ mod tests {
         let mut target_client = connect(target_address).await;
         let live_apply = target_client
             .replicate_doc(tonic::Request::new(ReplicateDocRequest {
+                authority: Some(
+                    crate::replication::capture_replica_authority(
+                        &target_manager.get_state(),
+                        "pending",
+                        0,
+                    )
+                    .unwrap(),
+                ),
                 index_name: "pending".into(),
                 shard_id: 0,
                 doc_id: "live".into(),

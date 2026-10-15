@@ -40,8 +40,9 @@ missing.
   `_seq_no`, `_primary_term`, and internal per-document `_version`. Sequence
   zero is valid; document versions start at 1 and increase across
   index/update/delete, including `not_found` deletes. Detected update no-ops
-  retain the current metadata. External version preconditions and client retry
-  tokens are not implemented.
+  retain the current metadata. Client-operation IDs provide bounded shard-local
+  retry identity; they are not an unbounded exactly-once ledger. External
+  version preconditions remain unsupported.
 - Index and delete accept paired `if_seq_no` and `if_primary_term`. Supplying
   only one is a 400. Create-only writes use `op_type=create` or
   `PUT/POST /{index}/_create/{id}` and return 409 without allocating a sequence
@@ -56,6 +57,11 @@ missing.
 - A pre-execution rejection has no receipt. A dispatched write whose outcome
   cannot be proven returns `write_outcome_unknown`; clients must not treat that
   as safe to retry.
+- A successful data certificate requires every captured in-sync copy's exact
+  proof or observed, settled conditional exclusion and the configured
+  `minimum_durable_copies` floor (default one). WAL/post-WAL uncertainty
+  immediately stops the copy; restart/promotion acquires fresh canonical
+  authority. These bounded guarantees are not full OpenSearch recovery parity.
 
 Evidence:
 `src/api/index/mod.rs`,
@@ -72,8 +78,10 @@ and
 - `refresh=true` performs a bounded primary-owned visibility round for the
   primary and authoritative in-sync replicas. Bulk performs one round per
   mutated shard after item execution, not one per item.
+- Write `_shards` counts describe actual data-copy acknowledgements and
+  committed exclusions. They are not overwritten by visibility results.
 - A bounded post-ack refresh failure keeps the write acknowledged and reports
-  failures in `_shards`; it does not turn a committed mutation into a failed
+  failures in the separate `_refresh` object; it does not turn a committed mutation into a failed
   bulk item. This differs from OpenSearch refresh-failure handling.
 - `GET/POST /{index}/_refresh` and `GET/POST /{index}/_flush` fan out across
   assigned copies and return a small shard-count response.

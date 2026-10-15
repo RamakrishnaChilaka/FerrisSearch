@@ -68,26 +68,6 @@ impl RefreshCluster {
             .data
             .into_result()
             .unwrap();
-        for shard in 0..shards {
-            let state = leader.cluster_manager.get_state();
-            let metadata = &state.indices[INDEX];
-            let routing = &metadata.shard_routing[&shard];
-            leader
-                .raft
-                .client_write(ClusterCommand::ActivatePrimary {
-                    index_name: INDEX.into(),
-                    index_uuid: metadata.uuid.to_string(),
-                    shard_id: shard,
-                    primary: routing.primary.clone(),
-                    allocation_id: state.primary_allocation_id(INDEX, shard).unwrap(),
-                    expected_term: routing.primary_term,
-                })
-                .await
-                .unwrap()
-                .data
-                .into_result()
-                .unwrap();
-        }
         let state = leader.cluster_manager.get_state();
         // Premature fixtures can be retired while their retained Arcs still hold the writer lock.
         Self::wait_for_applied_metadata(&cluster, state.version).await;
@@ -116,12 +96,22 @@ impl RefreshCluster {
                         .initialize_copy_identity_for_test(INDEX, shard, &uuid, allocation, term)
                         .unwrap();
                     let engine = Arc::new(
-                        CompositeEngine::new_with_mappings(
+                        CompositeEngine::open_with_copy_state(
                             directory,
                             Duration::from_secs(3600),
                             &mappings,
                             crate::wal::TranslogDurability::Request,
                             Arc::new(crate::engine::column_cache::ColumnCache::new(0, 0)),
+                            crate::engine::write_authority::CopyWriteState::for_copy(
+                                crate::engine::write_authority::CopyWriteBinding {
+                                    index_uuid: uuid,
+                                    shard_id: shard,
+                                    allocation_id: allocation,
+                                },
+                                true,
+                            )
+                            .unwrap(),
+                            false,
                         )
                         .unwrap(),
                     );
@@ -132,6 +122,62 @@ impl RefreshCluster {
                 .unwrap();
                 engines.insert((node, shard), engine);
             }
+            let primary = cluster
+                .nodes
+                .iter()
+                .find(|node| node.state.local_node_id == routing.primary)
+                .unwrap();
+            primary
+                .refresh_service
+                .activate_primary_for_lifecycle(INDEX, shard)
+                .await
+                .unwrap();
+            let active = leader.cluster_manager.get_state();
+            Self::wait_for_applied_metadata(&cluster, active.version).await;
+            let metadata = &active.indices[INDEX];
+            let routing = &metadata.shard_routing[&shard];
+            let history = active
+                .shard_allocation_ids(INDEX, shard)
+                .unwrap()
+                .primary_authority
+                .history
+                .as_ref()
+                .unwrap();
+            let authority = crate::cluster::state::WriteAuthorityIdentity {
+                index_uuid: metadata.uuid.to_string(),
+                shard_id: shard,
+                primary_node_id: routing.primary.clone(),
+                primary_allocation_id: active.primary_allocation_id(INDEX, shard).unwrap(),
+                primary_term: routing.primary_term,
+                activation_id: history.activation_id,
+            };
+            for node_id in std::iter::once(&routing.primary).chain(&routing.replicas) {
+                let node = cluster
+                    .nodes
+                    .iter()
+                    .find(|node| node.state.local_node_id == *node_id)
+                    .unwrap();
+                let manager = node.state.shard_manager.clone();
+                let allocation = active.shard_allocation_id(INDEX, shard, node_id).unwrap();
+                manager
+                    .raise_copy_fence_blocking(
+                        INDEX.into(),
+                        shard,
+                        metadata.uuid.to_string(),
+                        allocation,
+                        routing.primary_term,
+                    )
+                    .await
+                    .unwrap();
+                let authority = authority.clone();
+                let history = history.clone();
+                tokio::task::spawn_blocking(move || {
+                    manager.persist_copy_canonical_history(INDEX, allocation, &authority, &history)
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            }
             // All fixture copies are identically empty before their Raft admission.
             for replica in routing.replicas.iter().take(in_sync) {
                 leader
@@ -141,7 +187,7 @@ impl RefreshCluster {
                         index_uuid: metadata.uuid.to_string(),
                         shard_id: shard,
                         replica: replica.clone(),
-                        allocation_id: state.shard_allocation_id(INDEX, shard, replica).unwrap(),
+                        allocation_id: active.shard_allocation_id(INDEX, shard, replica).unwrap(),
                         primary: routing.primary.clone(),
                         primary_term: routing.primary_term,
                     })
@@ -181,6 +227,25 @@ impl RefreshCluster {
             assert_eq!(routing.in_sync_replicas.len(), in_sync);
         }
         Self { cluster, engines }
+    }
+
+    async fn set_minimum_durable_copies(&self, minimum: u32) {
+        let (status, body) = self
+            .cluster
+            .request(
+                0,
+                reqwest::Method::PUT,
+                &format!("/{INDEX}/_settings"),
+                Some(json!({"index": {"minimum_durable_copies": minimum}})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["acknowledged"], true, "{body}");
+        Self::wait_for_applied_metadata(
+            &self.cluster,
+            self.cluster.nodes[0].state.cluster_manager.version(),
+        )
+        .await;
     }
 
     fn replica(&self, shard: u32) -> usize {
@@ -247,8 +312,9 @@ impl RefreshCluster {
     }
 
     fn assert_refresh_response(&self, body: &Value) {
-        assert_eq!(body["_shards"]["total"], 3, "{body}");
-        assert_eq!(body["_shards"]["successful"], 3, "{body}");
+        assert_eq!(body["_refresh"]["total"], 3, "{body}");
+        assert_eq!(body["_refresh"]["successful"], 3, "{body}");
+        assert_eq!(body["_refresh"]["failed"], 0, "{body}");
         assert_eq!(body["_shards"]["failed"], 0, "{body}");
         assert_eq!(body["forced_refresh"], true, "{body}");
     }
@@ -563,10 +629,11 @@ bulk_visibility_test!(
 );
 
 fn assert_copy_failure(body: &Value, node_id: &str, shard: u32, primary: bool) {
-    assert_eq!(body["_shards"]["total"], 3, "{body}");
-    assert_eq!(body["_shards"]["successful"], 2, "{body}");
-    assert_eq!(body["_shards"]["failed"], 1, "{body}");
-    let failures = body["_shards"]["failures"].as_array().unwrap();
+    assert_eq!(body["_refresh"]["total"], 3, "{body}");
+    assert_eq!(body["_refresh"]["successful"], 2, "{body}");
+    assert_eq!(body["_refresh"]["failed"], 1, "{body}");
+    assert_eq!(body["_shards"]["failed"], 0, "{body}");
+    let failures = body["_refresh"]["failures"].as_array().unwrap();
     assert_eq!(failures.len(), 1, "{body}");
     let failure = &failures[0];
     assert_eq!(failure["node"], node_id, "{body}");
@@ -985,8 +1052,9 @@ async fn refresh_regression_grpc_refresh_failure_preserves_acknowledgement() {
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     assert_eq!(body["result"], "created", "{body}");
-    assert_eq!(body["_shards"]["failed"], 1, "{body}");
-    let failure = &body["_shards"]["failures"][0];
+    assert_eq!(body["_refresh"]["failed"], 1, "{body}");
+    assert_eq!(body["_shards"]["failed"], 0, "{body}");
+    let failure = &body["_refresh"]["failures"][0];
     assert_eq!(
         failure["node"],
         harness.cluster.nodes[replica].state.local_node_id
@@ -1072,10 +1140,15 @@ async fn refresh_regression_reports_every_failed_copy_without_unacknowledging() 
     assert_eq!(status, StatusCode::CREATED, "{body}");
     assert_eq!(body["result"], "created", "{body}");
     assert!(body["_seq_no"].is_u64(), "{body}");
-    assert_eq!(body["_shards"]["total"], 3, "{body}");
-    assert_eq!(body["_shards"]["successful"], 0, "{body}");
-    assert_eq!(body["_shards"]["failed"], 3, "{body}");
-    let failures = body["_shards"]["failures"].as_array().unwrap();
+    assert_eq!(body["_refresh"]["total"], 3, "{body}");
+    assert_eq!(body["_refresh"]["successful"], 0, "{body}");
+    assert_eq!(body["_refresh"]["failed"], 3, "{body}");
+    assert_eq!(
+        body["_shards"],
+        json!({"total": 3, "successful": 3, "failed": 0}),
+        "{body}"
+    );
+    let failures = body["_refresh"]["failures"].as_array().unwrap();
     assert_eq!(failures.len(), 3);
     let nodes = failures
         .iter()

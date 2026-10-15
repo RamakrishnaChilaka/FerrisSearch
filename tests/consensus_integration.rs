@@ -4,14 +4,17 @@
 //! flow: bootstrap → leader election → client_write → state machine apply.
 
 use ferrissearch::cluster::manager::ClusterManager;
-use ferrissearch::cluster::state::{IndexMetadata, NodeInfo, NodeRole, ShardRoutingEntry};
+use ferrissearch::cluster::state::{
+    CanonicalHistory, ClusterState, IndexMetadata, NodeInfo, NodeRole, PrimaryActivationFinish,
+    PrimaryAuthorityPhase, ShardCopyAllocation, ShardRoutingEntry, WriteAuthorityIdentity,
+};
 use ferrissearch::consensus;
 use ferrissearch::consensus::types::{ClusterCommand, ClusterResponse};
 use ferrissearch::shard::ShardManager;
 use ferrissearch::transport::TransportClient;
 use ferrissearch::transport::proto::{
-    ActivatePrimaryRequest, FailShardCopyRequest, JoinRequest, MarkPrimaryAvailableRequest,
-    MarkPrimaryUnavailableRequest, MarkReplicaInSyncRequest, NodeInfo as ProtoNodeInfo,
+    ActivatePrimaryRequest, FailShardCopyRequest, JoinRequest, MarkPrimaryUnavailableRequest,
+    MarkReplicaInSyncRequest, NodeInfo as ProtoNodeInfo, ShardAuthorityMutationRequest,
     ShardDocRequest, internal_transport_client::InternalTransportClient,
 };
 use ferrissearch::transport::server::create_transport_service_with_raft;
@@ -61,6 +64,41 @@ fn make_index(name: &str) -> IndexMetadata {
         mappings: std::collections::HashMap::new(),
         dynamic: Default::default(),
         settings: ferrissearch::cluster::state::IndexSettings::default(),
+    }
+}
+
+fn empty_activation_finish(state: &ClusterState, index: &str) -> PrimaryActivationFinish {
+    let metadata = &state.indices[index];
+    let routing = &metadata.shard_routing[&0];
+    let allocations = state.shard_allocation_ids(index, 0).unwrap();
+    assert_eq!(
+        allocations.primary_authority.phase,
+        PrimaryAuthorityPhase::Promoting
+    );
+    let activation_id = allocations.primary_authority.activation_id.unwrap();
+    PrimaryActivationFinish {
+        authority: WriteAuthorityIdentity {
+            index_uuid: metadata.uuid.to_string(),
+            shard_id: 0,
+            primary_node_id: routing.primary.clone(),
+            primary_allocation_id: allocations.primary.unwrap(),
+            primary_term: routing.primary_term,
+            activation_id,
+        },
+        history: CanonicalHistory {
+            activation_id,
+            primary_term: routing.primary_term,
+            max_seq_no: None,
+            digest: [1; 32],
+        },
+        eligible_replicas: routing
+            .in_sync_replicas
+            .iter()
+            .map(|node| ShardCopyAllocation {
+                node_id: node.clone(),
+                allocation_id: state.shard_allocation_id(index, 0, node).unwrap(),
+            })
+            .collect(),
     }
 }
 
@@ -770,6 +808,17 @@ async fn conditional_membership_rejects_stale_promotion_and_old_primary_term() {
         .await
         .unwrap();
     assert_eq!(activated.data, ClusterResponse::Ok);
+    let activation = empty_activation_finish(&state_handle.read().unwrap(), "conditional");
+    assert_eq!(
+        raft.client_write(ClusterCommand::FinishPrimaryActivation {
+            index_name: "conditional".into(),
+            activation,
+        })
+        .await
+        .unwrap()
+        .data,
+        ClusterResponse::Ok
+    );
 
     let stale_admission = raft
         .client_write(ClusterCommand::MarkReplicaInSync {
@@ -1270,6 +1319,19 @@ async fn grpc_conditional_membership_rpcs_apply_on_leader() {
         .unwrap()
         .into_inner();
     assert!(activated.acknowledged, "{}", activated.error);
+    let activation = empty_activation_finish(&state_handle.read().unwrap(), "grpc-conditional");
+    let finished = client
+        .finish_primary_activation(tonic::Request::new(ShardAuthorityMutationRequest {
+            index_name: "grpc-conditional".into(),
+            record_json: serde_json::to_vec(&activation).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        serde_json::from_slice::<ClusterResponse>(&finished.result_json).unwrap(),
+        ClusterResponse::Ok
+    );
 
     let admitted = client
         .mark_replica_in_sync(tonic::Request::new(MarkReplicaInSyncRequest {
@@ -1331,6 +1393,18 @@ async fn grpc_delayed_admission_rejects_same_node_reallocation_from_stale_target
             primary: "node-1".into(),
             allocation_id: primary_allocation_id,
             expected_term: 1,
+        })
+        .await
+        .unwrap()
+        .data,
+        ClusterResponse::Ok
+    );
+    let activation =
+        empty_activation_finish(&source_state_handle.read().unwrap(), "grpc-allocation-aba");
+    assert_eq!(
+        raft.client_write(ClusterCommand::FinishPrimaryActivation {
+            index_name: "grpc-allocation-aba".into(),
+            activation,
         })
         .await
         .unwrap()
@@ -1658,7 +1732,7 @@ async fn grpc_promote_only_primary_failure_marks_unavailable_without_candidate()
 }
 
 #[tokio::test]
-async fn grpc_primary_availability_is_conditional_and_activation_still_clears_it() {
+async fn grpc_unavailable_primary_requires_fresh_canonical_finish() {
     let (raft, state_handle) =
         consensus::create_raft_instance_mem(1, "grpc-primary-unavailable".into())
             .await
@@ -1715,25 +1789,62 @@ async fn grpc_primary_availability_is_conditional_and_activation_still_clears_it
             .unwrap()
             .primary_unavailable("unavailable", 0)
     );
-    let term_before_available =
+    let old_term =
         state_handle.read().unwrap().indices["unavailable"].shard_routing[&0].primary_term;
-    let stale_available = client
-        .mark_primary_available(tonic::Request::new(MarkPrimaryAvailableRequest {
+    let finish = |term, activation_id| {
+        let mut finish = empty_activation_finish(&state_handle.read().unwrap(), "unavailable");
+        finish.authority.primary_term = term;
+        finish.authority.activation_id = activation_id;
+        finish.history.primary_term = term;
+        finish.history.activation_id = activation_id;
+        finish
+    };
+    let old_activation_id = state_handle
+        .read()
+        .unwrap()
+        .shard_allocation_ids("unavailable", 0)
+        .unwrap()
+        .primary_authority
+        .activation_id
+        .unwrap();
+    let rejected = client
+        .finish_primary_activation(tonic::Request::new(ShardAuthorityMutationRequest {
             index_name: "unavailable".into(),
-            index_uuid: index_uuid.clone(),
-            shard_id: 0,
-            primary_node_id: "node-1".into(),
-            allocation_id: Some(allocation_id),
-            primary_term: term_before_available + 1,
+            record_json: serde_json::to_vec(&finish(old_term + 1, old_activation_id)).unwrap(),
         }))
         .await
         .unwrap()
         .into_inner();
-    assert!(!stale_available.acknowledged);
-    assert!(stale_available.error.contains("term mismatch"));
+    assert!(matches!(
+        serde_json::from_slice::<ClusterResponse>(&rejected.result_json).unwrap(),
+        ClusterResponse::WriteAuthorityRejected { .. }
+    ));
 
+    let activated = client
+        .activate_primary(tonic::Request::new(ActivatePrimaryRequest {
+            index_name: "unavailable".into(),
+            index_uuid: index_uuid.clone(),
+            shard_id: 0,
+            primary_node_id: "node-1".into(),
+            expected_term: old_term,
+            allocation_id: Some(allocation_id),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(activated.acknowledged, "{}", activated.error);
+    let activation_id = {
+        let state = state_handle.read().unwrap();
+        assert!(state.primary_unavailable("unavailable", 0));
+        let authority = &state
+            .shard_allocation_ids("unavailable", 0)
+            .unwrap()
+            .primary_authority;
+        assert_eq!(authority.phase, PrimaryAuthorityPhase::Promoting);
+        authority.activation_id.unwrap()
+    };
     TransportClient::new()
-        .forward_mark_primary_available(
+        .forward_finish_primary_activation(
             &NodeInfo {
                 id: "node-1".into(),
                 name: "node-1".into(),
@@ -1743,52 +1854,11 @@ async fn grpc_primary_availability_is_conditional_and_activation_still_clears_it
                 roles: vec![NodeRole::Data],
                 raft_node_id: 1,
             },
-            MarkPrimaryAvailableRequest {
-                index_name: "unavailable".into(),
-                index_uuid: index_uuid.clone(),
-                shard_id: 0,
-                primary_node_id: "node-1".into(),
-                allocation_id: Some(allocation_id),
-                primary_term: term_before_available,
-            },
+            "unavailable",
+            &finish(old_term + 1, activation_id),
         )
         .await
         .unwrap();
-    {
-        let state = state_handle.read().unwrap();
-        assert!(!state.primary_unavailable("unavailable", 0));
-        assert_eq!(
-            state.indices["unavailable"].shard_routing[&0].primary_term,
-            term_before_available
-        );
-    }
-
-    let unavailable = client
-        .mark_primary_unavailable(tonic::Request::new(MarkPrimaryUnavailableRequest {
-            index_name: "unavailable".into(),
-            index_uuid: index_uuid.clone(),
-            shard_id: 0,
-            primary_node_id: "node-1".into(),
-            allocation_id: Some(allocation_id),
-        }))
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(unavailable.acknowledged, "{}", unavailable.error);
-
-    let activated = client
-        .activate_primary(tonic::Request::new(ActivatePrimaryRequest {
-            index_name: "unavailable".into(),
-            index_uuid,
-            shard_id: 0,
-            primary_node_id: "node-1".into(),
-            expected_term: term_before_available,
-            allocation_id: Some(allocation_id),
-        }))
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(activated.acknowledged, "{}", activated.error);
     assert!(
         !state_handle
             .read()
@@ -1838,6 +1908,19 @@ async fn grpc_disk_loss_fails_closed_and_failure_report_restores_write_set() {
                 primary: "primary-node".into(),
                 allocation_id: primary_allocation_id,
                 expected_term: 1,
+            })
+            .await
+            .unwrap()
+            .data,
+        ClusterResponse::Ok
+    );
+    let activation =
+        empty_activation_finish(&target_state_handle.read().unwrap(), "grpc-disk-loss");
+    assert_eq!(
+        target_raft
+            .client_write(ClusterCommand::FinishPrimaryActivation {
+                index_name: "grpc-disk-loss".into(),
+                activation,
             })
             .await
             .unwrap()
@@ -1974,18 +2057,31 @@ async fn grpc_conditional_membership_rpcs_reject_non_leader() {
         .unwrap_err();
     assert_eq!(unavailable_error.code(), tonic::Code::FailedPrecondition);
 
-    let available_error = client
-        .mark_primary_available(tonic::Request::new(MarkPrimaryAvailableRequest {
-            index_name: "idx".into(),
+    let finish = PrimaryActivationFinish {
+        authority: WriteAuthorityIdentity {
             index_uuid: "uuid".into(),
             shard_id: 0,
             primary_node_id: "node-2".into(),
-            allocation_id: Some(1),
+            primary_allocation_id: 1,
             primary_term: 1,
+            activation_id: 1,
+        },
+        history: CanonicalHistory {
+            activation_id: 1,
+            primary_term: 1,
+            max_seq_no: None,
+            digest: [1; 32],
+        },
+        eligible_replicas: Vec::new(),
+    };
+    let finish_error = client
+        .finish_primary_activation(tonic::Request::new(ShardAuthorityMutationRequest {
+            index_name: "idx".into(),
+            record_json: serde_json::to_vec(&finish).unwrap(),
         }))
         .await
         .unwrap_err();
-    assert_eq!(available_error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(finish_error.code(), tonic::Code::FailedPrecondition);
 
     let fail_error = client
         .fail_shard_copy(tonic::Request::new(FailShardCopyRequest {
@@ -2003,7 +2099,7 @@ async fn grpc_conditional_membership_rpcs_reject_non_leader() {
 }
 
 #[tokio::test]
-async fn first_write_after_transport_restart_reactivates_primary() {
+async fn transport_restart_preserves_the_live_copy_authority_epoch() {
     let (raft, state_handle) =
         consensus::create_raft_instance_mem(1, "transport-restart-activation".into())
             .await
@@ -2057,7 +2153,6 @@ async fn first_write_after_transport_restart_reactivates_primary() {
     drop(first_client);
     first_server.abort();
     let _ = first_server.await;
-
     let (second_addr, second_server) = start_raft_grpc_server_with_shard_manager(
         raft,
         state_handle.clone(),
@@ -2081,8 +2176,8 @@ async fn first_write_after_transport_restart_reactivates_primary() {
     assert!(response.success, "{}", response.error);
     assert_eq!(
         state_handle.read().unwrap().indices["restart-activation"].shard_routing[&0].primary_term,
-        3,
-        "a new process incarnation must obtain a new primary term"
+        2,
+        "replacing only the transport does not restart the shared live copy"
     );
 
     second_server.abort();

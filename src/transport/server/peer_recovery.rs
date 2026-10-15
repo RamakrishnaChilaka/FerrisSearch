@@ -1109,7 +1109,7 @@ impl TransportService {
         &self,
         index_name: &str,
         shard_id: u32,
-    ) -> Result<OwnedRwLockReadGuard<()>, String> {
+    ) -> Result<Arc<OwnedRwLockReadGuard<()>>, String> {
         let state = self.cluster_manager.get_state();
         let metadata = state.indices.get(index_name).ok_or_else(|| {
             format!("index [{index_name}] is absent while acquiring the shard write barrier")
@@ -1128,7 +1128,7 @@ impl TransportService {
         {
             let _ = sender.send(());
         }
-        Ok(barrier.read_owned().await)
+        Ok(Arc::new(barrier.read_owned().await))
     }
 
     pub(super) async fn peer_recovery_exclusive_guard(
@@ -1181,6 +1181,46 @@ impl TransportService {
             ) == Some(session.target_allocation_id)
     }
 
+    pub(super) fn ensure_recovery_admission_permitted(
+        &self,
+        index: &str,
+        shard_id: u32,
+        expected_term: u64,
+    ) -> Result<(), String> {
+        let engine = self
+            .shard_manager
+            .get_shard(index, shard_id)
+            .ok_or_else(|| "peer recovery source engine is not open".to_string())?;
+        engine
+            .ensure_write_health()
+            .map_err(|error| format!("peer recovery source durability is fenced: {error:#}"))?;
+        let copy = engine.copy_write_state();
+        if self.raft.is_none() && !copy.enforces_primary_authority() {
+            return Ok(());
+        }
+        let epoch = copy
+            .primary_epoch()
+            .map_err(|error| format!("peer recovery source epoch is unavailable: {error:#}"))?
+            .ok_or_else(|| {
+                "peer recovery source has no canonical ACTIVE write epoch".to_string()
+            })?;
+        if epoch.identity.primary_term != expected_term
+            || epoch.identity.primary_node_id != self.local_node_id
+            || epoch.identity.shard_id != shard_id
+        {
+            return Err("peer recovery source epoch changed before admission".into());
+        }
+        epoch
+            .permit()
+            .map_err(|error| {
+                format!("peer recovery admission is blocked by write authority: {error:#}")
+            })?
+            .validate()
+            .map_err(|error| {
+                format!("peer recovery admission is blocked by write authority: {error:#}")
+            })
+    }
+
     fn observe_membership(&self, session: &SourceSessionAuthority) -> MembershipObservation {
         let state = self.cluster_manager.get_state();
         let Some(metadata) = state.indices.get(&session.index_name) else {
@@ -1215,6 +1255,11 @@ impl TransportService {
         &self,
         session: &SourceSessionAuthority,
     ) -> Result<(), String> {
+        self.ensure_recovery_admission_permitted(
+            &session.index_name,
+            session.shard_id,
+            session.primary_term,
+        )?;
         let Some(raft) = self.raft.as_ref() else {
             return Err("Raft is not initialized".to_string());
         };
@@ -1666,6 +1711,12 @@ impl TransportService {
                     "peer recovery source authority changed at the finalize barrier",
                 ));
             }
+            self.ensure_recovery_admission_permitted(
+                &session_guard.index_name,
+                session_guard.shard_id,
+                session_guard.primary_term,
+            )
+            .map_err(Status::failed_precondition)?;
         }
 
         let barrier_read = tokio::task::spawn_blocking(move || {
@@ -2092,55 +2143,8 @@ mod tests {
         }
     }
 
-    fn apply_recovery_operations_for_test(
-        target: &Arc<dyn SearchEngine>,
-        snapshot_processed_checkpoint: Option<u64>,
-        operations: Vec<RecoveryOperation>,
-    ) -> Vec<u64> {
-        let mut applied = Vec::new();
-        let decoded = operations
-            .into_iter()
-            .filter(|operation| {
-                snapshot_processed_checkpoint.is_none_or(|checkpoint| operation.seq_no > checkpoint)
-            })
-            .map(|operation| {
-                applied.push(operation.seq_no);
-                let mutation = match operation.op.as_str() {
-                    "index" => crate::engine::DocumentMutation::Index {
-                        doc_id: operation.doc_id,
-                        source: serde_json::from_slice(&operation.payload_json).unwrap(),
-                    },
-                    "delete" => crate::engine::DocumentMutation::Delete {
-                        doc_id: operation.doc_id,
-                    },
-                    "noop" => crate::engine::DocumentMutation::NoOp {
-                        reason: serde_json::from_slice::<serde_json::Value>(
-                            &operation.payload_json,
-                        )
-                        .unwrap()["_reason"]
-                            .as_str()
-                            .unwrap()
-                            .to_string(),
-                    },
-                    other => panic!("unknown recovery operation {other}"),
-                };
-                crate::engine::SequencedOperation {
-                    seq_no: operation.seq_no,
-                    primary_term: operation.primary_term,
-                    document_version: operation.document_version.unwrap_or(0),
-                    client_operation: None,
-                    mutation,
-                }
-            })
-            .collect::<Vec<_>>();
-        if !decoded.is_empty() {
-            target.apply_replica_batch(decoded).unwrap();
-        }
-        applied
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn stalled_catch_up_finalizes_and_reaches_source_checkpoint() {
+    async fn post_wal_failed_source_cannot_fetch_or_finalize_recovery_without_restart() {
         let dir = tempfile::tempdir().unwrap();
         let (service, shard_manager, _cluster_manager) = review_service(dir.path());
         let source = shard_manager
@@ -2202,6 +2206,7 @@ mod tests {
             })
             .await
             .unwrap();
+        assert!(target_manager.begin_peer_recovery_target("idx", 0));
 
         let session = Arc::new(Mutex::new(SourceSession {
             index_name: "idx".into(),
@@ -2236,55 +2241,37 @@ mod tests {
             registry.sessions.insert("session".into(), session);
         }
 
-        let mut cursor = snapshot.snapshot_cursor;
-        loop {
-            let response = service
-                .fetch_recovery_ops_inner(FetchRecoveryOpsRequest {
-                    session_id: "session".into(),
-                    cursor: Some(proto_cursor(cursor)),
-                    max_ops: MAX_RECOVERY_OPS as u32,
-                    snapshot_processed_checkpoint: snapshot_processed,
-                })
-                .await
-                .unwrap();
-            let next_cursor = require_cursor(response.next_cursor, "next cursor").unwrap();
-            if !response.complete && next_cursor == cursor && response.operations.is_empty() {
-                break;
-            }
-            apply_recovery_operations_for_test(&target, snapshot_processed, response.operations);
-            cursor = next_cursor;
-            if response.complete {
-                break;
-            }
-        }
-
-        let prepared = service
+        let cursor = snapshot.snapshot_cursor;
+        let fetch_error = service
+            .fetch_recovery_ops_inner(FetchRecoveryOpsRequest {
+                session_id: "session".into(),
+                cursor: Some(proto_cursor(cursor)),
+                max_ops: MAX_RECOVERY_OPS as u32,
+                snapshot_processed_checkpoint: snapshot_processed,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(fetch_error.code(), tonic::Code::Unavailable);
+        let finalize_error = service
             .prepare_finalize_recovery_inner(PrepareFinalizeRecoveryRequest {
                 session_id: "session".into(),
                 cursor: Some(proto_cursor(cursor)),
                 processed_checkpoint: target.sequence_stats().processed_checkpoint,
             })
             .await
-            .unwrap();
-        let barrier_wal_end = require_cursor(prepared.barrier_wal_end, "barrier WAL end").unwrap();
-        let finalize_next = require_cursor(prepared.next_cursor, "finalize next cursor").unwrap();
-        let applied =
-            apply_recovery_operations_for_test(&target, snapshot_processed, prepared.operations);
-
-        assert!(prepared.complete);
-        assert!(!prepared.retry_catch_up);
-        assert_eq!(applied, [1]);
-        assert_eq!(finalize_next, barrier_wal_end);
-        assert_eq!(
-            target.sequence_stats().processed_checkpoint,
-            prepared.barrier_processed_checkpoint
+            .unwrap_err();
+        assert_eq!(finalize_error.code(), tonic::Code::Unavailable);
+        assert!(source.refresh().is_err());
+        assert!(source.ensure_write_health().is_err());
+        assert!(target_manager.is_peer_recovery_target("idx", 0));
+        assert!(
+            service.cluster_manager.get_state().indices["idx"]
+                .in_sync_replica_nodes(0)
+                .is_empty()
         );
-        source.refresh().unwrap();
         target.refresh().unwrap();
-        assert_eq!(
-            source.get_document("late").unwrap(),
-            target.get_document("late").unwrap()
-        );
+        assert!(target.get_document("base").unwrap().is_some());
+        assert!(target.get_document("late").unwrap().is_none());
 
         if let Some(removed) = service.peer_recovery_state.remove_session("session").await {
             cleanup_session(removed).await;
@@ -3290,7 +3277,7 @@ mod tests {
                     primary: "primary".into(),
                     primary_term: 1,
                     replicas: vec!["replica".into()],
-                    in_sync_replicas: vec!["replica".into()],
+                    in_sync_replicas: Vec::new(),
                     unassigned_replicas: 0,
                 },
             )]),
@@ -3375,6 +3362,22 @@ mod tests {
         });
         committed_rx.await.unwrap();
 
+        let active = state_handle.read().unwrap().clone();
+        assert_eq!(
+            raft.client_write(ClusterCommand::MarkReplicaInSync {
+                index_name: "idx".into(),
+                index_uuid: "uuid-1".into(),
+                shard_id: 0,
+                replica: "replica".into(),
+                allocation_id: active.shard_allocation_id("idx", 0, "replica").unwrap(),
+                primary: "primary".into(),
+                primary_term: active.indices["idx"].shard_routing[&0].primary_term,
+            })
+            .await
+            .unwrap()
+            .data,
+            ClusterResponse::Ok
+        );
         let mut promoted = state_handle.read().unwrap().indices["idx"].clone();
         assert!(promoted.promote_replica_to(0, "replica"));
         assert_eq!(
@@ -3388,10 +3391,20 @@ mod tests {
 
         let response = write.await.unwrap().unwrap().into_inner();
         assert!(!response.success);
-        assert!(
-            response.error.contains("no longer the primary")
-                || response.error.contains("primary term changed")
+        let failure = crate::transport::write_failure::WriteFailure::response_failure(
+            response.failure,
+            &response.error,
+            response.seq_no,
+            response.primary_term,
+        )
+        .unwrap();
+        assert_eq!(
+            failure.outcome,
+            crate::transport::proto::WriteFailureOutcome::NotExecuted
         );
+        assert_eq!(failure.status, 503);
+        assert_eq!(failure.seq_no, None);
+        assert!(failure.reason.contains("primary"), "{failure:?}");
         assert!(
             shard_manager
                 .get_shard("idx", 0)
@@ -3569,18 +3582,18 @@ mod tests {
             "the deleted index left a zombie shard engine"
         );
 
-        let recreated = shard_manager
-            .open_shard_with_settings(
-                "idx",
-                0,
-                &HashMap::new(),
-                &IndexSettings::default(),
-                "uuid-new",
-            )
+        let response = service
+            .index_doc(forwarding_request(ShardDocRequest {
+                index_name: "idx".into(),
+                shard_id: 0,
+                doc_id: "new-index-doc".into(),
+                payload_json: serde_json::to_vec(&serde_json::json!({"value": 1})).unwrap(),
+                ..Default::default()
+            }))
+            .await
             .unwrap();
-        recreated
-            .add_document("new-index-doc", serde_json::json!({"value": 1}))
-            .unwrap();
+        assert!(response.get_ref().success, "{response:?}");
+        let recreated = shard_manager.get_shard("idx", 0).unwrap();
         recreated.flush().unwrap();
         assert_eq!(
             shard_manager.shard_data_dir("idx", 0),
@@ -3723,7 +3736,13 @@ mod tests {
         assert!(response.seq_no.is_none());
         assert!(response.error.contains("UUID"));
         assert!(shard_manager.get_shard("idx", 0).is_none());
-        assert!(!dir.path().join("uuid-old").exists());
+        assert!(
+            dir.path()
+                .join("uuid-old/shard_0")
+                .join(crate::shard::SHARD_COPY_IDENTITY_FILE)
+                .exists(),
+            "canonical activation created protected history; stale rejection must preserve its evidence"
+        );
         assert!(!dir.path().join("uuid-new").exists());
     }
 
@@ -4137,8 +4156,31 @@ mod tests {
         };
 
         assert!(service.shard_manager.begin_peer_recovery_target("idx", 0));
-        let replicate = service
+        let mut target_state = cluster_manager.get_state();
+        target_state
+            .indices
+            .get_mut("idx")
+            .unwrap()
+            .shard_routing
+            .get_mut(&0)
+            .unwrap()
+            .in_sync_replicas = vec!["replica".into()];
+        super::super::tests::test_activate_empty_history(&mut target_state, "idx", 0);
+        let target_allocation = target_state
+            .shard_allocation_id("idx", 0, "replica")
+            .unwrap();
+        let target_authority =
+            crate::replication::capture_replica_authority(&target_state, "idx", 0).unwrap();
+        let target_cluster = Arc::new(ClusterManager::new(target_state.cluster_name.clone()));
+        target_cluster.update_state(target_state);
+        let target_service = TransportService {
+            cluster_manager: target_cluster,
+            local_node_id: "replica".into(),
+            ..service.clone()
+        };
+        let replicate = target_service
             .replicate_doc(tonic::Request::new(ReplicateDocRequest {
+                authority: Some(target_authority),
                 index_name: "idx".into(),
                 shard_id: 0,
                 doc_id: "blocked".into(),
@@ -4147,9 +4189,7 @@ mod tests {
                 seq_no: snapshot.snapshot_next_seq_no,
                 index_uuid: "uuid-1".into(),
                 primary_term: Some(1),
-                target_allocation_id: cluster_manager
-                    .get_state()
-                    .shard_allocation_id("idx", 0, "primary"),
+                target_allocation_id: Some(target_allocation),
                 document_version: Some(1),
                 client_operation: None,
             }))

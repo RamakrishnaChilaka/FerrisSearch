@@ -1,5 +1,7 @@
 --------------------------- MODULE MC_D2_WriteAck ---------------------------
-\* Proposed D2/D4/D5/D14 control policy, not implemented Rust behavior.
+\* D2/D4/D5/D14 policy abstraction; "Current" retains the historical baseline.
+\* "Proposed" is the stable profile name for the policy implemented by FS013.
+\* Durable journals, restart authority, and canonical resync need separate checks.
 \* Reuses D1 matching, WAL, operation durability, checkpoints, and Raft actions.
 \* Copy I/O is an abstract post-WAL permit failure; torn bytes are not modeled.
 

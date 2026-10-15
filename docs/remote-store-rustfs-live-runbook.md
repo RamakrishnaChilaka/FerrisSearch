@@ -273,8 +273,11 @@ Expected artifacts include:
 .done
 index/meta.json
 translog.manifest
-translog.seqno
 ```
+
+Current WAL allocation state lives in the protected manifest, not a sequence
+sidecar. These cache artifacts do not imply mutable remote-store ingestion or
+multi-writer publication safety.
 
 One concrete check:
 

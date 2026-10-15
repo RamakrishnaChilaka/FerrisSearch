@@ -6,7 +6,8 @@
 use datafusion::arrow::array::StringArray;
 use ferrissearch::cluster::manager::ClusterManager;
 use ferrissearch::cluster::state::{
-    FieldMapping, FieldType, IndexMetadata, NodeInfo as DomainNodeInfo, NodeRole, ShardRoutingEntry,
+    CanonicalHistory, ClusterState, FieldMapping, FieldType, IndexMetadata,
+    NodeInfo as DomainNodeInfo, NodeRole, ShardRoutingEntry, WriteAuthorityIdentity,
 };
 use ferrissearch::search::{QueryClause, SearchRequest};
 use ferrissearch::shard::ShardManager;
@@ -23,6 +24,7 @@ use ferrissearch::transport::server::{
     create_transport_service_for_test, create_transport_service_with_raft,
 };
 use futures::TryStreamExt;
+use sha2::{Digest, Sha256};
 
 use std::collections::HashMap;
 #[cfg(feature = "transport-tls")]
@@ -32,6 +34,51 @@ use std::time::Duration;
 
 fn forwarding_request<T>(message: T) -> tonic::Request<T> {
     ferrissearch::transport::request_with_cluster_state_version(message, 0)
+}
+
+fn fixture_replica_authority(primary_term: u64) -> Option<proto::ReplicaWriteAuthority> {
+    Some(proto::ReplicaWriteAuthority {
+        primary_node_id: "primary-node".into(),
+        primary_allocation_id: 1,
+        primary_term,
+        activation_id: primary_term,
+        captured_state_version: 1,
+        safe_global_checkpoint: None,
+    })
+}
+
+// These no-Raft fixtures start from a known empty certified history; runtime
+// activation and failover are exercised by the real-Raft suites.
+fn certify_empty_fixture_authority(state: &mut ClusterState, index: &str) {
+    let metadata = state.indices[index].clone();
+    for (&shard_id, routing) in &metadata.shard_routing {
+        let allocations = state
+            .shard_allocations
+            .get_mut(index)
+            .unwrap()
+            .get_mut(&shard_id)
+            .unwrap();
+        let authority = WriteAuthorityIdentity {
+            index_uuid: metadata.uuid.to_string(),
+            shard_id,
+            primary_node_id: routing.primary.clone(),
+            primary_allocation_id: allocations.primary.unwrap(),
+            primary_term: routing.primary_term,
+            activation_id: routing.primary_term,
+        };
+        let mut digest = Sha256::new();
+        digest.update(b"ferrissearch-canonical-history-v1\0");
+        digest.update(serde_json::to_vec(&authority).unwrap());
+        digest.update(b"null");
+        allocations.primary_initialized = true;
+        allocations.primary_authority.finish(CanonicalHistory {
+            activation_id: authority.activation_id,
+            primary_term: authority.primary_term,
+            max_seq_no: None,
+            digest: digest.finalize().into(),
+        });
+    }
+    state.version += 1;
 }
 
 #[cfg(feature = "transport-tls")]
@@ -329,12 +376,14 @@ fn setup_multi_shard_single_node_cluster_state(cm: &ClusterManager, index_name: 
 /// Build cluster state for two-node replication tests.
 fn setup_two_node_cluster_state(
     primary_cm: &ClusterManager,
+    primary_shards: &ShardManager,
     replica_cm: &ClusterManager,
     index_name: &str,
     replica_port: u16,
 ) {
     setup_two_node_cluster_state_with_membership(
         primary_cm,
+        primary_shards,
         replica_cm,
         index_name,
         replica_port,
@@ -344,6 +393,7 @@ fn setup_two_node_cluster_state(
 
 fn setup_two_node_cluster_state_with_membership(
     primary_cm: &ClusterManager,
+    primary_shards: &ShardManager,
     replica_cm: &ClusterManager,
     index_name: &str,
     replica_port: u16,
@@ -393,8 +443,10 @@ fn setup_two_node_cluster_state_with_membership(
         dynamic: Default::default(),
         settings: ferrissearch::cluster::state::IndexSettings::default(),
     });
+    certify_empty_fixture_authority(&mut cs, index_name);
     primary_cm.update_state(cs.clone());
     replica_cm.update_state(cs);
+    install_canonical_fixture_copy(primary_cm, primary_shards, index_name, "primary-node");
 }
 
 fn setup_replica_target_state(cm: &ClusterManager, index_name: &str, primary_term: u64) {
@@ -436,13 +488,7 @@ fn setup_replica_target_state(cm: &ClusterManager, index_name: &str, primary_ter
         dynamic: Default::default(),
         settings: ferrissearch::cluster::state::IndexSettings::default(),
     });
-    state
-        .shard_allocations
-        .get_mut(index_name)
-        .unwrap()
-        .get_mut(&0)
-        .unwrap()
-        .primary_initialized = true;
+    certify_empty_fixture_authority(&mut state, index_name);
     cm.update_state(state);
 }
 
@@ -461,13 +507,53 @@ fn install_recovered_replica_fixture(
         state.shard_allocation_id(index_name, 0, "replica-node"),
         Some(1)
     );
+    install_canonical_fixture_copy(cluster_manager, shard_manager, index_name, "replica-node");
+}
+
+fn install_canonical_fixture_copy(
+    cluster_manager: &ClusterManager,
+    shard_manager: &ShardManager,
+    index_name: &str,
+    node: &str,
+) {
+    let state = cluster_manager.get_state();
+    let metadata = &state.indices[index_name];
+    let routing = &metadata.shard_routing[&0];
+    let allocation_id = state.shard_allocation_id(index_name, 0, node).unwrap();
+    let history = state
+        .shard_allocation_ids(index_name, 0)
+        .unwrap()
+        .primary_authority
+        .history
+        .as_ref()
+        .unwrap();
     shard_manager
-        .open_shard_with_settings(
+        .open_assigned_shard_with_settings(
             index_name,
             0,
             &metadata.mappings,
             &metadata.settings,
             metadata.uuid.as_str(),
+            ferrissearch::shard::AssignedShardOpen {
+                allocation_id,
+                primary_term: routing.primary_term,
+                allow_empty_creation: true,
+            },
+        )
+        .unwrap();
+    shard_manager
+        .persist_copy_canonical_history(
+            index_name,
+            allocation_id,
+            &WriteAuthorityIdentity {
+                index_uuid: metadata.uuid.to_string(),
+                shard_id: 0,
+                primary_node_id: routing.primary.clone(),
+                primary_allocation_id: state.primary_allocation_id(index_name, 0).unwrap(),
+                primary_term: routing.primary_term,
+                activation_id: history.activation_id,
+            },
+            history,
         )
         .unwrap();
 }
@@ -775,9 +861,10 @@ async fn replicate_doc_index_via_grpc() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("integ-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
-    setup_single_node_cluster_state(&cm, "replica-idx");
+    setup_replica_target_state(&cm, "replica-idx", 1);
+    install_recovered_replica_fixture(&cm, &sm, "replica-idx");
 
-    let addr = start_grpc_server(cm, sm.clone()).await;
+    let addr = start_replica_grpc_server(cm, sm.clone()).await;
     let mut client = connect_client(addr).await;
 
     // Replicate an index operation (simulates replica receiving from primary)
@@ -795,6 +882,7 @@ async fn replicate_doc_index_via_grpc() {
             target_allocation_id: Some(1),
             document_version: Some(1),
             client_operation: None,
+            authority: fixture_replica_authority(1),
         }))
         .await
         .unwrap()
@@ -836,9 +924,10 @@ async fn out_of_order_replica_delivery_keeps_the_newer_document_value() {
     let dir = tempfile::tempdir().unwrap();
     let cluster_manager = Arc::new(ClusterManager::new("d1-ordering".into()));
     let shard_manager = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
-    setup_single_node_cluster_state(&cluster_manager, "d1-ordering");
+    setup_replica_target_state(&cluster_manager, "d1-ordering", 1);
+    install_recovered_replica_fixture(&cluster_manager, &shard_manager, "d1-ordering");
 
-    let address = start_grpc_server(cluster_manager, shard_manager.clone()).await;
+    let address = start_replica_grpc_server(cluster_manager, shard_manager.clone()).await;
     let mut client = connect_client(address).await;
     for (seq_no, value) in [(1, 2), (0, 1)] {
         let response = client
@@ -854,6 +943,7 @@ async fn out_of_order_replica_delivery_keeps_the_newer_document_value() {
                 target_allocation_id: Some(1),
                 document_version: Some(seq_no + 1),
                 client_operation: None,
+                authority: fixture_replica_authority(1),
             }))
             .await
             .unwrap()
@@ -907,6 +997,7 @@ async fn deterministic_reordering_survives_promotion_and_new_write() {
                 target_allocation_id: Some(1),
                 document_version: Some(21 + offset),
                 client_operation: None,
+                authority: fixture_replica_authority(1),
             }))
             .await
             .unwrap()
@@ -926,6 +1017,7 @@ async fn deterministic_reordering_survives_promotion_and_new_write() {
             target_allocation_id: Some(1),
             document_version: Some(seq_no + 1),
             client_operation: None,
+            authority: fixture_replica_authority(1),
         })
         .collect();
     let response = client
@@ -936,6 +1028,7 @@ async fn deterministic_reordering_survives_promotion_and_new_write() {
             index_uuid: "d1-full-ordering-uuid".into(),
             primary_term: Some(1),
             target_allocation_id: Some(1),
+            authority: fixture_replica_authority(1),
         }))
         .await
         .unwrap()
@@ -1020,9 +1113,10 @@ async fn replicate_doc_delete_via_grpc() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("integ-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
-    setup_single_node_cluster_state(&cm, "rep-del-idx");
+    setup_replica_target_state(&cm, "rep-del-idx", 1);
+    install_recovered_replica_fixture(&cm, &sm, "rep-del-idx");
 
-    let addr = start_grpc_server(cm, sm.clone()).await;
+    let addr = start_replica_grpc_server(cm, sm.clone()).await;
     let mut client = connect_client(addr).await;
 
     // Index a doc first
@@ -1040,6 +1134,7 @@ async fn replicate_doc_delete_via_grpc() {
             target_allocation_id: Some(1),
             document_version: Some(2),
             client_operation: None,
+            authority: fixture_replica_authority(1),
         }))
         .await
         .unwrap();
@@ -1058,6 +1153,7 @@ async fn replicate_doc_delete_via_grpc() {
             target_allocation_id: Some(1),
             document_version: Some(2),
             client_operation: None,
+            authority: fixture_replica_authority(1),
         }))
         .await
         .unwrap()
@@ -1085,9 +1181,10 @@ async fn replicate_bulk_via_grpc() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("integ-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
-    setup_single_node_cluster_state(&cm, "bulk-rep-idx");
+    setup_replica_target_state(&cm, "bulk-rep-idx", 1);
+    install_recovered_replica_fixture(&cm, &sm, "bulk-rep-idx");
 
-    let addr = start_grpc_server(cm, sm.clone()).await;
+    let addr = start_replica_grpc_server(cm, sm.clone()).await;
     let mut client = connect_client(addr).await;
 
     // ReplicateBulkRequest uses repeated ReplicateDocRequest as ops
@@ -1104,6 +1201,7 @@ async fn replicate_bulk_via_grpc() {
             target_allocation_id: Some(1),
             document_version: Some(i + 1),
             client_operation: None,
+            authority: fixture_replica_authority(1),
         })
         .collect();
 
@@ -1115,6 +1213,7 @@ async fn replicate_bulk_via_grpc() {
             index_uuid: "bulk-rep-idx-uuid".into(),
             primary_term: Some(1),
             target_allocation_id: Some(1),
+            authority: fixture_replica_authority(1),
         }))
         .await
         .unwrap()
@@ -1407,6 +1506,7 @@ async fn replica_apply_rejects_uuid_allocation_term_and_missing_identity_fields(
         target_allocation_id: allocation_id,
         document_version: Some(1),
         client_operation: None,
+        authority: fixture_replica_authority(primary_term.unwrap_or(3)),
     };
 
     for invalid in [
@@ -1447,17 +1547,9 @@ async fn replica_apply_rejects_uuid_allocation_term_and_missing_identity_fields(
 async fn replica_fence_is_persisted_before_ack_and_restored_on_restart() {
     let dir = tempfile::tempdir().unwrap();
     let first_cm = Arc::new(ClusterManager::new("durable-fence".into()));
-    setup_replica_target_state(&first_cm, "durable-fence", 1);
+    setup_replica_target_state(&first_cm, "durable-fence", 3);
     let first_shards = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
-    first_shards
-        .open_shard_with_settings(
-            "durable-fence",
-            0,
-            &HashMap::new(),
-            &ferrissearch::cluster::state::IndexSettings::default(),
-            "durable-fence-uuid",
-        )
-        .unwrap();
+    install_recovered_replica_fixture(&first_cm, &first_shards, "durable-fence");
     let (first_address, first_server) =
         start_grpc_server_for_node_with_handle(first_cm, first_shards.clone(), "replica-node")
             .await;
@@ -1475,6 +1567,7 @@ async fn replica_fence_is_persisted_before_ack_and_restored_on_restart() {
             target_allocation_id: Some(1),
             document_version: Some(1),
             client_operation: None,
+            authority: fixture_replica_authority(3),
         }))
         .await
         .unwrap()
@@ -1487,6 +1580,10 @@ async fn replica_fence_is_persisted_before_ack_and_restored_on_restart() {
             .replica_fence,
         3
     );
+    let original_history = first_shards
+        .copy_identity("durable-fence", 0)
+        .unwrap()
+        .canonical_history;
     drop(first_client);
     first_server.abort();
     let _ = first_server.await;
@@ -1513,17 +1610,22 @@ async fn replica_fence_is_persisted_before_ack_and_restored_on_restart() {
             target_allocation_id: Some(1),
             document_version: Some(2),
             client_operation: None,
+            authority: fixture_replica_authority(1),
         }))
         .await
         .unwrap()
         .into_inner();
     assert!(!rejected.success);
     assert!(
-        rejected.error.contains("below local fence"),
+        rejected.error.contains("durable certificate and fence"),
         "{}",
         rejected.error
     );
+    let restored_identity = restarted_shards.copy_identity("durable-fence", 0).unwrap();
+    assert_eq!(restored_identity.replica_fence, 3);
+    assert_eq!(restored_identity.canonical_history, original_history);
     let engine = restarted_shards.get_shard("durable-fence", 0).unwrap();
+    assert_eq!(engine.sequence_stats().max_seq_no, Some(0));
     assert!(engine.get_document("new-term").unwrap().is_some());
     assert!(
         engine
@@ -1537,17 +1639,10 @@ async fn replica_fence_is_persisted_before_ack_and_restored_on_restart() {
 async fn bulk_replication_validates_common_identity_before_first_mutation() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("bulk-fence".into()));
-    setup_replica_target_state(&cm, "bulk-fence", 1);
+    setup_replica_target_state(&cm, "bulk-fence", 2);
     let shards = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
-    shards
-        .open_shard_with_settings(
-            "bulk-fence",
-            0,
-            &HashMap::new(),
-            &ferrissearch::cluster::state::IndexSettings::default(),
-            "bulk-fence-uuid",
-        )
-        .unwrap();
+    install_recovered_replica_fixture(&cm, &shards, "bulk-fence");
+    let before_identity = shards.copy_identity("bulk-fence", 0).unwrap();
     let address = start_grpc_server_for_node(cm, shards.clone(), "replica-node").await;
     let mut client = connect_client(address).await;
     let operation = |doc_id: &str, seq_no: u64, allocation_id: u64| ReplicateDocRequest {
@@ -1562,6 +1657,7 @@ async fn bulk_replication_validates_common_identity_before_first_mutation() {
         target_allocation_id: Some(allocation_id),
         document_version: Some(seq_no + 1),
         client_operation: None,
+        authority: fixture_replica_authority(2),
     };
     let missing_term = client
         .replicate_bulk(tonic::Request::new(ReplicateBulkRequest {
@@ -1571,6 +1667,7 @@ async fn bulk_replication_validates_common_identity_before_first_mutation() {
             index_uuid: "bulk-fence-uuid".into(),
             primary_term: None,
             target_allocation_id: Some(1),
+            authority: fixture_replica_authority(2),
         }))
         .await
         .unwrap_err();
@@ -1586,6 +1683,7 @@ async fn bulk_replication_validates_common_identity_before_first_mutation() {
             index_uuid: "bulk-fence-uuid".into(),
             primary_term: Some(2),
             target_allocation_id: Some(1),
+            authority: fixture_replica_authority(2),
         }))
         .await
         .unwrap_err();
@@ -1600,9 +1698,9 @@ async fn bulk_replication_validates_common_identity_before_first_mutation() {
             .is_empty()
     );
     assert_eq!(
-        shards.copy_identity("bulk-fence", 0).unwrap().replica_fence,
-        1,
-        "invalid bulk must not raise the fence before envelope validation completes"
+        shards.copy_identity("bulk-fence", 0).unwrap(),
+        before_identity,
+        "invalid bulk must not change durable authority before envelope validation completes"
     );
 }
 
@@ -1681,7 +1779,10 @@ async fn join_existing_raft_voter_via_grpc() {
     assert!(join_resp.state.is_some());
     let state = join_resp.state.unwrap();
     assert_eq!(state.cluster_name, "cluster-test");
-    assert_eq!(state.format_version, 1);
+    assert_eq!(
+        state.format_version,
+        ferrissearch::cluster::state::CLUSTER_STATE_FORMAT_VERSION
+    );
     assert!(state.nodes.iter().any(|n| n.id == "node-1"));
 
     let cs = cm.get_state();
@@ -1709,6 +1810,7 @@ async fn primary_write_replicates_to_replica_node() {
 
     setup_two_node_cluster_state(
         &primary_cm,
+        &primary_sm,
         &replica_cm,
         "replicated-idx",
         replica_addr.port(),
@@ -1783,6 +1885,7 @@ async fn reserved_source_never_mutates_primary_or_replica() {
 
     setup_two_node_cluster_state(
         &primary_cm,
+        &primary_sm,
         &replica_cm,
         "reserved-source-idx",
         replica_addr.port(),
@@ -1893,6 +1996,7 @@ async fn out_of_sync_replica_receives_no_live_writes_and_cannot_fail_them() {
     ));
     setup_two_node_cluster_state_with_membership(
         &primary_cm,
+        &primary_sm,
         &replica_cm,
         "out-of-sync-idx",
         replica_addr.port(),
@@ -1964,6 +2068,7 @@ async fn unreachable_in_sync_replica_still_fails_live_write() {
     ));
     setup_two_node_cluster_state(
         &primary_cm,
+        &primary_sm,
         &replica_cm,
         "required-replica-idx",
         unreachable_port,
@@ -1985,10 +2090,18 @@ async fn unreachable_in_sync_replica_still_fails_live_write() {
 
     assert!(!response.success);
     assert!(
-        response.error.contains("Replication failed"),
+        response.error.contains("replica-node") && response.error.contains("transport error"),
         "{}",
         response.error
     );
+    let failure = response.failure.unwrap();
+    assert_eq!(
+        failure.outcome,
+        proto::WriteFailureOutcome::Indeterminate as i32
+    );
+    assert_eq!(failure.error_type, "write_outcome_unknown");
+    assert_eq!(failure.seq_no, Some(0));
+    assert_eq!(response.seq_no, failure.seq_no);
 }
 
 #[tokio::test]
@@ -2010,6 +2123,7 @@ async fn primary_delete_replicates_to_replica_node() {
 
     setup_two_node_cluster_state(
         &primary_cm,
+        &primary_sm,
         &replica_cm,
         "del-repl-idx",
         replica_addr.port(),
@@ -2080,6 +2194,7 @@ async fn primary_bulk_replicates_to_replica_node() {
 
     setup_two_node_cluster_state(
         &primary_cm,
+        &primary_sm,
         &replica_cm,
         "bulk-repl-idx",
         replica_addr.port(),
@@ -3506,9 +3621,10 @@ async fn replicate_doc_returns_sequence_proof() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("integ-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
-    setup_single_node_cluster_state(&cm, "cp-idx");
+    setup_replica_target_state(&cm, "cp-idx", 1);
+    install_recovered_replica_fixture(&cm, &sm, "cp-idx");
 
-    let addr = start_grpc_server(cm, sm.clone()).await;
+    let addr = start_replica_grpc_server(cm, sm.clone()).await;
     let mut client = connect_client(addr).await;
 
     // A higher sequence can be processed without advancing the contiguous checkpoint.
@@ -3526,6 +3642,7 @@ async fn replicate_doc_returns_sequence_proof() {
             target_allocation_id: Some(1),
             document_version: Some(1),
             client_operation: None,
+            authority: fixture_replica_authority(1),
         }))
         .await
         .unwrap()
@@ -3553,6 +3670,7 @@ async fn replicate_doc_returns_sequence_proof() {
                 target_allocation_id: Some(1),
                 document_version: Some(1),
                 client_operation: None,
+                authority: fixture_replica_authority(1),
             }))
             .await
             .unwrap()
@@ -3579,6 +3697,7 @@ async fn replicate_doc_returns_sequence_proof() {
             target_allocation_id: Some(1),
             document_version: Some(1),
             client_operation: None,
+            authority: fixture_replica_authority(1),
         }))
         .await
         .unwrap()
@@ -3602,6 +3721,7 @@ async fn replicate_doc_returns_sequence_proof() {
                 target_allocation_id: Some(1),
                 document_version: Some(1),
                 client_operation: None,
+                authority: fixture_replica_authority(1),
             }))
             .await
             .unwrap()
@@ -3617,9 +3737,10 @@ async fn replicate_bulk_returns_sequence_proof() {
     let dir = tempfile::tempdir().unwrap();
     let cm = Arc::new(ClusterManager::new("integ-test".into()));
     let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
-    setup_single_node_cluster_state(&cm, "bulk-cp-idx");
+    setup_replica_target_state(&cm, "bulk-cp-idx", 1);
+    install_recovered_replica_fixture(&cm, &sm, "bulk-cp-idx");
 
-    let addr = start_grpc_server(cm, sm).await;
+    let addr = start_replica_grpc_server(cm, sm).await;
     let mut client = connect_client(addr).await;
 
     let ops: Vec<ReplicateDocRequest> = (0..3)
@@ -3635,6 +3756,7 @@ async fn replicate_bulk_returns_sequence_proof() {
             target_allocation_id: Some(1),
             document_version: Some(i as u64 + 1),
             client_operation: None,
+            authority: fixture_replica_authority(1),
         })
         .collect();
 
@@ -3646,6 +3768,7 @@ async fn replicate_bulk_returns_sequence_proof() {
             index_uuid: "bulk-cp-idx-uuid".into(),
             primary_term: Some(1),
             target_allocation_id: Some(1),
+            authority: fixture_replica_authority(1),
         }))
         .await
         .unwrap()
@@ -3673,8 +3796,9 @@ async fn async_replica_response_separates_processed_from_persisted() {
             sync_interval_ms: 3_600_000,
         },
     ));
-    setup_single_node_cluster_state(&cm, "async-proof-idx");
-    let addr = start_grpc_server(cm, sm).await;
+    setup_replica_target_state(&cm, "async-proof-idx", 1);
+    install_recovered_replica_fixture(&cm, &sm, "async-proof-idx");
+    let addr = start_replica_grpc_server(cm, sm).await;
     let mut client = connect_client(addr).await;
 
     let response = client
@@ -3690,6 +3814,7 @@ async fn async_replica_response_separates_processed_from_persisted() {
             target_allocation_id: Some(1),
             document_version: Some(1),
             client_operation: None,
+            authority: fixture_replica_authority(1),
         }))
         .await
         .unwrap()
@@ -3775,7 +3900,13 @@ async fn primary_write_advances_global_checkpoint() {
         Duration::from_secs(60),
     ));
 
-    setup_two_node_cluster_state(&primary_cm, &replica_cm, "gc-idx", replica_addr.port());
+    setup_two_node_cluster_state(
+        &primary_cm,
+        &primary_sm,
+        &replica_cm,
+        "gc-idx",
+        replica_addr.port(),
+    );
     install_recovered_replica_fixture(&replica_cm, &replica_sm, "gc-idx");
 
     let primary_addr = start_primary_grpc_server(primary_cm, primary_sm.clone()).await;
@@ -3838,6 +3969,7 @@ async fn writes_regression_conditional_rest_updates_and_mixed_bulk_keep_replica_
     .await;
     setup_two_node_cluster_state(
         &primary_cm,
+        &primary_sm,
         &replica_cm,
         "writes-replicated",
         replica_addr.port(),
@@ -4035,7 +4167,13 @@ async fn gcp_transport_rejects_checkpoint_observations_from_previous_copy_author
             "replica-node",
         )
         .await;
-        setup_two_node_cluster_state(&primary_cm, &replica_cm, index, replica_addr.port());
+        setup_two_node_cluster_state(
+            &primary_cm,
+            &primary_sm,
+            &replica_cm,
+            index,
+            replica_addr.port(),
+        );
         for manager in [&primary_cm, &replica_cm] {
             let mut state = manager.get_state();
             let metadata = state.indices.get_mut(index).unwrap();
@@ -4048,8 +4186,20 @@ async fn gcp_transport_rejects_checkpoint_observations_from_previous_copy_author
                     dimension: None,
                 },
             );
+            certify_empty_fixture_authority(&mut state, index);
             manager.update_state(state);
         }
+        primary_sm
+            .raise_copy_fence_blocking(
+                index.into(),
+                0,
+                primary_cm.get_state().indices[index].uuid.to_string(),
+                1,
+                2,
+            )
+            .await
+            .unwrap();
+        install_canonical_fixture_copy(&primary_cm, &primary_sm, index, "primary-node");
         install_recovered_replica_fixture(&replica_cm, &replica_sm, index);
         primary_sm.isr_tracker.update_replica_checkpoint(
             index,
@@ -4138,6 +4288,7 @@ async fn two_replica_checkpoint_cluster(
     dirs.push(primary_dir);
     setup_two_node_cluster_state(
         &primary_manager,
+        &primary_shards,
         &replica_managers[0].0,
         index,
         replica_ports[0],
@@ -4184,17 +4335,19 @@ async fn two_replica_checkpoint_cluster(
     ] {
         manager.update_state(state.clone());
     }
-    let metadata = &state.indices[index];
-    for (_, shards) in &replica_managers {
-        shards
-            .open_shard_with_settings(
-                index,
-                0,
-                &metadata.mappings,
-                &metadata.settings,
-                metadata.uuid.as_str(),
-            )
-            .unwrap();
+    primary_shards.apply_settings(index, &state.indices[index].settings);
+    assert_eq!(
+        primary_shards
+            .get_settings_manager(index)
+            .unwrap()
+            .refresh_interval(),
+        Duration::from_secs(3600)
+    );
+    for ((manager, shards), node) in replica_managers
+        .iter()
+        .zip(["replica-node", "replica-node-2"])
+    {
+        install_canonical_fixture_copy(manager, shards, index, node);
     }
     let (address, server) = start_grpc_server_for_node_with_handle(
         primary_manager,
@@ -4683,7 +4836,13 @@ async fn concurrent_primary_receipts_match_primary_and_replica_wal() {
         Duration::from_secs(60),
     ));
     let index = "receipt-index";
-    setup_two_node_cluster_state(&primary_cm, &replica_cm, index, replica_addr.port());
+    setup_two_node_cluster_state(
+        &primary_cm,
+        &primary_sm,
+        &replica_cm,
+        index,
+        replica_addr.port(),
+    );
     for manager in [&primary_cm, &replica_cm] {
         let mut state = manager.get_state();
         let metadata = state.indices.get_mut(index).unwrap();
@@ -4841,8 +5000,9 @@ async fn replicate_bulk_rejects_invalid_sequence_ranges_before_writing() {
     let manager = Arc::new(ClusterManager::new("replica-validation".into()));
     let shards = Arc::new(ShardManager::new(directory.path(), Duration::from_secs(60)));
     let index = "replica-validation";
-    setup_single_node_cluster_state(&manager, index);
-    let address = start_grpc_server(manager, shards.clone()).await;
+    setup_replica_target_state(&manager, index, 1);
+    install_recovered_replica_fixture(&manager, &shards, index);
+    let address = start_replica_grpc_server(manager, shards.clone()).await;
     let mut client = connect_client(address).await;
     let operation = |seq_no, op: &str| ReplicateDocRequest {
         index_name: index.into(),
@@ -4856,6 +5016,7 @@ async fn replicate_bulk_rejects_invalid_sequence_ranges_before_writing() {
         target_allocation_id: Some(1),
         document_version: Some(seq_no.saturating_add(1)),
         client_operation: None,
+        authority: fixture_replica_authority(1),
     };
     for ops in [
         vec![operation(10, "index"), operation(12, "index")],
@@ -4870,6 +5031,7 @@ async fn replicate_bulk_rejects_invalid_sequence_ranges_before_writing() {
                 index_uuid: format!("{index}-uuid"),
                 primary_term: Some(1),
                 target_allocation_id: Some(1),
+                authority: fixture_replica_authority(1),
             }))
             .await
             .unwrap_err();
@@ -4905,7 +5067,13 @@ async fn bulk_replication_advances_global_checkpoint() {
         primary_dir.path(),
         Duration::from_secs(60),
     ));
-    setup_two_node_cluster_state(&primary_cm, &replica_cm, "bgc-idx", replica_addr.port());
+    setup_two_node_cluster_state(
+        &primary_cm,
+        &primary_sm,
+        &replica_cm,
+        "bgc-idx",
+        replica_addr.port(),
+    );
     install_recovered_replica_fixture(&replica_cm, &replica_sm, "bgc-idx");
 
     let primary_addr = start_primary_grpc_server(primary_cm, primary_sm.clone()).await;
@@ -4966,7 +5134,13 @@ async fn delete_replication_advances_global_checkpoint() {
         primary_dir.path(),
         Duration::from_secs(60),
     ));
-    setup_two_node_cluster_state(&primary_cm, &replica_cm, "dgc-idx", replica_addr.port());
+    setup_two_node_cluster_state(
+        &primary_cm,
+        &primary_sm,
+        &replica_cm,
+        "dgc-idx",
+        replica_addr.port(),
+    );
     install_recovered_replica_fixture(&replica_cm, &replica_sm, "dgc-idx");
 
     let primary_addr = start_primary_grpc_server(primary_cm, primary_sm.clone()).await;
@@ -5029,7 +5203,13 @@ async fn isr_tracker_updated_after_replication() {
         primary_dir.path(),
         Duration::from_secs(60),
     ));
-    setup_two_node_cluster_state(&primary_cm, &replica_cm, "isr-idx", replica_addr.port());
+    setup_two_node_cluster_state(
+        &primary_cm,
+        &primary_sm,
+        &replica_cm,
+        "isr-idx",
+        replica_addr.port(),
+    );
     install_recovered_replica_fixture(&replica_cm, &replica_sm, "isr-idx");
 
     let primary_addr = start_primary_grpc_server(primary_cm, primary_sm.clone()).await;

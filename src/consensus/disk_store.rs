@@ -22,6 +22,8 @@ const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
 /// Log table: maps log index (u64) → JSON-serialized Entry.
 const LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("log");
+const RAFT_STORAGE_FORMAT_VERSION: u32 = 1;
+const RAFT_STORAGE_FORMAT_KEY: &str = "storage_format_version";
 
 // ─── DiskLogStore ───────────────────────────────────────────────────────────
 
@@ -34,6 +36,7 @@ pub struct DiskLogStore {
 impl DiskLogStore {
     /// Open (or create) a persistent log store at the given path.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let existing_database = path.as_ref().try_exists()?;
         let db = Database::create(path.as_ref())
             .map_err(|e| io::Error::other(format!("redb open: {e}")))?;
 
@@ -42,9 +45,44 @@ impl DiskLogStore {
             let tx = db
                 .begin_write()
                 .map_err(|e| io::Error::other(format!("redb write: {e}")))?;
-            let _ = tx
-                .open_table(META_TABLE)
-                .map_err(|e| io::Error::other(format!("redb table: {e}")))?;
+            {
+                let mut meta = tx
+                    .open_table(META_TABLE)
+                    .map_err(|e| io::Error::other(format!("redb table: {e}")))?;
+                let format_error = |reason| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        crate::consensus::UnsupportedRaftFormatError::new(
+                            "Raft storage format",
+                            reason,
+                        ),
+                    )
+                };
+                if existing_database {
+                    let version = meta
+                        .get(RAFT_STORAGE_FORMAT_KEY)
+                        .map_err(Self::io_err)?
+                        .ok_or_else(|| {
+                            format_error("persistent format marker is missing".to_string())
+                        })?;
+                    let version: u32 =
+                        serde_json::from_slice(version.value()).map_err(|error| {
+                            format_error(format!("cannot decode persistent format marker: {error}"))
+                        })?;
+                    if version != RAFT_STORAGE_FORMAT_VERSION {
+                        return Err(format_error(format!(
+                            "version {version} is unsupported; expected {RAFT_STORAGE_FORMAT_VERSION}",
+                        )));
+                    }
+                } else {
+                    let version =
+                        serde_json::to_vec(&RAFT_STORAGE_FORMAT_VERSION).map_err(|error| {
+                            Self::io_err(format!("encode persistent format marker: {error}"))
+                        })?;
+                    meta.insert(RAFT_STORAGE_FORMAT_KEY, version.as_slice())
+                        .map_err(Self::io_err)?;
+                }
+            }
             let _ = tx
                 .open_table(LOG_TABLE)
                 .map_err(|e| io::Error::other(format!("redb table: {e}")))?;
