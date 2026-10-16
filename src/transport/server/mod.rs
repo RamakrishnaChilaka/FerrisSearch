@@ -2701,6 +2701,46 @@ impl InternalTransport for TransportService {
         Ok(Response::new(RemoteStoreSearchResponse { results }))
     }
 
+    async fn commit_remote_store_publication(
+        &self,
+        request: Request<RemoteStorePublishCommitRequest>,
+    ) -> Result<Response<RemoteStorePublishCommitResponse>, Status> {
+        self.wait_for_forwarded_state(
+            &request,
+            Some(&request.get_ref().index_name),
+            None,
+            Some(&request.get_ref().index_uuid),
+        )
+        .await?;
+        let req = request.into_inner();
+        let raft = self
+            .raft
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("Raft not initialised on this node"))?;
+        let payload: crate::engine::remote_store::ForwardedSequencerCommitRequest =
+            serde_json::from_slice(&req.request_json).map_err(|error| {
+                Status::invalid_argument(format!(
+                    "invalid ForwardedSequencerCommitRequest JSON: {error}"
+                ))
+            })?;
+        let outcome = crate::engine::remote_store::execute_local_sequencer_commit(
+            &self.cluster_manager,
+            &self.transport_client,
+            raft,
+            &self.storage_manager,
+            &self.local_node_id,
+            &req.index_name,
+            &req.index_uuid,
+            &payload,
+        )
+        .await;
+        let result_json = serde_json::to_vec(&outcome)
+            .map_err(|error| Status::internal(format!("encode sequencer result: {error}")))?;
+        Ok(Response::new(RemoteStorePublishCommitResponse {
+            result_json,
+        }))
+    }
+
     async fn sql_record_batch(
         &self,
         request: Request<SqlRecordBatchRequest>,

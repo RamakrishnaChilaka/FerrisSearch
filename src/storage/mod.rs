@@ -34,6 +34,9 @@ use tokio::sync::Mutex;
 use url::Url;
 
 mod conditional;
+pub mod inventory;
+pub mod janitor;
+pub mod publication;
 
 #[cfg(test)]
 use conditional::LocalCasCrashStage;
@@ -42,6 +45,30 @@ pub use conditional::{
     CompareAndSwapOutcome, CompareToken, ConditionalRead, ConditionalStorageError,
     CreateImmutableOutcome, ImmutableObjectIdentity, PublicationCapabilityStatus,
     run_shared_conditional_race_and_contract_suite,
+};
+pub use inventory::{
+    DEFAULT_INVENTORY_ACTIVE_GRACE_MS, DEFAULT_INVENTORY_MAX_REPORTED_OBJECTS,
+    DEFAULT_INVENTORY_RETENTION_GENERATIONS, DEFAULT_INVENTORY_RETENTION_HORIZON_MS,
+    InventoryObjectEntry, InventoryObjectKind, InventorySummaryCounts, ObjectReachabilityClass,
+    ReachabilityInventoryOptions, ReachabilityInventoryReport,
+};
+pub use janitor::{
+    DEFAULT_JANITOR_MAX_DELETE_BYTES_PER_RUN, DEFAULT_JANITOR_MAX_DELETES_PER_RUN,
+    DEFAULT_JANITOR_SWEEP_GRACE_MS, JANITOR_MARKS_FORMAT_VERSION, JanitorCandidateAction,
+    JanitorCandidateDecision, JanitorMarkEntry, JanitorMarksDocument, JanitorOptions,
+    JanitorRunReport, janitor_marks_key,
+};
+pub use publication::{
+    FormatCapability, MAX_LINEAGE_WALK_GENERATIONS, PUBLICATION_RECORD_FORMAT_CAPABILITY,
+    PUBLICATION_RECORD_FORMAT_VERSION, PublicationAttemptOutcome, PublicationAttemptRecord,
+    PublicationCommitOutcome, PublicationCommittedRecord, PublicationCrashStage, PublicationError,
+    PublicationIntentRecord, PublicationPhase, PublicationPreparedRecord, PublicationResolution,
+    REMOTE_MANIFEST_FORMAT_CAPABILITY, REMOTE_MANIFEST_POINTER_FORMAT_CAPABILITY,
+    SPLIT_BUNDLE_FORMAT_CAPABILITY, SPLIT_BUNDLE_FORMAT_VERSION, SequencerCommitRequest,
+    compute_publication_request_fingerprint, deterministic_publication_doc_id,
+    deterministic_publication_split_id, is_canonical_manifest_path, is_canonical_split_bundle_path,
+    manifest_operation_key, publication_attempt_key, publication_committed_key,
+    publication_intent_key, publication_prepared_key, validate_publication_operation_id,
 };
 
 /// Directory name used under `<data_dir>/` for the node-local remote_store root.
@@ -59,8 +86,10 @@ pub const REMOTE_STORE_STAGING_DIR_NAME: &str = "_remote_store_staging";
 /// `FSBND` + version byte. Bumping the version byte reserves room for a
 /// future format change without needing a separate checksum scheme.
 const BUNDLE_MAGIC: &[u8; 6] = b"FSBND\x01";
-pub const REMOTE_MANIFEST_FORMAT_VERSION: u32 = 2;
-pub const REMOTE_MANIFEST_POINTER_FORMAT_VERSION: u32 = 2;
+pub const REMOTE_MANIFEST_MIN_READ_FORMAT_VERSION: u32 = 2;
+pub const REMOTE_MANIFEST_FORMAT_VERSION: u32 = 3;
+pub const REMOTE_MANIFEST_POINTER_MIN_READ_FORMAT_VERSION: u32 = 2;
+pub const REMOTE_MANIFEST_POINTER_FORMAT_VERSION: u32 = 3;
 
 /// Backend behind a `StorageManager`. Remote backends have no local root.
 #[derive(Debug, Clone)]
@@ -174,12 +203,19 @@ pub struct StorageManager {
     /// extract operations against the local cache. Key format:
     /// `"<index_uuid>/<split_id>"`.
     split_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// Per-index async mutex used by the active sequencer to serialize
+    /// single-sequencer manifest commits on this node.
+    sequencer_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     cache_entries: Arc<StdMutex<HashMap<String, CachedSplitEntry>>>,
     pin_counts: Arc<StdMutex<HashMap<String, usize>>>,
     remote_store_inflight_bytes: Arc<AtomicU64>,
     remote_store_queue_depth: Arc<AtomicUsize>,
     capability_state: Arc<StdMutex<CapabilityProbeState>>,
     capability_probe_lock: Arc<Mutex<()>>,
+    cached_writer_authorities:
+        Arc<StdMutex<HashMap<String, crate::cluster::state::ManifestWriterAuthority>>>,
+    publication_crash_stage: Arc<StdMutex<Option<PublicationCrashStage>>>,
+    janitor_fail_delete_paths: Arc<StdMutex<HashSet<String>>>,
     #[cfg(test)]
     local_cas_crash_stage: Arc<StdMutex<Option<LocalCasCrashStage>>>,
 }
@@ -247,12 +283,16 @@ impl StorageManager {
             local_workdir,
             publish_lock: Arc::new(Mutex::new(())),
             split_locks: Arc::new(Mutex::new(HashMap::new())),
+            sequencer_locks: Arc::new(Mutex::new(HashMap::new())),
             cache_entries: Arc::new(StdMutex::new(HashMap::new())),
             pin_counts: Arc::new(StdMutex::new(HashMap::new())),
             remote_store_inflight_bytes: Arc::new(AtomicU64::new(0)),
             remote_store_queue_depth: Arc::new(AtomicUsize::new(0)),
             capability_state: Arc::new(StdMutex::new(initial_capability)),
             capability_probe_lock: Arc::new(Mutex::new(())),
+            cached_writer_authorities: Arc::new(StdMutex::new(HashMap::new())),
+            publication_crash_stage: Arc::new(StdMutex::new(None)),
+            janitor_fail_delete_paths: Arc::new(StdMutex::new(HashSet::new())),
             #[cfg(test)]
             local_cas_crash_stage: Arc::new(StdMutex::new(None)),
         })
@@ -282,12 +322,16 @@ impl StorageManager {
             local_workdir,
             publish_lock: Arc::new(Mutex::new(())),
             split_locks: Arc::new(Mutex::new(HashMap::new())),
+            sequencer_locks: Arc::new(Mutex::new(HashMap::new())),
             cache_entries: Arc::new(StdMutex::new(HashMap::new())),
             pin_counts: Arc::new(StdMutex::new(HashMap::new())),
             remote_store_inflight_bytes: Arc::new(AtomicU64::new(0)),
             remote_store_queue_depth: Arc::new(AtomicUsize::new(0)),
             capability_state: Arc::new(StdMutex::new(initial_capability)),
             capability_probe_lock: Arc::new(Mutex::new(())),
+            cached_writer_authorities: Arc::new(StdMutex::new(HashMap::new())),
+            publication_crash_stage: Arc::new(StdMutex::new(None)),
+            janitor_fail_delete_paths: Arc::new(StdMutex::new(HashSet::new())),
             #[cfg(test)]
             local_cas_crash_stage: Arc::new(StdMutex::new(None)),
         })
@@ -564,7 +608,12 @@ impl StorageManager {
         split: &RemoteSplitManifest,
     ) -> Result<PathBuf> {
         let expected_key = Self::split_bundle_key(index_uuid, &split.split_id);
-        if split.bundle_path != expected_key {
+        let op_id = split
+            .tags
+            .get("operation_id")
+            .map(String::as_str)
+            .unwrap_or("");
+        if !is_canonical_split_bundle_path(index_uuid, &split.split_id, op_id, &split.bundle_path) {
             anyhow::bail!(
                 "bundle_path {} does not match canonical key {} for split {}",
                 split.bundle_path,
@@ -677,7 +726,12 @@ impl StorageManager {
         split: &RemoteSplitManifest,
     ) -> Result<String> {
         let expected_key = Self::split_bundle_key(index_uuid, &split.split_id);
-        if split.bundle_path != expected_key {
+        let op_id = split
+            .tags
+            .get("operation_id")
+            .map(String::as_str)
+            .unwrap_or("");
+        if !is_canonical_split_bundle_path(index_uuid, &split.split_id, op_id, &split.bundle_path) {
             anyhow::bail!(
                 "bundle_path {} does not match canonical key {} for split {}",
                 split.bundle_path,
@@ -833,7 +887,7 @@ impl StorageManager {
     /// Load the mutable manifest pointer for an index.
     ///
     /// Returns `Ok(None)` when the pointer does not exist (fresh/empty index).
-    /// Corrupt JSON or object-store errors surface as `Err`.
+    /// Corrupt JSON, unsupported versions, or invalid pointer fields surface as `Err`.
     pub async fn load_manifest_pointer(
         &self,
         index_uuid: &str,
@@ -857,20 +911,148 @@ impl StorageManager {
                             format!("cannot decode current format at {location}: {error}"),
                         )
                     })?;
-                if pointer.version != REMOTE_MANIFEST_POINTER_FORMAT_VERSION {
-                    return Err(crate::common::unsupported_index_format(
-                        "remote manifest pointer",
-                        format!(
-                            "version {} is not supported; expected {}",
-                            pointer.version, REMOTE_MANIFEST_POINTER_FORMAT_VERSION
-                        ),
-                    ));
-                }
+                pointer.validate_for_index(index_uuid)?;
                 Ok(Some(pointer))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(err) => Err(anyhow::Error::from(err)),
         }
+    }
+
+    pub(crate) async fn load_manifest_at_path(
+        &self,
+        index_uuid: &str,
+        manifest_path: &str,
+        expected_generation: u64,
+        expected_schema_hash: Option<&str>,
+    ) -> Result<(RemoteStoreManifest, String)> {
+        if !is_canonical_manifest_path(index_uuid, expected_generation, None, manifest_path) {
+            anyhow::bail!(
+                "manifest_path '{manifest_path}' is not a canonical manifest key for index '{index_uuid}' generation {expected_generation}"
+            );
+        }
+        let location = self.object_path(manifest_path)?;
+        let result = self.get_object(&location).await.with_context(|| {
+            format!("manifest generation {expected_generation} not found at {location}")
+        })?;
+        let bytes = match result.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                crate::metrics::record_object_store_request("get", "error");
+                return Err(anyhow::Error::from(error));
+            }
+        };
+        crate::metrics::record_object_store_request("get", "success");
+        crate::metrics::record_object_store_transfer("download", bytes.len());
+        let actual_checksum = publication::sha256_prefixed(&bytes);
+        let manifest: RemoteStoreManifest = serde_json::from_slice(&bytes).map_err(|error| {
+            crate::common::unsupported_index_format(
+                "remote store manifest",
+                format!("cannot decode current format at {location}: {error}"),
+            )
+        })?;
+        manifest.validate_for_read(index_uuid, expected_generation, expected_schema_hash)?;
+        if manifest.version >= 3
+            && !is_canonical_manifest_path(
+                index_uuid,
+                expected_generation,
+                Some(&manifest.operation_id),
+                manifest_path,
+            )
+        {
+            anyhow::bail!(
+                "manifest_path '{}' does not match operation_id '{}' for generation {}",
+                manifest_path,
+                manifest.operation_id,
+                expected_generation
+            );
+        }
+        Ok((manifest, actual_checksum))
+    }
+
+    pub(crate) async fn load_manifest_for_pointer(
+        &self,
+        index_uuid: &str,
+        pointer: &RemoteManifestPointer,
+        expected_schema_hash: Option<&str>,
+    ) -> Result<RemoteStoreManifest> {
+        pointer.validate_for_index(index_uuid)?;
+        if pointer.current_generation == 0 {
+            anyhow::bail!(
+                "cannot load manifest for generation-0 empty pointer on index '{index_uuid}'"
+            );
+        }
+        let (manifest, actual_checksum) = self
+            .load_manifest_at_path(
+                index_uuid,
+                &pointer.manifest_path,
+                pointer.current_generation,
+                expected_schema_hash,
+            )
+            .await?;
+        pointer.validate_manifest_agreement(&manifest, &actual_checksum)?;
+        Ok(manifest)
+    }
+
+    pub async fn verify_manifest_lineage_chain(
+        &self,
+        index_uuid: &str,
+        head: &RemoteStoreManifest,
+        expected_schema_hash: Option<&str>,
+    ) -> Result<()> {
+        let mut current = head.clone();
+        let mut steps = 0usize;
+        while current.parent_generation > 0 {
+            steps += 1;
+            if steps > MAX_LINEAGE_WALK_GENERATIONS {
+                anyhow::bail!(
+                    "manifest lineage chain exceeded {MAX_LINEAGE_WALK_GENERATIONS} generations for index '{index_uuid}'"
+                );
+            }
+            let Some(ref parent_path) = current.parent_manifest_path else {
+                anyhow::bail!(
+                    "manifest generation {} for index '{}' is missing parent_manifest_path for parent_generation {}",
+                    current.generation,
+                    index_uuid,
+                    current.parent_generation
+                );
+            };
+            let (parent, _) = self
+                .load_manifest_at_path(
+                    index_uuid,
+                    parent_path,
+                    current.parent_generation,
+                    expected_schema_hash,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "broken manifest lineage for index '{}' at generation {}: parent generation {} at '{}' could not be loaded",
+                        index_uuid, current.generation, current.parent_generation, parent_path
+                    )
+                })?;
+            if parent.writer_epoch > current.writer_epoch {
+                anyhow::bail!(
+                    "broken manifest lineage for index '{}': parent generation {} has writer_epoch {} > child generation {} writer_epoch {}",
+                    index_uuid,
+                    parent.generation,
+                    parent.writer_epoch,
+                    current.generation,
+                    current.writer_epoch
+                );
+            }
+            if parent.schema_generation > current.schema_generation {
+                anyhow::bail!(
+                    "broken manifest lineage for index '{}': parent generation {} has schema_generation {} > child schema_generation {}",
+                    index_uuid,
+                    parent.generation,
+                    parent.schema_generation,
+                    current.schema_generation
+                );
+            }
+            current = parent;
+        }
+        Ok(())
     }
 
     /// Load the immutable manifest for a specific generation.
@@ -884,66 +1066,91 @@ impl StorageManager {
         generation: u64,
         expected_schema_hash: Option<&str>,
     ) -> Result<RemoteStoreManifest> {
-        let location = self.object_path(&manifest_generation_key(index_uuid, generation))?;
-        let result = self
-            .get_object(&location)
-            .await
-            .with_context(|| format!("manifest generation {generation} not found"))?;
-        let bytes = match result.bytes().await {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                crate::metrics::record_object_store_request("get", "error");
-                return Err(anyhow::Error::from(error));
+        let legacy_key = manifest_generation_key(index_uuid, generation);
+        let legacy_loc = self.object_path(&legacy_key)?;
+        match self.get_object(&legacy_loc).await {
+            Ok(result) => {
+                let bytes = match result.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        crate::metrics::record_object_store_request("get", "error");
+                        return Err(anyhow::Error::from(error));
+                    }
+                };
+                crate::metrics::record_object_store_request("get", "success");
+                crate::metrics::record_object_store_transfer("download", bytes.len());
+                let manifest: RemoteStoreManifest =
+                    serde_json::from_slice(&bytes).map_err(|error| {
+                        crate::common::unsupported_index_format(
+                            "remote store manifest",
+                            format!("cannot decode current format at {legacy_loc}: {error}"),
+                        )
+                    })?;
+                manifest.validate_for_read(index_uuid, generation, expected_schema_hash)?;
+                return Ok(manifest);
             }
-        };
-        crate::metrics::record_object_store_request("get", "success");
-        crate::metrics::record_object_store_transfer("download", bytes.len());
-        let manifest: RemoteStoreManifest = serde_json::from_slice(&bytes).map_err(|error| {
-            crate::common::unsupported_index_format(
-                "remote store manifest",
-                format!("cannot decode current format at {location}: {error}"),
-            )
-        })?;
-        if manifest.version != REMOTE_MANIFEST_FORMAT_VERSION {
-            return Err(crate::common::unsupported_index_format(
-                "remote store manifest",
-                format!(
-                    "version {} is not supported; expected {}",
-                    manifest.version, REMOTE_MANIFEST_FORMAT_VERSION
-                ),
-            ));
-        }
-        if let Some(split) = manifest
-            .published_splits()
-            .find(|split| split.checksum.starts_with("sha256:pending:"))
-        {
-            return Err(crate::common::unsupported_index_format(
-                "remote store manifest",
-                format!("split '{}' contains a placeholder checksum", split.split_id),
-            ));
+            Err(object_store::Error::NotFound { .. }) => {}
+            Err(err) => return Err(anyhow::Error::from(err)),
         }
 
-        if manifest.generation != generation {
-            anyhow::bail!(
-                "manifest generation mismatch: pointer requested {}, payload declares {}",
-                generation,
-                manifest.generation
-            );
-        }
-        if let Some(expected) = expected_schema_hash
-            && manifest.schema_hash != expected
+        if let Ok(Some(pointer)) = self.load_manifest_pointer(index_uuid).await
+            && pointer.current_generation >= generation
+            && !pointer.manifest_path.is_empty()
         {
-            anyhow::bail!(
-                "manifest schema_hash mismatch: expected {}, payload declares {}",
-                expected,
-                manifest.schema_hash
-            );
+            if pointer.current_generation == generation {
+                return self
+                    .load_manifest_for_pointer(index_uuid, &pointer, expected_schema_hash)
+                    .await;
+            }
+            let mut next_path = Some(pointer.manifest_path.clone());
+            let mut expected_gen = pointer.current_generation;
+            let mut steps = 0usize;
+            while let Some(m_path) = next_path.take() {
+                steps += 1;
+                if steps > MAX_LINEAGE_WALK_GENERATIONS {
+                    break;
+                }
+                let Ok((manifest, _)) = self
+                    .load_manifest_at_path(index_uuid, &m_path, expected_gen, expected_schema_hash)
+                    .await
+                else {
+                    break;
+                };
+                if manifest.generation == generation {
+                    return Ok(manifest);
+                }
+                if manifest.parent_generation == 0 || manifest.parent_generation < generation {
+                    break;
+                }
+                expected_gen = manifest.parent_generation;
+                next_path = manifest.parent_manifest_path;
+            }
         }
-        Ok(manifest)
+
+        let gen_prefix = format!("{index_uuid}/manifests/{generation:012}");
+        let prefix_path = self.object_path(&gen_prefix)?;
+        let mut list_stream = self.object_store().list(Some(&prefix_path));
+        while let Some(item) = list_stream.next().await {
+            let meta = item?;
+            let path_str = meta.location.to_string();
+            if path_str.contains(".ferris.") && path_str.ends_with("#0") {
+                continue;
+            }
+            if path_str.ends_with(".json") {
+                let (manifest, _) = self
+                    .load_manifest_at_path(index_uuid, &path_str, generation, expected_schema_hash)
+                    .await?;
+                return Ok(manifest);
+            }
+        }
+
+        anyhow::bail!("manifest generation {generation} not found")
     }
 
-    /// Convenience: resolve the pointer and load the matching manifest.
-    /// Returns `Ok(None)` when the pointer does not exist.
+    /// Convenience: resolve the pointer, validate pointer-manifest agreement and
+    /// parent lineage, and load the matching manifest.
+    /// Returns `Ok(None)` when the pointer does not exist or is a generation-0
+    /// empty fenced pointer.
     pub async fn load_current_manifest(
         &self,
         index_uuid: &str,
@@ -952,8 +1159,13 @@ impl StorageManager {
         let Some(pointer) = self.load_manifest_pointer(index_uuid).await? else {
             return Ok(None);
         };
+        if pointer.current_generation == 0 {
+            return Ok(None);
+        }
         let manifest = self
-            .load_manifest(index_uuid, pointer.current_generation, expected_schema_hash)
+            .load_manifest_for_pointer(index_uuid, &pointer, expected_schema_hash)
+            .await?;
+        self.verify_manifest_lineage_chain(index_uuid, &manifest, expected_schema_hash)
             .await?;
         Ok(Some(manifest))
     }
@@ -973,7 +1185,7 @@ impl StorageManager {
         let current = self
             .load_manifest_pointer_with_token(&manifest.index_uuid)
             .await?;
-        self.publish_manifest_conditional(manifest, current.as_ref().map(|(_, token)| token))
+        self.publish_manifest_conditional(manifest, current.as_ref())
             .await
     }
 
@@ -997,7 +1209,7 @@ impl StorageManager {
         index_name: &str,
         schema_hash: &str,
         settings: Option<&crate::cluster::state::RemoteStoreSettings>,
-        new_split: RemoteSplitManifest,
+        mut new_split: RemoteSplitManifest,
     ) -> Result<RemoteStoreManifest> {
         let _guard = self.publish_lock.lock().await;
         self.ensure_publication_supported().await?;
@@ -1009,8 +1221,16 @@ impl StorageManager {
             .load_current_manifest_unchecked_with_token(index_uuid)
             .await?;
 
-        let (generation, mut splits, existing_settings, expected_token) = match current {
-            Some((existing, token)) => {
+        let (
+            generation,
+            parent_generation,
+            parent_manifest_path,
+            writer_epoch,
+            mut splits,
+            existing_settings,
+            expected_pointer,
+        ) = match current {
+            Some((Some(existing), pointer, token)) => {
                 if existing.schema_hash != schema_hash {
                     anyhow::bail!(
                         "schema_hash mismatch while appending split: manifest={} local={}",
@@ -1020,12 +1240,24 @@ impl StorageManager {
                 }
                 (
                     existing.generation + 1,
+                    existing.generation,
+                    Some(pointer.manifest_path.clone()),
+                    pointer.writer_epoch.max(existing.writer_epoch).max(1),
                     existing.splits,
                     existing.settings,
-                    Some(token),
+                    Some((pointer, token)),
                 )
             }
-            None => (1, Vec::new(), None, None),
+            Some((None, pointer, token)) => (
+                1,
+                0,
+                None,
+                pointer.writer_epoch.max(1),
+                Vec::new(),
+                None,
+                Some((pointer, token)),
+            ),
+            None => (1, 0, None, 1, Vec::new(), None, None),
         };
 
         // Reject duplicate split_id within the same manifest — `published_splits`
@@ -1037,6 +1269,18 @@ impl StorageManager {
                 index_uuid
             );
         }
+        let operation_id = format!("op-gen-{generation}-{}", new_split.split_id);
+        let request_fingerprint = publication::sha256_prefixed(
+            format!(
+                "{index_uuid}:{schema_hash}:{operation_id}:{}",
+                new_split.checksum
+            )
+            .as_bytes(),
+        );
+        new_split
+            .tags
+            .entry("operation_id".into())
+            .or_insert_with(|| operation_id.clone());
         splits.push(new_split);
 
         let manifest = RemoteStoreManifest {
@@ -1044,19 +1288,25 @@ impl StorageManager {
             engine: crate::cluster::state::IndexEngine::RemoteStore,
             index_uuid: index_uuid.to_string(),
             index_name: index_name.to_string(),
-            generation,
-            published_at: chrono::Utc::now().to_rfc3339(),
+            schema_generation: 1,
             schema_hash: schema_hash.to_string(),
+            generation,
+            parent_generation,
+            parent_manifest_path,
+            writer_epoch,
+            operation_id,
+            request_fingerprint,
+            published_at: chrono::Utc::now().to_rfc3339(),
             settings: settings.cloned().or(existing_settings),
             splits,
         };
 
-        self.publish_manifest_conditional(&manifest, expected_token.as_ref())
+        self.publish_manifest_conditional(&manifest, expected_pointer.as_ref())
             .await?;
         Ok(manifest)
     }
 
-    async fn load_manifest_pointer_with_token(
+    pub(crate) async fn load_manifest_pointer_with_token(
         &self,
         index_uuid: &str,
     ) -> Result<Option<(RemoteManifestPointer, CompareToken)>> {
@@ -1071,15 +1321,7 @@ impl StorageManager {
                     format!("cannot decode current format at {location}: {error}"),
                 )
             })?;
-        if pointer.version != REMOTE_MANIFEST_POINTER_FORMAT_VERSION {
-            return Err(crate::common::unsupported_index_format(
-                "remote manifest pointer",
-                format!(
-                    "version {} is not supported; expected {}",
-                    pointer.version, REMOTE_MANIFEST_POINTER_FORMAT_VERSION
-                ),
-            ));
-        }
+        pointer.validate_for_index(index_uuid)?;
         Ok(Some((pointer, read.token)))
     }
 
@@ -1089,15 +1331,24 @@ impl StorageManager {
     async fn load_current_manifest_unchecked_with_token(
         &self,
         index_uuid: &str,
-    ) -> Result<Option<(RemoteStoreManifest, CompareToken)>> {
+    ) -> Result<
+        Option<(
+            Option<RemoteStoreManifest>,
+            RemoteManifestPointer,
+            CompareToken,
+        )>,
+    > {
         let Some((pointer, token)) = self.load_manifest_pointer_with_token(index_uuid).await?
         else {
             return Ok(None);
         };
+        if pointer.current_generation == 0 {
+            return Ok(Some((None, pointer, token)));
+        }
         let manifest = self
-            .load_manifest(index_uuid, pointer.current_generation, None)
+            .load_manifest_for_pointer(index_uuid, &pointer, None)
             .await?;
-        Ok(Some((manifest, token)))
+        Ok(Some((Some(manifest), pointer, token)))
     }
 
     /// Internal conditional publish that writes the immutable generation via
@@ -1106,7 +1357,7 @@ impl StorageManager {
     async fn publish_manifest_conditional(
         &self,
         manifest: &RemoteStoreManifest,
-        expected_pointer_token: Option<&CompareToken>,
+        expected_pointer: Option<&(RemoteManifestPointer, CompareToken)>,
     ) -> Result<RemoteManifestPointer> {
         if manifest.version != REMOTE_MANIFEST_FORMAT_VERSION {
             return Err(crate::common::unsupported_index_format(
@@ -1117,26 +1368,42 @@ impl StorageManager {
                 ),
             ));
         }
-        let generation_key = manifest_generation_key(&manifest.index_uuid, manifest.generation);
+        manifest.validate_for_read(&manifest.index_uuid, manifest.generation, None)?;
+        let generation_key = manifest.canonical_manifest_path();
         let generation_path = self.object_path(&generation_key)?;
         let manifest_bytes = serde_json::to_vec_pretty(manifest)
             .context("failed to serialize manifest before publish")?;
+        let manifest_checksum = publication::sha256_prefixed(&manifest_bytes);
         let create_outcome = self
             .create_immutable(&generation_path, manifest_bytes)
             .await?;
         create_outcome.ensure_matching_content(&generation_path)?;
 
+        let next_revision = expected_pointer
+            .map(|(ptr, _)| ptr.pointer_revision.saturating_add(1).max(1))
+            .unwrap_or(1);
         let pointer = RemoteManifestPointer {
             version: REMOTE_MANIFEST_POINTER_FORMAT_VERSION,
+            index_uuid: manifest.index_uuid.clone(),
+            pointer_revision: next_revision,
+            writer_epoch: manifest.writer_epoch.max(1),
             current_generation: manifest.generation,
             manifest_path: generation_key,
+            manifest_checksum: Some(manifest_checksum),
+            last_operation_id: (!manifest.operation_id.is_empty())
+                .then(|| manifest.operation_id.clone()),
             manifest_etag: None,
         };
+        pointer.validate_for_index(&manifest.index_uuid)?;
         let pointer_path = self.object_path(&manifest_pointer_key(&manifest.index_uuid))?;
         let pointer_bytes = serde_json::to_vec_pretty(&pointer)
             .context("failed to serialize manifest pointer before publish")?;
         match self
-            .compare_and_swap_optional(&pointer_path, expected_pointer_token, pointer_bytes)
+            .compare_and_swap_optional(
+                &pointer_path,
+                expected_pointer.map(|(_, token)| token),
+                pointer_bytes,
+            )
             .await?
         {
             CompareAndSwapOutcome::Swapped { .. } => Ok(pointer),
@@ -1462,14 +1729,187 @@ fn build_s3_backend(uri: &str) -> Result<(Arc<dyn ObjectStore>, Option<String>)>
     Ok((store, unsupported_reason))
 }
 
+const fn default_schema_generation() -> u64 {
+    1
+}
+
 /// Mutable pointer to the currently published immutable manifest generation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RemoteManifestPointer {
     pub version: u32,
+    #[serde(default)]
+    pub index_uuid: String,
+    #[serde(default)]
+    pub pointer_revision: u64,
+    #[serde(default)]
+    pub writer_epoch: u64,
     pub current_generation: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub manifest_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_checksum: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_etag: Option<String>,
+}
+
+impl RemoteManifestPointer {
+    pub fn validate_for_index(&self, expected_index_uuid: &str) -> Result<()> {
+        if !REMOTE_MANIFEST_POINTER_FORMAT_CAPABILITY.supports_read(self.version) {
+            return Err(crate::common::unsupported_index_format(
+                "remote manifest pointer",
+                format!(
+                    "version {} is not supported; supported read window is {}..={}",
+                    self.version,
+                    REMOTE_MANIFEST_POINTER_FORMAT_CAPABILITY.min_read_version,
+                    REMOTE_MANIFEST_POINTER_FORMAT_CAPABILITY.max_read_version
+                ),
+            ));
+        }
+        if self.version == 2 {
+            if self.current_generation == 0 || self.manifest_path.is_empty() {
+                anyhow::bail!(
+                    "v2 remote manifest pointer for index '{expected_index_uuid}' requires positive current_generation and non-empty manifest_path"
+                );
+            }
+            if !is_canonical_manifest_path(
+                expected_index_uuid,
+                self.current_generation,
+                None,
+                &self.manifest_path,
+            ) {
+                anyhow::bail!(
+                    "v2 remote manifest pointer path '{}' is not canonical for index '{}' generation {}",
+                    self.manifest_path,
+                    expected_index_uuid,
+                    self.current_generation
+                );
+            }
+            return Ok(());
+        }
+
+        if self.index_uuid != expected_index_uuid {
+            anyhow::bail!(
+                "manifest pointer index_uuid mismatch: expected '{}', pointer declares '{}'",
+                expected_index_uuid,
+                self.index_uuid
+            );
+        }
+        if self.pointer_revision == 0 || self.writer_epoch == 0 {
+            anyhow::bail!(
+                "manifest pointer for index '{expected_index_uuid}' requires positive pointer_revision and writer_epoch"
+            );
+        }
+        if self.current_generation == 0 {
+            if !self.manifest_path.is_empty()
+                || self.manifest_checksum.is_some()
+                || self.last_operation_id.is_some()
+            {
+                anyhow::bail!(
+                    "generation-0 empty manifest pointer for index '{expected_index_uuid}' must not carry manifest_path, manifest_checksum, or last_operation_id"
+                );
+            }
+            return Ok(());
+        }
+
+        if self.manifest_path.is_empty() {
+            anyhow::bail!(
+                "manifest pointer for index '{}' generation {} is missing manifest_path",
+                expected_index_uuid,
+                self.current_generation
+            );
+        }
+        if !is_canonical_manifest_path(
+            expected_index_uuid,
+            self.current_generation,
+            self.last_operation_id.as_deref(),
+            &self.manifest_path,
+        ) {
+            anyhow::bail!(
+                "manifest pointer path '{}' is not canonical for index '{}' generation {}",
+                self.manifest_path,
+                expected_index_uuid,
+                self.current_generation
+            );
+        }
+        let Some(ref checksum) = self.manifest_checksum else {
+            anyhow::bail!(
+                "manifest pointer for index '{}' generation {} is missing manifest_checksum",
+                expected_index_uuid,
+                self.current_generation
+            );
+        };
+        if !checksum.starts_with("sha256:") || checksum.len() != 71 {
+            anyhow::bail!(
+                "manifest pointer for index '{expected_index_uuid}' has malformed manifest_checksum '{checksum}'"
+            );
+        }
+        let Some(ref op_id) = self.last_operation_id else {
+            anyhow::bail!(
+                "manifest pointer for index '{}' generation {} is missing last_operation_id",
+                expected_index_uuid,
+                self.current_generation
+            );
+        };
+        validate_publication_operation_id(op_id).map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
+
+    pub fn validate_manifest_agreement(
+        &self,
+        manifest: &RemoteStoreManifest,
+        actual_manifest_checksum: &str,
+    ) -> Result<()> {
+        if manifest.index_uuid != self.index_uuid && !self.index_uuid.is_empty() {
+            anyhow::bail!(
+                "pointer/manifest index_uuid mismatch: pointer='{}' manifest='{}'",
+                self.index_uuid,
+                manifest.index_uuid
+            );
+        }
+        if manifest.generation != self.current_generation {
+            anyhow::bail!(
+                "manifest generation mismatch: pointer requested {}, payload declares {}",
+                self.current_generation,
+                manifest.generation
+            );
+        }
+        if let Some(ref expected_checksum) = self.manifest_checksum
+            && expected_checksum != actual_manifest_checksum
+        {
+            anyhow::bail!(
+                "manifest checksum mismatch at '{}': pointer expected {}, actual {}",
+                self.manifest_path,
+                expected_checksum,
+                actual_manifest_checksum
+            );
+        }
+        if self.version >= 3 {
+            if manifest.version < 3 {
+                anyhow::bail!(
+                    "v3 manifest pointer at '{}' cannot reference legacy v{} manifest",
+                    self.manifest_path,
+                    manifest.version
+                );
+            }
+            if self.last_operation_id.as_deref() != Some(manifest.operation_id.as_str()) {
+                anyhow::bail!(
+                    "pointer/manifest operation_id mismatch: pointer={:?}, manifest='{}'",
+                    self.last_operation_id,
+                    manifest.operation_id
+                );
+            }
+            if self.writer_epoch < manifest.writer_epoch {
+                anyhow::bail!(
+                    "pointer writer_epoch {} is older than referenced manifest writer_epoch {}",
+                    self.writer_epoch,
+                    manifest.writer_epoch
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Immutable manifest for one remote-store generation.
@@ -1479,9 +1919,21 @@ pub struct RemoteStoreManifest {
     pub engine: crate::cluster::state::IndexEngine,
     pub index_uuid: String,
     pub index_name: String,
-    pub generation: u64,
-    pub published_at: String,
+    #[serde(default = "default_schema_generation")]
+    pub schema_generation: u64,
     pub schema_hash: String,
+    pub generation: u64,
+    #[serde(default)]
+    pub parent_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_manifest_path: Option<String>,
+    #[serde(default)]
+    pub writer_epoch: u64,
+    #[serde(default)]
+    pub operation_id: String,
+    #[serde(default)]
+    pub request_fingerprint: String,
+    pub published_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<crate::cluster::state::RemoteStoreSettings>,
     #[serde(default)]
@@ -1493,6 +1945,149 @@ impl RemoteStoreManifest {
         self.splits
             .iter()
             .filter(|split| matches!(split.state, RemoteSplitState::Published))
+    }
+
+    pub fn canonical_manifest_path(&self) -> String {
+        if self.version >= 3 && !self.operation_id.is_empty() {
+            manifest_operation_key(&self.index_uuid, self.generation, &self.operation_id)
+        } else {
+            manifest_generation_key(&self.index_uuid, self.generation)
+        }
+    }
+
+    pub fn validate_for_read(
+        &self,
+        expected_index_uuid: &str,
+        expected_generation: u64,
+        expected_schema_hash: Option<&str>,
+    ) -> Result<()> {
+        if !REMOTE_MANIFEST_FORMAT_CAPABILITY.supports_read(self.version) {
+            return Err(crate::common::unsupported_index_format(
+                "remote store manifest",
+                format!(
+                    "version {} is not supported; supported read window is {}..={}",
+                    self.version,
+                    REMOTE_MANIFEST_FORMAT_CAPABILITY.min_read_version,
+                    REMOTE_MANIFEST_FORMAT_CAPABILITY.max_read_version
+                ),
+            ));
+        }
+        if let Some(split) = self
+            .published_splits()
+            .find(|split| split.checksum.starts_with("sha256:pending:"))
+        {
+            return Err(crate::common::unsupported_index_format(
+                "remote store manifest",
+                format!("split '{}' contains a placeholder checksum", split.split_id),
+            ));
+        }
+        if self.index_uuid != expected_index_uuid {
+            anyhow::bail!(
+                "manifest index_uuid mismatch: expected '{}', payload declares '{}'",
+                expected_index_uuid,
+                self.index_uuid
+            );
+        }
+        if self.generation == 0 || self.generation != expected_generation {
+            anyhow::bail!(
+                "manifest generation mismatch: pointer requested {}, payload declares {}",
+                expected_generation,
+                self.generation
+            );
+        }
+        if self.schema_generation == 0 {
+            anyhow::bail!(
+                "manifest generation {} for index '{}' has invalid zero schema_generation",
+                self.generation,
+                self.index_uuid
+            );
+        }
+        if let Some(expected) = expected_schema_hash
+            && self.schema_hash != expected
+        {
+            anyhow::bail!(
+                "manifest schema_hash mismatch: expected {}, payload declares {}",
+                expected,
+                self.schema_hash
+            );
+        }
+        let mut seen_splits = HashSet::new();
+        for split in &self.splits {
+            if !seen_splits.insert(split.split_id.as_str()) {
+                anyhow::bail!(
+                    "duplicate split_id '{}' in manifest generation {} for index '{}'",
+                    split.split_id,
+                    self.generation,
+                    self.index_uuid
+                );
+            }
+        }
+        if self.version >= 3 {
+            if self.writer_epoch == 0 {
+                anyhow::bail!(
+                    "v3 manifest generation {} for index '{}' requires positive writer_epoch",
+                    self.generation,
+                    self.index_uuid
+                );
+            }
+            validate_publication_operation_id(&self.operation_id).map_err(|err| {
+                anyhow::anyhow!(
+                    "v3 manifest generation {} for index '{}' has invalid operation_id '{}': {}",
+                    self.generation,
+                    self.index_uuid,
+                    self.operation_id,
+                    err
+                )
+            })?;
+            if !self.request_fingerprint.starts_with("sha256:") {
+                anyhow::bail!(
+                    "v3 manifest generation {} for index '{}' requires sha256 request_fingerprint, got '{}'",
+                    self.generation,
+                    self.index_uuid,
+                    self.request_fingerprint
+                );
+            }
+            if self.generation == 1 {
+                if self.parent_generation != 0 || self.parent_manifest_path.is_some() {
+                    anyhow::bail!(
+                        "manifest generation 1 for index '{}' must have parent_generation 0 and no parent_manifest_path",
+                        self.index_uuid
+                    );
+                }
+            } else {
+                if self.parent_generation != self.generation - 1 {
+                    anyhow::bail!(
+                        "broken manifest lineage at generation {} for index '{}': expected parent_generation {}, got {}",
+                        self.generation,
+                        self.index_uuid,
+                        self.generation - 1,
+                        self.parent_generation
+                    );
+                }
+                let Some(ref parent_path) = self.parent_manifest_path else {
+                    anyhow::bail!(
+                        "broken manifest lineage at generation {} for index '{}': missing parent_manifest_path",
+                        self.generation,
+                        self.index_uuid
+                    );
+                };
+                if !is_canonical_manifest_path(
+                    &self.index_uuid,
+                    self.parent_generation,
+                    None,
+                    parent_path,
+                ) {
+                    anyhow::bail!(
+                        "broken manifest lineage at generation {} for index '{}': parent_manifest_path '{}' is not canonical for parent_generation {}",
+                        self.generation,
+                        self.index_uuid,
+                        parent_path,
+                        self.parent_generation
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1553,6 +2148,9 @@ pub struct SplitFieldTerms {
 }
 
 #[cfg(test)]
+mod fs017_021_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
@@ -1562,8 +2160,13 @@ mod tests {
     fn remote_manifest_pointer_roundtrip() {
         let pointer = RemoteManifestPointer {
             version: REMOTE_MANIFEST_POINTER_FORMAT_VERSION,
+            index_uuid: "idx-uuid".into(),
+            pointer_revision: 3,
+            writer_epoch: 2,
             current_generation: 42,
-            manifest_path: "manifests/42.json".into(),
+            manifest_path: "idx-uuid/manifests/000000000042/op-42.json".into(),
+            manifest_checksum: Some(format!("sha256:{}", "a".repeat(64))),
+            last_operation_id: Some("op-42".into()),
             manifest_etag: Some("etag-42".into()),
         };
 
@@ -1579,9 +2182,15 @@ mod tests {
             engine: crate::cluster::state::IndexEngine::RemoteStore,
             index_uuid: "idx-uuid".into(),
             index_name: "events".into(),
-            generation: 7,
-            published_at: "2026-04-16T00:00:00Z".into(),
+            schema_generation: 1,
             schema_hash: "sha256:schema".into(),
+            generation: 7,
+            parent_generation: 6,
+            parent_manifest_path: Some("idx-uuid/manifests/000000000006/op-6.json".into()),
+            writer_epoch: 2,
+            operation_id: "op-7".into(),
+            request_fingerprint: format!("sha256:{}", "b".repeat(64)),
+            published_at: "2026-04-16T00:00:00Z".into(),
             settings: Some(crate::cluster::state::RemoteStoreSettings {
                 object_store_uri: Some("s3://bucket/indexes".into()),
                 manifest_path: Some("manifests/7.json".into()),
@@ -1748,14 +2357,28 @@ mod tests {
         generation: u64,
         schema_hash: &str,
     ) -> RemoteStoreManifest {
+        let parent_generation = generation.saturating_sub(1);
+        let operation_id = format!("op-gen-{generation}");
         RemoteStoreManifest {
             version: REMOTE_MANIFEST_FORMAT_VERSION,
             engine: crate::cluster::state::IndexEngine::RemoteStore,
             index_uuid: index_uuid.into(),
             index_name: "events".into(),
-            generation,
-            published_at: "2026-04-16T00:00:00Z".into(),
+            schema_generation: 1,
             schema_hash: schema_hash.into(),
+            generation,
+            parent_generation,
+            parent_manifest_path: (parent_generation > 0).then(|| {
+                manifest_operation_key(
+                    index_uuid,
+                    parent_generation,
+                    &format!("op-gen-{parent_generation}"),
+                )
+            }),
+            writer_epoch: 1,
+            operation_id,
+            request_fingerprint: format!("sha256:{}", "1".repeat(64)),
+            published_at: "2026-04-16T00:00:00Z".into(),
             settings: None,
             splits: vec![RemoteSplitManifest {
                 split_id: "split-a".into(),
@@ -1795,8 +2418,13 @@ mod tests {
                 &path,
                 serde_json::to_vec(&RemoteManifestPointer {
                     version: 1,
+                    index_uuid: "idx-1".into(),
+                    pointer_revision: 1,
+                    writer_epoch: 1,
                     current_generation: 1,
                     manifest_path: "idx-1/manifests/000000000001.json".into(),
+                    manifest_checksum: None,
+                    last_operation_id: None,
                     manifest_etag: None,
                 })
                 .unwrap(),
@@ -1813,11 +2441,14 @@ mod tests {
     async fn publish_then_load_current_manifest_roundtrips() {
         let temp_dir = TempDir::new().unwrap();
         let manager = StorageManager::new_in_path(temp_dir.path()).unwrap();
-        let manifest = sample_manifest("idx-1", 7, "sha256:v1");
+        let manifest = sample_manifest("idx-1", 1, "sha256:v1");
 
         let pointer = manager.publish_manifest(&manifest).await.unwrap();
-        assert_eq!(pointer.current_generation, 7);
-        assert_eq!(pointer.manifest_path, "idx-1/manifests/000000000007.json");
+        assert_eq!(pointer.current_generation, 1);
+        assert_eq!(
+            pointer.manifest_path,
+            "idx-1/manifests/000000000001/op-gen-1.json"
+        );
 
         let loaded_pointer = manager
             .load_manifest_pointer("idx-1")

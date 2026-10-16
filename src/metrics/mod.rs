@@ -515,6 +515,91 @@ pub static OBJECT_STORE_TRANSFER_BYTES_TOTAL: LazyLock<IntCounterVec> = LazyLock
     counter
 });
 
+pub static REMOTE_STORE_PUBLICATION_ATTEMPTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "ferrissearch_remote_store_publication_attempts_total",
+            "Remote-store manifest publication attempts by outcome",
+        ),
+        &["outcome"],
+    )
+    .expect("metric: remote_store_publication_attempts_total");
+    for outcome in [
+        "committed",
+        "replayed",
+        "superseded",
+        "conflict",
+        "indeterminate",
+        "aborted",
+    ] {
+        let _ = counter.with_label_values(&[outcome]);
+    }
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: remote_store_publication_attempts_total");
+    counter
+});
+
+pub static REMOTE_STORE_POINTER_FENCES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "ferrissearch_remote_store_pointer_fences_total",
+            "Remote-store manifest pointer fence operations by outcome",
+        ),
+        &["outcome"],
+    )
+    .expect("metric: remote_store_pointer_fences_total");
+    for outcome in ["fenced", "conflict", "failed"] {
+        let _ = counter.with_label_values(&[outcome]);
+    }
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: remote_store_pointer_fences_total");
+    counter
+});
+
+pub static REMOTE_STORE_JANITOR_RUNS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "ferrissearch_remote_store_janitor_runs_total",
+            "Remote-store object janitor runs by mode and outcome",
+        ),
+        &["mode", "outcome"],
+    )
+    .expect("metric: remote_store_janitor_runs_total");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: remote_store_janitor_runs_total");
+    counter
+});
+
+pub static REMOTE_STORE_JANITOR_CANDIDATES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "ferrissearch_remote_store_janitor_candidates_total",
+            "Remote-store janitor candidate evaluations by action",
+        ),
+        &["action"],
+    )
+    .expect("metric: remote_store_janitor_candidates_total");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: remote_store_janitor_candidates_total");
+    counter
+});
+
+pub static REMOTE_STORE_JANITOR_DELETED_BYTES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "ferrissearch_remote_store_janitor_deleted_bytes_total",
+        "Total bytes reclaimed by the remote-store janitor in destructive mode",
+    )
+    .expect("metric: remote_store_janitor_deleted_bytes_total");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: remote_store_janitor_deleted_bytes_total");
+    counter
+});
+
 fn set_column_cache_budget_gauges(
     effective_memory_gauge: &IntGauge,
     cache_budget_gauge: &IntGauge,
@@ -566,6 +651,11 @@ fn initialize_metrics() {
     let _ = &*COLUMN_CACHE_BUDGET_BYTES;
     let _ = &*OBJECT_STORE_REQUESTS_TOTAL;
     let _ = &*OBJECT_STORE_TRANSFER_BYTES_TOTAL;
+    let _ = &*REMOTE_STORE_PUBLICATION_ATTEMPTS_TOTAL;
+    let _ = &*REMOTE_STORE_POINTER_FENCES_TOTAL;
+    let _ = &*REMOTE_STORE_JANITOR_RUNS_TOTAL;
+    let _ = &*REMOTE_STORE_JANITOR_CANDIDATES_TOTAL;
+    let _ = &*REMOTE_STORE_JANITOR_DELETED_BYTES_TOTAL;
 }
 
 pub fn record_object_store_request(operation: &str, outcome: &str) {
@@ -578,6 +668,34 @@ pub fn record_object_store_transfer(direction: &str, bytes: usize) {
     OBJECT_STORE_TRANSFER_BYTES_TOTAL
         .with_label_values(&[direction])
         .inc_by(bytes as u64);
+}
+
+pub fn record_remote_store_publication_attempt(outcome: &str) {
+    REMOTE_STORE_PUBLICATION_ATTEMPTS_TOTAL
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+pub fn record_remote_store_pointer_fence(outcome: &str) {
+    REMOTE_STORE_POINTER_FENCES_TOTAL
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+pub fn record_remote_store_janitor_run(mode: &str, outcome: &str) {
+    REMOTE_STORE_JANITOR_RUNS_TOTAL
+        .with_label_values(&[mode, outcome])
+        .inc();
+}
+
+pub fn record_remote_store_janitor_candidate(action: &str) {
+    REMOTE_STORE_JANITOR_CANDIDATES_TOTAL
+        .with_label_values(&[action])
+        .inc();
+}
+
+pub fn record_remote_store_janitor_deleted_bytes(bytes: u64) {
+    REMOTE_STORE_JANITOR_DELETED_BYTES_TOTAL.inc_by(bytes);
 }
 
 pub fn set_column_cache_budget_metrics(

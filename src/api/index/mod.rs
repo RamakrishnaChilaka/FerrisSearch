@@ -2122,23 +2122,28 @@ pub async fn get_index_settings(
     )
 }
 
+#[derive(Default, serde::Deserialize)]
+pub struct RemoteStorePublishParams {
+    pub operation_id: Option<String>,
+}
+
 /// POST /{index}/_remote_store/publish — Build a split from the supplied
-/// documents and publish it as a new manifest generation.
+/// documents and publish it as a new manifest generation via the fenced
+/// single-sequencer protocol.
 ///
 /// Body format:
 /// ```json
-/// { "docs": [ {"_id": "a", "title": "..."}, {"title": "..."} ] }
+/// { "operation_id": "op-1", "docs": [ {"_id": "a", "title": "..."}, {"title": "..."} ] }
 /// ```
 ///
 /// This endpoint is only valid for indices created with `engine: remote_store`.
-/// Any other engine is rejected with 400. The publish is executed locally on
-/// the node that receives the request. Multi-node readers therefore require
-/// every node to use the same shared object-store root; local filesystem roots
-/// are suitable only when all work stays on that node, while S3-compatible
-/// storage provides a shared backend.
+/// Any other engine is rejected with 400. Any HTTP node may stage the split
+/// bundle and operation records, then routes manifest sequencing through the
+/// Raft-leased index sequencer.
 pub async fn publish_remote_store_documents(
     State(state): State<AppState>,
     Path(index_name): Path<crate::common::IndexName>,
+    Query(params): Query<RemoteStorePublishParams>,
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     let cluster_state = state.cluster_manager.get_state();
@@ -2168,6 +2173,29 @@ pub async fn publish_remote_store_documents(
         );
     }
 
+    let body_op_id = match body.get("operation_id") {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::Null) | None => None,
+        Some(_) => {
+            return crate::api::error_response(
+                StatusCode::BAD_REQUEST,
+                "illegal_argument_exception",
+                "'operation_id' must be a string when supplied",
+            );
+        }
+    };
+    let requested_operation_id = match (params.operation_id, body_op_id) {
+        (Some(q), Some(b)) if q != b => {
+            return crate::api::error_response(
+                StatusCode::BAD_REQUEST,
+                "illegal_argument_exception",
+                format!("query operation_id [{q}] does not match body operation_id [{b}]"),
+            );
+        }
+        (Some(q), _) => Some(q),
+        (None, b) => b,
+    };
+
     let docs_value = match body.get("docs") {
         Some(v) => v,
         None => {
@@ -2190,8 +2218,14 @@ pub async fn publish_remote_store_documents(
     };
     let docs: Vec<Value> = docs_array.to_vec();
 
-    match crate::engine::remote_store::publish_docs(&state, index_name.as_str(), &metadata, docs)
-        .await
+    match crate::engine::remote_store::publish_docs_with_operation(
+        &state,
+        index_name.as_str(),
+        &metadata,
+        docs,
+        requested_operation_id,
+    )
+    .await
     {
         Ok(response) => (StatusCode::OK, Json(response)),
         Err(err_resp) => err_resp,
@@ -2240,6 +2274,89 @@ pub async fn verify_remote_store_splits(
     };
 
     match crate::engine::remote_store::verify_splits(&state, index_name.as_str(), &metadata).await {
+        Ok(response) => (StatusCode::OK, Json(response)),
+        Err(err_resp) => err_resp,
+    }
+}
+
+/// GET /{index}/_remote_store/inventory — Build a non-mutating reachability
+/// inventory of object-store state for a `remote_store` index.
+pub async fn get_remote_store_inventory(
+    State(state): State<AppState>,
+    Path(index_name): Path<crate::common::IndexName>,
+) -> (StatusCode, Json<Value>) {
+    let cluster_state = state.cluster_manager.get_state();
+    let Some(metadata) = cluster_state.indices.get(index_name.as_str()).cloned() else {
+        return crate::api::error_response(
+            StatusCode::NOT_FOUND,
+            "index_not_found_exception",
+            format!("no such index [{}]", index_name.as_str()),
+        );
+    };
+    match crate::engine::remote_store::inspect_inventory(
+        &state,
+        index_name.as_str(),
+        &metadata,
+        None,
+    )
+    .await
+    {
+        Ok(response) => (StatusCode::OK, Json(response)),
+        Err(err_resp) => err_resp,
+    }
+}
+
+/// POST /{index}/_remote_store/inventory — Build a non-mutating reachability
+/// inventory with optional retention/pin overrides.
+pub async fn inspect_remote_store_inventory(
+    State(state): State<AppState>,
+    Path(index_name): Path<crate::common::IndexName>,
+    body: Option<Json<Value>>,
+) -> (StatusCode, Json<Value>) {
+    let cluster_state = state.cluster_manager.get_state();
+    let Some(metadata) = cluster_state.indices.get(index_name.as_str()).cloned() else {
+        return crate::api::error_response(
+            StatusCode::NOT_FOUND,
+            "index_not_found_exception",
+            format!("no such index [{}]", index_name.as_str()),
+        );
+    };
+    match crate::engine::remote_store::inspect_inventory(
+        &state,
+        index_name.as_str(),
+        &metadata,
+        body.map(|Json(v)| v),
+    )
+    .await
+    {
+        Ok(response) => (StatusCode::OK, Json(response)),
+        Err(err_resp) => err_resp,
+    }
+}
+
+/// POST /{index}/_remote_store/janitor — Execute a rate-limited object-store
+/// janitor pass (defaults to `dry_run = true`).
+pub async fn run_remote_store_janitor(
+    State(state): State<AppState>,
+    Path(index_name): Path<crate::common::IndexName>,
+    body: Option<Json<Value>>,
+) -> (StatusCode, Json<Value>) {
+    let cluster_state = state.cluster_manager.get_state();
+    let Some(metadata) = cluster_state.indices.get(index_name.as_str()).cloned() else {
+        return crate::api::error_response(
+            StatusCode::NOT_FOUND,
+            "index_not_found_exception",
+            format!("no such index [{}]", index_name.as_str()),
+        );
+    };
+    match crate::engine::remote_store::run_janitor(
+        &state,
+        index_name.as_str(),
+        &metadata,
+        body.map(|Json(v)| v),
+    )
+    .await
+    {
         Ok(response) => (StatusCode::OK, Json(response)),
         Err(err_resp) => err_resp,
     }

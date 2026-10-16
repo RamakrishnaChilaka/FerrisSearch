@@ -154,6 +154,10 @@ default_configs=(
     fs013-cached-restart
     fs013-cross-epoch
     fs013-restart-witness
+    fs018-safe
+    fs018-unfenced-activate
+    fs018-blind-overwrite
+    fs018-fingerprint-mismatch
     trace-validator
     two-shard
 )
@@ -245,6 +249,10 @@ fs013-no-journal       expected FS013JournalBeforeProposal: unpublished intent
 fs013-cached-restart   expected FS013FreshRestartAuthority: cached ACTIVE reuse
 fs013-cross-epoch      expected FS013OldRejectionScoped: late callback revokes new epoch
 fs013-restart-witness  witness FS013NoDurableRestartWitness: durable debt survives restart
+fs018-safe             pass: fenced single-sequencer manifest publication and retry safety
+fs018-unfenced-activate expected FS018NoStaleEpochCommit: activating epoch before pointer fence
+fs018-blind-overwrite  expected FS018NoLostCommittedSplit: unconditional pointer overwrite loses split
+fs018-fingerprint-mismatch expected FS018UniqueOperationIdentity: conflicting retry reuses operation ID
 trace-validator         pass: strict JSONL conversion and D1 trace acceptance/rejection
 trace-validator-round4  pass: slow restart, truncation, NoOp, and late-message traces
 two-shard               pass: red sibling does not block failover/allocation
@@ -671,6 +679,26 @@ run_config() {
             module="MC_FS013_WriteAuthority.tla"
             cfg="MC_FS013_RestartWitness.cfg"
             expected="FS013NoDurableRestartWitness"
+            ;;
+        fs018-safe|MC_FS018_Safe)
+            module="MC_FS018_ManifestPublication.tla"
+            cfg="MC_FS018_Safe.cfg"
+            expected="pass"
+            ;;
+        fs018-unfenced-activate|MC_FS018_UnfencedActivate)
+            module="MC_FS018_ManifestPublication.tla"
+            cfg="MC_FS018_UnfencedActivate.cfg"
+            expected="FS018NoStaleEpochCommit"
+            ;;
+        fs018-blind-overwrite|MC_FS018_BlindOverwrite)
+            module="MC_FS018_ManifestPublication.tla"
+            cfg="MC_FS018_BlindOverwrite.cfg"
+            expected="FS018NoLostCommittedSplit"
+            ;;
+        fs018-fingerprint-mismatch|MC_FS018_FingerprintMismatch)
+            module="MC_FS018_ManifestPublication.tla"
+            cfg="MC_FS018_FingerprintMismatch.cfg"
+            expected="FS018UniqueOperationIdentity"
             ;;
         two-shard|MC_TwoShardIsolation)
             module="MC_TwoShardIsolation.tla"

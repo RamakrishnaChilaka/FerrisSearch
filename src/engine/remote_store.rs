@@ -1412,11 +1412,503 @@ fn strip_split_wal(staging_dir: &std::path::Path) -> anyhow::Result<()> {
 /// Failures never publish a partial split. Build cleanup is best-effort; later
 /// failures may leave staging files or an uploaded unreferenced bundle for a
 /// future janitor.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ForwardedSequencerCommitRequest {
+    pub operation_id: String,
+    pub request_fingerprint: String,
+    pub schema_generation: u64,
+    pub schema_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<crate::cluster::state::RemoteStoreSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_authority: Option<crate::cluster::state::ManifestWriterAuthority>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) enum ForwardedSequencerCommitResponse {
+    Committed(crate::storage::PublicationCommitOutcome),
+    Conflict {
+        operation_id: String,
+        reason: String,
+    },
+    Indeterminate {
+        operation_id: String,
+        reason: String,
+    },
+    RetryableAuthority {
+        reason: String,
+    },
+    Fatal {
+        reason: String,
+    },
+}
+
+fn current_raft_leader_term(
+    raft: &crate::consensus::types::RaftInstance,
+    authority_term: u64,
+) -> u64 {
+    openraft::async_runtime::WatchReceiver::borrow_watched(&raft.metrics())
+        .current_term
+        .max(authority_term)
+        .max(1)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_local_sequencer_commit(
+    cluster_manager: &crate::cluster::ClusterManager,
+    transport_client: &crate::transport::TransportClient,
+    raft: &crate::consensus::types::RaftInstance,
+    storage_manager: &crate::storage::StorageManager,
+    local_node_id: &str,
+    index_name: &str,
+    index_uuid: &str,
+    payload: &ForwardedSequencerCommitRequest,
+) -> ForwardedSequencerCommitResponse {
+    use crate::cluster::state::{
+        DEFAULT_MANIFEST_WRITER_LEASE_DURATION_MS, ManifestLeaseAcquireReason,
+        ManifestWriterIdentity, ManifestWriterMutation, ManifestWriterPhase,
+    };
+
+    let lock_arc = storage_manager.sequencer_lock(index_uuid).await;
+    let _sequencer_guard = lock_arc.lock().await;
+    if let Some(ref auth) = payload.known_authority {
+        storage_manager.observe_writer_authority(auth);
+    }
+
+    for _ in 0..4 {
+        let cluster_state = cluster_manager.get_state();
+        let Some(metadata) = cluster_state.indices.get(index_name) else {
+            return ForwardedSequencerCommitResponse::Fatal {
+                reason: format!("no such index [{index_name}]"),
+            };
+        };
+        if metadata.uuid.as_str() != index_uuid {
+            return ForwardedSequencerCommitResponse::Fatal {
+                reason: format!(
+                    "index [{index_name}] UUID mismatch: expected {index_uuid}, found {}",
+                    metadata.uuid
+                ),
+            };
+        }
+
+        let now_ms = now_epoch_ms().max(1);
+        if let Some(state_auth) = cluster_state.manifest_writer_authorities.get(index_name) {
+            storage_manager.observe_writer_authority(state_auth);
+        }
+        let authority = storage_manager
+            .cached_writer_authority(index_uuid)
+            .unwrap_or_else(|| {
+                crate::cluster::state::ManifestWriterAuthority::unassigned(index_name, index_uuid)
+            });
+
+        // If the cluster state in a unit test has no registered nodes at all,
+        // fence and commit directly on the local storage manager.
+        if cluster_state.nodes.is_empty() {
+            let (fenced_ptr, _) = match storage_manager.fence_manifest_pointer(index_uuid, 1).await
+            {
+                Ok(res) => res,
+                Err(error) => {
+                    return classify_commit_error(&payload.operation_id, error);
+                }
+            };
+            return match storage_manager
+                .commit_prepared_publication_locked(&crate::storage::SequencerCommitRequest {
+                    index_uuid: index_uuid.to_string(),
+                    index_name: index_name.to_string(),
+                    operation_id: payload.operation_id.clone(),
+                    request_fingerprint: payload.request_fingerprint.clone(),
+                    schema_generation: payload.schema_generation,
+                    schema_hash: payload.schema_hash.clone(),
+                    writer_epoch: fenced_ptr.writer_epoch,
+                    lease_id: 1,
+                    sequencer_node_id: local_node_id.to_string(),
+                    fenced_pointer_revision: fenced_ptr.pointer_revision,
+                    settings: payload.settings.clone(),
+                })
+                .await
+            {
+                Ok(outcome) => ForwardedSequencerCommitResponse::Committed(outcome),
+                Err(error) => classify_commit_error(&payload.operation_id, error),
+            };
+        }
+        if !cluster_state.nodes.contains_key(local_node_id) {
+            return ForwardedSequencerCommitResponse::RetryableAuthority {
+                reason: format!("node '{local_node_id}' is not a registered cluster member"),
+            };
+        }
+
+        match &authority.phase {
+            ManifestWriterPhase::Active {
+                holder_node,
+                writer_epoch,
+                lease_id,
+                fenced_pointer_revision,
+                fenced_pointer_token,
+            } if holder_node == local_node_id && now_ms < authority.lease_expires_at_millis => {
+                let mut active_epoch = *writer_epoch;
+                let mut active_lease_id = *lease_id;
+                let mut active_fenced_rev = *fenced_pointer_revision;
+                if now_ms.saturating_add(DEFAULT_MANIFEST_WRITER_LEASE_DURATION_MS / 3)
+                    >= authority.lease_expires_at_millis
+                {
+                    let renew_mutation = ManifestWriterMutation::Renew {
+                        identity: ManifestWriterIdentity {
+                            index_uuid: index_uuid.to_string(),
+                            holder_node: local_node_id.to_string(),
+                            writer_epoch: active_epoch,
+                            lease_id: active_lease_id,
+                        },
+                        expected_fenced_pointer_revision: *fenced_pointer_revision,
+                        expected_fenced_pointer_token: fenced_pointer_token.clone(),
+                        now_millis: now_ms,
+                        lease_duration_ms: DEFAULT_MANIFEST_WRITER_LEASE_DURATION_MS,
+                        leader_term: current_raft_leader_term(raft, authority.leader_term),
+                    };
+                    match transport_client
+                        .propose_manifest_writer_authority_mutation(
+                            raft,
+                            cluster_manager,
+                            index_name,
+                            renew_mutation,
+                        )
+                        .await
+                    {
+                        Ok(renewed) => {
+                            storage_manager.observe_writer_authority(&renewed);
+                            if let ManifestWriterPhase::Active {
+                                writer_epoch,
+                                lease_id,
+                                fenced_pointer_revision,
+                                ..
+                            } = renewed.phase
+                            {
+                                active_epoch = writer_epoch;
+                                active_lease_id = lease_id;
+                                active_fenced_rev = fenced_pointer_revision;
+                            }
+                        }
+                        Err(error) => {
+                            return ForwardedSequencerCommitResponse::RetryableAuthority {
+                                reason: format!("failed to renew manifest writer lease: {error:#}"),
+                            };
+                        }
+                    }
+                }
+
+                return match storage_manager
+                    .commit_prepared_publication_locked(&crate::storage::SequencerCommitRequest {
+                        index_uuid: index_uuid.to_string(),
+                        index_name: index_name.to_string(),
+                        operation_id: payload.operation_id.clone(),
+                        request_fingerprint: payload.request_fingerprint.clone(),
+                        schema_generation: payload.schema_generation,
+                        schema_hash: payload.schema_hash.clone(),
+                        writer_epoch: active_epoch,
+                        lease_id: active_lease_id,
+                        sequencer_node_id: local_node_id.to_string(),
+                        fenced_pointer_revision: active_fenced_rev,
+                        settings: payload.settings.clone(),
+                    })
+                    .await
+                {
+                    Ok(outcome) => ForwardedSequencerCommitResponse::Committed(outcome),
+                    Err(error) => classify_commit_error(&payload.operation_id, error),
+                };
+            }
+            ManifestWriterPhase::Fencing {
+                holder_node,
+                writer_epoch,
+                lease_id,
+            } if holder_node == local_node_id && now_ms < authority.lease_expires_at_millis => {
+                let (fenced_ptr, fenced_token) = match storage_manager
+                    .fence_manifest_pointer(index_uuid, *writer_epoch)
+                    .await
+                {
+                    Ok(res) => res,
+                    Err(error) => return classify_commit_error(&payload.operation_id, error),
+                };
+                let activate_now = now_epoch_ms().max(now_ms);
+                let activate_mutation = ManifestWriterMutation::Activate {
+                    identity: ManifestWriterIdentity {
+                        index_uuid: index_uuid.to_string(),
+                        holder_node: local_node_id.to_string(),
+                        writer_epoch: *writer_epoch,
+                        lease_id: *lease_id,
+                    },
+                    fenced_pointer_revision: fenced_ptr.pointer_revision,
+                    fenced_pointer_token: fenced_token.as_str().to_string(),
+                    now_millis: activate_now,
+                    lease_duration_ms: DEFAULT_MANIFEST_WRITER_LEASE_DURATION_MS,
+                    leader_term: current_raft_leader_term(raft, authority.leader_term),
+                };
+                match transport_client
+                    .propose_manifest_writer_authority_mutation(
+                        raft,
+                        cluster_manager,
+                        index_name,
+                        activate_mutation,
+                    )
+                    .await
+                {
+                    Ok(activated) => {
+                        storage_manager.observe_writer_authority(&activated);
+                        continue;
+                    }
+                    Err(error) => {
+                        return ForwardedSequencerCommitResponse::RetryableAuthority {
+                            reason: format!("failed to activate manifest writer lease: {error:#}"),
+                        };
+                    }
+                }
+            }
+            _ => {
+                let reason = if authority.phase.is_unassigned() {
+                    ManifestLeaseAcquireReason::Unassigned
+                } else if authority
+                    .phase
+                    .holder_node()
+                    .is_some_and(|holder| !cluster_state.nodes.contains_key(holder))
+                {
+                    ManifestLeaseAcquireReason::HolderUnavailable
+                } else if now_ms >= authority.lease_expires_at_millis {
+                    ManifestLeaseAcquireReason::Expired
+                } else {
+                    return ForwardedSequencerCommitResponse::RetryableAuthority {
+                        reason: format!(
+                            "manifest writer lease for '{index_name}' is held by {:?}",
+                            authority.phase.holder_node()
+                        ),
+                    };
+                };
+
+                let acquire_mutation = ManifestWriterMutation::Acquire {
+                    expected: authority.expected_snapshot(),
+                    candidate_node: local_node_id.to_string(),
+                    reason,
+                    now_millis: now_ms,
+                    lease_duration_ms: DEFAULT_MANIFEST_WRITER_LEASE_DURATION_MS,
+                    leader_term: current_raft_leader_term(raft, authority.leader_term),
+                };
+                match transport_client
+                    .propose_manifest_writer_authority_mutation(
+                        raft,
+                        cluster_manager,
+                        index_name,
+                        acquire_mutation,
+                    )
+                    .await
+                {
+                    Ok(acquired) => {
+                        storage_manager.observe_writer_authority(&acquired);
+                        continue;
+                    }
+                    Err(error) => {
+                        return ForwardedSequencerCommitResponse::RetryableAuthority {
+                            reason: format!("failed to acquire manifest writer lease: {error:#}"),
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    ForwardedSequencerCommitResponse::RetryableAuthority {
+        reason: format!(
+            "exceeded local sequencer authority stabilization attempts for index '{index_name}'"
+        ),
+    }
+}
+
+fn classify_commit_error(
+    operation_id: &str,
+    error: anyhow::Error,
+) -> ForwardedSequencerCommitResponse {
+    if let Some(pub_err) = error.downcast_ref::<crate::storage::PublicationError>() {
+        return match pub_err {
+            crate::storage::PublicationError::OperationConflict {
+                operation_id,
+                reason,
+            } => ForwardedSequencerCommitResponse::Conflict {
+                operation_id: operation_id.clone(),
+                reason: reason.clone(),
+            },
+            crate::storage::PublicationError::Indeterminate {
+                operation_id,
+                reason,
+            } => ForwardedSequencerCommitResponse::Indeterminate {
+                operation_id: operation_id.clone(),
+                reason: reason.clone(),
+            },
+            crate::storage::PublicationError::StaleWriterEpoch { .. }
+            | crate::storage::PublicationError::UnfencedPointer { .. }
+            | crate::storage::PublicationError::PointerConflict { .. } => {
+                ForwardedSequencerCommitResponse::RetryableAuthority {
+                    reason: pub_err.to_string(),
+                }
+            }
+            crate::storage::PublicationError::NotCommitted { .. }
+            | crate::storage::PublicationError::InjectedCrash { .. } => {
+                ForwardedSequencerCommitResponse::Fatal {
+                    reason: pub_err.to_string(),
+                }
+            }
+        };
+    }
+    if let Some(cond_err) = error.downcast_ref::<crate::storage::ConditionalStorageError>() {
+        return match cond_err {
+            crate::storage::ConditionalStorageError::Indeterminate { reason, .. } => {
+                ForwardedSequencerCommitResponse::Indeterminate {
+                    operation_id: operation_id.to_string(),
+                    reason: reason.clone(),
+                }
+            }
+            crate::storage::ConditionalStorageError::Conflict { reason, .. } => {
+                ForwardedSequencerCommitResponse::RetryableAuthority {
+                    reason: reason.clone(),
+                }
+            }
+            other => ForwardedSequencerCommitResponse::Fatal {
+                reason: other.to_string(),
+            },
+        };
+    }
+    ForwardedSequencerCommitResponse::Fatal {
+        reason: format!("{error:#}"),
+    }
+}
+
+async fn coordinate_sequencer_commit(
+    state: &AppState,
+    index_name: &str,
+    index_uuid: &str,
+    payload: &ForwardedSequencerCommitRequest,
+) -> ForwardedSequencerCommitResponse {
+    let mut last_retry_reason = String::new();
+    for attempt in 0..8 {
+        let cluster_state = state.cluster_manager.get_state();
+        let now_ms = now_epoch_ms().max(1);
+        let state_authority = cluster_state
+            .manifest_writer_authorities
+            .get(index_name)
+            .cloned();
+        if let Some(ref auth) = state_authority {
+            state.storage_manager.observe_writer_authority(auth);
+        }
+        let authority = state.storage_manager.cached_writer_authority(index_uuid);
+
+        let remote_holder = authority
+            .as_ref()
+            .and_then(|auth| {
+                if now_ms < auth.lease_expires_at_millis {
+                    auth.phase.holder_node()
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                // When unassigned and this node is a follower, route sequencing to the
+                // Raft master node so concurrent initial publishes do not race Acquire across followers.
+                if !state.raft.is_leader() {
+                    cluster_state.master_node.as_deref()
+                } else {
+                    None
+                }
+            })
+            .filter(|holder| *holder != state.local_node_id)
+            .and_then(|holder| cluster_state.nodes.get(holder).cloned());
+
+        let mut req_with_auth = payload.clone();
+        req_with_auth.known_authority = authority;
+
+        let response = if let Some(target_node) = remote_holder {
+            match state
+                .transport_client
+                .forward_remote_store_publish_commit(
+                    &target_node,
+                    index_name,
+                    index_uuid,
+                    &req_with_auth,
+                )
+                .await
+            {
+                Ok(resp) => resp,
+                Err(error) => ForwardedSequencerCommitResponse::RetryableAuthority {
+                    reason: format!(
+                        "forwarding publish commit to sequencer node '{}' failed: {error:#}",
+                        target_node.id
+                    ),
+                },
+            }
+        } else {
+            execute_local_sequencer_commit(
+                &state.cluster_manager,
+                &state.transport_client,
+                &state.raft,
+                &state.storage_manager,
+                &state.local_node_id,
+                index_name,
+                index_uuid,
+                &req_with_auth,
+            )
+            .await
+        };
+
+        match response {
+            ForwardedSequencerCommitResponse::RetryableAuthority { reason } => {
+                last_retry_reason = reason;
+                if attempt + 1 < 8 {
+                    tokio::time::sleep(Duration::from_millis(25 * (attempt as u64 + 1))).await;
+                }
+            }
+            other => return other,
+        }
+    }
+
+    ForwardedSequencerCommitResponse::RetryableAuthority {
+        reason: last_retry_reason,
+    }
+}
+
+fn outcome_to_publish_json(
+    index_name: &str,
+    outcome: &crate::storage::PublicationCommitOutcome,
+) -> serde_json::Value {
+    serde_json::json!({
+        "index": index_name,
+        "index_uuid": outcome.index_uuid,
+        "operation_id": outcome.operation_id,
+        "split_id": outcome.split_id,
+        "generation": outcome.generation,
+        "parent_generation": outcome.parent_generation,
+        "parent_manifest_path": outcome.parent_manifest_path,
+        "manifest_path": outcome.manifest_path,
+        "manifest_checksum": outcome.manifest_checksum,
+        "writer_epoch": outcome.writer_epoch,
+        "pointer_revision": outcome.pointer_revision,
+        "replayed": outcome.replayed,
+        "doc_count": outcome.doc_count,
+        "size_bytes": outcome.size_bytes,
+    })
+}
+
+#[cfg(test)]
 pub(crate) async fn publish_docs(
     state: &AppState,
     index_name: &str,
     metadata: &IndexMetadata,
     docs: Vec<serde_json::Value>,
+) -> Result<serde_json::Value, (StatusCode, Json<Value>)> {
+    publish_docs_with_operation(state, index_name, metadata, docs, None).await
+}
+
+/// Publish a batch of JSON documents as a new split on this index using the
+/// ADR 0002 fenced single-sequencer commit protocol.
+pub(crate) async fn publish_docs_with_operation(
+    state: &AppState,
+    index_name: &str,
+    metadata: &IndexMetadata,
+    docs: Vec<serde_json::Value>,
+    requested_operation_id: Option<String>,
 ) -> Result<serde_json::Value, (StatusCode, Json<Value>)> {
     if docs.is_empty() {
         return Err(crate::api::error_response(
@@ -1439,6 +1931,16 @@ pub(crate) async fn publish_docs(
                 docs.len(),
                 MAX_DOCS_PER_PUBLISH
             ),
+        ));
+    }
+
+    if let Some(ref op_id) = requested_operation_id
+        && let Err(error) = crate::storage::validate_publication_operation_id(op_id)
+    {
+        return Err(crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            error,
         ));
     }
 
@@ -1480,17 +1982,18 @@ pub(crate) async fn publish_docs(
     }
 
     let index_uuid = metadata.uuid.as_str().to_string();
-    let split_id = uuid::Uuid::new_v4().to_string();
+    let operation_id = requested_operation_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let split_id = crate::storage::deterministic_publication_split_id(&index_uuid, &operation_id);
     let staging_dir = state.storage_manager.staging_dir(&index_uuid, &split_id);
 
-    // Extract or generate _id per doc, then strip _id from payload so stored
-    // source stays clean (mirrors single-doc index path).
+    // Extract or deterministically derive _id per doc from (index_uuid, operation_id, ordinal),
+    // then strip _id from payload so stored source stays clean and retries produce identical splits.
     let mut prepared: Vec<(String, serde_json::Value)> = Vec::with_capacity(docs.len());
-    for mut doc in docs {
+    for (ordinal, mut doc) in docs.into_iter().enumerate() {
         let doc_id = if let Some(id) = doc.get("_id").and_then(|v| v.as_str()) {
             id.to_string()
         } else {
-            uuid::Uuid::new_v4().to_string()
+            crate::storage::deterministic_publication_doc_id(&index_uuid, &operation_id, ordinal)
         };
         if let Some(obj) = doc.as_object_mut() {
             obj.remove("_id");
@@ -1498,98 +2001,172 @@ pub(crate) async fn publish_docs(
         prepared.push((doc_id, doc));
     }
 
-    let mappings_arc = Arc::new(metadata.mappings.clone());
-    let staging_for_build = staging_dir.clone();
-    let mappings_for_build = Arc::clone(&mappings_arc);
-    let doc_count = prepared.len() as u64;
-
-    // Build the split on the write worker pool — it's blocking I/O.
-    let build_result = state
-        .worker_pools
-        .spawn_write(move || -> anyhow::Result<()> {
-            if staging_for_build.exists() {
-                std::fs::remove_dir_all(&staging_for_build)?;
-            }
-            std::fs::create_dir_all(&staging_for_build)?;
-            let column_cache = Arc::new(crate::engine::column_cache::ColumnCache::new(0, 0));
-            let engine = crate::engine::tantivy::HotEngine::new_remote_split_with_mappings(
-                &staging_for_build,
-                Duration::from_secs(60),
-                mappings_for_build.as_ref(),
-                column_cache,
-            )?;
-            use crate::engine::SearchEngine;
-            for (doc_id, payload) in prepared {
-                engine.add_document(&doc_id, payload)?;
-            }
-            engine.flush()?;
-            Ok(())
-        })
-        .await;
-
-    if let Err(e) = match build_result {
-        Ok(inner) => inner,
-        Err(join_err) => Err(anyhow::anyhow!(join_err)),
-    } {
-        let _ = std::fs::remove_dir_all(&staging_dir);
-        if e.is::<DocumentValidationError>() || e.is::<crate::common::ReservedDocumentFieldError>()
-        {
+    let schema_generation = 1u64;
+    let schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
+    let request_fingerprint = match crate::storage::compute_publication_request_fingerprint(
+        &index_uuid,
+        schema_generation,
+        &schema_hash,
+        &prepared,
+    ) {
+        Ok(fp) => fp,
+        Err(error) => {
             return Err(crate::api::error_response(
                 StatusCode::BAD_REQUEST,
-                "mapper_parsing_exception",
-                e,
+                "illegal_argument_exception",
+                error,
             ));
         }
-        tracing::error!(
-            "remote_store: split build failed for {} split_id {}: {}",
-            index_name,
-            split_id,
-            e
-        );
-        return Err(crate::api::error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "remote_store_build_exception",
-            format!("split build failed: {e}"),
-        ));
-    }
+    };
 
-    // Immutable bundles cannot retain mutable WAL checkpoints without their WAL.
-    let staging_for_strip = staging_dir.clone();
-    let strip_result = state
-        .worker_pools
-        .spawn_write(move || strip_split_wal(&staging_for_strip))
-        .await;
-    if let Err(e) = match strip_result {
-        Ok(inner) => inner,
-        Err(join_err) => Err(anyhow::anyhow!(join_err)),
-    } {
-        tracing::error!(
-            "remote_store: failed to strip mutable WAL state from split {} of {}: {:#}",
-            split_id,
-            index_name,
-            e
-        );
-        return Err(crate::api::error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "remote_store_build_exception",
-            format!("failed to remove mutable WAL state before split publication: {e:#}"),
-        ));
-    }
-
-    // Pack + upload the bundle. `upload_split_bundle` is uniform across local
-    // and remote backends: on a local backend the bundle becomes a file under
-    // `<data_dir>/_remote_store/<uuid>/splits/<split_id>/bundle`; on s3:// it
-    // becomes an object at the same relative key.
-    let (bundle_key, checksum, size_bytes) = match state
+    // Fast path: check if operation_id is already committed or conflicting.
+    let (existing_intent, existing_prepared) = match state
         .storage_manager
-        .upload_split_bundle(&index_uuid, &split_id, &staging_dir)
+        .resolve_publication_operation(&index_uuid, &operation_id, &request_fingerprint)
         .await
     {
-        Ok(triple) => triple,
-        Err(e) => {
+        Ok(crate::storage::PublicationResolution::Committed(outcome)) => {
+            crate::metrics::record_remote_store_publication_attempt("replayed");
+            return Ok(outcome_to_publish_json(index_name, &outcome));
+        }
+        Ok(crate::storage::PublicationResolution::Conflict {
+            operation_id,
+            reason,
+        }) => {
+            crate::metrics::record_remote_store_publication_attempt("conflict");
+            return Err(crate::api::error_response(
+                StatusCode::CONFLICT,
+                "operation_id_conflict",
+                format!("operation_id [{operation_id}] conflict: {reason}"),
+            ));
+        }
+        Ok(crate::storage::PublicationResolution::NotCommitted { intent, prepared }) => {
+            (intent, prepared)
+        }
+        Err(error) => {
+            return Err(crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "remote_store_publish_exception",
+                format!("failed to resolve publication operation '{operation_id}': {error:#}"),
+            ));
+        }
+    };
+
+    let doc_count = prepared.len() as u64;
+    let planned_bundle_path =
+        crate::storage::StorageManager::split_bundle_key(&index_uuid, &split_id);
+
+    // Stage immutable intent.json before building or uploading the split bundle.
+    if existing_intent.is_none() {
+        let now_ms = now_epoch_ms();
+        let intent = crate::storage::PublicationIntentRecord {
+            format_version: crate::storage::PUBLICATION_RECORD_FORMAT_VERSION,
+            index_uuid: index_uuid.clone(),
+            index_name: index_name.to_string(),
+            operation_id: operation_id.clone(),
+            request_fingerprint: request_fingerprint.clone(),
+            schema_generation,
+            schema_hash: schema_hash.clone(),
+            split_id: split_id.clone(),
+            planned_bundle_path: planned_bundle_path.clone(),
+            doc_count,
+            producer_node_id: state.local_node_id.clone(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            created_at_epoch_ms: now_ms,
+        };
+        if let Err(error) = state
+            .storage_manager
+            .stage_publication_intent(&intent)
+            .await
+        {
+            if let Some(crate::storage::PublicationError::OperationConflict {
+                operation_id,
+                reason,
+            }) = error.downcast_ref::<crate::storage::PublicationError>()
+            {
+                return Err(crate::api::error_response(
+                    StatusCode::CONFLICT,
+                    "operation_id_conflict",
+                    format!("operation_id [{operation_id}] conflict: {reason}"),
+                ));
+            }
+            return Err(crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "remote_store_publish_exception",
+                format!("failed to stage publication intent: {error:#}"),
+            ));
+        }
+    }
+
+    if state
+        .storage_manager
+        .take_publication_crash_stage_if_matches(
+            crate::storage::PublicationCrashStage::AfterIntentBeforeBundleUpload,
+        )
+    {
+        return Err(crate::api::error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "remote_store_publish_exception",
+            format!(
+                "injected crash for operation_id [{operation_id}] after intent creation before bundle upload"
+            ),
+        ));
+    }
+
+    let prepared_already_valid = match existing_prepared.as_ref() {
+        Some(prep) => state
+            .storage_manager
+            .verify_prepared_split_bundle(&index_uuid, prep)
+            .await
+            .is_ok(),
+        None => false,
+    };
+
+    if !prepared_already_valid {
+        let mappings_arc = Arc::new(metadata.mappings.clone());
+        let staging_for_build = staging_dir.clone();
+        let mappings_for_build = Arc::clone(&mappings_arc);
+
+        // Build the split on the write worker pool — it's blocking I/O.
+        let build_result = state
+            .worker_pools
+            .spawn_write(move || -> anyhow::Result<()> {
+                if staging_for_build.exists() {
+                    std::fs::remove_dir_all(&staging_for_build)?;
+                }
+                std::fs::create_dir_all(&staging_for_build)?;
+                let column_cache = Arc::new(crate::engine::column_cache::ColumnCache::new(0, 0));
+                let engine = crate::engine::tantivy::HotEngine::new_remote_split_with_mappings(
+                    &staging_for_build,
+                    Duration::from_secs(60),
+                    mappings_for_build.as_ref(),
+                    column_cache,
+                )?;
+                use crate::engine::SearchEngine;
+                for (doc_id, payload) in prepared {
+                    engine.add_document(&doc_id, payload)?;
+                }
+                engine.flush()?;
+                Ok(())
+            })
+            .await;
+
+        if let Err(e) = match build_result {
+            Ok(inner) => inner,
+            Err(join_err) => Err(anyhow::anyhow!(join_err)),
+        } {
             let _ = std::fs::remove_dir_all(&staging_dir);
+            if e.is::<DocumentValidationError>()
+                || e.is::<crate::common::ReservedDocumentFieldError>()
+            {
+                return Err(crate::api::error_response(
+                    StatusCode::BAD_REQUEST,
+                    "mapper_parsing_exception",
+                    e,
+                ));
+            }
             tracing::error!(
-                "remote_store: bundle upload failed for {} split_id {}: {}",
+                "remote_store: split build failed for {} split_id {}: {}",
                 index_name,
                 split_id,
                 e
@@ -1597,81 +2174,352 @@ pub(crate) async fn publish_docs(
             return Err(crate::api::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "remote_store_build_exception",
-                format!("bundle upload failed: {e}"),
+                format!("split build failed: {e}"),
             ));
         }
-    };
 
-    // Staging bytes are no longer needed after a successful upload.
-    let _ = std::fs::remove_dir_all(&staging_dir);
-
-    let schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
-
-    let new_split = crate::storage::RemoteSplitManifest {
-        split_id: split_id.clone(),
-        state: crate::storage::RemoteSplitState::Published,
-        bundle_path: bundle_key,
-        bundle_etag: None,
-        hotcache_path: None,
-        checksum,
-        doc_count,
-        size_bytes,
-        uncompressed_bytes: size_bytes,
-        hotcache_bytes: None,
-        time_range: None,
-        tags: std::collections::BTreeMap::new(),
-        field_ranges,
-        field_terms,
-    };
-
-    let settings_clone = metadata.settings.remote_store.clone();
-    let manifest = match state
-        .storage_manager
-        .append_split_and_publish(
-            &index_uuid,
-            index_name,
-            &schema_hash,
-            settings_clone.as_ref(),
-            new_split,
-        )
-        .await
-    {
-        Ok(m) => m,
-        Err(e) => {
-            // Leave the split dir in place — a janitor will reap it after
-            // a future PR lands. Returning an error on manifest failure
-            // matches Quickwit's indexer behavior.
+        // Immutable bundles cannot retain mutable WAL checkpoints without their WAL.
+        let staging_for_strip = staging_dir.clone();
+        let strip_result = state
+            .worker_pools
+            .spawn_write(move || strip_split_wal(&staging_for_strip))
+            .await;
+        if let Err(e) = match strip_result {
+            Ok(inner) => inner,
+            Err(join_err) => Err(anyhow::anyhow!(join_err)),
+        } {
             tracing::error!(
-                "remote_store: manifest publish failed for {} split_id {}: {}",
-                index_name,
+                "remote_store: failed to strip mutable WAL state from split {} of {}: {:#}",
                 split_id,
+                index_name,
                 e
             );
-            let status = match e.downcast_ref::<crate::storage::ConditionalStorageError>() {
-                Some(
-                    crate::storage::ConditionalStorageError::Conflict { .. }
-                    | crate::storage::ConditionalStorageError::ImmutableConflict { .. },
-                ) => StatusCode::CONFLICT,
-                Some(crate::storage::ConditionalStorageError::UnsupportedBackend { .. }) => {
-                    StatusCode::SERVICE_UNAVAILABLE
-                }
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
             return Err(crate::api::error_response(
-                status,
-                "remote_store_publish_exception",
-                format!("manifest publish failed: {e}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "remote_store_build_exception",
+                format!("failed to remove mutable WAL state before split publication: {e:#}"),
             ));
         }
+
+        let (bundle_key, checksum, size_bytes) = match state
+            .storage_manager
+            .upload_split_bundle(&index_uuid, &split_id, &staging_dir)
+            .await
+        {
+            Ok(triple) => triple,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&staging_dir);
+                tracing::error!(
+                    "remote_store: bundle upload failed for {} split_id {}: {}",
+                    index_name,
+                    split_id,
+                    e
+                );
+                return Err(crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "remote_store_build_exception",
+                    format!("bundle upload failed: {e}"),
+                ));
+            }
+        };
+
+        let _ = std::fs::remove_dir_all(&staging_dir);
+
+        if state
+            .storage_manager
+            .take_publication_crash_stage_if_matches(
+                crate::storage::PublicationCrashStage::AfterBundleUploadBeforePreparedRecord,
+            )
+        {
+            return Err(crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "remote_store_publish_exception",
+                format!(
+                    "injected crash for operation_id [{operation_id}] after bundle upload before prepared record"
+                ),
+            ));
+        }
+
+        let mut tags = std::collections::BTreeMap::new();
+        tags.insert("operation_id".to_string(), operation_id.clone());
+        let new_split = crate::storage::RemoteSplitManifest {
+            split_id: split_id.clone(),
+            state: crate::storage::RemoteSplitState::Published,
+            bundle_path: bundle_key,
+            bundle_etag: None,
+            hotcache_path: None,
+            checksum,
+            doc_count,
+            size_bytes,
+            uncompressed_bytes: size_bytes,
+            hotcache_bytes: None,
+            time_range: None,
+            tags,
+            field_ranges,
+            field_terms,
+        };
+        let now_ms = now_epoch_ms();
+        let prepared_record = crate::storage::PublicationPreparedRecord {
+            format_version: crate::storage::PUBLICATION_RECORD_FORMAT_VERSION,
+            index_uuid: index_uuid.clone(),
+            index_name: index_name.to_string(),
+            operation_id: operation_id.clone(),
+            request_fingerprint: request_fingerprint.clone(),
+            schema_generation,
+            schema_hash: schema_hash.clone(),
+            producer_node_id: state.local_node_id.clone(),
+            prepared_at: chrono::Utc::now().to_rfc3339(),
+            prepared_at_epoch_ms: now_ms,
+            split: new_split,
+        };
+        if let Err(error) = state
+            .storage_manager
+            .write_publication_prepared(&prepared_record)
+            .await
+        {
+            if let Some(crate::storage::PublicationError::OperationConflict {
+                operation_id,
+                reason,
+            }) = error.downcast_ref::<crate::storage::PublicationError>()
+            {
+                return Err(crate::api::error_response(
+                    StatusCode::CONFLICT,
+                    "operation_id_conflict",
+                    format!("operation_id [{operation_id}] conflict: {reason}"),
+                ));
+            }
+            return Err(crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "remote_store_publish_exception",
+                format!("failed to write prepared publication record: {error:#}"),
+            ));
+        }
+    }
+
+    let sequencer_req = ForwardedSequencerCommitRequest {
+        operation_id: operation_id.clone(),
+        request_fingerprint,
+        schema_generation,
+        schema_hash,
+        settings: metadata.settings.remote_store.clone(),
+        known_authority: None,
     };
 
-    Ok(serde_json::json!({
-        "index": index_name,
-        "split_id": split_id,
-        "generation": manifest.generation,
-        "doc_count": doc_count,
-        "size_bytes": size_bytes,
-    }))
+    match coordinate_sequencer_commit(state, index_name, &index_uuid, &sequencer_req).await {
+        ForwardedSequencerCommitResponse::Committed(outcome) => {
+            Ok(outcome_to_publish_json(index_name, &outcome))
+        }
+        ForwardedSequencerCommitResponse::Conflict {
+            operation_id,
+            reason,
+        } => Err(crate::api::error_response(
+            StatusCode::CONFLICT,
+            "operation_id_conflict",
+            format!("operation_id [{operation_id}] conflict: {reason}"),
+        )),
+        ForwardedSequencerCommitResponse::Indeterminate {
+            operation_id,
+            reason,
+        } => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "remote_store_publish_indeterminate_exception",
+                    "reason": format!("publication outcome for operation_id [{operation_id}] is indeterminate; retry with the same operation_id: {reason}"),
+                    "operation_id": operation_id,
+                },
+                "status": StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+            })),
+        )),
+        ForwardedSequencerCommitResponse::RetryableAuthority { reason } => {
+            Err(crate::api::error_response(
+                StatusCode::CONFLICT,
+                "remote_store_publish_exception",
+                format!("manifest publish failed after sequencer authority contention: {reason}"),
+            ))
+        }
+        ForwardedSequencerCommitResponse::Fatal { reason } => Err(crate::api::error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "remote_store_publish_exception",
+            format!("manifest publish failed: {reason}"),
+        )),
+    }
+}
+
+pub(crate) async fn inspect_inventory(
+    state: &AppState,
+    index_name: &str,
+    metadata: &IndexMetadata,
+    body: Option<Value>,
+) -> Result<Value, (StatusCode, Json<Value>)> {
+    if !matches!(
+        metadata.settings.engine,
+        crate::cluster::state::IndexEngine::RemoteStore
+    ) {
+        return Err(crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            format!(
+                "index [{}] uses engine [{}] which does not support remote_store inventory",
+                index_name, metadata.settings.engine
+            ),
+        ));
+    }
+
+    let cluster_state = state.cluster_manager.get_state();
+    let mut options = crate::storage::ReachabilityInventoryOptions::for_index(
+        metadata.uuid.as_str(),
+        Some(index_name.to_string()),
+    );
+    options.active_writer_authority = cluster_state
+        .manifest_writer_authorities
+        .get(index_name)
+        .cloned();
+
+    if let Some(ref obj) = body.and_then(|v| v.as_object().cloned()) {
+        if let Some(gen_cap) = obj.get("retention_generations").and_then(Value::as_u64) {
+            options.retention_generations = gen_cap as usize;
+        }
+        if let Some(horizon_ms) = obj.get("retention_horizon_ms").and_then(Value::as_u64) {
+            options.retention_horizon_ms = horizon_ms;
+        }
+        if let Some(grace_ms) = obj.get("active_grace_ms").and_then(Value::as_u64) {
+            options.active_grace_ms = grace_ms;
+        }
+        if let Some(now_ms) = obj.get("now_epoch_ms").and_then(Value::as_u64) {
+            options.now_epoch_ms = now_ms;
+        }
+        if let Some(max_objs) = obj.get("max_reported_objects").and_then(Value::as_u64) {
+            options.max_reported_objects = max_objs as usize;
+        }
+        if let Some(pinned_splits) = obj.get("pinned_split_ids").and_then(Value::as_array) {
+            for item in pinned_splits {
+                if let Some(s) = item.as_str() {
+                    options.pinned_split_ids.insert(s.to_string());
+                }
+            }
+        }
+        if let Some(pinned_gens) = obj.get("pinned_generations").and_then(Value::as_array) {
+            for item in pinned_gens {
+                if let Some(g) = item.as_u64() {
+                    options.pinned_generations.insert(g);
+                }
+            }
+        }
+    }
+
+    let report = state
+        .storage_manager
+        .build_reachability_inventory(&options)
+        .await
+        .map_err(|error| {
+            crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "remote_store_inventory_exception",
+                format!("failed to build reachability inventory: {error:#}"),
+            )
+        })?;
+    serde_json::to_value(report).map_err(|error| {
+        crate::api::error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "serialization_exception",
+            error,
+        )
+    })
+}
+
+pub(crate) async fn run_janitor(
+    state: &AppState,
+    index_name: &str,
+    metadata: &IndexMetadata,
+    body: Option<Value>,
+) -> Result<Value, (StatusCode, Json<Value>)> {
+    if !matches!(
+        metadata.settings.engine,
+        crate::cluster::state::IndexEngine::RemoteStore
+    ) {
+        return Err(crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            format!(
+                "index [{}] uses engine [{}] which does not support remote_store janitor",
+                index_name, metadata.settings.engine
+            ),
+        ));
+    }
+
+    let cluster_state = state.cluster_manager.get_state();
+    let mut janitor_opts = crate::storage::JanitorOptions::dry_run_for_index(
+        metadata.uuid.as_str(),
+        Some(index_name.to_string()),
+    );
+    janitor_opts.inventory_options.active_writer_authority = cluster_state
+        .manifest_writer_authorities
+        .get(index_name)
+        .cloned();
+
+    if let Some(ref obj) = body.and_then(|v| v.as_object().cloned()) {
+        if let Some(dry_run) = obj.get("dry_run").and_then(Value::as_bool) {
+            janitor_opts.dry_run = dry_run;
+        }
+        if let Some(max_del) = obj.get("max_deletes_per_run").and_then(Value::as_u64) {
+            janitor_opts.max_deletes_per_run = max_del as usize;
+        }
+        if let Some(max_bytes) = obj.get("max_delete_bytes_per_run").and_then(Value::as_u64) {
+            janitor_opts.max_delete_bytes_per_run = max_bytes;
+        }
+        if let Some(sweep_grace) = obj.get("sweep_grace_ms").and_then(Value::as_u64) {
+            janitor_opts.sweep_grace_ms = sweep_grace;
+        }
+        if let Some(gen_cap) = obj.get("retention_generations").and_then(Value::as_u64) {
+            janitor_opts.inventory_options.retention_generations = gen_cap as usize;
+        }
+        if let Some(horizon_ms) = obj.get("retention_horizon_ms").and_then(Value::as_u64) {
+            janitor_opts.inventory_options.retention_horizon_ms = horizon_ms;
+        }
+        if let Some(grace_ms) = obj.get("active_grace_ms").and_then(Value::as_u64) {
+            janitor_opts.inventory_options.active_grace_ms = grace_ms;
+        }
+        if let Some(now_ms) = obj.get("now_epoch_ms").and_then(Value::as_u64) {
+            janitor_opts.inventory_options.now_epoch_ms = now_ms;
+        }
+        if let Some(pinned_splits) = obj.get("pinned_split_ids").and_then(Value::as_array) {
+            for item in pinned_splits {
+                if let Some(s) = item.as_str() {
+                    janitor_opts
+                        .inventory_options
+                        .pinned_split_ids
+                        .insert(s.to_string());
+                }
+            }
+        }
+        if let Some(pinned_gens) = obj.get("pinned_generations").and_then(Value::as_array) {
+            for item in pinned_gens {
+                if let Some(g) = item.as_u64() {
+                    janitor_opts.inventory_options.pinned_generations.insert(g);
+                }
+            }
+        }
+    }
+
+    let report = state
+        .storage_manager
+        .run_janitor(&janitor_opts)
+        .await
+        .map_err(|error| {
+            crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "remote_store_janitor_exception",
+                format!("failed to run object-store janitor: {error:#}"),
+            )
+        })?;
+    serde_json::to_value(report).map_err(|error| {
+        crate::api::error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "serialization_exception",
+            error,
+        )
+    })
 }
 
 /// Walk every `Published` split in the current manifest, recompute its

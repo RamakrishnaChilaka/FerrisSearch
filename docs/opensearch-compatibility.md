@@ -205,6 +205,8 @@ The status applies only to the scope described in the canonical JSON entry.
 | `PUT` | `/{index}/_settings` | Partial |
 | `POST` | `/{index}/_remote_store/publish` | Intentionally different |
 | `POST` | `/{index}/_remote_store/verify` | Intentionally different |
+| `GET`, `POST` | `/{index}/_remote_store/inventory` | Intentionally different |
+| `POST` | `/{index}/_remote_store/janitor` | Intentionally different |
 | `POST` | `/{index}/_doc` | Partial |
 | `PUT`, `POST` | `/{index}/_doc/{id}` | Partial |
 | `GET` | `/{index}/_doc/{id}` | Partial |

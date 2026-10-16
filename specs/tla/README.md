@@ -875,6 +875,32 @@ real serialized canonical/journal/settlement/certification boundaries; it is
 checked by `check_write_authority_trace.py`, not the D1 schema-v4 TLC relation,
 and is not a global concurrent linearization proof.
 
+## Supplementary FS018 fenced manifest publication checks
+
+`MC_FS018_ManifestPublication.tla` models the ADR 0002 / FS-017..FS-019
+single-sequencer remote-store manifest publication protocol across two
+operation IDs, two request fingerprints, two Raft writer epochs, two manifest
+generations, and pointer revisions up to 5.
+
+| Model action | Source boundary |
+| --- | --- |
+| `FS018StageIntent`, `FS018PrepareBundle` | `StorageManager::stage_publication_intent`, `upload_split_bundle`, and `write_publication_prepared`. |
+| `FS018AcquireEpoch`, `FS018FencePointer`, `FS018ActivateEpoch` | `ManifestWriterMutation::Acquire`, `StorageManager::fence_manifest_pointer`, and `ManifestWriterMutation::Activate`. |
+| `FS018StageCandidateManifest`, `FS018CommitPointer`, `FS018AbortStaleAttempt`, `FS018RecordCommitted` | `StorageManager::commit_prepared_publication` candidate manifest creation, conditional pointer CAS, `Superseded` attempt recording, and `committed.json` repair. |
+
+```bash
+./scripts/tla/check.sh fs018-safe fs018-unfenced-activate fs018-blind-overwrite fs018-fingerprint-mismatch
+```
+
+October 16, 2026, Java 25 and pinned TLA+ tools 1.7.4, one worker per profile:
+
+| Runner | Result | Generated / distinct | Depth |
+| --- | --- | ---: | ---: |
+| `fs018-safe` | All safety invariants (`FS018PointerReferencesValidManifest`, `FS018MonotonicLineage`, `FS018NoLostCommittedSplit`, `FS018NoStaleEpochCommit`, `FS018UniqueOperationIdentity`, `FS018OrphanClassificationSound`) pass | 3,457 / 1,524 | 19 |
+| `fs018-unfenced-activate` | Retains `FS018NoStaleEpochCommit` violation when activating an epoch without fencing `manifest.current.json` first | 1,421 / 567 | 9 |
+| `fs018-blind-overwrite` | Retains `FS018NoLostCommittedSplit` violation when pointer updates omit CAS | 2,640 / 1,128 | 15 |
+| `fs018-fingerprint-mismatch` | Retains `FS018UniqueOperationIdentity` violation when conflicting retries overwrite an operation ID | 20 / 15 | 3 |
+
 ## Empty-store and copy-failure rules
 
 G1 models CreateIndex routing with `initialized = FALSE`, allocation ID 1 for
