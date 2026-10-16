@@ -398,6 +398,16 @@ message RemoteStoreSearchResponse {
     repeated RemoteStoreSplitSearchResult results = 1;
 }
 
+message RemoteStorePublishCommitRequest {
+    string index_name = 1;
+    string index_uuid = 2;
+    bytes request_json = 3;
+}
+
+message RemoteStorePublishCommitResponse {
+    bytes result_json = 1;
+}
+
 // ─── Replication ──────────────────────────────────────────────────────────────
 
 message ReplicaWriteAuthority {
@@ -887,6 +897,7 @@ service InternalTransport {
     rpc SearchShardDsl(ShardSearchDslRequest) returns (ShardSearchResponse);
     rpc GetRemoteStoreLeafStatus(RemoteStoreLeafStatusRequest) returns (RemoteStoreLeafStatusResponse);
     rpc SearchRemoteStoreSplits(RemoteStoreSearchRequest) returns (RemoteStoreSearchResponse);
+    rpc CommitRemoteStorePublication(RemoteStorePublishCommitRequest) returns (RemoteStorePublishCommitResponse);
 
     // Shard-level SQL (returns Arrow IPC RecordBatch)
     rpc SqlRecordBatch(SqlRecordBatchRequest) returns (SqlRecordBatchResponse);

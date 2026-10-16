@@ -8048,3 +8048,224 @@ async fn group_by_unmapped_builtin_body_is_rejected_as_text() -> Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn fs017_021_multi_node_fenced_publish_retry_failover_inventory_and_janitor_end_to_end()
+-> Result<()> {
+    let harness = MultiNodeRestHarness::start_three_nodes_with_shared_remote_store(vec![
+        NodeRole::Master,
+        NodeRole::Data,
+    ])
+    .await?;
+
+    let (status, create_body) = put_json_to_base_url(
+        &harness.client,
+        &harness.nodes[0].base_url,
+        "/fenced-events",
+        json!({
+            "engine": "remote_store",
+            "mappings": {
+                "properties": {
+                    "title": { "type": "text" },
+                    "seq": { "type": "integer" }
+                }
+            }
+        }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{create_body}");
+
+    let leader_version = harness.nodes[0].app_state.cluster_manager.version();
+    for node in &harness.nodes {
+        node.app_state
+            .cluster_manager
+            .wait_for_version(leader_version)
+            .await?;
+    }
+
+    // 1. Publish concurrently across all 3 nodes (leader and followers) with explicit operation_ids.
+    let mut publish_tasks = Vec::new();
+    for (idx, node) in harness.nodes.iter().enumerate() {
+        let client = harness.client.clone();
+        let base_url = node.base_url.clone();
+        let op_id = format!("cluster-op-{}", idx + 1);
+        let doc_id = format!("doc-{}", idx + 1);
+        publish_tasks.push(tokio::spawn(async move {
+            post_json_to_base_url(
+                &client,
+                &base_url,
+                &format!("/fenced-events/_remote_store/publish?operation_id={op_id}"),
+                json!({
+                    "docs": [
+                        { "_id": doc_id, "title": format!("from node {}", idx + 1), "seq": (idx + 1) as i64 }
+                    ]
+                }),
+            )
+            .await
+        }));
+    }
+
+    let mut generations = std::collections::HashSet::new();
+    let mut split_by_op = std::collections::HashMap::new();
+    for task in publish_tasks {
+        let (p_status, p_body) = task.await??;
+        assert_eq!(p_status, StatusCode::OK, "{p_body}");
+        assert_eq!(p_body["replayed"], json!(false), "{p_body}");
+        assert!(p_body["writer_epoch"].as_u64().unwrap_or(0) >= 1);
+        assert!(p_body["pointer_revision"].as_u64().unwrap_or(0) >= 2);
+        let manifest_gen = p_body["generation"].as_u64().expect("generation");
+        generations.insert(manifest_gen);
+        split_by_op.insert(
+            p_body["operation_id"].as_str().unwrap().to_string(),
+            (
+                manifest_gen,
+                p_body["split_id"].as_str().unwrap().to_string(),
+            ),
+        );
+    }
+    assert_eq!(
+        generations,
+        std::collections::HashSet::from([1u64, 2u64, 3u64])
+    );
+
+    // 2. Idempotent retry of cluster-op-1 on a different node returns 200 OK with replayed=true
+    // and the original generation & split_id without advancing the manifest generation!
+    let (retry_status, retry_body) = post_json_to_base_url(
+        &harness.client,
+        &harness.nodes[2].base_url,
+        "/fenced-events/_remote_store/publish",
+        json!({
+            "operation_id": "cluster-op-1",
+            "docs": [
+                { "_id": "doc-1", "title": "from node 1", "seq": 1 }
+            ]
+        }),
+    )
+    .await?;
+    assert_eq!(retry_status, StatusCode::OK, "{retry_body}");
+    assert_eq!(retry_body["replayed"], json!(true), "{retry_body}");
+    assert_eq!(
+        retry_body["generation"].as_u64().unwrap(),
+        split_by_op["cluster-op-1"].0
+    );
+    assert_eq!(
+        retry_body["split_id"].as_str().unwrap(),
+        split_by_op["cluster-op-1"].1
+    );
+
+    // 3. Conflicting retry of cluster-op-1 with different document content returns 409 operation_id_conflict.
+    let (conflict_status, conflict_body) = post_json_to_base_url(
+        &harness.client,
+        &harness.nodes[1].base_url,
+        "/fenced-events/_remote_store/publish?operation_id=cluster-op-1",
+        json!({
+            "docs": [
+                { "_id": "doc-1", "title": "DIFFERENT PAYLOAD", "seq": 999 }
+            ]
+        }),
+    )
+    .await?;
+    assert_eq!(conflict_status, StatusCode::CONFLICT, "{conflict_body}");
+    assert_eq!(
+        conflict_body["error"]["type"],
+        json!("operation_id_conflict")
+    );
+
+    // 4. Inject an abandoned staging crash on node-1 for op-abandoned, then inspect inventory and run janitor.
+    harness.nodes[0]
+        .app_state
+        .storage_manager
+        .set_publication_crash_stage_for_test(Some(
+            ferrissearch::storage::PublicationCrashStage::AfterBundleUploadBeforePreparedRecord,
+        ));
+    let (crash_status, _crash_body) = post_json_to_base_url(
+        &harness.client,
+        &harness.nodes[0].base_url,
+        "/fenced-events/_remote_store/publish?operation_id=op-abandoned",
+        json!({
+            "docs": [
+                { "_id": "doc-abandoned", "title": "abandoned bundle", "seq": 404 }
+            ]
+        }),
+    )
+    .await?;
+    assert_eq!(crash_status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    let future_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 1_000_000;
+
+    let (inv_status, inv_body) = post_json_to_base_url(
+        &harness.client,
+        &harness.nodes[1].base_url,
+        "/fenced-events/_remote_store/inventory",
+        json!({ "now_epoch_ms": future_now }),
+    )
+    .await?;
+    assert_eq!(inv_status, StatusCode::OK, "{inv_body}");
+    assert_eq!(inv_body["current_generation"], json!(3));
+    assert_eq!(inv_body["lineage_healthy"], json!(true));
+    assert!(
+        inv_body["summary"]["reclaimable_objects"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 2
+    );
+
+    // Default janitor call is dry_run=true.
+    let (dry_status, dry_body) = post_json_to_base_url(
+        &harness.client,
+        &harness.nodes[2].base_url,
+        "/fenced-events/_remote_store/janitor",
+        json!({ "now_epoch_ms": future_now }),
+    )
+    .await?;
+    assert_eq!(dry_status, StatusCode::OK, "{dry_body}");
+    assert_eq!(dry_body["dry_run"], json!(true));
+    assert_eq!(dry_body["deleted_objects"], json!(0));
+    assert!(dry_body["would_delete_objects"].as_u64().unwrap_or(0) >= 2);
+
+    // Destructive janitor run reclaims the abandoned intent and bundle while keeping all 3 committed splits.
+    let (jan_status, jan_body) = post_json_to_base_url(
+        &harness.client,
+        &harness.nodes[2].base_url,
+        "/fenced-events/_remote_store/janitor",
+        json!({
+            "dry_run": false,
+            "now_epoch_ms": future_now,
+            "sweep_grace_ms": 0
+        }),
+    )
+    .await?;
+    assert_eq!(jan_status, StatusCode::OK, "{jan_body}");
+    assert_eq!(jan_body["dry_run"], json!(false));
+    assert!(jan_body["deleted_objects"].as_u64().unwrap_or(0) >= 2);
+
+    // Verify all 3 committed splits remain searchable and pass /_remote_store/verify!
+    let (verify_status, verify_body) = post_json_to_base_url(
+        &harness.client,
+        &harness.nodes[0].base_url,
+        "/fenced-events/_remote_store/verify",
+        json!({}),
+    )
+    .await?;
+    assert_eq!(verify_status, StatusCode::OK, "{verify_body}");
+    assert_eq!(verify_body["generation"], json!(3));
+    assert_eq!(verify_body["ok_count"], json!(3));
+    assert_eq!(verify_body["mismatch_count"], json!(0));
+    assert_eq!(verify_body["missing_count"], json!(0));
+
+    let (count_status, count_body) = post_json_to_base_url(
+        &harness.client,
+        &harness.nodes[1].base_url,
+        "/fenced-events/_count",
+        json!({ "query": { "match_all": {} } }),
+    )
+    .await?;
+    assert_eq!(count_status, StatusCode::OK, "{count_body}");
+    assert_eq!(count_body["count"], json!(3));
+
+    Ok(())
+}

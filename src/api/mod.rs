@@ -342,6 +342,14 @@ pub fn create_router(mut state: AppState) -> Router {
             "/{index}/_remote_store/verify",
             post(index::verify_remote_store_splits),
         )
+        .route(
+            "/{index}/_remote_store/inventory",
+            get(index::get_remote_store_inventory).post(index::inspect_remote_store_inventory),
+        )
+        .route(
+            "/{index}/_remote_store/janitor",
+            post(index::run_remote_store_janitor),
+        )
         // Document operations
         .route("/{index}/_doc", post(index::index_document))
         .route("/{index}/_doc/{id}", put(index::index_document_with_id))

@@ -192,10 +192,11 @@
       "methods": ["POST"],
       "path": "/{index}/_remote_store/publish",
       "classification": "intentionally_different",
-      "summary": "FerrisSearch-only manual immutable split publication; not near-real-time OpenSearch ingest.",
+      "summary": "FerrisSearch-only fenced single-sequencer immutable split publication with operation-ID retry deduplication; not near-real-time OpenSearch ingest.",
       "evidence": [
-        "src/engine/remote_store.rs#publish_docs",
-        "tests/rest_api_integration.rs#remote_store_search_returns_hits_from_published_split"
+        "src/engine/remote_store.rs#publish_docs_with_operation",
+        "tests/rest_api_integration.rs#remote_store_search_returns_hits_from_published_split",
+        "tests/rest_api_integration.rs#fs017_021_multi_node_fenced_publish_retry_failover_inventory_and_janitor_end_to_end"
       ]
     },
     {
@@ -207,6 +208,28 @@
       "evidence": [
         "src/engine/remote_store.rs#verify_splits",
         "tests/rest_api_integration.rs#remote_store_verify_reports_ok_for_untouched_splits"
+      ]
+    },
+    {
+      "id": "remote-store-inventory",
+      "methods": ["GET", "POST"],
+      "path": "/{index}/_remote_store/inventory",
+      "classification": "intentionally_different",
+      "summary": "FerrisSearch-only non-mutating object-store reachability inventory across pointer, manifest lineage, operation records, and active pins.",
+      "evidence": [
+        "src/api/index/mod.rs#inspect_remote_store_inventory",
+        "tests/rest_api_integration.rs#fs017_021_multi_node_fenced_publish_retry_failover_inventory_and_janitor_end_to_end"
+      ]
+    },
+    {
+      "id": "remote-store-janitor",
+      "methods": ["POST"],
+      "path": "/{index}/_remote_store/janitor",
+      "classification": "intentionally_different",
+      "summary": "FerrisSearch-only dry-run-first, rate-limited object-store janitor that reclaims only unpinned objects outside retention and active-lease safety windows.",
+      "evidence": [
+        "src/api/index/mod.rs#run_remote_store_janitor",
+        "tests/rest_api_integration.rs#fs017_021_multi_node_fenced_publish_retry_failover_inventory_and_janitor_end_to_end"
       ]
     },
     {

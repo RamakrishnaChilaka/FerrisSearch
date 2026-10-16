@@ -1126,6 +1126,31 @@ impl TransportClient {
             .collect()
     }
 
+    pub(crate) async fn forward_remote_store_publish_commit(
+        &self,
+        node: &NodeInfo,
+        index_name: &str,
+        index_uuid: &str,
+        request_payload: &crate::engine::remote_store::ForwardedSequencerCommitRequest,
+    ) -> Result<crate::engine::remote_store::ForwardedSequencerCommitResponse, anyhow::Error> {
+        let mut client = self.connect(&node.host, node.transport_port).await?;
+        let request = self.forwarding_request(
+            RemoteStorePublishCommitRequest {
+                index_name: index_name.to_string(),
+                index_uuid: index_uuid.to_string(),
+                request_json: serde_json::to_vec(request_payload)?,
+            },
+            index_name,
+            None,
+        );
+        let response = client
+            .commit_remote_store_publication(request)
+            .await?
+            .into_inner();
+        serde_json::from_slice(&response.result_json)
+            .context("decode remote_store publish commit response")
+    }
+
     /// Forward a SQL RecordBatch request to a specific shard (returns Arrow IPC)
     #[allow(clippy::too_many_arguments)]
     pub async fn forward_sql_batch_to_shard(

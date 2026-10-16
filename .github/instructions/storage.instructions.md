@@ -32,22 +32,27 @@ Do not collapse these responsibilities into API handlers.
 
 ## Current Limits That Must Stay Explicit
 
-- `StorageManager` now provides conditional object-store primitives
+- `StorageManager` provides conditional object-store primitives
   (`create_immutable`, `read_with_token`, `compare_and_swap`,
-  `compare_and_swap_optional`) and capability probing (FS-015), and manifest
-  publication uses `create_immutable` plus pointer CAS. However, there is not
-  yet a Raft-managed writer lease/epoch (FS-016), parent/epoch/operation-ID
-  manifest lineage (FS-017), or fenced single-sequencer commit path (FS-018).
-  Do not claim full multi-writer publication safety yet.
-- `append_split_and_publish()` detects concurrent pointer/generation conflicts
-  via CAS and fails closed rather than silently overwriting a concurrent
-  generation, but retry deduplication and sequencer coordination remain
-  FS-016..FS-018 work.
+  `compare_and_swap_optional`) and capability probing (FS-015); Raft replicates
+  per-index `ManifestWriterAuthority` leases and monotonic epochs (FS-016);
+  manifests and pointers record parent lineage, writer epoch, operation ID,
+  request fingerprint, schema generation, and format capability windows
+  (FS-017); `remote_store` publication stages immutable bundles plus
+  `intent`/`prepared`/`committed`/attempt records and sequences commits through
+  the active fenced sequencer (FS-018/FS-019); and `StorageManager` provides a
+  non-mutating reachability inventory (`build_reachability_inventory`, FS-020)
+  and a conservative dry-run-first janitor (`run_janitor`, FS-021). However,
+  general optimistic multi-writer manifest merging, split compaction, and
+  versioned document deletion are not implemented yet.
 - Standard `_doc`, `_bulk`, `_update`, and `_delete` APIs do not mutate a
   remote-store index. The dedicated publish endpoint is not near-real-time
   ingest.
-- There is no object-store split compactor, tombstone lifecycle, retention
-  watermark, or garbage collector. Node-local cache reaping is not object GC.
+- There is no object-store split compactor or tombstone lifecycle yet. The
+  FS-021 janitor defaults to `dry_run = true` and in destructive mode reclaims
+  only unpinned `Abandoned` and `Superseded` objects outside the active-lease
+  and retention horizons when listing and lineage are healthy. Node-local cache
+  reaping remains separate from object-store reclamation.
 - Split hydration currently downloads the full bundle into memory before
   writing/extracting it; do not describe this as streaming hydration.
 - Root scheduling performs per-query leaf status discovery. There is no

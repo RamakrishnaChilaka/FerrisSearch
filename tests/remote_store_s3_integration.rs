@@ -60,14 +60,23 @@ fn random_prefix() -> String {
 }
 
 fn sample_manifest(index_uuid: &str, generation: u64) -> RemoteStoreManifest {
+    let parent_generation = generation.saturating_sub(1);
     RemoteStoreManifest {
         version: REMOTE_MANIFEST_FORMAT_VERSION,
         engine: IndexEngine::RemoteStore,
         index_uuid: index_uuid.into(),
         index_name: "events".into(),
-        generation,
-        published_at: "2026-04-21T00:00:00Z".into(),
+        schema_generation: 1,
         schema_hash: "sha256:v1".into(),
+        generation,
+        parent_generation,
+        parent_manifest_path: (parent_generation > 0).then(|| {
+            format!("{index_uuid}/manifests/{parent_generation:012}/op-{parent_generation}.json")
+        }),
+        writer_epoch: 1,
+        operation_id: format!("op-{generation}"),
+        request_fingerprint: format!("sha256:{}", "1".repeat(64)),
+        published_at: "2026-04-21T00:00:00Z".into(),
         settings: None,
         splits: vec![RemoteSplitManifest {
             split_id: format!("split-{generation}"),

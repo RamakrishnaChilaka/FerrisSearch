@@ -6,7 +6,7 @@
 >
 > **Current-behavior authority:** source and tests.
 >
-> **Last source audit:** 2026-10-16 for FS-014, FS-015, and FS-016; 2026-10-15 for FS-013;
+> **Last source audit:** 2026-10-16 for FS-014 through FS-021; 2026-10-15 for FS-013;
 > 2026-10-14 for FS-010 and FS-012; 2026-10-13 for FS-003,
 > FS-004, and FS-011; 2026-10-09 for
 > FS-002; 2026-10-08 for FS-001 and FS-007; 2026-09-27
@@ -601,7 +601,7 @@ the selected protocol.
 
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-002
 
-**Status (2026-10-16):** Implemented locally, pending merge. `ClusterState`
+**Status (2026-10-16):** Implemented and merged in PR #182. `ClusterState`
 now stores one `ManifestWriterAuthority` (`Unassigned`, `Fencing`, `Active`)
 per `remote_store` index with a strictly monotonic `last_writer_epoch` and
 `last_lease_id` that are never reused across re-acquisitions, transfers, or
@@ -614,9 +614,7 @@ putting split inventory or query scheduling state in Raft.
 **Completion evidence:** unit, state-machine, transport snapshot roundtrip,
 3-node real-Raft follower-forwarding/transfer/leader-change, and persistent
 `DiskLogStore` restart tests covering acquire, activate, renew, transfer,
-expiry, leader change, holder removal, and stale-writer rejection. Manifest
-parent/epoch/operation-ID versioning and fenced single-sequencer commit remain
-FS-017 and FS-018.
+expiry, leader change, holder removal, and stale-writer rejection.
 
 **Historical evidence (before FS-016):** Raft knows index metadata but no
 authoritative manifest writer or monotonic writer epoch.
@@ -631,8 +629,20 @@ rejection have state-machine, transport, multi-node, and restart coverage.
 
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-005, FS-016
 
-**Evidence:** `RemoteStoreManifest` records generation and schema hash but not
-the lineage/fencing data required for idempotent concurrent production.
+**Status (2026-10-16):** Implemented. `RemoteStoreManifest` (write format v3,
+read compatibility window `2..=3`) records `schema_generation`, `schema_hash`,
+`parent_generation`, `parent_manifest_path`, `writer_epoch`, `operation_id`,
+and `request_fingerprint`, while `RemoteManifestPointer` (write format v3,
+read compatibility window `2..=3`) records `index_uuid`, `pointer_revision`,
+`writer_epoch`, `current_generation`, `manifest_path`, `manifest_checksum`,
+and `last_operation_id`, including explicit generation-0 empty fenced pointers.
+Readers validate pointer-to-manifest agreement and walk parent lineage,
+rejecting broken lineage or unsupported versions while keeping v2 manifests
+readable within the declared compatibility window.
+
+**Historical evidence (before FS-017):** `RemoteStoreManifest` records
+generation and schema hash but not the lineage/fencing data required for
+idempotent concurrent production.
 
 **Outcome:** A backward-declared manifest format records parent generation,
 writer epoch, publication operation ID, logical schema generation, and
@@ -646,8 +656,21 @@ readable within the compatibility window.
 
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-015, FS-016, FS-017
 
-**Evidence:** current publication derives `generation + 1` and overwrites the
-pointer under only an in-process mutex.
+**Status (2026-10-16):** Implemented. Any HTTP coordinator can act as a
+producer staging immutable split bundles and operation records
+(`publications/<operation_id>/{intent,prepared,committed}.json` and
+`publication-attempts/<operation_id>/<attempt_id>.json`) with deterministic
+operation-derived document and split IDs, then forwards sequencing via
+`CommitRemoteStorePublication` (or executes locally) on the active Raft-leased
+`ManifestWriterAuthority` holder. The sequencer fences `manifest.current.json`
+before activating its epoch in Raft, serializes commits under the active epoch,
+validates parent lineage and operation fingerprints, writes candidate manifests
+at `manifests/<generation:012>/<operation_id>.json`, conditionally swaps
+`manifest.current.json`, repairs missing `committed.json` records on retry, and
+exports Prometheus publication and fence metrics.
+
+**Historical evidence (before FS-018):** current publication derives
+`generation + 1` and overwrites the pointer under only an in-process mutex.
 
 **Outcome:** Parallel producers stage immutable outputs, while the leased
 sequencer validates parent/epoch/op ID and conditionally commits one next
@@ -661,10 +684,22 @@ inspectable audit record and metrics.
 
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-007, FS-018
 
-**Evidence:** in-process publication tests cannot prove cross-process fencing.
-The bounded TLA+ model in `specs/tla/` found an allocation ABA and a stale-primary
-gap in the pre-#144 design, before the Rust fixes. Model the FS-002
-sequencer protocol the same way before implementing FS-018.
+**Status (2026-10-16):** Implemented. `specs/tla/MC_FS018_ManifestPublication.tla`
+and the `fs018-safe`, `fs018-unfenced-activate`, `fs018-blind-overwrite`, and
+`fs018-fingerprint-mismatch` TLC configurations verify single-sequencer pointer
+fencing, pointer CAS, monotonic lineage, operation-ID uniqueness, and orphan
+classification before implementation. Storage and multi-node tests cover crash
+and retry at every publication phase (`IntentCreated`, `ArtifactUploaded`,
+`Prepared`, `ManifestCreated`, `PointerCommitted`, `CommitRecorded`,
+before/after-commit `Indeterminate` pointer CAS, and stale-epoch failover
+rebasing) across local filesystem, remote `ObjectStore`, 4-process OS child
+subprocesses, and a 3-node REST/gRPC cluster.
+
+**Historical evidence (before FS-019):** in-process publication tests cannot
+prove cross-process fencing. The bounded TLA+ model in `specs/tla/` found an
+allocation ABA and a stale-primary gap in the pre-#144 design, before the Rust
+fixes. Model the FS-002 sequencer protocol the same way before implementing
+FS-018.
 
 **Outcome:** Process-backed filesystem and S3-compatible tests run independent
 producers and sequencer failover at every publication boundary.
@@ -677,9 +712,17 @@ orphan classification after every injected crash.
 
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-017
 
-**Evidence:** uploaded bundles and immutable manifests can become unreachable,
-but there is no authoritative inventory separating staging, committed,
-retained, pinned, and orphaned objects.
+**Status (2026-10-16):** Implemented. `StorageManager::build_reachability_inventory`
+and `GET/POST /{index}/_remote_store/inventory` enumerate index objects without
+mutation, walk `manifest.current.json` and the retained parent manifest chain,
+inspect operation and attempt records plus active reader pins and writer
+leases, and emit a bounded machine-readable `ReachabilityInventoryReport`
+classifying every object (`Committed`, `Retained`, `Pinned`, `Staging`,
+`Prepared`, `Unresolved`, `Superseded`, `Abandoned`, `Unknown`, `Corrupt`).
+
+**Historical evidence (before FS-020):** uploaded bundles and immutable
+manifests can become unreachable, but there is no authoritative inventory
+separating staging, committed, retained, pinned, and orphaned objects.
 
 **Outcome:** An offline/maintenance scanner enumerates object-store state,
 walks retained manifest lineage, classifies every object, and emits bounded
@@ -694,8 +737,17 @@ retained old generations, active pins, and malformed metadata conservatively.
 
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-003, FS-020
 
-**Evidence:** node-local cache reaping exists, but object-store artifacts never
-enter a retention-aware reclaim protocol.
+**Status (2026-10-16):** Implemented. `StorageManager::run_janitor` and
+`POST /{index}/_remote_store/janitor` consume the reachability inventory,
+default to `dry_run = true`, explain every candidate decision, persist durable
+sweep marks in `<index_uuid>/janitor/marks.json` across restarts, enforce
+`sweep_grace_ms` and per-run object/byte rate limits, recompute reachability
+immediately before deletion to prevent false positives from delayed readers or
+pins, block destructive sweeps on partial listings or unhealthy/unresolved
+lineage, and record Prometheus janitor metrics.
+
+**Historical evidence (before FS-021):** node-local cache reaping exists, but
+object-store artifacts never enter a retention-aware reclaim protocol.
 
 **Outcome:** A rate-limited janitor consumes reachability inventory, defaults to
 dry run, explains every candidate, and deletes only objects beyond the
