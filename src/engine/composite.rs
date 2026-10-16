@@ -1954,6 +1954,36 @@ impl SearchEngine for CompositeEngine {
         self.text.deleted_documents_with_versions()
     }
 
+    fn restore_documents_with_versions(
+        &self,
+        live_docs: &[super::LiveDocumentVersionTuple],
+        tombstones: &[super::DeletedDocumentVersionTuple],
+        watermark_state: Option<super::SealWatermarkState>,
+    ) -> Result<usize> {
+        let _vector_recovery = self
+            .vector_recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let rebuild_vectors = self.prepare_vector_rebuild(true)?;
+        let count =
+            match self
+                .text
+                .restore_documents_with_versions(live_docs, tombstones, watermark_state)
+            {
+                Ok(count) => count,
+                Err(error) => {
+                    return Err(self.record_vector_staleness_after_text_failure(
+                        "restore documents with versions",
+                        error,
+                    ));
+                }
+            };
+        if rebuild_vectors {
+            self.rebuild_vectors_locked()?;
+        }
+        Ok(count)
+    }
+
     fn global_checkpoint(&self) -> Option<u64> {
         *self
             .global_cp

@@ -469,7 +469,58 @@ pub const DEFAULT_HOT_DELTA_MAX_SEAL_AGE_MS: u64 = 30_000;
 pub const DEFAULT_HOT_DELTA_MAX_UNSEALED_BYTES: u64 = 512 * 1024 * 1024;
 pub const DEFAULT_HOT_DELTA_MAX_UNSEALED_OPS: u64 = 100_000;
 
-/// Hot-delta and automatic bounded split sealing policy (`FS-034`, `FS-035`).
+/// Lifecycle migration authority phase (`FS-043`, ADR 0004 section 3.10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexMigrationPhase {
+    MutableOnly,
+    TieringBootstrap,
+    TieringValidate,
+    Tiered,
+    MutableRollbackPreparing,
+}
+
+impl IndexMigrationPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MutableOnly => "mutable_only",
+            Self::TieringBootstrap => "tiering_bootstrap",
+            Self::TieringValidate => "tiering_validate",
+            Self::Tiered => "tiered",
+            Self::MutableRollbackPreparing => "mutable_rollback_preparing",
+        }
+    }
+}
+
+impl std::fmt::Display for IndexMigrationPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Compact Raft-replicated lifecycle migration record (`FS-043`, ADR 0004 section 3.10).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexMigrationRecord {
+    pub migration_id: String,
+    pub phase: IndexMigrationPhase,
+    #[serde(default)]
+    pub source_mode: String,
+    #[serde(default)]
+    pub target_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_manifest_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub bootstrap_watermarks: std::collections::BTreeMap<u32, u64>,
+    #[serde(default)]
+    pub equivalence_verified: bool,
+    #[serde(default)]
+    pub fast_rollback_retained: bool,
+    #[serde(default)]
+    pub updated_at_epoch_ms: u64,
+}
+
+/// Hot-delta and automatic bounded split sealing policy (`FS-034`, `FS-035`, `FS-043`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct HotDeltaSealPolicy {
@@ -489,6 +540,8 @@ pub struct HotDeltaSealPolicy {
     pub max_unsealed_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_unsealed_ops: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration: Option<IndexMigrationRecord>,
 }
 
 impl Default for HotDeltaSealPolicy {
@@ -502,6 +555,7 @@ impl Default for HotDeltaSealPolicy {
             max_seal_age_ms: None,
             max_unsealed_bytes: None,
             max_unsealed_ops: None,
+            migration: None,
         }
     }
 }
@@ -1133,6 +1187,25 @@ impl IndexMetadata {
                 .is_some_and(RemoteStoreSettings::has_enabled_hot_delta)
     }
 
+    pub fn uses_manifest_writer_authority(&self) -> bool {
+        self.uses_remote_store()
+            || self
+                .settings
+                .remote_store
+                .as_ref()
+                .and_then(|rs| rs.hot_delta.as_ref())
+                .and_then(|hd| hd.migration.as_ref())
+                .is_some()
+    }
+
+    pub fn migration_record(&self) -> Option<&IndexMigrationRecord> {
+        self.settings
+            .remote_store
+            .as_ref()
+            .and_then(|rs| rs.hot_delta.as_ref())
+            .and_then(|hd| hd.migration.as_ref())
+    }
+
     pub fn is_tiered(&self) -> bool {
         self.number_of_shards > 0 && self.uses_remote_store()
     }
@@ -1247,6 +1320,12 @@ impl IndexMetadata {
                 ));
             }
         }
+        if body.pointer("/index/lifecycle_mode").is_some() || body.get("lifecycle_mode").is_some() {
+            return Err(
+                "index.lifecycle_mode cannot be changed directly via _settings; use POST /{index}/_lifecycle/migrate or POST /{index}/_lifecycle/rollback"
+                    .into(),
+            );
+        }
         let mut updated = self.clone();
         if let Some(value) = body.pointer("/index/number_of_replicas") {
             let replicas = parse_u32_setting(value, "index.number_of_replicas")?;
@@ -1275,15 +1354,65 @@ impl IndexMetadata {
                 updated.settings.flush_threshold_bytes = Some(value);
             }
         }
+        if let Some(expected_uuid) = body
+            .pointer("/index/_expected_uuid")
+            .and_then(|v| v.as_str())
+            && self.uuid.as_str() != expected_uuid
+        {
+            return Err(format!(
+                "index [{}] UUID mismatch: expected {expected_uuid}, found {}",
+                self.name, self.uuid
+            ));
+        }
+        if let Some(expected_mig) = body
+            .pointer("/index/_expected_migration_id")
+            .and_then(|v| v.as_str())
+            && self
+                .migration_record()
+                .is_none_or(|m| m.migration_id != expected_mig)
+        {
+            return Err(format!(
+                "index [{}] migration_id mismatch: expected {expected_mig}",
+                self.name
+            ));
+        }
+        if let Some(internal_hd) = body.pointer("/index/_internal_lifecycle_hot_delta") {
+            if internal_hd.is_null() {
+                if let Some(mut rs) = updated.settings.remote_store.clone() {
+                    rs.hot_delta = None;
+                    updated.settings.remote_store = (!rs.is_empty()).then_some(rs);
+                }
+            } else {
+                let hd: HotDeltaSealPolicy = serde_json::from_value(internal_hd.clone())
+                    .map_err(|e| format!("invalid internal lifecycle hot_delta: {e}"))?;
+                hd.validate()?;
+                let mut rs = updated.settings.remote_store.clone().unwrap_or_default();
+                rs.hot_delta = Some(hd);
+                updated.settings.remote_store = (!rs.is_empty()).then_some(rs);
+            }
+        }
         if let Some(hd_val) = body
             .pointer("/index/hot_delta")
             .or_else(|| body.pointer("/index/remote_store/hot_delta"))
         {
+            if hd_val.is_null() || hd_val.get("migration").is_some() {
+                return Err(
+                    "index.hot_delta lifecycle state cannot be replaced via _settings; use POST /{index}/_lifecycle/migrate or POST /{index}/_lifecycle/rollback"
+                        .into(),
+                );
+            }
             let mut hd: HotDeltaSealPolicy = serde_json::from_value(hd_val.clone())
                 .map_err(|e| format!("invalid hot_delta settings: {e}"))?;
             if hd_val.get("enabled").is_none() {
-                hd.enabled = true;
+                hd.enabled = self.is_tiered();
             }
+            if hd.enabled != self.is_tiered() {
+                return Err(
+                    "index.hot_delta.enabled cannot be toggled via _settings; use POST /{index}/_lifecycle/migrate or POST /{index}/_lifecycle/rollback"
+                        .into(),
+                );
+            }
+            hd.migration = self.migration_record().cloned();
             hd.validate()?;
             let mut rs = updated.settings.remote_store.clone().unwrap_or_default();
             rs.hot_delta = Some(hd);
@@ -1373,6 +1502,14 @@ impl IndexMetadata {
         };
 
         metadata.settings.engine = engine;
+        if let Some(restore_uuid) = body
+            .get("_restore_uuid")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            metadata.uuid = IndexUuid::new(restore_uuid);
+        }
         metadata.settings.refresh_interval_ms = refresh_interval_ms;
         metadata.settings.flush_threshold_bytes = flush_threshold_bytes;
         metadata.settings.remote_store = remote_store_settings;
@@ -1861,11 +1998,11 @@ impl ClusterState {
         }
         let index_name = metadata.name.clone();
         let index_uuid = metadata.uuid.to_string();
-        let is_remote_store = matches!(metadata.settings.engine, IndexEngine::RemoteStore);
+        let needs_manifest_authority = metadata.uses_manifest_writer_authority();
         self.indices.insert(metadata.name.clone(), metadata);
         self.shard_allocations
             .insert(index_name.clone(), allocations);
-        if is_remote_store {
+        if needs_manifest_authority {
             self.manifest_writer_authorities.insert(
                 index_name.clone(),
                 ManifestWriterAuthority::unassigned(index_name, index_uuid),
@@ -1895,7 +2032,7 @@ impl ClusterState {
                     "manifest writer authority references unknown index '{key}'"
                 ));
             };
-            if !matches!(metadata.settings.engine, IndexEngine::RemoteStore) {
+            if !metadata.uses_manifest_writer_authority() {
                 return Err(format!(
                     "manifest writer authority for '{key}' is invalid because engine is '{}', not remote_store",
                     metadata.settings.engine
@@ -1938,7 +2075,7 @@ impl ClusterState {
             .indices
             .get(index_name)
             .ok_or_else(|| format!("index '{index_name}' does not exist"))?;
-        if !matches!(metadata.settings.engine, IndexEngine::RemoteStore) {
+        if !metadata.uses_manifest_writer_authority() {
             return Err(format!(
                 "index '{index_name}' uses engine '{}', not remote_store",
                 metadata.settings.engine

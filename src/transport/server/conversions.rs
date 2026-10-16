@@ -562,10 +562,7 @@ pub fn proto_to_cluster_state(
                 authority.index_name
             )));
         };
-        if !matches!(
-            index_meta.settings.engine,
-            crate::cluster::state::IndexEngine::RemoteStore
-        ) {
+        if !index_meta.uses_manifest_writer_authority() {
             return Err(Status::invalid_argument(format!(
                 "manifest writer authority for '{}' is invalid because engine is '{}', not remote_store",
                 authority.index_name, index_meta.settings.engine

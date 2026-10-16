@@ -1123,6 +1123,15 @@ pub trait SearchEngine: Send + Sync {
         Ok(Vec::new())
     }
 
+    fn restore_documents_with_versions(
+        &self,
+        _live_docs: &[LiveDocumentVersionTuple],
+        _tombstones: &[DeletedDocumentVersionTuple],
+        _watermark_state: Option<SealWatermarkState>,
+    ) -> Result<usize> {
+        anyhow::bail!("document version restoration is not supported by this engine")
+    }
+
     /// Get the monotonic minimum persisted checkpoint across authoritative copies.
     /// Only meaningful on the primary shard; `None` means it is not yet available.
     fn global_checkpoint(&self) -> Option<u64> {

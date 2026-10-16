@@ -39,6 +39,9 @@ use crate::engine::tantivy::{canonical_keyword_scalar, visit_indexed_keyword_val
 use crate::engine::{DocumentValidationError, SearchEngine};
 use crate::search::{PartialAggResult, QueryClause, RangeCondition, SearchRequest};
 
+mod workflows;
+pub(crate) use workflows::*;
+
 const REMOTE_STORE_TERM_SUMMARY_CAP: usize = 64;
 
 type SplitFieldSummaries = (
@@ -46,15 +49,75 @@ type SplitFieldSummaries = (
     BTreeMap<String, crate::storage::SplitFieldTerms>,
 );
 
-/// Process-local cache for open remote_store split readers.
+pub const DEFAULT_LEAF_INVENTORY_TTL_MS: u64 = 1_500;
+pub const DEFAULT_LEAF_INVENTORY_MAX_LEAVES: usize = 256;
+pub const DEFAULT_LEAF_INVENTORY_MAX_SPLITS_PER_LEAF: usize = 1_024;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LeafCapabilityInventorySnapshot {
+    pub ttl_ms: u64,
+    pub max_leaves: usize,
+    pub max_splits_per_leaf: usize,
+    pub tracked_leaves: usize,
+    pub tracked_split_entries: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub refresh_rpcs: u64,
+    pub refresh_errors: u64,
+    pub conservative_fallbacks: u64,
+    pub member_evictions: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CachedLeafCapabilityEntry {
+    snapshot: LeafStatusSnapshot,
+    refreshed_at_epoch_ms: u64,
+    consecutive_failures: u32,
+}
+
+#[derive(Debug)]
+struct LeafCapabilityInventoryState {
+    ttl_ms: u64,
+    max_leaves: usize,
+    max_splits_per_leaf: usize,
+    entries: HashMap<String, CachedLeafCapabilityEntry>,
+    hits: u64,
+    misses: u64,
+    refresh_rpcs: u64,
+    refresh_errors: u64,
+    conservative_fallbacks: u64,
+    member_evictions: u64,
+}
+
+impl Default for LeafCapabilityInventoryState {
+    fn default() -> Self {
+        Self {
+            ttl_ms: DEFAULT_LEAF_INVENTORY_TTL_MS,
+            max_leaves: DEFAULT_LEAF_INVENTORY_MAX_LEAVES,
+            max_splits_per_leaf: DEFAULT_LEAF_INVENTORY_MAX_SPLITS_PER_LEAF,
+            entries: HashMap::new(),
+            hits: 0,
+            misses: 0,
+            refresh_rpcs: 0,
+            refresh_errors: 0,
+            conservative_fallbacks: 0,
+            member_evictions: 0,
+        }
+    }
+}
+
+/// Process-local cache for open remote_store split readers and root-side
+/// bounded leaf capability/load inventory (`FS-045`, `FS-046`).
 pub struct RemoteSplitReaderCache {
     readers: RwLock<HashMap<String, Arc<CachedRemoteSplitReader>>>,
+    leaf_inventory: std::sync::Mutex<LeafCapabilityInventoryState>,
 }
 
 impl Default for RemoteSplitReaderCache {
     fn default() -> Self {
         Self {
             readers: RwLock::new(HashMap::new()),
+            leaf_inventory: std::sync::Mutex::new(LeafCapabilityInventoryState::default()),
         }
     }
 }
@@ -610,6 +673,290 @@ fn build_split_field_summaries(
 }
 
 impl RemoteSplitReaderCache {
+    pub fn configure_leaf_inventory(
+        &self,
+        ttl_ms: u64,
+        max_leaves: usize,
+        max_splits_per_leaf: usize,
+    ) {
+        let mut inv = self
+            .leaf_inventory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        inv.ttl_ms = ttl_ms;
+        inv.max_leaves = max_leaves.max(1);
+        inv.max_splits_per_leaf = max_splits_per_leaf.max(1);
+    }
+
+    pub fn leaf_inventory_snapshot(&self) -> LeafCapabilityInventorySnapshot {
+        let inv = self
+            .leaf_inventory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tracked_split_entries = inv
+            .entries
+            .values()
+            .map(|e| e.snapshot.split_statuses.len())
+            .sum();
+        LeafCapabilityInventorySnapshot {
+            ttl_ms: inv.ttl_ms,
+            max_leaves: inv.max_leaves,
+            max_splits_per_leaf: inv.max_splits_per_leaf,
+            tracked_leaves: inv.entries.len(),
+            tracked_split_entries,
+            hits: inv.hits,
+            misses: inv.misses,
+            refresh_rpcs: inv.refresh_rpcs,
+            refresh_errors: inv.refresh_errors,
+            conservative_fallbacks: inv.conservative_fallbacks,
+            member_evictions: inv.member_evictions,
+        }
+    }
+
+    pub(crate) fn reconcile_leaf_membership(&self, active_leaf_ids: &HashSet<String>) {
+        let mut inv = self
+            .leaf_inventory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let before = inv.entries.len();
+        inv.entries
+            .retain(|node_id, _| active_leaf_ids.contains(node_id));
+        let evicted = before.saturating_sub(inv.entries.len());
+        if evicted > 0 {
+            inv.member_evictions = inv.member_evictions.saturating_add(evicted as u64);
+            crate::metrics::REMOTE_STORE_LEAF_INVENTORY_EVENTS_TOTAL
+                .with_label_values(&["evict_member"])
+                .inc_by(evicted as u64);
+            crate::metrics::CACHE_EVICTIONS_TOTAL
+                .with_label_values(&["leaf_inventory", "stale_split"])
+                .inc_by(evicted as u64);
+        }
+        let max_leaves = inv.max_leaves.max(1);
+        while inv.entries.len() > max_leaves {
+            if let Some(oldest_node) = inv
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.refreshed_at_epoch_ms)
+                .map(|(k, _)| k.clone())
+            {
+                inv.entries.remove(&oldest_node);
+                crate::metrics::CACHE_EVICTIONS_TOTAL
+                    .with_label_values(&["leaf_inventory", "capacity_overflow"])
+                    .inc();
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub(crate) fn get_fresh_leaf_status(
+        &self,
+        storage_manager: &crate::storage::StorageManager,
+        node_id: &str,
+        required_splits: &[AssignedRemoteSplit],
+        now_ms: u64,
+    ) -> Option<LeafStatusSnapshot> {
+        let mut inv = self
+            .leaf_inventory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ttl_ms = inv.ttl_ms;
+        let max_splits = inv.max_splits_per_leaf.max(1);
+        if let Some(entry) = inv.entries.get(node_id)
+            && entry.consecutive_failures == 0
+            && now_ms.saturating_sub(entry.refreshed_at_epoch_ms) <= ttl_ms
+            && (required_splits.len() > max_splits
+                || entry.snapshot.split_statuses.len() >= max_splits
+                || required_splits
+                    .iter()
+                    .all(|s| entry.snapshot.split_statuses.contains_key(&s.split_id)))
+        {
+            let snapshot = entry.snapshot.clone();
+            inv.hits = inv.hits.saturating_add(1);
+            drop(inv);
+            crate::metrics::REMOTE_STORE_LEAF_INVENTORY_EVENTS_TOTAL
+                .with_label_values(&["hit"])
+                .inc();
+            storage_manager.record_cache_tier_hit("leaf_inventory");
+            return Some(snapshot);
+        }
+        inv.misses = inv.misses.saturating_add(1);
+        drop(inv);
+        crate::metrics::REMOTE_STORE_LEAF_INVENTORY_EVENTS_TOTAL
+            .with_label_values(&["miss"])
+            .inc();
+        storage_manager.record_cache_tier_miss("leaf_inventory");
+        None
+    }
+
+    pub(crate) fn record_leaf_status_refresh(
+        &self,
+        node_id: &str,
+        status: LeafStatusSnapshot,
+        now_ms: u64,
+        counted_rpc: bool,
+    ) {
+        let mut inv = self
+            .leaf_inventory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if counted_rpc {
+            inv.refresh_rpcs = inv.refresh_rpcs.saturating_add(1);
+            crate::metrics::REMOTE_STORE_LEAF_INVENTORY_EVENTS_TOTAL
+                .with_label_values(&["refresh_rpc"])
+                .inc();
+        }
+        let max_splits = inv.max_splits_per_leaf.max(1);
+        let mut merged_splits = inv
+            .entries
+            .get(node_id)
+            .map(|e| e.snapshot.split_statuses.clone())
+            .unwrap_or_default();
+        let incoming_keys: HashSet<String> = status.split_statuses.keys().cloned().collect();
+        for (split_id, warmth) in status.split_statuses {
+            merged_splits.insert(split_id, warmth);
+        }
+        while merged_splits.len() > max_splits {
+            if let Some(victim) = merged_splits
+                .keys()
+                .find(|k| !incoming_keys.contains(*k))
+                .cloned()
+                .or_else(|| merged_splits.keys().next().cloned())
+            {
+                merged_splits.remove(&victim);
+            } else {
+                break;
+            }
+        }
+        inv.entries.insert(
+            node_id.to_string(),
+            CachedLeafCapabilityEntry {
+                snapshot: LeafStatusSnapshot {
+                    root_capable: status.root_capable,
+                    leaf_capable: status.leaf_capable,
+                    inflight_bytes: status.inflight_bytes,
+                    queue_depth: status.queue_depth,
+                    split_statuses: merged_splits,
+                },
+                refreshed_at_epoch_ms: now_ms,
+                consecutive_failures: 0,
+            },
+        );
+        let max_leaves = inv.max_leaves.max(1);
+        while inv.entries.len() > max_leaves {
+            if let Some(oldest_node) = inv
+                .entries
+                .iter()
+                .filter(|(k, _)| k.as_str() != node_id)
+                .min_by_key(|(_, e)| e.refreshed_at_epoch_ms)
+                .map(|(k, _)| k.clone())
+            {
+                inv.entries.remove(&oldest_node);
+                crate::metrics::CACHE_EVICTIONS_TOTAL
+                    .with_label_values(&["leaf_inventory", "capacity_overflow"])
+                    .inc();
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub(crate) fn record_leaf_status_failure(
+        &self,
+        node: &crate::cluster::state::NodeInfo,
+        now_ms: u64,
+    ) -> LeafStatusSnapshot {
+        let mut inv = self
+            .leaf_inventory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        inv.refresh_rpcs = inv.refresh_rpcs.saturating_add(1);
+        inv.refresh_errors = inv.refresh_errors.saturating_add(1);
+        inv.conservative_fallbacks = inv.conservative_fallbacks.saturating_add(1);
+        crate::metrics::REMOTE_STORE_LEAF_INVENTORY_EVENTS_TOTAL
+            .with_label_values(&["refresh_rpc"])
+            .inc();
+        crate::metrics::REMOTE_STORE_LEAF_INVENTORY_EVENTS_TOTAL
+            .with_label_values(&["refresh_error"])
+            .inc();
+        crate::metrics::REMOTE_STORE_LEAF_INVENTORY_EVENTS_TOTAL
+            .with_label_values(&["fallback"])
+            .inc();
+        let failures = inv
+            .entries
+            .get(&node.id)
+            .map(|e| e.consecutive_failures.saturating_add(1))
+            .unwrap_or(1);
+        let fallback = LeafStatusSnapshot {
+            root_capable: node_is_remote_store_root(node),
+            leaf_capable: node_is_remote_store_leaf(node),
+            inflight_bytes: u64::MAX / 4,
+            queue_depth: usize::MAX / 4,
+            split_statuses: HashMap::new(),
+        };
+        inv.entries.insert(
+            node.id.clone(),
+            CachedLeafCapabilityEntry {
+                snapshot: fallback.clone(),
+                refreshed_at_epoch_ms: now_ms,
+                consecutive_failures: failures,
+            },
+        );
+        let max_leaves = inv.max_leaves.max(1);
+        while inv.entries.len() > max_leaves {
+            if let Some(oldest_node) = inv
+                .entries
+                .iter()
+                .filter(|(k, _)| k.as_str() != node.id)
+                .min_by_key(|(_, e)| e.refreshed_at_epoch_ms)
+                .map(|(k, _)| k.clone())
+            {
+                inv.entries.remove(&oldest_node);
+                crate::metrics::CACHE_EVICTIONS_TOTAL
+                    .with_label_values(&["leaf_inventory", "capacity_overflow"])
+                    .inc();
+            } else {
+                break;
+            }
+        }
+        fallback
+    }
+
+    pub(crate) fn record_leaf_batch_execution_outcome(
+        &self,
+        node_id: &str,
+        succeeded_split_ids: &[String],
+        failed: bool,
+        now_ms: u64,
+    ) {
+        let mut inv = self
+            .leaf_inventory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if failed {
+            inv.entries.remove(node_id);
+            return;
+        }
+        let max_splits = inv.max_splits_per_leaf.max(1);
+        if let Some(entry) = inv.entries.get_mut(node_id) {
+            for split_id in succeeded_split_ids {
+                if entry.snapshot.split_statuses.len() < max_splits
+                    || entry.snapshot.split_statuses.contains_key(split_id)
+                {
+                    entry.snapshot.split_statuses.insert(
+                        split_id.clone(),
+                        SplitWarmth {
+                            artifact_cached: true,
+                            reader_cached: true,
+                        },
+                    );
+                }
+            }
+            entry.refreshed_at_epoch_ms = now_ms;
+            entry.consecutive_failures = 0;
+        }
+    }
+
     pub(crate) fn has_reader(&self, index_uuid: &str, split_id: &str, checksum: &str) -> bool {
         let key = reader_cache_key(index_uuid, split_id, checksum);
         self.readers
@@ -618,37 +965,70 @@ impl RemoteSplitReaderCache {
             .contains_key(&key)
     }
 
+    fn sync_reader_accounting(&self, storage_manager: &crate::storage::StorageManager) {
+        let (count, total_bytes) = {
+            let readers = self.readers.read().unwrap_or_else(|e| e.into_inner());
+            let bytes: u64 = readers.values().map(|r| r.size_bytes).sum();
+            (readers.len(), bytes)
+        };
+        storage_manager.update_reader_cache_accounting(count, total_bytes);
+    }
+
     pub(crate) fn evict_for_index(
         &self,
         index_uuid: &str,
         live_split_ids: &HashSet<String>,
         budget_bytes: Option<u64>,
     ) {
-        let mut readers = self.readers.write().unwrap_or_else(|e| e.into_inner());
-        let mut entries: Vec<_> = readers
-            .iter()
-            .filter(|(_, reader)| reader.index_uuid == index_uuid)
-            .map(|(key, reader)| (key.clone(), Arc::clone(reader)))
-            .collect();
+        self.evict_for_index_with_storage(index_uuid, live_split_ids, budget_bytes, None);
+    }
 
-        let mut total_bytes: u64 = entries.iter().map(|(_, reader)| reader.size_bytes).sum();
-        entries.sort_by_key(|(_, reader)| {
-            (
-                live_split_ids.contains(&reader.split_id),
-                reader.last_access_epoch_ms.load(Ordering::Relaxed),
-            )
-        });
+    pub(crate) fn evict_for_index_with_storage(
+        &self,
+        index_uuid: &str,
+        live_split_ids: &HashSet<String>,
+        budget_bytes: Option<u64>,
+        storage_manager: Option<&crate::storage::StorageManager>,
+    ) {
+        let mut evicted_reasons = Vec::new();
+        {
+            let mut readers = self.readers.write().unwrap_or_else(|e| e.into_inner());
+            let mut entries: Vec<_> = readers
+                .iter()
+                .filter(|(_, reader)| reader.index_uuid == index_uuid)
+                .map(|(key, reader)| (key.clone(), Arc::clone(reader)))
+                .collect();
 
-        for (key, reader) in entries {
-            let is_stale = !live_split_ids.contains(&reader.split_id);
-            let over_budget = budget_bytes.is_some_and(|budget| total_bytes > budget);
-            if !is_stale && !over_budget {
-                continue;
+            let mut total_bytes: u64 = entries.iter().map(|(_, reader)| reader.size_bytes).sum();
+            entries.sort_by_key(|(_, reader)| {
+                (
+                    live_split_ids.contains(&reader.split_id),
+                    reader.last_access_epoch_ms.load(Ordering::Relaxed),
+                )
+            });
+
+            for (key, reader) in entries {
+                let is_stale = !live_split_ids.contains(&reader.split_id);
+                let over_budget = budget_bytes.is_some_and(|budget| total_bytes > budget);
+                if !is_stale && !over_budget {
+                    continue;
+                }
+
+                if readers.remove(&key).is_some() {
+                    total_bytes = total_bytes.saturating_sub(reader.size_bytes);
+                    evicted_reasons.push(if is_stale {
+                        "stale_split"
+                    } else {
+                        "budget_pressure"
+                    });
+                }
             }
-
-            if readers.remove(&key).is_some() {
-                total_bytes = total_bytes.saturating_sub(reader.size_bytes);
+        }
+        if let Some(sm) = storage_manager {
+            for reason in evicted_reasons {
+                sm.record_cache_eviction("reader", reason);
             }
+            self.sync_reader_accounting(sm);
         }
     }
 
@@ -667,9 +1047,11 @@ impl RemoteSplitReaderCache {
             .get(&key)
             .cloned()
         {
+            context.storage_manager.record_cache_tier_hit("reader");
             reader.touch(context.storage_manager.as_ref());
             return Ok(reader);
         }
+        context.storage_manager.record_cache_tier_miss("reader");
 
         let split_dir = context
             .storage_manager
@@ -717,12 +1099,15 @@ impl RemoteSplitReaderCache {
         });
         entry.touch(context.storage_manager.as_ref());
 
-        let mut readers = self.readers.write().unwrap_or_else(|e| e.into_inner());
-        let reader = readers
-            .entry(key)
-            .or_insert_with(|| Arc::clone(&entry))
-            .clone();
+        let reader = {
+            let mut readers = self.readers.write().unwrap_or_else(|e| e.into_inner());
+            readers
+                .entry(key)
+                .or_insert_with(|| Arc::clone(&entry))
+                .clone()
+        };
         reader.touch(context.storage_manager.as_ref());
+        self.sync_reader_accounting(context.storage_manager.as_ref());
         Ok(reader)
     }
 }
@@ -776,9 +1161,12 @@ pub(crate) async fn execute_leaf_search_batch(
         .remote_store
         .as_ref()
         .and_then(|settings| settings.split_cache_bytes);
-    context
-        .reader_cache
-        .evict_for_index(metadata.uuid.as_str(), live_split_ids, budget_bytes);
+    context.reader_cache.evict_for_index_with_storage(
+        metadata.uuid.as_str(),
+        live_split_ids,
+        budget_bytes,
+        Some(context.storage_manager.as_ref()),
+    );
     context.storage_manager.reap_split_cache(
         metadata.uuid.as_str(),
         live_split_ids,
@@ -854,9 +1242,12 @@ pub(crate) async fn execute_leaf_search_batch(
         outcomes.push(outcome);
     }
 
-    context
-        .reader_cache
-        .evict_for_index(metadata.uuid.as_str(), live_split_ids, budget_bytes);
+    context.reader_cache.evict_for_index_with_storage(
+        metadata.uuid.as_str(),
+        live_split_ids,
+        budget_bytes,
+        Some(context.storage_manager.as_ref()),
+    );
     context.storage_manager.reap_split_cache(
         metadata.uuid.as_str(),
         live_split_ids,
@@ -873,6 +1264,12 @@ async fn collect_leaf_statuses(
     splits: &[AssignedRemoteSplit],
     leaf_nodes: &[crate::cluster::state::NodeInfo],
 ) -> HashMap<String, LeafStatusSnapshot> {
+    let now_ms = now_epoch_ms();
+    let active_leaf_ids: HashSet<String> = leaf_nodes.iter().map(|n| n.id.clone()).collect();
+    state
+        .remote_store_reader_cache
+        .reconcile_leaf_membership(&active_leaf_ids);
+
     let cluster_state = state.cluster_manager.get_state();
     let local_leaf_context = local_leaf_status_snapshot(
         &cluster_state,
@@ -882,6 +1279,14 @@ async fn collect_leaf_statuses(
         index_uuid,
         splits,
     );
+    if active_leaf_ids.contains(&state.local_node_id) {
+        state.remote_store_reader_cache.record_leaf_status_refresh(
+            &state.local_node_id,
+            local_leaf_context.clone(),
+            now_ms,
+            false,
+        );
+    }
 
     let mut statuses = HashMap::new();
     statuses.insert(state.local_node_id.clone(), local_leaf_context);
@@ -889,6 +1294,15 @@ async fn collect_leaf_statuses(
     let mut futures = Vec::new();
     for node in leaf_nodes {
         if node.id == state.local_node_id {
+            continue;
+        }
+        if let Some(cached) = state.remote_store_reader_cache.get_fresh_leaf_status(
+            state.storage_manager.as_ref(),
+            &node.id,
+            splits,
+            now_ms,
+        ) {
+            statuses.insert(node.id.clone(), cached);
             continue;
         }
         let client = state.transport_client.clone();
@@ -903,13 +1317,41 @@ async fn collect_leaf_statuses(
                 Some(ctx) => crate::worker::with_task_request_context(ctx, fut).await,
                 None => fut.await,
             };
-            (node.id.clone(), status)
+            (node, status)
         }));
     }
 
+    let mut fallback_statuses = Vec::new();
     for result in futures::future::join_all(futures).await {
-        if let Ok((node_id, Ok(status))) = result {
-            statuses.insert(node_id, status);
+        match result {
+            Ok((node, Ok(status))) => {
+                state.remote_store_reader_cache.record_leaf_status_refresh(
+                    &node.id,
+                    status.clone(),
+                    now_ms,
+                    true,
+                );
+                statuses.insert(node.id, status);
+            }
+            Ok((node, Err(_))) => {
+                let fallback = state
+                    .remote_store_reader_cache
+                    .record_leaf_status_failure(&node, now_ms);
+                fallback_statuses.push((node.id, fallback));
+            }
+            Err(_) => {}
+        }
+    }
+
+    // If no remote or local leaf reported healthy status (or as a conservative
+    // fallback when status RPCs fail), keep fallback entries available with
+    // lowest priority so scheduling can still attempt execution and fail over cleanly.
+    let has_capable_leaf = statuses
+        .iter()
+        .any(|(id, st)| active_leaf_ids.contains(id) && st.leaf_capable);
+    if !has_capable_leaf {
+        for (node_id, fallback) in fallback_statuses {
+            statuses.entry(node_id).or_insert(fallback);
         }
     }
 
@@ -1692,9 +2134,39 @@ pub(crate) async fn search_with_resolved_snapshot(
             }
         }
 
+        let batch_results = futures::future::join_all(work).await;
+        let outcome_now_ms = now_epoch_ms();
+        for (node_id, _assigned, result) in &batch_results {
+            match result {
+                Ok(outcomes) => {
+                    let mut succeeded_ids = Vec::new();
+                    let mut had_error = false;
+                    for o in outcomes {
+                        if o.error.is_some() {
+                            had_error = true;
+                        } else {
+                            succeeded_ids.push(o.split_id.clone());
+                        }
+                    }
+                    state
+                        .remote_store_reader_cache
+                        .record_leaf_batch_execution_outcome(
+                            node_id,
+                            &succeeded_ids,
+                            had_error,
+                            outcome_now_ms,
+                        );
+                }
+                Err(_) => {
+                    state
+                        .remote_store_reader_cache
+                        .record_leaf_batch_execution_outcome(node_id, &[], true, outcome_now_ms);
+                }
+            }
+        }
         let round = apply_remote_store_batch_results(
             index_name,
-            futures::future::join_all(work).await,
+            batch_results,
             &split_lookup,
             &mut accumulator,
         );
@@ -3285,7 +3757,17 @@ pub(crate) async fn seal_hot_delta(
     metadata: &IndexMetadata,
     body: Option<Value>,
 ) -> Result<Value, (StatusCode, Json<Value>)> {
-    if !metadata.is_tiered() {
+    seal_hot_delta_with_mode(state, index_name, metadata, body, false).await
+}
+
+pub(super) async fn seal_hot_delta_with_mode(
+    state: &AppState,
+    index_name: &str,
+    metadata: &IndexMetadata,
+    body: Option<Value>,
+    allow_migration_bootstrap: bool,
+) -> Result<Value, (StatusCode, Json<Value>)> {
+    if !metadata.is_tiered() && !allow_migration_bootstrap {
         return Err(crate::api::error_response(
             StatusCode::BAD_REQUEST,
             "illegal_argument_exception",
@@ -6178,5 +6660,95 @@ mod tests {
             .expect("verify_splits must still work on read-only remote data");
         assert_eq!(verified["generation"], 1);
         assert_eq!(verified["ok_count"], 1);
+    }
+
+    #[test]
+    fn fs046_bounded_leaf_capability_inventory_avoids_fanout_converges_on_churn_and_falls_back_conservatively()
+     {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = StorageManager::new_in_path(temp_dir.path()).unwrap();
+        let cache = RemoteSplitReaderCache::default();
+        cache.configure_leaf_inventory(2_000, 2, 2);
+
+        let split_a = test_split("split-a");
+        let split_b = test_split("split-b");
+        let split_c = test_split("split-c");
+
+        // 1. Cold lookup is a miss.
+        assert!(
+            cache
+                .get_fresh_leaf_status(&sm, "node-2", std::slice::from_ref(&split_a), 1_000)
+                .is_none()
+        );
+        assert_eq!(cache.leaf_inventory_snapshot().misses, 1);
+
+        // 2. Refresh populates inventory and subsequent lookup within TTL is a hit without RPC.
+        cache.record_leaf_status_refresh(
+            "node-2",
+            test_status(&[(
+                "split-a",
+                SplitWarmth {
+                    artifact_cached: true,
+                    reader_cached: false,
+                },
+            )]),
+            1_000,
+            true,
+        );
+        let hit = cache
+            .get_fresh_leaf_status(&sm, "node-2", std::slice::from_ref(&split_a), 2_500)
+            .expect("within TTL must hit");
+        assert!(hit.split_statuses["split-a"].artifact_cached);
+        assert_eq!(cache.leaf_inventory_snapshot().hits, 1);
+        assert_eq!(cache.leaf_inventory_snapshot().refresh_rpcs, 1);
+
+        // 3. Piggybacked batch outcome marks split as reader_cached and refreshes timestamp.
+        cache.record_leaf_batch_execution_outcome(
+            "node-2",
+            &["split-a".to_string(), "split-b".to_string()],
+            false,
+            2_800,
+        );
+        let hit2 = cache
+            .get_fresh_leaf_status(&sm, "node-2", &[split_a.clone(), split_b.clone()], 4_000)
+            .expect("piggybacked refresh extends freshness");
+        assert!(hit2.split_statuses["split-a"].reader_cached);
+        assert!(hit2.split_statuses["split-b"].reader_cached);
+
+        // 4. Per-leaf split cardinality stays bounded at max_splits_per_leaf = 2.
+        cache.record_leaf_status_refresh(
+            "node-2",
+            test_status(&[(
+                "split-c",
+                SplitWarmth {
+                    artifact_cached: true,
+                    reader_cached: true,
+                },
+            )]),
+            4_100,
+            true,
+        );
+        assert!(cache.leaf_inventory_snapshot().tracked_split_entries <= 2);
+
+        // 5. Insertion enforces max_leaves = 2, and membership reconciliation evicts departed leaves.
+        cache.record_leaf_status_refresh("node-3", test_status(&[]), 4_200, true);
+        cache.record_leaf_status_refresh("node-4", test_status(&[]), 4_300, true);
+        assert_eq!(cache.leaf_inventory_snapshot().tracked_leaves, 2);
+        let active = HashSet::from(["node-4".to_string()]);
+        cache.reconcile_leaf_membership(&active);
+        let snap = cache.leaf_inventory_snapshot();
+        assert_eq!(snap.tracked_leaves, 1);
+        assert!(snap.member_evictions >= 1);
+        assert!(
+            cache
+                .get_fresh_leaf_status(&sm, "node-2", std::slice::from_ref(&split_c), 4_300)
+                .is_none()
+        );
+
+        // 6. Status failure records conservative fallback and invalidates fresh hits until next refresh.
+        let fallback = cache.record_leaf_status_failure(&test_leaf("node-3"), 4_400);
+        assert!(fallback.leaf_capable);
+        assert!(fallback.inflight_bytes > 0);
+        assert_eq!(cache.leaf_inventory_snapshot().conservative_fallbacks, 1);
     }
 }

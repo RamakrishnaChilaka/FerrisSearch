@@ -545,6 +545,42 @@ pub fn create_router(mut state: AppState) -> Router {
         // The streaming handler applies admission and byte limits before buffering.
         .layer(DefaultBodyLimit::disable());
 
+    let lifecycle_router = Router::new()
+        .route(
+            "/{index}/_remote_store/repair",
+            post(index::repair_remote_store_handler),
+        )
+        .route(
+            "/{index}/_lifecycle/migrate",
+            post(index::migrate_index_lifecycle_handler),
+        )
+        .route(
+            "/{index}/_lifecycle/rollback",
+            post(index::rollback_index_lifecycle_handler),
+        )
+        .route(
+            "/{index}/_lifecycle/status",
+            get(index::get_index_lifecycle_status_handler),
+        )
+        .route(
+            "/_snapshot/{snapshot_id}",
+            post(index::create_cluster_snapshot_handler)
+                .put(index::create_cluster_snapshot_handler)
+                .get(index::get_cluster_snapshot_handler),
+        )
+        .route(
+            "/_snapshot/{snapshot_id}/_verify",
+            post(index::verify_cluster_snapshot_handler),
+        )
+        .route(
+            "/_snapshot/{snapshot_id}/_restore",
+            post(index::restore_cluster_snapshot_handler),
+        )
+        .route(
+            "/_nodes/cache/inventory",
+            get(index::get_node_cache_inventory_handler),
+        );
+
     Router::new()
         .route("/", get(handle_root))
         .route("/_cluster/health", get(cluster::get_health))
@@ -634,6 +670,7 @@ pub fn create_router(mut state: AppState) -> Router {
         .route("/{index}/_flush", post(index::flush_index))
         .route("/{index}/_flush", get(index::flush_index))
         .route("/{index}/_forcemerge", post(index::force_merge_index))
+        .merge(lifecycle_router)
         .merge(bulk_router)
         .layer(middleware::from_fn_with_state(
             security_manager,

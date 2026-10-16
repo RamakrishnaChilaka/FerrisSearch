@@ -1088,6 +1088,194 @@ pub static HOT_DELTA_RETIRED_RANGES_TOTAL: LazyLock<IntCounter> = LazyLock::new(
     counter
 });
 
+pub static CACHE_TIER_REQUESTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "ferrissearch_cache_tier_requests_total",
+            "Cache lookups by tier and outcome (hit or miss)",
+        ),
+        &["tier", "outcome"],
+    )
+    .expect("metric: cache_tier_requests_total");
+    for tier in ["artifact", "reader", "column", "leaf_inventory"] {
+        for outcome in ["hit", "miss"] {
+            let _ = counter.with_label_values(&[tier, outcome]);
+        }
+    }
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: cache_tier_requests_total");
+    counter
+});
+
+pub static CACHE_TIER_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "ferrissearch_cache_tier_bytes",
+            "Tracked cache bytes by tier and accounting kind (logical, physical, pinned)",
+        ),
+        &["tier", "kind"],
+    )
+    .expect("metric: cache_tier_bytes");
+    for tier in ["artifact", "reader", "column", "staging"] {
+        for kind in ["logical", "physical", "pinned"] {
+            let _ = gauge.with_label_values(&[tier, kind]);
+        }
+    }
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register: cache_tier_bytes");
+    gauge
+});
+
+pub static CACHE_EVICTIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "ferrissearch_cache_evictions_total",
+            "Cache evictions by tier and eviction reason",
+        ),
+        &["tier", "reason"],
+    )
+    .expect("metric: cache_evictions_total");
+    for tier in ["artifact", "reader", "column", "leaf_inventory"] {
+        for reason in [
+            "stale_split",
+            "budget_pressure",
+            "corrupt_or_repaired",
+            "manual",
+            "capacity_overflow",
+        ] {
+            let _ = counter.with_label_values(&[tier, reason]);
+        }
+    }
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: cache_evictions_total");
+    counter
+});
+
+pub static CACHE_ADMISSION_REJECTIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "ferrissearch_cache_admission_rejections_total",
+            "Cache admission rejections by tier and rejection reason",
+        ),
+        &["tier", "reason"],
+    )
+    .expect("metric: cache_admission_rejections_total");
+    for tier in ["artifact", "reader", "column"] {
+        for reason in [
+            "oversized_entry",
+            "pinned_budget_exhausted",
+            "resource_pool_exhausted",
+            "decompression_bomb",
+        ] {
+            let _ = counter.with_label_values(&[tier, reason]);
+        }
+    }
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: cache_admission_rejections_total");
+    counter
+});
+
+pub static HYDRATION_STREAMED_BYTES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "ferrissearch_hydration_streamed_bytes_total",
+            "Total bytes streamed during split bundle hydration by stage (download, unpack)",
+        ),
+        &["stage"],
+    )
+    .expect("metric: hydration_streamed_bytes_total");
+    for stage in ["download", "unpack"] {
+        let _ = counter.with_label_values(&[stage]);
+    }
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: hydration_streamed_bytes_total");
+    counter
+});
+
+pub static HYDRATION_DURATION_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
+    let histogram = Histogram::with_opts(
+        HistogramOpts::new(
+            "ferrissearch_hydration_duration_seconds",
+            "Duration of split bundle streaming hydration and verification in seconds",
+        )
+        .buckets(vec![
+            0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0,
+        ]),
+    )
+    .expect("metric: hydration_duration_seconds");
+    REGISTRY
+        .register(Box::new(histogram.clone()))
+        .expect("register: hydration_duration_seconds");
+    histogram
+});
+
+pub static HYDRATION_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "ferrissearch_hydration_failures_total",
+            "Total split bundle hydration failures by reason",
+        ),
+        &["reason"],
+    )
+    .expect("metric: hydration_failures_total");
+    for reason in [
+        "checksum_mismatch",
+        "decompression_bomb",
+        "short_read",
+        "cancelled",
+        "io_error",
+    ] {
+        let _ = counter.with_label_values(&[reason]);
+    }
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: hydration_failures_total");
+    counter
+});
+
+pub static HYDRATION_COALESCED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "ferrissearch_hydration_coalesced_total",
+        "Duplicate split bundle downloads suppressed by single-flight hydration locking",
+    )
+    .expect("metric: hydration_coalesced_total");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: hydration_coalesced_total");
+    counter
+});
+
+pub static REMOTE_STORE_LEAF_INVENTORY_EVENTS_TOTAL: LazyLock<IntCounterVec> =
+    LazyLock::new(|| {
+        let counter = IntCounterVec::new(
+            Opts::new(
+                "ferrissearch_remote_store_leaf_inventory_events_total",
+                "Root leaf-capability and load inventory events separated from query traffic",
+            ),
+            &["event"],
+        )
+        .expect("metric: remote_store_leaf_inventory_events_total");
+        for event in [
+            "hit",
+            "miss",
+            "refresh_rpc",
+            "refresh_error",
+            "fallback",
+            "evict_member",
+        ] {
+            let _ = counter.with_label_values(&[event]);
+        }
+        REGISTRY
+            .register(Box::new(counter.clone()))
+            .expect("register: remote_store_leaf_inventory_events_total");
+        counter
+    });
+
 fn set_column_cache_budget_gauges(
     effective_memory_gauge: &IntGauge,
     cache_budget_gauge: &IntGauge,
@@ -1169,6 +1357,15 @@ fn initialize_metrics() {
     let _ = &*HOT_DELTA_SEALED_DOCS_TOTAL;
     let _ = &*HOT_DELTA_SEALED_BYTES_TOTAL;
     let _ = &*HOT_DELTA_RETIRED_RANGES_TOTAL;
+    let _ = &*CACHE_TIER_REQUESTS_TOTAL;
+    let _ = &*CACHE_TIER_BYTES;
+    let _ = &*CACHE_EVICTIONS_TOTAL;
+    let _ = &*CACHE_ADMISSION_REJECTIONS_TOTAL;
+    let _ = &*HYDRATION_STREAMED_BYTES_TOTAL;
+    let _ = &*HYDRATION_DURATION_SECONDS;
+    let _ = &*HYDRATION_FAILURES_TOTAL;
+    let _ = &*HYDRATION_COALESCED_TOTAL;
+    let _ = &*REMOTE_STORE_LEAF_INVENTORY_EVENTS_TOTAL;
 }
 
 pub fn record_replica_state_transition(from: &str, to: &str) {

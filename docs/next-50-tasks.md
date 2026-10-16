@@ -1192,7 +1192,7 @@ partial listings, compaction crash, and repeated GC cannot delete live data.
 
 ### FS-042 — Deliver Backup, Restore, Verify, And Repair Workflows
 
-**Class:** Release blocker | **Gate:** 2 | **Depends on:** FS-003, FS-022, FS-041
+**Status:** Implemented (`ClusterBackupManifest`, `POST /_snapshot/{snapshot_id}`, `GET /_snapshot/{snapshot_id}`, `POST /_snapshot/{snapshot_id}/_verify`, `POST /_snapshot/{snapshot_id}/_restore`, `POST /{index}/_remote_store/repair`, and `restore_documents_with_versions`) | **Class:** Release blocker | **Gate:** 2 | **Depends on:** FS-003, FS-022, FS-041
 
 **Evidence:** checksum verification exists for remote bundles, but there is no
 complete production recovery workflow for control-plane metadata plus data.
@@ -1207,7 +1207,7 @@ irreparable corruption behavior.
 
 ### FS-043 — Migrate Existing Indices Without Reinterpreting Semantics
 
-**Class:** Release blocker | **Gate:** 2 | **Depends on:** FS-004, FS-037, FS-042
+**Status:** Implemented (`IndexMigrationPhase`, `IndexMigrationRecord`, `POST /{index}/_lifecycle/migrate`, `POST /{index}/_lifecycle/rollback`, `GET /{index}/_lifecycle/status`, oracle equivalence verification, fast retained local rollback, and post-retirement base reconstruction) | **Class:** Release blocker | **Gate:** 2 | **Depends on:** FS-004, FS-037, FS-042
 
 **Evidence:** current index metadata chooses one engine at creation and has no
 online lifecycle migration.
@@ -1222,7 +1222,7 @@ silently changing durability or visibility.
 
 ### FS-044 — Stream Bundle Hydration And Verification
 
-**Class:** Scale blocker | **Gate:** 3 | **Depends on:** FS-028, FS-031
+**Status:** Implemented (`stream_bundle_to_temp_file_with_reservation`, `unpack_bundle_file_into`, `HydrationLimits`, incremental SHA-256 verification, compressed/uncompressed decompression-bomb rejection, and atomic `.done` marker promotion) | **Class:** Scale blocker | **Gate:** 3 | **Depends on:** FS-028, FS-031
 
 **Evidence:** `fetch_split_into_cache()` obtains full bundle bytes before local
 write/extraction.
@@ -1237,7 +1237,7 @@ failure never warms cache, and concurrent fetch remains single-flight.
 
 ### FS-045 — Unify Cache Inventory, Admission, And Eviction
 
-**Class:** Scale blocker | **Gate:** 3 | **Depends on:** FS-031, FS-044
+**Status:** Implemented (`NodeCacheInventorySnapshot`, `rebuild_cache_inventory_from_disk`, `enforce_artifact_admission_budget`, `GET /_nodes/cache/inventory`, and unified tier accounting across artifact, reader, column, and staging tiers) | **Class:** Scale blocker | **Gate:** 3 | **Depends on:** FS-031, FS-044
 
 **Evidence:** column arrays, split artifacts, reader pins, and query/hydration
 memory use separate budgets and inventories.
@@ -1252,7 +1252,7 @@ attribute hits/misses/evictions by tier.
 
 ### FS-046 — Maintain A Bounded Leaf Capability And Load Inventory
 
-**Class:** Scale blocker | **Gate:** 3 | **Depends on:** FS-033, FS-045
+**Status:** Implemented (`LeafCapabilityInventorySnapshot`, TTL-bounded leaf inventory on `RemoteSplitReaderCache`, piggybacked batch warmth updates, membership convergence, cardinality caps, and conservative fallback) | **Class:** Scale blocker | **Gate:** 3 | **Depends on:** FS-033, FS-045
 
 **Evidence:** roots query every candidate leaf for cache/load status on the
 request path.

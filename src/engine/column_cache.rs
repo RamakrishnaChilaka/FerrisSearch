@@ -176,6 +176,10 @@ pub struct ColumnCache {
     /// is only built when `matched_docs / max_doc >= threshold`. Below this,
     /// only matching docs are read directly without populating the cache.
     populate_threshold: f64,
+    hits: std::sync::atomic::AtomicU64,
+    misses: std::sync::atomic::AtomicU64,
+    admission_rejections: std::sync::atomic::AtomicU64,
+    evictions: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ColumnCache {
@@ -184,6 +188,8 @@ impl ColumnCache {
     /// Pass 0 for max_bytes to create a no-op cache that never stores anything.
     /// Pass 0 for threshold_percent to always eagerly populate on miss.
     pub fn new(max_bytes: u64, populate_threshold_percent: u8) -> Self {
+        let evictions = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let evictions_for_listener = Arc::clone(&evictions);
         let inner = moka::sync::Cache::builder()
             .weigher(|_key: &CacheKey, value: &CacheValue| {
                 let bytes = match value {
@@ -192,12 +198,30 @@ impl ColumnCache {
                 };
                 bytes.min(u32::MAX as u64) as u32
             })
+            .eviction_listener(move |_key, _value, cause| {
+                let reason = match cause {
+                    moka::notification::RemovalCause::Size => "budget_pressure",
+                    moka::notification::RemovalCause::Explicit => "manual",
+                    moka::notification::RemovalCause::Replaced => "capacity_overflow",
+                    moka::notification::RemovalCause::Expired => "stale_split",
+                };
+                if !matches!(cause, moka::notification::RemovalCause::Replaced) {
+                    evictions_for_listener.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                crate::metrics::CACHE_EVICTIONS_TOTAL
+                    .with_label_values(&["column", reason])
+                    .inc();
+            })
             .max_capacity(max_bytes)
             .build();
         let threshold = (populate_threshold_percent.min(100) as f64) / 100.0;
         Self {
             inner,
             populate_threshold: threshold,
+            hits: std::sync::atomic::AtomicU64::new(0),
+            misses: std::sync::atomic::AtomicU64::new(0),
+            admission_rejections: std::sync::atomic::AtomicU64::new(0),
+            evictions,
         }
     }
 
@@ -220,8 +244,21 @@ impl ColumnCache {
             format: CacheFormat::Arrow,
         };
         match self.inner.get(&key) {
-            Some(CacheValue::Arrow(array)) => Some(array),
-            _ => None,
+            Some(CacheValue::Arrow(array)) => {
+                self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::metrics::CACHE_TIER_REQUESTS_TOTAL
+                    .with_label_values(&["column", "hit"])
+                    .inc();
+                Some(array)
+            }
+            _ => {
+                self.misses
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::metrics::CACHE_TIER_REQUESTS_TOTAL
+                    .with_label_values(&["column", "miss"])
+                    .inc();
+                None
+            }
         }
     }
 
@@ -250,8 +287,21 @@ impl ColumnCache {
             format: CacheFormat::Grouped,
         };
         match self.inner.get(&key) {
-            Some(CacheValue::Grouped(column)) => Some(column),
-            _ => None,
+            Some(CacheValue::Grouped(column)) => {
+                self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::metrics::CACHE_TIER_REQUESTS_TOTAL
+                    .with_label_values(&["column", "hit"])
+                    .inc();
+                Some(column)
+            }
+            _ => {
+                self.misses
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::metrics::CACHE_TIER_REQUESTS_TOTAL
+                    .with_label_values(&["column", "miss"])
+                    .inc();
+                None
+            }
         }
     }
 
@@ -274,9 +324,21 @@ impl ColumnCache {
     fn insert_value(&self, key: CacheKey, value: CacheValue, value_bytes: u64) {
         let max = self.inner.policy().max_capacity().unwrap_or(0);
         if max > 0 && value_bytes > max / 4 {
+            self.admission_rejections
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::metrics::CACHE_ADMISSION_REJECTIONS_TOTAL
+                .with_label_values(&["column", "oversized_entry"])
+                .inc();
             return; // too large — would thrash the cache
         }
         self.inner.insert(key, value);
+        let weighted = i64::try_from(self.inner.weighted_size()).unwrap_or(i64::MAX);
+        crate::metrics::CACHE_TIER_BYTES
+            .with_label_values(&["column", "logical"])
+            .set(weighted);
+        crate::metrics::CACHE_TIER_BYTES
+            .with_label_values(&["column", "physical"])
+            .set(weighted);
     }
 
     /// Maximum cache capacity in bytes.
@@ -292,7 +354,26 @@ impl ColumnCache {
 
     /// Weighted size of all entries (approximate bytes).
     pub fn weighted_size(&self) -> u64 {
+        self.inner.run_pending_tasks();
         self.inner.weighted_size()
+    }
+
+    pub fn hits(&self) -> u64 {
+        self.hits.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn misses(&self) -> u64 {
+        self.misses.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn admission_rejections(&self) -> u64 {
+        self.admission_rejections
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn evictions(&self) -> u64 {
+        self.inner.run_pending_tasks();
+        self.evictions.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

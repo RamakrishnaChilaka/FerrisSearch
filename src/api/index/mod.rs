@@ -2319,6 +2319,7 @@ pub async fn get_index_settings(
                         "minimum_durable_copies": metadata.settings.minimum_durable_copies,
                         "engine": metadata.settings.engine.to_string(),
                         "lifecycle_mode": metadata.lifecycle_mode().as_str(),
+                        "migration": metadata.migration_record(),
                         "refresh_interval_ms": metadata.settings.refresh_interval_ms,
                         "flush_threshold_bytes": metadata.settings.flush_threshold_bytes,
                         "dynamic": metadata.dynamic.to_string(),
@@ -2696,6 +2697,193 @@ pub async fn rollback_remote_store_manifest(
         Ok(response) => (StatusCode::OK, Json(response)),
         Err(err_resp) => err_resp,
     }
+}
+
+/// POST /_snapshot/{snapshot_id} or PUT /_snapshot/{snapshot_id} — Capture a
+/// cluster-wide or filtered index backup manifest (`FS-042`).
+pub async fn create_cluster_snapshot_handler(
+    State(state): State<AppState>,
+    Path(snapshot_id): Path<String>,
+    body: Option<Json<Value>>,
+) -> (StatusCode, Json<Value>) {
+    match crate::engine::remote_store::create_cluster_snapshot(
+        &state,
+        &snapshot_id,
+        body.map(|Json(v)| v),
+    )
+    .await
+    {
+        Ok(response) => (StatusCode::OK, Json(response)),
+        Err(err_resp) => err_resp,
+    }
+}
+
+/// GET /_snapshot/{snapshot_id} — Inspect a stored cluster backup manifest (`FS-042`).
+pub async fn get_cluster_snapshot_handler(
+    State(state): State<AppState>,
+    Path(snapshot_id): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    match crate::engine::remote_store::get_cluster_snapshot(&state, &snapshot_id).await {
+        Ok(response) => (StatusCode::OK, Json(response)),
+        Err(err_resp) => err_resp,
+    }
+}
+
+/// POST /_snapshot/{snapshot_id}/_verify — Verify backup manifest integrity and
+/// referenced remote_store / local-shard artifacts (`FS-042`).
+pub async fn verify_cluster_snapshot_handler(
+    State(state): State<AppState>,
+    Path(snapshot_id): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    match crate::engine::remote_store::verify_cluster_snapshot(&state, &snapshot_id).await {
+        Ok(response) => (StatusCode::OK, Json(response)),
+        Err(err_resp) => err_resp,
+    }
+}
+
+/// POST /_snapshot/{snapshot_id}/_restore — Verify and restore a cluster
+/// backup snapshot (`FS-042`).
+pub async fn restore_cluster_snapshot_handler(
+    State(state): State<AppState>,
+    Path(snapshot_id): Path<String>,
+    body: Option<Json<Value>>,
+) -> (StatusCode, Json<Value>) {
+    match crate::engine::remote_store::restore_cluster_snapshot(
+        &state,
+        &snapshot_id,
+        body.map(|Json(v)| v),
+    )
+    .await
+    {
+        Ok(response) => (StatusCode::OK, Json(response)),
+        Err(err_resp) => err_resp,
+    }
+}
+
+/// POST /{index}/_remote_store/repair — Repair or quarantine corrupt
+/// remote_store pointers, local cache artifacts, and split bundles (`FS-042`).
+pub async fn repair_remote_store_handler(
+    State(state): State<AppState>,
+    Path(index_name): Path<crate::common::IndexName>,
+    body: Option<Json<Value>>,
+) -> (StatusCode, Json<Value>) {
+    let cluster_state = state.cluster_manager.get_state();
+    let Some(metadata) = cluster_state.indices.get(index_name.as_str()).cloned() else {
+        return crate::api::error_response(
+            StatusCode::NOT_FOUND,
+            "index_not_found_exception",
+            format!("no such index [{}]", index_name.as_str()),
+        );
+    };
+    match crate::engine::remote_store::repair_remote_store_index(
+        &state,
+        index_name.as_str(),
+        &metadata,
+        body.map(|Json(v)| v),
+    )
+    .await
+    {
+        Ok(response) => (StatusCode::OK, Json(response)),
+        Err(err_resp) => err_resp,
+    }
+}
+
+/// POST /{index}/_lifecycle/migrate — Online migration of a `MutableOnly`
+/// index to `Tiered` (`FS-043`).
+pub async fn migrate_index_lifecycle_handler(
+    State(state): State<AppState>,
+    Path(index_name): Path<crate::common::IndexName>,
+    body: Option<Json<Value>>,
+) -> (StatusCode, Json<Value>) {
+    let cluster_state = state.cluster_manager.get_state();
+    let Some(metadata) = cluster_state.indices.get(index_name.as_str()).cloned() else {
+        return crate::api::error_response(
+            StatusCode::NOT_FOUND,
+            "index_not_found_exception",
+            format!("no such index [{}]", index_name.as_str()),
+        );
+    };
+    match crate::engine::remote_store::migrate_index_lifecycle(
+        &state,
+        index_name.as_str(),
+        &metadata,
+        body.map(|Json(v)| v),
+    )
+    .await
+    {
+        Ok(response) => (StatusCode::OK, Json(response)),
+        Err(err_resp) => err_resp,
+    }
+}
+
+/// POST /{index}/_lifecycle/rollback — Roll back an in-progress or completed
+/// lifecycle migration to `MutableOnly` (`FS-043`).
+pub async fn rollback_index_lifecycle_handler(
+    State(state): State<AppState>,
+    Path(index_name): Path<crate::common::IndexName>,
+    body: Option<Json<Value>>,
+) -> (StatusCode, Json<Value>) {
+    let cluster_state = state.cluster_manager.get_state();
+    let Some(metadata) = cluster_state.indices.get(index_name.as_str()).cloned() else {
+        return crate::api::error_response(
+            StatusCode::NOT_FOUND,
+            "index_not_found_exception",
+            format!("no such index [{}]", index_name.as_str()),
+        );
+    };
+    match crate::engine::remote_store::rollback_index_lifecycle(
+        &state,
+        index_name.as_str(),
+        &metadata,
+        body.map(|Json(v)| v),
+    )
+    .await
+    {
+        Ok(response) => (StatusCode::OK, Json(response)),
+        Err(err_resp) => err_resp,
+    }
+}
+
+/// GET /{index}/_lifecycle/status — Inspect index lifecycle and migration status (`FS-043`).
+pub async fn get_index_lifecycle_status_handler(
+    State(state): State<AppState>,
+    Path(index_name): Path<crate::common::IndexName>,
+) -> (StatusCode, Json<Value>) {
+    let cluster_state = state.cluster_manager.get_state();
+    let Some(metadata) = cluster_state.indices.get(index_name.as_str()).cloned() else {
+        return crate::api::error_response(
+            StatusCode::NOT_FOUND,
+            "index_not_found_exception",
+            format!("no such index [{}]", index_name.as_str()),
+        );
+    };
+    match crate::engine::remote_store::get_index_lifecycle_status(
+        &state,
+        index_name.as_str(),
+        &metadata,
+    )
+    .await
+    {
+        Ok(response) => (StatusCode::OK, Json(response)),
+        Err(err_resp) => err_resp,
+    }
+}
+
+/// GET /_nodes/cache/inventory — Inspect unified node cache inventory and
+/// root-side leaf capability/load inventory without filesystem scans (`FS-045`, `FS-046`).
+pub async fn get_node_cache_inventory_handler(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<Value>) {
+    let cache_inventory = state.storage_manager.cache_inventory_snapshot();
+    let leaf_inventory = state.remote_store_reader_cache.leaf_inventory_snapshot();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "node_id": state.local_node_id,
+            "cache_inventory": cache_inventory,
+            "leaf_inventory": leaf_inventory,
+        })),
+    )
 }
 
 /// PUT /{index}/_settings — Update dynamic index settings.

@@ -6042,6 +6042,210 @@ impl HotEngine {
         })
     }
 
+    pub fn restore_documents_with_versions(
+        &self,
+        live_docs: &[super::LiveDocumentVersionTuple],
+        tombstones: &[super::DeletedDocumentVersionTuple],
+        watermark_state: Option<super::SealWatermarkState>,
+    ) -> Result<usize> {
+        let _maintenance = self.maintenance_guard("restore documents with versions")?;
+        self.with_translog("restore documents with versions", |tl| {
+            // 1. Flush/commit any unrefreshed local operations first so we never overwrite newer local writes.
+            {
+                let mut writer_state = self
+                    .writer_state_with_replay(tl, "restore documents with versions pre-commit")?;
+                let boundary = self.current_committed_boundary()?;
+                let committed = self.commit_writer_at_boundary(
+                    &mut writer_state,
+                    "restore documents with versions pre-commit",
+                    boundary,
+                )?;
+                drop(writer_state);
+                self.reload_reader()?;
+                self.persist_committed_boundary(&committed)?;
+            }
+
+            if live_docs.is_empty() && tombstones.is_empty() {
+                if let Some(wm) = watermark_state {
+                    self.persist_seal_watermark_state(&wm)?;
+                }
+                return Ok(0);
+            }
+
+            // Winner map: doc_id -> (Option<source>, seq_no, primary_term, version)
+            // None = tombstone winner, Some(source) = live document winner.
+            let mut winners: std::collections::BTreeMap<
+                String,
+                (Option<serde_json::Value>, u64, u64, u64),
+            > = std::collections::BTreeMap::new();
+
+            if let Ok(local_live) = self.live_documents_with_versions() {
+                for (doc_id, source, seq_no, term, ver) in local_live {
+                    let cand_key = (seq_no, term.max(1), ver.max(1), false);
+                    let replace = winners
+                        .get(&doc_id)
+                        .is_none_or(|(s, ps, pt, pv)| cand_key >= (*ps, *pt, *pv, s.is_none()));
+                    if replace {
+                        winners.insert(doc_id, (Some(source), seq_no, term.max(1), ver.max(1)));
+                    }
+                }
+            }
+            if let Ok(entries) = tl.read_all() {
+                for entry in entries {
+                    let Ok(op) = document_operation(&entry) else {
+                        continue;
+                    };
+                    if let WalDocumentOperation::Delete {
+                        doc_id, version, ..
+                    } = op
+                    {
+                        let term = entry.primary_term.max(1);
+                        let ver = version.max(1);
+                        let cand_key = (entry.seq_no, term, ver, true);
+                        let replace = winners
+                            .get(doc_id)
+                            .is_none_or(|(s, ps, pt, pv)| cand_key >= (*ps, *pt, *pv, s.is_none()));
+                        if replace {
+                            winners.insert(doc_id.to_string(), (None, entry.seq_no, term, ver));
+                        }
+                    }
+                }
+            }
+            for (doc_id, source, seq_no, term, ver) in live_docs {
+                let cand_key = (*seq_no, (*term).max(1), (*ver).max(1), false);
+                let replace = winners
+                    .get(doc_id)
+                    .is_none_or(|(s, ps, pt, pv)| cand_key >= (*ps, *pt, *pv, s.is_none()));
+                if replace {
+                    winners.insert(
+                        doc_id.clone(),
+                        (Some(source.clone()), *seq_no, (*term).max(1), (*ver).max(1)),
+                    );
+                }
+            }
+            for (doc_id, seq_no, term, ver) in tombstones {
+                let cand_key = (*seq_no, (*term).max(1), (*ver).max(1), true);
+                let replace = winners
+                    .get(doc_id)
+                    .is_none_or(|(s, ps, pt, pv)| cand_key >= (*ps, *pt, *pv, s.is_none()));
+                if replace {
+                    winners.insert(
+                        doc_id.clone(),
+                        (None, *seq_no, (*term).max(1), (*ver).max(1)),
+                    );
+                }
+            }
+
+            let mut max_seq: Option<u64> = self.current_committed_boundary()?.max_seq_no;
+            let mut max_term: u64 = self.current_primary_term().max(1);
+            let mut by_seq: std::collections::BTreeMap<u64, super::SequencedOperation> =
+                std::collections::BTreeMap::new();
+
+            for (doc_id, (source_opt, seq_no, term, ver)) in &winners {
+                max_seq = Some(max_seq.map_or(*seq_no, |m| m.max(*seq_no)));
+                max_term = max_term.max(*term);
+                if tl.find_entry(*seq_no)?.is_none() {
+                    let mutation = match source_opt {
+                        Some(src) => super::DocumentMutation::Index {
+                            doc_id: doc_id.clone(),
+                            source: src.clone(),
+                        },
+                        None => super::DocumentMutation::Delete {
+                            doc_id: doc_id.clone(),
+                        },
+                    };
+                    by_seq
+                        .entry(*seq_no)
+                        .or_insert_with(|| super::SequencedOperation {
+                            seq_no: *seq_no,
+                            primary_term: *term,
+                            document_version: *ver,
+                            client_operation: None,
+                            mutation,
+                        });
+                }
+            }
+
+            if !by_seq.is_empty() {
+                let ops: Vec<super::SequencedOperation> = by_seq.into_values().collect();
+                let wal_entries: Vec<_> = ops.iter().map(sequenced_wal_entry).collect();
+                tl.write_document_batch_with_seq(&wal_entries)?;
+            }
+
+            let id_field = self
+                .field_registry
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .id_field;
+            let mut writer_state = self
+                .writer
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
+            let mut restored_live_count = 0usize;
+            {
+                let writer = writer_state.writer_mut("restore documents with versions")?;
+                for (doc_id, (source_opt, seq_no, term, ver)) in &winners {
+                    writer.delete_term(Term::from_field_text(id_field, doc_id));
+                    if let Some(source) = source_opt {
+                        let doc = self.build_tantivy_doc(doc_id, source, *seq_no, *term, *ver)?;
+                        writer.add_document(doc)?;
+                        restored_live_count += 1;
+                    }
+                }
+            }
+
+            if let Some(hi) = max_seq {
+                let mut new_boundary = self.current_committed_boundary()?;
+                new_boundary.processed_checkpoint = Some(hi);
+                new_boundary.persisted_checkpoint = Some(hi);
+                new_boundary.max_seq_no = Some(hi);
+                new_boundary.max_seq_no_of_updates_or_deletes =
+                    new_boundary.max_seq_no_of_updates_or_deletes.max(Some(hi));
+                new_boundary.term_sequence_state.current_term = max_term;
+                self.reset_apply_state_to_commit(new_boundary.clone())?;
+                for (doc_id, (source_opt, seq_no, term, ver)) in &winners {
+                    match source_opt {
+                        Some(_) => {
+                            if let Some(pos) = tl.find_entry_position(*seq_no, *term)? {
+                                self.version_map_write()?
+                                    .map
+                                    .apply_index_at(doc_id, *seq_no, *term, *ver, pos);
+                            }
+                        }
+                        None => {
+                            self.version_map_write()?
+                                .map
+                                .apply_delete_at(doc_id, *seq_no, *term, *ver);
+                        }
+                    }
+                }
+                let committed = self.commit_writer_at_boundary(
+                    &mut writer_state,
+                    "restore documents with versions",
+                    new_boundary,
+                )?;
+                drop(writer_state);
+                self.reload_reader()?;
+                self.persist_committed_boundary(&committed)?;
+            } else {
+                let boundary = self.current_committed_boundary()?;
+                let committed = self.commit_writer_at_boundary(
+                    &mut writer_state,
+                    "restore documents with versions",
+                    boundary,
+                )?;
+                drop(writer_state);
+                self.reload_reader()?;
+                self.persist_committed_boundary(&committed)?;
+            }
+
+            if let Some(wm) = watermark_state {
+                self.persist_seal_watermark_state(&wm)?;
+            }
+            Ok(restored_live_count)
+        })
+    }
+
     pub fn unsealed_delta_stats(&self) -> Result<super::UnsealedDeltaStats> {
         let wm = self.load_seal_watermark_state()?;
         let (stats, first_unsealed_ms) = {
@@ -10889,6 +11093,15 @@ impl super::SearchEngine for HotEngine {
 
     fn deleted_documents_with_versions(&self) -> Result<Vec<super::DeletedDocumentVersionTuple>> {
         HotEngine::deleted_documents_with_versions(self)
+    }
+
+    fn restore_documents_with_versions(
+        &self,
+        live_docs: &[super::LiveDocumentVersionTuple],
+        tombstones: &[super::DeletedDocumentVersionTuple],
+        watermark_state: Option<super::SealWatermarkState>,
+    ) -> Result<usize> {
+        HotEngine::restore_documents_with_versions(self, live_docs, tombstones, watermark_state)
     }
 }
 

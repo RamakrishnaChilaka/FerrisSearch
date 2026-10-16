@@ -364,6 +364,24 @@ impl StorageManager {
             }
             pinned_splits.extend(lease.pinned_split_ids);
         }
+        if let Ok(snapshots_prefix) = self.object_path("_snapshots") {
+            let mut snap_stream = self.object_store().list(Some(&snapshots_prefix));
+            let suffix = format!("/indices/{index_uuid}/manifest.json");
+            while let Some(Ok(meta)) = snap_stream.next().await {
+                let loc = meta.location.to_string();
+                if loc.ends_with(&suffix)
+                    && let Ok(bytes) = self.get_bytes(&meta.location).await
+                    && let Ok(snap_manifest) = serde_json::from_slice::<RemoteStoreManifest>(&bytes)
+                {
+                    if snap_manifest.generation > 0 {
+                        effective_pinned_generations.insert(snap_manifest.generation);
+                    }
+                    for s in snap_manifest.published_splits() {
+                        pinned_splits.insert(s.split_id.clone());
+                    }
+                }
+            }
+        }
 
         // 1. Load and validate current pointer + walk ancestor manifest lineage.
         let pointer_key = manifest_pointer_key(index_uuid);
