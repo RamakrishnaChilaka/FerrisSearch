@@ -907,6 +907,187 @@ pub static RESOURCE_RESERVATIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(
     counter
 });
 
+pub static WORK_CLASS_SATURATION_RATIO: LazyLock<GaugeVec> = LazyLock::new(|| {
+    let gauge = GaugeVec::new(
+        Opts::new(
+            "ferrissearch_work_class_saturation_ratio",
+            "Active concurrency divided by effective concurrency ceiling per work class and priority tier",
+        ),
+        &["work_class", "tier"],
+    )
+    .expect("metric: work_class_saturation_ratio");
+    for (class, tier) in [
+        ("search", "foreground"),
+        ("sql", "foreground"),
+        ("write", "foreground"),
+        ("hydration", "background"),
+        ("recovery", "background"),
+        ("maintenance", "background"),
+    ] {
+        let _ = gauge.with_label_values(&[class, tier]);
+    }
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register: work_class_saturation_ratio");
+    gauge
+});
+
+pub static BACKGROUND_THROTTLED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "ferrissearch_background_throttled_total",
+            "Background work throttling and starvation-promotion events by work class and reason",
+        ),
+        &["work_class", "reason"],
+    )
+    .expect("metric: background_throttled_total");
+    for class in ["hydration", "recovery", "maintenance"] {
+        for reason in ["foreground_pressure", "io_budget", "starvation_promoted"] {
+            let _ = counter.with_label_values(&[class, reason]);
+        }
+    }
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: background_throttled_total");
+    counter
+});
+
+pub static WORK_CLASS_IO_BYTES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "ferrissearch_work_class_io_bytes_total",
+            "Total I/O bytes accounted by work class",
+        ),
+        &["work_class"],
+    )
+    .expect("metric: work_class_io_bytes_total");
+    for class in [
+        "search",
+        "sql",
+        "write",
+        "hydration",
+        "recovery",
+        "maintenance",
+    ] {
+        let _ = counter.with_label_values(&[class]);
+    }
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: work_class_io_bytes_total");
+    counter
+});
+
+pub static CLASSIFIED_ERRORS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "ferrissearch_classified_errors_total",
+            "Total classified errors by stable error class and execution stage",
+        ),
+        &["error_class", "stage"],
+    )
+    .expect("metric: classified_errors_total");
+    for class in ["retryable", "terminal", "corruption", "overload"] {
+        for stage in [
+            "queue",
+            "search",
+            "sql",
+            "write",
+            "hydration",
+            "replication",
+            "recovery",
+            "merge",
+            "maintenance",
+        ] {
+            let _ = counter.with_label_values(&[class, stage]);
+        }
+    }
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: classified_errors_total");
+    counter
+});
+
+pub static STAGE_EXECUTION_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    let histogram = HistogramVec::new(
+        HistogramOpts::new(
+            "ferrissearch_stage_execution_duration_seconds",
+            "Observed execution duration by trace stage in seconds",
+        )
+        .buckets(vec![
+            0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0,
+        ]),
+        &["stage"],
+    )
+    .expect("metric: stage_execution_duration_seconds");
+    REGISTRY
+        .register(Box::new(histogram.clone()))
+        .expect("register: stage_execution_duration_seconds");
+    histogram
+});
+
+pub static HOT_DELTA_SEALS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "ferrissearch_hot_delta_seals_total",
+            "Hot-delta to immutable-split seal attempts by trigger and outcome",
+        ),
+        &["trigger", "outcome"],
+    )
+    .expect("metric: hot_delta_seals_total");
+    for trigger in ["auto_docs", "auto_bytes", "auto_age", "manual"] {
+        for outcome in [
+            "committed",
+            "replayed",
+            "skipped_empty",
+            "skipped_policy",
+            "backpressure",
+            "failed",
+        ] {
+            let _ = counter.with_label_values(&[trigger, outcome]);
+        }
+    }
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: hot_delta_seals_total");
+    counter
+});
+
+pub static HOT_DELTA_SEALED_DOCS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "ferrissearch_hot_delta_sealed_docs_total",
+        "Total documents sealed from the mutable hot delta into immutable splits",
+    )
+    .expect("metric: hot_delta_sealed_docs_total");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: hot_delta_sealed_docs_total");
+    counter
+});
+
+pub static HOT_DELTA_SEALED_BYTES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "ferrissearch_hot_delta_sealed_bytes_total",
+        "Total split bundle bytes sealed from the mutable hot delta",
+    )
+    .expect("metric: hot_delta_sealed_bytes_total");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: hot_delta_sealed_bytes_total");
+    counter
+});
+
+pub static HOT_DELTA_RETIRED_RANGES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "ferrissearch_hot_delta_retired_ranges_total",
+        "Total hot-delta sequence ranges retired after manifest visibility watermark commit",
+    )
+    .expect("metric: hot_delta_retired_ranges_total");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: hot_delta_retired_ranges_total");
+    counter
+});
+
 fn set_column_cache_budget_gauges(
     effective_memory_gauge: &IntGauge,
     cache_budget_gauge: &IntGauge,
@@ -979,6 +1160,15 @@ fn initialize_metrics() {
     let _ = &*RESOURCE_POOL_CAPACITY_BYTES;
     let _ = &*RESOURCE_POOL_RESERVED_BYTES;
     let _ = &*RESOURCE_RESERVATIONS_TOTAL;
+    let _ = &*WORK_CLASS_SATURATION_RATIO;
+    let _ = &*BACKGROUND_THROTTLED_TOTAL;
+    let _ = &*WORK_CLASS_IO_BYTES_TOTAL;
+    let _ = &*CLASSIFIED_ERRORS_TOTAL;
+    let _ = &*STAGE_EXECUTION_DURATION_SECONDS;
+    let _ = &*HOT_DELTA_SEALS_TOTAL;
+    let _ = &*HOT_DELTA_SEALED_DOCS_TOTAL;
+    let _ = &*HOT_DELTA_SEALED_BYTES_TOTAL;
+    let _ = &*HOT_DELTA_RETIRED_RANGES_TOTAL;
 }
 
 pub fn record_replica_state_transition(from: &str, to: &str) {

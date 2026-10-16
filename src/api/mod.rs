@@ -76,16 +76,30 @@ pub struct AppState {
     pub sql_approximate_top_k: bool,
 }
 
-/// Build a consistent OpenSearch-style error response.
+/// Build a consistent OpenSearch-style error response with stable error classification (`FS-033`).
 pub fn error_response(
     status: StatusCode,
     error_type: &str,
     reason: impl std::fmt::Display,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let reason_str = reason.to_string();
+    let error_class = crate::worker::classify_http_error(status.as_u16(), error_type, &reason_str);
+    let current_ctx = crate::worker::current_request_context();
+    let stage = current_ctx
+        .as_ref()
+        .map_or(crate::worker::ExecutionStage::Search, |c| c.default_stage());
+    if let Some(ref ctx) = current_ctx {
+        ctx.set_last_error_class(error_class);
+    }
+    crate::worker::record_classified_error(error_class, stage);
     (
         status,
         Json(serde_json::json!({
-            "error": { "type": error_type, "reason": reason.to_string() },
+            "error": {
+                "type": error_type,
+                "reason": reason_str,
+                "error_class": error_class.as_str(),
+            },
             "status": status.as_u16()
         })),
     )
@@ -97,7 +111,7 @@ pub fn error_response(
 pub(crate) fn reject_write_if_engine_read_only(
     metadata: &crate::cluster::state::IndexMetadata,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
-    if metadata.settings.engine.supports_writes() {
+    if metadata.supports_writes() {
         None
     } else {
         Some(error_response(
@@ -299,21 +313,149 @@ async fn request_context_middleware(req: Request<Body>, next: Next) -> Response 
         crate::metrics::DEADLINE_EXHAUSTED_TOTAL
             .with_label_values(&[stage.as_str()])
             .inc();
-        return error_response(
+        let req_id = req
+            .headers()
+            .get(crate::worker::REQUEST_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(crate::worker::sanitize_trace_id)
+            .unwrap_or_else(|| "req-0".to_string());
+        let mut response = error_response(
             StatusCode::GATEWAY_TIMEOUT,
             "deadline_exceeded_exception",
             format!("request deadline budget (0 ms) exhausted during stage [{stage}]"),
         )
         .into_response();
+        if let Ok(val) = header::HeaderValue::from_str(&req_id) {
+            response
+                .headers_mut()
+                .insert(crate::worker::REQUEST_ID_HEADER, val);
+        }
+        response.headers_mut().insert(
+            crate::worker::ERROR_CLASS_HEADER,
+            header::HeaderValue::from_static("overload"),
+        );
+        return response;
     }
 
     let ctx = match effective_budget {
         Some(budget) => crate::worker::RequestCancellationContext::with_budget(budget),
         None => crate::worker::RequestCancellationContext::new(),
     };
+    ctx.set_default_stage(stage);
+    if let Some(req_id) = req
+        .headers()
+        .get(crate::worker::REQUEST_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
+        let _ = ctx.set_request_id(req_id);
+    }
+    if let Some(op_id) = req
+        .headers()
+        .get(crate::worker::OPERATION_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| {
+            req.uri().query().and_then(|q| {
+                q.split('&').find_map(|pair| {
+                    let (k, v) = pair.split_once('=')?;
+                    (k == "operation_id").then_some(v)
+                })
+            })
+        })
+    {
+        let _ = ctx.set_operation_id(op_id);
+    }
+    if let Some(snap_id) = req
+        .headers()
+        .get(crate::worker::SNAPSHOT_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
+        let _ = ctx.set_snapshot_id(snap_id);
+    }
+    if let Some(assign_id) = req
+        .headers()
+        .get(crate::worker::ASSIGNMENT_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
+        let _ = ctx.set_assignment_id(assign_id);
+    }
+    if let Some(task_id) = req
+        .headers()
+        .get(crate::worker::TASK_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
+        let _ = ctx.set_task_id(task_id);
+    }
+    let trace_ids = ctx.trace_ids();
+    let span = tracing::info_span!(
+        "http_request",
+        request_id = %trace_ids.request_id,
+        operation_id = trace_ids.operation_id.as_deref().unwrap_or(""),
+        snapshot_id = trace_ids.snapshot_id.as_deref().unwrap_or(""),
+        assignment_id = trace_ids.assignment_id.as_deref().unwrap_or(""),
+        task_id = trace_ids.task_id.as_deref().unwrap_or(""),
+        stage = %stage.as_str(),
+    );
     let mut drop_guard = ctx.drop_guard(crate::worker::CancellationReason::ClientDisconnected);
-    let response = crate::worker::with_task_request_context(ctx, next.run(req)).await;
+    let mut response = tracing::Instrument::instrument(
+        crate::worker::with_task_request_context(ctx.clone(), next.run(req)),
+        span,
+    )
+    .await;
     drop_guard.disarm();
+    let final_ids = ctx.trace_ids();
+    if let Ok(val) = header::HeaderValue::from_str(&final_ids.request_id) {
+        response
+            .headers_mut()
+            .insert(crate::worker::REQUEST_ID_HEADER, val);
+    }
+    if let Some(ref op_id) = final_ids.operation_id
+        && let Ok(val) = header::HeaderValue::from_str(op_id)
+    {
+        response
+            .headers_mut()
+            .insert(crate::worker::OPERATION_ID_HEADER, val);
+    }
+    if let Some(ref snap_id) = final_ids.snapshot_id
+        && let Ok(val) = header::HeaderValue::from_str(snap_id)
+    {
+        response
+            .headers_mut()
+            .insert(crate::worker::SNAPSHOT_ID_HEADER, val);
+    }
+    if let Some(ref assign_id) = final_ids.assignment_id
+        && let Ok(val) = header::HeaderValue::from_str(assign_id)
+    {
+        response
+            .headers_mut()
+            .insert(crate::worker::ASSIGNMENT_ID_HEADER, val);
+    }
+    if let Some(ref task_id) = final_ids.task_id
+        && let Ok(val) = header::HeaderValue::from_str(task_id)
+    {
+        response
+            .headers_mut()
+            .insert(crate::worker::TASK_ID_HEADER, val);
+    }
+    let timings = ctx.stage_snapshot().encode_compact();
+    if let Ok(val) = header::HeaderValue::from_str(&timings) {
+        response
+            .headers_mut()
+            .insert(crate::worker::STAGE_TIMINGS_HEADER, val);
+    }
+    if response.status().as_u16() >= 400
+        && !response
+            .headers()
+            .contains_key(crate::worker::ERROR_CLASS_HEADER)
+    {
+        let err_class = ctx.last_error_class().unwrap_or_else(|| {
+            crate::worker::classify_http_error(response.status().as_u16(), "", "")
+        });
+        if let Ok(val) = header::HeaderValue::from_str(err_class.as_str()) {
+            response
+                .headers_mut()
+                .insert(crate::worker::ERROR_CLASS_HEADER, val);
+        }
+    }
     response
 }
 
@@ -439,6 +581,11 @@ pub fn create_router(mut state: AppState) -> Router {
             "/{index}/_remote_store/janitor",
             post(index::run_remote_store_janitor),
         )
+        .route(
+            "/{index}/_remote_store/seal",
+            post(index::seal_remote_store_delta),
+        )
+        .route("/{index}/_seal", post(index::seal_remote_store_delta))
         // Document operations
         .route("/{index}/_doc", post(index::index_document))
         .route("/{index}/_doc/{id}", put(index::index_document_with_id))

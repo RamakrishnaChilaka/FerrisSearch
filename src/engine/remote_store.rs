@@ -1190,6 +1190,15 @@ pub(crate) async fn search(
         }
     };
 
+    let snapshot_id = format!(
+        "snap-{}-g{}-e{}",
+        metadata.uuid, manifest.generation, manifest.writer_epoch
+    );
+    crate::worker::set_current_trace_snapshot_id(&snapshot_id);
+    if !manifest.operation_id.is_empty() {
+        crate::worker::set_current_trace_operation_id(&manifest.operation_id);
+    }
+
     let pruning_predicate = build_split_pruning_predicate(&search_req.query, &metadata.mappings);
     let published_split_count = manifest.published_splits().count();
     let split_plans: Vec<_> = manifest
@@ -1272,7 +1281,9 @@ pub(crate) async fn search(
     let mut failed = 0u32;
     let mut assigned_split_ids = HashSet::new();
 
+    let mut round_index = 0usize;
     while !pending_splits.is_empty() {
+        let round_started = std::time::Instant::now();
         let assignments = assign_remote_store_splits(
             metadata.uuid.as_str(),
             manifest.generation,
@@ -1306,26 +1317,36 @@ pub(crate) async fn search(
 
         let mut work = Vec::new();
         for (node_id, splits) in assignments {
+            let assignment_id = format!(
+                "assign-g{}-r{}-{}",
+                manifest.generation, round_index, node_id
+            );
+            crate::worker::set_current_trace_assignment_id(&assignment_id);
             let node_id_for_result = node_id.clone();
             if node_id == state.local_node_id {
                 let context = leaf_context.clone();
                 let metadata = metadata.clone();
                 let search_req = search_req.clone();
                 let live_split_ids = live_split_ids.clone();
+                let child_ctx = crate::worker::current_request_context().map(|ctx| {
+                    let c = ctx.child();
+                    let _ = c.set_assignment_id(&assignment_id);
+                    c
+                });
                 work.push(
                     async move {
-                        (
-                            node_id_for_result,
-                            splits.clone(),
-                            execute_leaf_search_batch(
-                                &context,
-                                &metadata,
-                                &search_req,
-                                &splits,
-                                &live_split_ids,
-                            )
-                            .await,
-                        )
+                        let fut = execute_leaf_search_batch(
+                            &context,
+                            &metadata,
+                            &search_req,
+                            &splits,
+                            &live_split_ids,
+                        );
+                        let res = match child_ctx {
+                            Some(ctx) => crate::worker::with_task_request_context(ctx, fut).await,
+                            None => fut.await,
+                        };
+                        (node_id_for_result, splits.clone(), res)
                     }
                     .boxed(),
                 );
@@ -1338,22 +1359,26 @@ pub(crate) async fn search(
                 let index_uuid = metadata.uuid.to_string();
                 let search_req = search_req.clone();
                 let live_split_ids: Vec<_> = live_split_ids.iter().cloned().collect();
+                let child_ctx = crate::worker::current_request_context().map(|ctx| {
+                    let c = ctx.child();
+                    let _ = c.set_assignment_id(&assignment_id);
+                    c
+                });
                 work.push(
                     async move {
-                        (
-                            node_id_for_result,
-                            splits.clone(),
-                            client
-                                .forward_remote_store_search(
-                                    &node,
-                                    &index_name,
-                                    &index_uuid,
-                                    &search_req,
-                                    &splits,
-                                    &live_split_ids,
-                                )
-                                .await,
-                        )
+                        let fut = client.forward_remote_store_search(
+                            &node,
+                            &index_name,
+                            &index_uuid,
+                            &search_req,
+                            &splits,
+                            &live_split_ids,
+                        );
+                        let res = match child_ctx {
+                            Some(ctx) => crate::worker::with_task_request_context(ctx, fut).await,
+                            None => fut.await,
+                        };
+                        (node_id_for_result, splits.clone(), res)
                     }
                     .boxed(),
                 );
@@ -1366,6 +1391,13 @@ pub(crate) async fn search(
             &split_lookup,
             &mut accumulator,
         );
+        if round_index > 0 {
+            crate::worker::record_current_stage_duration(
+                crate::worker::TraceStage::Retry,
+                round_started.elapsed(),
+            );
+        }
+        round_index += 1;
         unhealthy_nodes.extend(round.newly_unhealthy_nodes);
 
         if round.next_pending.is_empty() {
@@ -1383,6 +1415,7 @@ pub(crate) async fn search(
         return Err(error);
     }
 
+    let merge_started = std::time::Instant::now();
     let all_hits =
         crate::search::merge_sorted_hit_lists(accumulator.split_hit_lists, &search_req.sort);
     let aggregations = if accumulator.partial_aggs.is_empty() {
@@ -1390,6 +1423,10 @@ pub(crate) async fn search(
     } else {
         crate::search::merge_aggregations(accumulator.partial_aggs.clone(), &search_req.aggs)
     };
+    crate::worker::record_current_stage_duration(
+        crate::worker::TraceStage::PartialMerge,
+        merge_started.elapsed(),
+    );
 
     Ok(DistributedDslSearchResult {
         all_hits,
@@ -1404,7 +1441,11 @@ pub(crate) async fn search(
 }
 
 fn strip_split_wal(staging_dir: &std::path::Path) -> anyhow::Result<()> {
-    for name in ["translog.manifest", "translog.committed"] {
+    for name in [
+        "translog.manifest",
+        "translog.committed",
+        crate::engine::SEAL_WATERMARK_FILE,
+    ] {
         let path = staging_dir.join(name);
         if path.try_exists()? {
             std::fs::remove_file(path)?;
@@ -1451,6 +1492,7 @@ pub(crate) struct ForwardedSequencerCommitRequest {
     pub known_authority: Option<crate::cluster::state::ManifestWriterAuthority>,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) enum ForwardedSequencerCommitResponse {
     Committed(crate::storage::PublicationCommitOutcome),
@@ -1900,7 +1942,7 @@ fn outcome_to_publish_json(
     index_name: &str,
     outcome: &crate::storage::PublicationCommitOutcome,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut json = serde_json::json!({
         "index": index_name,
         "index_uuid": outcome.index_uuid,
         "operation_id": outcome.operation_id,
@@ -1915,7 +1957,12 @@ fn outcome_to_publish_json(
         "replayed": outcome.replayed,
         "doc_count": outcome.doc_count,
         "size_bytes": outcome.size_bytes,
-    })
+    });
+    if !outcome.published_watermarks.is_empty() {
+        json["published_watermarks"] =
+            serde_json::to_value(&outcome.published_watermarks).unwrap_or(serde_json::Value::Null);
+    }
+    json
 }
 
 #[cfg(test)]
@@ -2170,8 +2217,8 @@ pub(crate) async fn publish_docs_with_operation(
                     column_cache,
                 )?;
                 use crate::engine::SearchEngine;
-                for (doc_id, payload) in prepared {
-                    engine.add_document(&doc_id, payload)?;
+                if !prepared.is_empty() {
+                    engine.bulk_add_documents(prepared)?;
                 }
                 engine.flush()?;
                 Ok(())
@@ -2670,6 +2717,1011 @@ pub(crate) async fn verify_splits(
         "mismatch_count": mismatch_count,
         "missing_count": missing_count,
         "unsupported_count": 0,
+    }))
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HotDeltaSealOptions {
+    #[serde(default = "default_seal_force")]
+    pub force: bool,
+    #[serde(default = "default_seal_retire")]
+    pub retire_after_commit: bool,
+    #[serde(default)]
+    pub max_docs: Option<usize>,
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+    #[serde(default)]
+    pub elapsed_age_ms: Option<u64>,
+}
+
+const fn default_seal_force() -> bool {
+    true
+}
+
+const fn default_seal_retire() -> bool {
+    true
+}
+
+impl Default for HotDeltaSealOptions {
+    fn default() -> Self {
+        Self {
+            force: true,
+            retire_after_commit: true,
+            max_docs: None,
+            max_bytes: None,
+            elapsed_age_ms: None,
+        }
+    }
+}
+
+pub fn deterministic_hot_delta_seal_operation_id(
+    index_uuid: &str,
+    shard_id: u32,
+    start_seq_no: u64,
+    through_seq_no: u64,
+) -> String {
+    let raw = format!("seal-{index_uuid}-s{shard_id}-{start_seq_no}-{through_seq_no}");
+    if raw.len() <= 120 {
+        raw
+    } else {
+        let mut hasher = sha2::Sha256::new();
+        use sha2::Digest;
+        hasher.update(raw.as_bytes());
+        let hex: String = hasher
+            .finalize()
+            .iter()
+            .take(16)
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        format!("seal-s{shard_id}-{start_seq_no}-{through_seq_no}-{hex}")
+    }
+}
+
+/// Reconcile local hot-delta retirement against the committed manifest's
+/// `published_watermarks` (`FS-036`). Idempotent across retries and restarts.
+pub(crate) async fn reconcile_published_watermark_retirement(
+    state: &AppState,
+    index_name: &str,
+    metadata: &IndexMetadata,
+) -> anyhow::Result<BTreeMap<u32, usize>> {
+    let mut retired_by_shard = BTreeMap::new();
+    if !metadata.is_tiered() {
+        return Ok(retired_by_shard);
+    }
+    let expected_schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
+    let Some(manifest) = state
+        .storage_manager
+        .load_current_manifest(metadata.uuid.as_str(), Some(&expected_schema_hash))
+        .await?
+    else {
+        return Ok(retired_by_shard);
+    };
+    if manifest.published_watermarks.is_empty() {
+        return Ok(retired_by_shard);
+    }
+    let local_shards = crate::api::index::ensure_local_index_shards_open(
+        state,
+        index_name,
+        metadata,
+        "reconcile published watermark retirement",
+    )
+    .await;
+    for (shard_id, engine) in local_shards {
+        let Some(wm) = manifest.published_watermarks.get(&shard_id) else {
+            continue;
+        };
+        let target_seq = wm.sealed_through_seq_no;
+        let generation = manifest.generation;
+        let retired = state
+            .worker_pools
+            .spawn_maintenance("retire_sealed_delta", move || {
+                engine.retire_sealed_delta_through(target_seq, generation)
+            })
+            .await?;
+        retired_by_shard.insert(shard_id, retired);
+    }
+    Ok(retired_by_shard)
+}
+
+/// Seal eligible hot-delta ranges on local primary shards into immutable splits
+/// and commit the updated publication visibility watermark (`FS-034`, `FS-035`, `FS-036`).
+pub(crate) async fn seal_hot_delta(
+    state: &AppState,
+    index_name: &str,
+    metadata: &IndexMetadata,
+    body: Option<Value>,
+) -> Result<Value, (StatusCode, Json<Value>)> {
+    if !metadata.is_tiered() {
+        return Err(crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            format!(
+                "index [{}] has lifecycle_mode [{}] which does not support hot-delta sealing (requires a tiered index)",
+                index_name,
+                metadata.lifecycle_mode()
+            ),
+        ));
+    }
+
+    let options: HotDeltaSealOptions = match body {
+        Some(v) if !v.is_null() => serde_json::from_value(v).map_err(|error| {
+            crate::api::error_response(
+                StatusCode::BAD_REQUEST,
+                "illegal_argument_exception",
+                format!("invalid seal request body: {error}"),
+            )
+        })?,
+        _ => HotDeltaSealOptions::default(),
+    };
+
+    if let Err(error) = state.storage_manager.ensure_publication_supported().await {
+        return Err(crate::api::error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "remote_store_publish_exception",
+            error,
+        ));
+    }
+
+    let policy = metadata
+        .effective_hot_delta_seal_policy()
+        .unwrap_or_default();
+    let max_seal_docs = options
+        .max_docs
+        .unwrap_or_else(|| policy.effective_max_seal_docs())
+        .max(1);
+    let max_seal_bytes = options
+        .max_bytes
+        .unwrap_or_else(|| policy.effective_max_seal_bytes())
+        .max(1);
+
+    let expected_schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
+    let current_manifest = state
+        .storage_manager
+        .load_current_manifest(metadata.uuid.as_str(), Some(&expected_schema_hash))
+        .await
+        .map_err(|error| {
+            crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "remote_store_manifest_exception",
+                format!("failed to load current manifest before sealing: {error:#}"),
+            )
+        })?;
+
+    let local_shards = crate::api::index::ensure_local_index_shards_open(
+        state,
+        index_name,
+        metadata,
+        "hot-delta seal",
+    )
+    .await;
+
+    let mut shard_reports = Vec::new();
+    let mut splits_sealed = 0usize;
+    let mut total_docs_sealed = 0u64;
+    let mut total_tombstones_sealed = 0u64;
+
+    for (shard_id, routing) in &metadata.shard_routing {
+        if routing.primary != state.local_node_id {
+            continue;
+        }
+        let Some((_, engine)) = local_shards.iter().find(|(sid, _)| sid == shard_id) else {
+            return Err(crate::api::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "shard_not_available_exception",
+                format!("primary shard [{index_name}][{shard_id}] is not open on local node"),
+            ));
+        };
+
+        // First, if a previous manifest commit already advanced this shard's
+        // published watermark beyond `retired_through_seq_no`, reconcile retirement.
+        let mut wm_state = engine.seal_watermark_state().map_err(|error| {
+            crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "remote_store_seal_exception",
+                format!("failed to load seal watermark state: {error:#}"),
+            )
+        })?;
+        let committed_wm = current_manifest
+            .as_ref()
+            .and_then(|m| m.published_watermarks.get(shard_id))
+            .cloned();
+        if let Some(ref cwm) = committed_wm
+            && options.retire_after_commit
+            && wm_state
+                .retired_through_seq_no
+                .is_none_or(|r| r < cwm.sealed_through_seq_no)
+        {
+            let engine_for_retire = engine.clone();
+            let target_seq = cwm.sealed_through_seq_no;
+            let generation = cwm.updated_at_generation;
+            state
+                .worker_pools
+                .spawn_maintenance("reconcile_retire_sealed_delta", move || {
+                    engine_for_retire.retire_sealed_delta_through(target_seq, generation)
+                })
+                .await
+                .map_err(|error| {
+                    crate::api::error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "remote_store_seal_exception",
+                        format!("failed to reconcile post-commit delta retirement: {error:#}"),
+                    )
+                })?;
+            wm_state = engine.seal_watermark_state().map_err(|error| {
+                crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "remote_store_seal_exception",
+                    format!("failed to reload seal watermark state: {error:#}"),
+                )
+            })?;
+        }
+
+        let after_seq_no = match (
+            committed_wm.as_ref().map(|w| w.sealed_through_seq_no),
+            wm_state.sealed_through_seq_no,
+        ) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+
+        // Check if there is an interrupted ActiveSealBarrier to resume for the next range.
+        let resumed_barrier = wm_state.active_seal.clone().filter(|active| {
+            let expected_start = after_seq_no.map_or(0, |s| s.saturating_add(1));
+            active.start_seq_no == expected_start && active.through_seq_no >= active.start_seq_no
+        });
+
+        let delta_stats = engine.unsealed_delta_stats().map_err(|error| {
+            crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "remote_store_seal_exception",
+                format!("failed to inspect unsealed delta stats: {error:#}"),
+            )
+        })?;
+
+        let candidate_opt = if let Some(ref barrier) = resumed_barrier {
+            let max_ops_for_resume =
+                usize::try_from(barrier.through_seq_no - barrier.start_seq_no + 1)
+                    .unwrap_or(usize::MAX);
+            engine
+                .enumerate_seal_boundary(after_seq_no, max_ops_for_resume, u64::MAX)
+                .map_err(|error| {
+                    crate::api::error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "remote_store_seal_exception",
+                        format!("failed to re-enumerate active seal barrier: {error:#}"),
+                    )
+                })?
+        } else {
+            engine
+                .enumerate_seal_boundary(after_seq_no, max_seal_docs, max_seal_bytes)
+                .map_err(|error| {
+                    crate::api::error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "remote_store_seal_exception",
+                        format!("failed to enumerate hot-delta seal boundary: {error:#}"),
+                    )
+                })?
+        };
+
+        let Some(candidate) = candidate_opt else {
+            let trigger_label = if options.force { "manual" } else { "auto_docs" };
+            crate::metrics::HOT_DELTA_SEALS_TOTAL
+                .with_label_values(&[trigger_label, "skipped_empty"])
+                .inc();
+            shard_reports.push(serde_json::json!({
+                "shard_id": shard_id,
+                "status": "skipped_empty",
+                "sealed_through_seq_no": after_seq_no,
+                "retired_through_seq_no": wm_state.retired_through_seq_no,
+            }));
+            continue;
+        };
+
+        let trigger_label = if options.force {
+            "manual"
+        } else if candidate.operation_count >= policy.effective_min_seal_docs() {
+            "auto_docs"
+        } else if candidate.estimated_bytes >= policy.effective_min_seal_bytes() {
+            "auto_bytes"
+        } else {
+            let age_ms = options
+                .elapsed_age_ms
+                .unwrap_or(delta_stats.oldest_unsealed_age_ms);
+            if policy.effective_max_seal_age_ms() > 0
+                && age_ms >= policy.effective_max_seal_age_ms()
+            {
+                "auto_age"
+            } else {
+                crate::metrics::HOT_DELTA_SEALS_TOTAL
+                    .with_label_values(&["auto_docs", "skipped_policy"])
+                    .inc();
+                shard_reports.push(serde_json::json!({
+                    "shard_id": shard_id,
+                    "status": "skipped_policy",
+                    "unsealed_ops": candidate.operation_count,
+                    "unsealed_bytes": candidate.estimated_bytes,
+                    "min_seal_docs": policy.effective_min_seal_docs(),
+                    "min_seal_bytes": policy.effective_min_seal_bytes(),
+                    "max_seal_age_ms": policy.effective_max_seal_age_ms(),
+                    "sealed_through_seq_no": after_seq_no,
+                    "retired_through_seq_no": wm_state.retired_through_seq_no,
+                }));
+                continue;
+            }
+        };
+
+        let index_uuid = metadata.uuid.as_str().to_string();
+        let operation_id = resumed_barrier
+            .as_ref()
+            .map(|b| b.operation_id.clone())
+            .unwrap_or_else(|| {
+                deterministic_hot_delta_seal_operation_id(
+                    &index_uuid,
+                    *shard_id,
+                    candidate.start_seq_no,
+                    candidate.through_seq_no,
+                )
+            });
+        crate::worker::set_current_trace_operation_id(&operation_id);
+
+        let barrier = crate::engine::ActiveSealBarrier {
+            seal_id: operation_id.clone(),
+            operation_id: operation_id.clone(),
+            start_seq_no: candidate.start_seq_no,
+            through_seq_no: candidate.through_seq_no,
+            primary_term: candidate.primary_term,
+            live_doc_count: candidate.live_doc_count(),
+            tombstone_count: candidate.tombstone_count(),
+            estimated_bytes: candidate.estimated_bytes,
+            created_at_epoch_ms: now_epoch_ms(),
+        };
+        engine
+            .record_active_seal_barrier(Some(barrier))
+            .map_err(|error| {
+                crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "remote_store_seal_exception",
+                    format!("failed to persist active seal barrier: {error:#}"),
+                )
+            })?;
+
+        // Reserve Memory and TempDisk from ResourceGovernor (FS-031) and yield under foreground pressure (FS-032).
+        let current_ctx = crate::worker::current_request_context();
+        state
+            .worker_pools
+            .admission()
+            .cooperative_background_yield(
+                crate::worker::WorkClass::Maintenance,
+                current_ctx.as_ref(),
+            )
+            .await
+            .map_err(|error| {
+                crate::api::error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rejected_execution_exception",
+                    error,
+                )
+            })?;
+        let mut mem_reservation = state
+            .worker_pools
+            .resource_governor()
+            .try_reserve(
+                crate::worker::ResourcePoolKind::Memory,
+                candidate.estimated_bytes.max(1024),
+            )
+            .map_err(|error| {
+                crate::api::error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rejected_execution_exception",
+                    error,
+                )
+            })?;
+        let mut temp_disk_reservation = state
+            .worker_pools
+            .resource_governor()
+            .try_reserve(
+                crate::worker::ResourcePoolKind::TempDisk,
+                candidate.estimated_bytes.max(1024),
+            )
+            .map_err(|error| {
+                crate::api::error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rejected_execution_exception",
+                    error,
+                )
+            })?;
+
+        let mut live_docs: Vec<(String, serde_json::Value)> = Vec::new();
+        let mut raw_docs_for_summaries: Vec<serde_json::Value> = Vec::new();
+        let mut doc_versions: Vec<crate::storage::SplitDocVersionRecord> = Vec::new();
+        let mut tombstones: Vec<crate::storage::SplitTombstoneRecord> = Vec::new();
+        for rec in &candidate.records {
+            match rec {
+                crate::engine::SealedDocumentRecord::Live {
+                    doc_id,
+                    source,
+                    seq_no,
+                    primary_term,
+                    version,
+                } => {
+                    live_docs.push((doc_id.clone(), source.clone()));
+                    raw_docs_for_summaries.push(source.clone());
+                    doc_versions.push(crate::storage::SplitDocVersionRecord {
+                        doc_id: doc_id.clone(),
+                        seq_no: *seq_no,
+                        primary_term: *primary_term,
+                        version: *version,
+                    });
+                }
+                crate::engine::SealedDocumentRecord::Tombstone {
+                    doc_id,
+                    seq_no,
+                    primary_term,
+                    version,
+                } => {
+                    tombstones.push(crate::storage::SplitTombstoneRecord {
+                        doc_id: doc_id.clone(),
+                        seq_no: *seq_no,
+                        primary_term: *primary_term,
+                        version: *version,
+                    });
+                }
+            }
+        }
+
+        let seal_range_meta = crate::storage::SplitSealRangeMetadata {
+            shard_id: *shard_id,
+            start_seq_no: candidate.start_seq_no,
+            end_seq_no: candidate.through_seq_no,
+            primary_term: candidate.primary_term,
+            doc_versions,
+            tombstones,
+        };
+
+        let (field_ranges, field_terms) = build_split_field_summaries(
+            &raw_docs_for_summaries,
+            &metadata.mappings,
+        )
+        .map_err(|error| {
+            crate::api::error_response(StatusCode::BAD_REQUEST, "mapper_parsing_exception", error)
+        })?;
+
+        let schema_generation = 1u64;
+        let schema_hash = expected_schema_hash.clone();
+        let fingerprint_payload = serde_json::json!({
+            "kind": "hot_delta_seal_v1",
+            "index_uuid": index_uuid,
+            "shard_id": shard_id,
+            "start_seq_no": candidate.start_seq_no,
+            "through_seq_no": candidate.through_seq_no,
+            "primary_term": candidate.primary_term,
+            "schema_generation": schema_generation,
+            "schema_hash": schema_hash,
+            "live_docs": live_docs,
+            "tombstones": seal_range_meta.tombstones,
+        });
+        let raw_fp = crate::engine::ClientOperationIntent::fingerprint_json(&fingerprint_payload)
+            .map_err(|error| {
+            crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "remote_store_seal_exception",
+                error,
+            )
+        })?;
+        let request_fingerprint = if raw_fp.starts_with("sha256:") {
+            raw_fp
+        } else {
+            format!("sha256:{raw_fp}")
+        };
+
+        let split_id =
+            crate::storage::deterministic_publication_split_id(&index_uuid, &operation_id);
+        let staging_dir = state.storage_manager.staging_dir(&index_uuid, &split_id);
+
+        let (existing_intent, existing_prepared) = match state
+            .storage_manager
+            .resolve_publication_operation(&index_uuid, &operation_id, &request_fingerprint)
+            .await
+        {
+            Ok(crate::storage::PublicationResolution::Committed(outcome)) => {
+                crate::metrics::HOT_DELTA_SEALS_TOTAL
+                    .with_label_values(&[trigger_label, "replayed"])
+                    .inc();
+                if options.retire_after_commit {
+                    let engine_for_retire = engine.clone();
+                    let target_seq = candidate.through_seq_no;
+                    let generation = outcome.generation;
+                    let _ = state
+                        .worker_pools
+                        .spawn_maintenance("retire_replayed_seal", move || {
+                            engine_for_retire.retire_sealed_delta_through(target_seq, generation)
+                        })
+                        .await;
+                }
+                let updated_wm = engine.seal_watermark_state().unwrap_or_default();
+                splits_sealed += 1;
+                shard_reports.push(serde_json::json!({
+                    "shard_id": shard_id,
+                    "status": "replayed",
+                    "operation_id": operation_id,
+                    "split_id": outcome.split_id,
+                    "generation": outcome.generation,
+                    "start_seq_no": candidate.start_seq_no,
+                    "through_seq_no": candidate.through_seq_no,
+                    "sealed_through_seq_no": updated_wm.sealed_through_seq_no,
+                    "retired_through_seq_no": updated_wm.retired_through_seq_no,
+                }));
+                continue;
+            }
+            Ok(crate::storage::PublicationResolution::Conflict {
+                operation_id,
+                reason,
+            }) => {
+                crate::metrics::HOT_DELTA_SEALS_TOTAL
+                    .with_label_values(&[trigger_label, "failed"])
+                    .inc();
+                return Err(crate::api::error_response(
+                    StatusCode::CONFLICT,
+                    "operation_id_conflict",
+                    format!("seal operation_id [{operation_id}] conflict: {reason}"),
+                ));
+            }
+            Ok(crate::storage::PublicationResolution::NotCommitted { intent, prepared }) => {
+                (intent, prepared)
+            }
+            Err(error) => {
+                crate::metrics::HOT_DELTA_SEALS_TOTAL
+                    .with_label_values(&[trigger_label, "failed"])
+                    .inc();
+                return Err(crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "remote_store_seal_exception",
+                    format!("failed to resolve seal operation '{operation_id}': {error:#}"),
+                ));
+            }
+        };
+
+        let live_doc_count = live_docs.len() as u64;
+        let intent_doc_count = (live_doc_count + candidate.tombstone_count()).max(1);
+        let planned_bundle_path =
+            crate::storage::StorageManager::split_bundle_key(&index_uuid, &split_id);
+
+        if existing_intent.is_none() {
+            let now_ms = now_epoch_ms();
+            let intent = crate::storage::PublicationIntentRecord {
+                format_version: crate::storage::PUBLICATION_RECORD_FORMAT_VERSION,
+                index_uuid: index_uuid.clone(),
+                index_name: index_name.to_string(),
+                operation_id: operation_id.clone(),
+                request_fingerprint: request_fingerprint.clone(),
+                schema_generation,
+                schema_hash: schema_hash.clone(),
+                split_id: split_id.clone(),
+                planned_bundle_path: planned_bundle_path.clone(),
+                doc_count: intent_doc_count,
+                producer_node_id: state.local_node_id.clone(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                created_at_epoch_ms: now_ms,
+            };
+            state
+                .storage_manager
+                .stage_publication_intent(&intent)
+                .await
+                .map_err(|error| {
+                    crate::metrics::HOT_DELTA_SEALS_TOTAL
+                        .with_label_values(&[trigger_label, "failed"])
+                        .inc();
+                    crate::api::error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "remote_store_seal_exception",
+                        format!("failed to stage seal intent: {error:#}"),
+                    )
+                })?;
+        }
+
+        if state
+            .storage_manager
+            .take_publication_crash_stage_if_matches(
+                crate::storage::PublicationCrashStage::AfterIntentBeforeBundleUpload,
+            )
+        {
+            crate::metrics::HOT_DELTA_SEALS_TOTAL
+                .with_label_values(&[trigger_label, "failed"])
+                .inc();
+            return Err(crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "remote_store_publish_exception",
+                format!(
+                    "injected crash for operation_id [{operation_id}] after intent creation before bundle upload"
+                ),
+            ));
+        }
+
+        let prepared_already_valid = match existing_prepared.as_ref() {
+            Some(prep) => state
+                .storage_manager
+                .verify_prepared_split_bundle(&index_uuid, prep)
+                .await
+                .is_ok(),
+            None => false,
+        };
+
+        if !prepared_already_valid {
+            let mappings_for_build = Arc::new(metadata.mappings.clone());
+            let staging_for_build = staging_dir.clone();
+            let seal_meta_for_build = seal_range_meta.clone();
+            let build_res = state
+                .worker_pools
+                .spawn_maintenance("build_sealed_split", move || {
+                    if staging_for_build.exists() {
+                        std::fs::remove_dir_all(&staging_for_build)?;
+                    }
+                    std::fs::create_dir_all(&staging_for_build)?;
+                    let column_cache =
+                        Arc::new(crate::engine::column_cache::ColumnCache::new(0, 0));
+                    let split_engine =
+                        crate::engine::tantivy::HotEngine::new_remote_split_with_mappings(
+                            &staging_for_build,
+                            Duration::from_secs(60),
+                            mappings_for_build.as_ref(),
+                            column_cache,
+                        )?;
+                    if !live_docs.is_empty() {
+                        split_engine.bulk_add_documents(live_docs)?;
+                    }
+                    split_engine.flush()?;
+                    strip_split_wal(&staging_for_build)?;
+                    let versions_bytes = serde_json::to_vec_pretty(&seal_meta_for_build)?;
+                    std::fs::write(staging_for_build.join("seal.versions.json"), versions_bytes)?;
+                    Ok(())
+                })
+                .await;
+
+            if let Err(error) = build_res {
+                let _ = std::fs::remove_dir_all(&staging_dir);
+                crate::metrics::HOT_DELTA_SEALS_TOTAL
+                    .with_label_values(&[trigger_label, "failed"])
+                    .inc();
+                return Err(crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "remote_store_build_exception",
+                    format!("sealed split build failed: {error:#}"),
+                ));
+            }
+
+            let (bundle_key, checksum, size_bytes) = state
+                .storage_manager
+                .upload_split_bundle(&index_uuid, &split_id, &staging_dir)
+                .await
+                .map_err(|error| {
+                    let _ = std::fs::remove_dir_all(&staging_dir);
+                    crate::metrics::HOT_DELTA_SEALS_TOTAL
+                        .with_label_values(&[trigger_label, "failed"])
+                        .inc();
+                    crate::api::error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "remote_store_build_exception",
+                        format!("sealed bundle upload failed: {error:#}"),
+                    )
+                })?;
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            let _ = mem_reservation.reconcile(size_bytes.max(1));
+            let _ = temp_disk_reservation.reconcile(size_bytes.max(1));
+
+            if state
+                .storage_manager
+                .take_publication_crash_stage_if_matches(
+                    crate::storage::PublicationCrashStage::AfterBundleUploadBeforePreparedRecord,
+                )
+            {
+                crate::metrics::HOT_DELTA_SEALS_TOTAL
+                    .with_label_values(&[trigger_label, "failed"])
+                    .inc();
+                return Err(crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "remote_store_publish_exception",
+                    format!(
+                        "injected crash for operation_id [{operation_id}] after bundle upload before prepared record"
+                    ),
+                ));
+            }
+
+            let mut tags = std::collections::BTreeMap::new();
+            tags.insert("operation_id".to_string(), operation_id.clone());
+            let mut new_split = crate::storage::RemoteSplitManifest {
+                split_id: split_id.clone(),
+                state: crate::storage::RemoteSplitState::Published,
+                bundle_path: bundle_key,
+                bundle_etag: None,
+                hotcache_path: None,
+                checksum,
+                doc_count: live_doc_count,
+                size_bytes,
+                uncompressed_bytes: size_bytes,
+                hotcache_bytes: None,
+                time_range: None,
+                tags,
+                field_ranges,
+                field_terms,
+            };
+            new_split.set_seal_range(&seal_range_meta);
+
+            let now_ms = now_epoch_ms();
+            let prepared_record = crate::storage::PublicationPreparedRecord {
+                format_version: crate::storage::PUBLICATION_RECORD_FORMAT_VERSION,
+                index_uuid: index_uuid.clone(),
+                index_name: index_name.to_string(),
+                operation_id: operation_id.clone(),
+                request_fingerprint: request_fingerprint.clone(),
+                schema_generation,
+                schema_hash: schema_hash.clone(),
+                producer_node_id: state.local_node_id.clone(),
+                prepared_at: chrono::Utc::now().to_rfc3339(),
+                prepared_at_epoch_ms: now_ms,
+                split: new_split,
+            };
+            state
+                .storage_manager
+                .write_publication_prepared(&prepared_record)
+                .await
+                .map_err(|error| {
+                    crate::metrics::HOT_DELTA_SEALS_TOTAL
+                        .with_label_values(&[trigger_label, "failed"])
+                        .inc();
+                    crate::api::error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "remote_store_publish_exception",
+                        format!("failed to write prepared seal record: {error:#}"),
+                    )
+                })?;
+        }
+        drop(mem_reservation);
+        drop(temp_disk_reservation);
+
+        let sequencer_req = ForwardedSequencerCommitRequest {
+            operation_id: operation_id.clone(),
+            request_fingerprint,
+            schema_generation,
+            schema_hash: schema_hash.clone(),
+            settings: metadata.settings.remote_store.clone(),
+            known_authority: None,
+        };
+
+        let outcome = match coordinate_sequencer_commit(
+            state,
+            index_name,
+            &index_uuid,
+            &sequencer_req,
+        )
+        .await
+        {
+            ForwardedSequencerCommitResponse::Committed(outcome) => outcome,
+            ForwardedSequencerCommitResponse::Conflict {
+                operation_id,
+                reason,
+            } => {
+                crate::metrics::HOT_DELTA_SEALS_TOTAL
+                    .with_label_values(&[trigger_label, "failed"])
+                    .inc();
+                return Err(crate::api::error_response(
+                    StatusCode::CONFLICT,
+                    "operation_id_conflict",
+                    format!("operation_id [{operation_id}] conflict: {reason}"),
+                ));
+            }
+            ForwardedSequencerCommitResponse::Indeterminate {
+                operation_id,
+                reason,
+            } => {
+                crate::metrics::HOT_DELTA_SEALS_TOTAL
+                    .with_label_values(&[trigger_label, "failed"])
+                    .inc();
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": {
+                            "type": "remote_store_publish_indeterminate_exception",
+                            "reason": format!("publication outcome for operation_id [{operation_id}] is indeterminate; retry with the same operation_id: {reason}"),
+                            "error_class": "retryable",
+                            "operation_id": operation_id,
+                        },
+                        "status": StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                    })),
+                ));
+            }
+            ForwardedSequencerCommitResponse::RetryableAuthority { reason } => {
+                crate::metrics::HOT_DELTA_SEALS_TOTAL
+                    .with_label_values(&[trigger_label, "failed"])
+                    .inc();
+                return Err(crate::api::error_response(
+                    StatusCode::CONFLICT,
+                    "remote_store_publish_exception",
+                    format!(
+                        "manifest seal publish failed after sequencer authority contention: {reason}"
+                    ),
+                ));
+            }
+            ForwardedSequencerCommitResponse::Fatal { reason } => {
+                crate::metrics::HOT_DELTA_SEALS_TOTAL
+                    .with_label_values(&[trigger_label, "failed"])
+                    .inc();
+                return Err(crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "remote_store_publish_exception",
+                    format!("manifest seal publish failed: {reason}"),
+                ));
+            }
+        };
+
+        crate::metrics::HOT_DELTA_SEALS_TOTAL
+            .with_label_values(&[trigger_label, "committed"])
+            .inc();
+        crate::metrics::HOT_DELTA_SEALED_DOCS_TOTAL.inc_by(live_doc_count);
+        crate::metrics::HOT_DELTA_SEALED_BYTES_TOTAL.inc_by(outcome.size_bytes);
+
+        let mut retired_docs = 0usize;
+        if options.retire_after_commit {
+            let committed_manifest = state
+                .storage_manager
+                .load_current_manifest(&index_uuid, Some(&schema_hash))
+                .await
+                .map_err(|error| {
+                    crate::api::error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "remote_store_manifest_exception",
+                        format!("failed to verify committed manifest after seal: {error:#}"),
+                    )
+                })?
+                .ok_or_else(|| {
+                    crate::api::error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "remote_store_manifest_exception",
+                        "committed manifest disappeared before delta retirement",
+                    )
+                })?;
+            let verified_wm = committed_manifest
+                .published_watermarks
+                .get(shard_id)
+                .filter(|w| w.sealed_through_seq_no >= candidate.through_seq_no)
+                .ok_or_else(|| {
+                    crate::api::error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "remote_store_manifest_exception",
+                        format!(
+                            "committed manifest generation {} does not yet cover shard {} through seq_no {}",
+                            committed_manifest.generation, shard_id, candidate.through_seq_no
+                        ),
+                    )
+                })?;
+            let engine_for_retire = engine.clone();
+            let target_seq = verified_wm.sealed_through_seq_no;
+            let generation = committed_manifest.generation;
+            retired_docs = state
+                .worker_pools
+                .spawn_maintenance("retire_sealed_delta", move || {
+                    engine_for_retire.retire_sealed_delta_through(target_seq, generation)
+                })
+                .await
+                .map_err(|error| {
+                    crate::api::error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "remote_store_seal_exception",
+                        format!("failed to retire sealed hot-delta range: {error:#}"),
+                    )
+                })?;
+        }
+
+        let updated_wm = engine.seal_watermark_state().unwrap_or_default();
+        splits_sealed += 1;
+        total_docs_sealed += live_doc_count;
+        total_tombstones_sealed += candidate.tombstone_count();
+        shard_reports.push(serde_json::json!({
+            "shard_id": shard_id,
+            "status": if outcome.replayed { "replayed" } else { "committed" },
+            "trigger": trigger_label,
+            "operation_id": outcome.operation_id,
+            "split_id": outcome.split_id,
+            "generation": outcome.generation,
+            "start_seq_no": candidate.start_seq_no,
+            "through_seq_no": candidate.through_seq_no,
+            "live_doc_count": live_doc_count,
+            "tombstone_count": candidate.tombstone_count(),
+            "retired_doc_count": retired_docs,
+            "sealed_through_seq_no": updated_wm.sealed_through_seq_no.or(Some(candidate.through_seq_no)),
+            "retired_through_seq_no": updated_wm.retired_through_seq_no,
+            "published_watermarks": outcome.published_watermarks,
+        }));
+    }
+
+    Ok(serde_json::json!({
+        "index": index_name,
+        "index_uuid": metadata.uuid,
+        "splits_sealed": splits_sealed,
+        "docs_sealed": total_docs_sealed,
+        "tombstones_sealed": total_tombstones_sealed,
+        "shards": shard_reports,
+    }))
+}
+
+/// Resolve a document by `_id` from the committed manifest's published splits,
+/// respecting split-recorded operation versions and tombstones (`FS-034`, `FS-036`).
+pub(crate) async fn get_document_from_published_splits(
+    state: &AppState,
+    metadata: &IndexMetadata,
+    shard_id: u32,
+    doc_id: &str,
+) -> anyhow::Result<Option<crate::engine::DocumentRead>> {
+    let expected_schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
+    let Some(manifest) = state
+        .storage_manager
+        .load_current_manifest(metadata.uuid.as_str(), Some(&expected_schema_hash))
+        .await?
+    else {
+        return Ok(None);
+    };
+
+    // Find the winning version across published splits for this shard.
+    // Tuple: (seq_no, primary_term, version, is_tombstone, split_manifest)
+    let mut winner: Option<(u64, u64, u64, bool, crate::storage::RemoteSplitManifest)> = None;
+    for split in manifest.published_splits() {
+        let Some(range) = split.seal_range()? else {
+            continue;
+        };
+        if range.shard_id != shard_id {
+            continue;
+        }
+        for dv in &range.doc_versions {
+            if dv.doc_id == doc_id {
+                let replace = winner
+                    .as_ref()
+                    .is_none_or(|(s, t, _, _, _)| (dv.seq_no, dv.primary_term) >= (*s, *t));
+                if replace {
+                    winner = Some((dv.seq_no, dv.primary_term, dv.version, false, split.clone()));
+                }
+            }
+        }
+        for ts in &range.tombstones {
+            if ts.doc_id == doc_id {
+                let replace = winner
+                    .as_ref()
+                    .is_none_or(|(s, t, _, _, _)| (ts.seq_no, ts.primary_term) >= (*s, *t));
+                if replace {
+                    winner = Some((ts.seq_no, ts.primary_term, ts.version, true, split.clone()));
+                }
+            }
+        }
+    }
+
+    let Some((seq_no, primary_term, version, is_tombstone, winning_split)) = winner else {
+        return Ok(None);
+    };
+    if is_tombstone {
+        return Ok(None);
+    }
+
+    let assigned = AssignedRemoteSplit::from_manifest(&winning_split);
+    let leaf_ctx = LeafExecutionContext {
+        worker_pools: state.worker_pools.clone(),
+        storage_manager: state.storage_manager.clone(),
+        reader_cache: state.remote_store_reader_cache.clone(),
+    };
+    let reader = leaf_ctx
+        .reader_cache
+        .get_or_open(&leaf_ctx, metadata, &assigned)
+        .await?;
+    let engine = reader.engine.clone();
+    let doc_id_owned = doc_id.to_string();
+    let source_opt: Option<serde_json::Value> = state
+        .worker_pools
+        .spawn_search(move || engine.get_document(&doc_id_owned))
+        .await??;
+    Ok(source_opt.map(|source| crate::engine::DocumentRead {
+        source,
+        seq_no,
+        primary_term,
+        version,
     }))
 }
 

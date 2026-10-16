@@ -75,6 +75,7 @@ struct ApplyState {
     checkpoints: LocalCheckpointTracker,
     term_sequences: PrimaryTermSequenceState,
     max_seq_no_of_updates_or_deletes: Option<u64>,
+    first_unsealed_write_epoch_ms: Option<u64>,
 }
 
 struct VersionMapState {
@@ -169,6 +170,7 @@ impl ApplyState {
             checkpoints: LocalCheckpointTracker::new(committed.clone())?,
             term_sequences,
             max_seq_no_of_updates_or_deletes: committed.max_seq_no_of_updates_or_deletes,
+            first_unsealed_write_epoch_ms: None,
         })
     }
 
@@ -186,6 +188,7 @@ impl ApplyState {
         versions.map.reset();
         versions.complete = false;
         self.max_seq_no_of_updates_or_deletes = committed.max_seq_no_of_updates_or_deletes;
+        self.first_unsealed_write_epoch_ms = None;
         Ok(())
     }
 
@@ -199,6 +202,14 @@ impl ApplyState {
         self.checkpoints.mark_processed(seq_no);
         if matches!(durability, TranslogDurability::Request) {
             self.checkpoints.mark_persisted(seq_no);
+        }
+        if self.first_unsealed_write_epoch_ms.is_none() {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(1)
+                .max(1);
+            self.first_unsealed_write_epoch_ms = Some(now_ms);
         }
         Ok(())
     }
@@ -1494,7 +1505,9 @@ impl HotEngine {
             data_dir,
             refresh_interval,
             mappings,
-            TranslogDurability::Request,
+            TranslogDurability::Async {
+                sync_interval_ms: 60_000,
+            },
             column_cache,
             HotEngineOpenOptions {
                 existing_only: false,
@@ -1640,7 +1653,9 @@ impl HotEngine {
             .reload_policy(ReloadPolicy::Manual)
             .try_into()?;
 
-        if matches!(durability, TranslogDurability::Async { .. }) {
+        if matches!(durability, TranslogDurability::Async { .. })
+            && matches!(purpose, HotEnginePurpose::LocalShard)
+        {
             translog.start_sync_task();
         }
         let committed_boundary_path = data_dir.join("translog.committed");
@@ -2005,9 +2020,33 @@ impl HotEngine {
             return Ok(Some(CurrentVersion::Native(version)));
         }
 
-        Ok(self
-            .find_refreshed_document(doc_id)?
-            .map(|(_, _, version)| CurrentVersion::Native(VersionValue::Index(version))))
+        if let Some((_, _, version)) = self.find_refreshed_document(doc_id)? {
+            return Ok(Some(CurrentVersion::Native(VersionValue::Index(version))));
+        }
+
+        if self.seal_watermark_path().is_file()
+            && let Ok(wm) = self.load_seal_watermark_state()
+            && let Some(entry) = wm.sealed_doc_versions.get(doc_id)
+        {
+            let v = if entry.deleted {
+                VersionValue::Delete(super::version_map::DeleteVersionValue {
+                    seq_no: entry.seq_no,
+                    primary_term: entry.primary_term,
+                    version: entry.version,
+                    deleted_at: Instant::now(),
+                })
+            } else {
+                VersionValue::Index(super::version_map::IndexVersionValue {
+                    seq_no: entry.seq_no,
+                    primary_term: entry.primary_term,
+                    version: entry.version,
+                    wal_position: None,
+                })
+            };
+            return Ok(Some(CurrentVersion::Native(v)));
+        }
+
+        Ok(None)
     }
 
     fn restore_committed_versions_from_wal(
@@ -5457,6 +5496,533 @@ impl HotEngine {
             .term_sequences
             .current_term()
             .max(1)
+    }
+
+    fn seal_watermark_path(&self) -> PathBuf {
+        self.committed_boundary_path
+            .with_file_name(super::SEAL_WATERMARK_FILE)
+    }
+
+    pub fn load_seal_watermark_state(&self) -> Result<super::SealWatermarkState> {
+        let path = self.seal_watermark_path();
+        if !path.is_file() {
+            return Ok(super::SealWatermarkState::default());
+        }
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("failed to read seal watermark state at {path:?}"))?;
+        let state: super::SealWatermarkState = serde_json::from_slice(&bytes).map_err(|error| {
+            crate::common::unsupported_index_format(
+                "shard seal watermark",
+                format!("cannot decode {path:?}: {error}"),
+            )
+        })?;
+        state.validate()?;
+        Ok(state)
+    }
+
+    pub fn persist_seal_watermark_state(&self, state: &super::SealWatermarkState) -> Result<()> {
+        state.validate()?;
+        let path = self.seal_watermark_path();
+        let tmp_path = path.with_extension("json.tmp");
+        let bytes = serde_json::to_vec_pretty(state)
+            .context("failed to serialize shard seal watermark state")?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp_path)
+            .with_context(|| format!("failed to open {tmp_path:?}"))?;
+        std::io::Write::write_all(&mut file, &bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp_path, &path)
+            .with_context(|| format!("failed to rename {tmp_path:?} to {path:?}"))?;
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    }
+
+    pub fn record_active_seal_barrier(
+        &self,
+        barrier: Option<super::ActiveSealBarrier>,
+    ) -> Result<()> {
+        let mut state = self.load_seal_watermark_state()?;
+        state.active_seal = barrier;
+        self.persist_seal_watermark_state(&state)
+    }
+
+    pub fn live_documents_with_versions(&self) -> Result<Vec<super::LiveDocumentVersionTuple>> {
+        let registry = self
+            .field_registry
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let searcher = self.reader.searcher();
+        let mut docs = Vec::new();
+        for (segment_ord, segment) in searcher.segment_readers().iter().enumerate() {
+            let seq_col = segment.fast_fields().u64(SEQ_NO_FIELD_NAME).ok();
+            let term_col = segment.fast_fields().u64(PRIMARY_TERM_FIELD_NAME).ok();
+            let ver_col = segment.fast_fields().u64(VERSION_FIELD_NAME).ok();
+            for doc_id in segment.doc_ids_alive() {
+                let address = tantivy::DocAddress::new(segment_ord as u32, doc_id);
+                let stored = searcher.doc::<TantivyDocument>(address)?;
+                let Some(id_str) = stored
+                    .get_all(registry.id_field)
+                    .next()
+                    .and_then(|v| v.as_str())
+                else {
+                    continue;
+                };
+                let Some(source) = stored
+                    .get_all(registry.source_field)
+                    .next()
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Self::decode_stored_source_with_registry(&registry, s))
+                else {
+                    continue;
+                };
+                let seq_no = seq_col.as_ref().and_then(|c| c.first(doc_id)).unwrap_or(0);
+                let primary_term = term_col.as_ref().and_then(|c| c.first(doc_id)).unwrap_or(1);
+                let version = ver_col.as_ref().and_then(|c| c.first(doc_id)).unwrap_or(1);
+                docs.push((id_str.to_string(), source, seq_no, primary_term, version));
+            }
+        }
+        Ok(docs)
+    }
+
+    pub fn deleted_documents_with_versions(
+        &self,
+    ) -> Result<Vec<super::DeletedDocumentVersionTuple>> {
+        let entries = self.with_translog("read deleted versions", |tl| tl.read_all())?;
+        let mut latest_by_doc: std::collections::BTreeMap<String, (bool, u64, u64, u64)> =
+            std::collections::BTreeMap::new();
+        for entry in entries {
+            let Ok(op) = document_operation(&entry) else {
+                continue;
+            };
+            match op {
+                WalDocumentOperation::Index {
+                    doc_id, version, ..
+                } => {
+                    let update = latest_by_doc
+                        .get(doc_id)
+                        .is_none_or(|(_, s, t, _)| (entry.seq_no, entry.primary_term) >= (*s, *t));
+                    if update {
+                        latest_by_doc.insert(
+                            doc_id.to_string(),
+                            (false, entry.seq_no, entry.primary_term, version),
+                        );
+                    }
+                }
+                WalDocumentOperation::Delete {
+                    doc_id, version, ..
+                } => {
+                    let update = latest_by_doc
+                        .get(doc_id)
+                        .is_none_or(|(_, s, t, _)| (entry.seq_no, entry.primary_term) >= (*s, *t));
+                    if update {
+                        latest_by_doc.insert(
+                            doc_id.to_string(),
+                            (true, entry.seq_no, entry.primary_term, version),
+                        );
+                    }
+                }
+                WalDocumentOperation::NoOp { .. } => {}
+            }
+        }
+        Ok(latest_by_doc
+            .into_iter()
+            .filter_map(|(doc_id, (is_del, seq_no, term, ver))| {
+                is_del.then_some((doc_id, seq_no, term, ver))
+            })
+            .collect())
+    }
+
+    pub fn enumerate_seal_boundary(
+        &self,
+        after_seq_no: Option<u64>,
+        max_docs: usize,
+        max_bytes: u64,
+    ) -> Result<Option<super::SealBatchCandidate>> {
+        let stats = self.sequence_stats();
+        let Some(persisted_cp) = stats.persisted_checkpoint.or(stats.processed_checkpoint) else {
+            return Ok(None);
+        };
+        if !self
+            .missing_sequence_intervals_through(persisted_cp)
+            .is_empty()
+        {
+            anyhow::bail!(
+                "cannot enumerate seal boundary through {persisted_cp}: sequence gaps exist"
+            );
+        }
+        let start_seq_no = match after_seq_no {
+            Some(prev) => match prev.checked_add(1) {
+                Some(next) => next,
+                None => return Ok(None),
+            },
+            None => 0,
+        };
+        if start_seq_no > persisted_cp {
+            return Ok(None);
+        }
+
+        let wal_entries = self.with_translog("enumerate_seal_boundary", |tl| tl.read_all())?;
+        let mut by_seq: std::collections::BTreeMap<u64, crate::wal::TranslogEntry> =
+            std::collections::BTreeMap::new();
+        for entry in wal_entries {
+            if entry.seq_no >= start_seq_no && entry.seq_no <= persisted_cp {
+                let replace = by_seq
+                    .get(&entry.seq_no)
+                    .is_none_or(|prev| entry.primary_term >= prev.primary_term);
+                if replace {
+                    by_seq.insert(entry.seq_no, entry);
+                }
+            }
+        }
+
+        let max_docs = max_docs.max(1);
+        let max_bytes = max_bytes.max(1);
+        let mut through_seq_no = None;
+        let mut max_primary_term = self.current_primary_term();
+        let mut operation_count = 0usize;
+        let mut estimated_bytes = 0u64;
+        let mut coalesced: std::collections::BTreeMap<String, super::SealedDocumentRecord> =
+            std::collections::BTreeMap::new();
+
+        for seq in start_seq_no..=persisted_cp {
+            let Some(entry) = by_seq.get(&seq) else {
+                anyhow::bail!(
+                    "cannot enumerate seal boundary: WAL is missing contiguous sequence {seq} in {start_seq_no}..={persisted_cp}"
+                );
+            };
+            let op = document_operation(entry)?;
+            let entry_bytes = (entry.payload.to_string().len() as u64).saturating_add(64);
+            if operation_count > 0
+                && (operation_count >= max_docs
+                    || estimated_bytes.saturating_add(entry_bytes) > max_bytes)
+            {
+                break;
+            }
+            through_seq_no = Some(seq);
+            max_primary_term = max_primary_term.max(entry.primary_term);
+            operation_count += 1;
+            estimated_bytes = estimated_bytes.saturating_add(entry_bytes);
+
+            match op {
+                WalDocumentOperation::Index {
+                    doc_id,
+                    source,
+                    version,
+                    ..
+                } => {
+                    let mut normalized = source.clone();
+                    {
+                        let registry = self
+                            .field_registry
+                            .read()
+                            .unwrap_or_else(|error| error.into_inner());
+                        Self::normalize_result_source_with_registry(&registry, &mut normalized);
+                    }
+                    coalesced.insert(
+                        doc_id.to_string(),
+                        super::SealedDocumentRecord::Live {
+                            doc_id: doc_id.to_string(),
+                            source: normalized,
+                            seq_no: entry.seq_no,
+                            primary_term: entry.primary_term,
+                            version,
+                        },
+                    );
+                }
+                WalDocumentOperation::Delete {
+                    doc_id, version, ..
+                } => {
+                    coalesced.insert(
+                        doc_id.to_string(),
+                        super::SealedDocumentRecord::Tombstone {
+                            doc_id: doc_id.to_string(),
+                            seq_no: entry.seq_no,
+                            primary_term: entry.primary_term,
+                            version,
+                        },
+                    );
+                }
+                WalDocumentOperation::NoOp { .. } => {}
+            }
+        }
+
+        let Some(through_seq_no) = through_seq_no else {
+            return Ok(None);
+        };
+
+        Ok(Some(super::SealBatchCandidate {
+            start_seq_no,
+            through_seq_no,
+            primary_term: max_primary_term,
+            operation_count,
+            estimated_bytes,
+            records: coalesced.into_values().collect(),
+        }))
+    }
+
+    pub fn retire_sealed_delta_through(
+        &self,
+        committed_watermark_seq_no: u64,
+        manifest_generation: u64,
+    ) -> Result<usize> {
+        let _maintenance = self.maintenance_guard("retire sealed delta")?;
+        self.with_translog("retire sealed delta", |tl| {
+            let mut wm = self.load_seal_watermark_state()?;
+            if wm
+                .retired_through_seq_no
+                .is_some_and(|retired| retired >= committed_watermark_seq_no)
+            {
+                wm.sealed_through_seq_no = Some(
+                    wm.sealed_through_seq_no
+                        .map_or(committed_watermark_seq_no, |s| {
+                            s.max(committed_watermark_seq_no)
+                        }),
+                );
+                wm.last_sealed_generation = Some(
+                    wm.last_sealed_generation
+                        .map_or(manifest_generation, |g| g.max(manifest_generation)),
+                );
+                if wm
+                    .active_seal
+                    .as_ref()
+                    .is_some_and(|a| a.through_seq_no <= committed_watermark_seq_no)
+                {
+                    wm.active_seal = None;
+                }
+                self.persist_seal_watermark_state(&wm)?;
+                return Ok(0);
+            }
+
+            // Commit any buffered writes into the Tantivy reader while holding `_maintenance` and `tl`.
+            {
+                let mut writer_state = self.writer_state_with_replay(tl, "retire sealed delta")?;
+                let boundary = self.current_committed_boundary()?;
+                let committed = self.commit_writer_at_boundary(
+                    &mut writer_state,
+                    "retire sealed delta",
+                    boundary,
+                )?;
+                drop(writer_state);
+                self.reload_reader()?;
+                self.persist_committed_boundary(&committed)?;
+            }
+
+            // Record sealed document versions <= committed_watermark_seq_no from WAL and reader
+            // so post-retirement CRUD, OCC, `_update`, and `DELETE` preserve exact version numbers.
+            if let Ok(entries) = tl.read_all() {
+                for entry in entries {
+                    if entry.seq_no > committed_watermark_seq_no {
+                        continue;
+                    }
+                    let Ok(op) = document_operation(&entry) else {
+                        continue;
+                    };
+                    match op {
+                        WalDocumentOperation::Index {
+                            doc_id, version, ..
+                        } => {
+                            let update = wm.sealed_doc_versions.get(doc_id).is_none_or(|prev| {
+                                (entry.seq_no, entry.primary_term)
+                                    >= (prev.seq_no, prev.primary_term)
+                            });
+                            if update {
+                                wm.sealed_doc_versions.insert(
+                                    doc_id.to_string(),
+                                    super::SealedDocVersionEntry {
+                                        seq_no: entry.seq_no,
+                                        primary_term: entry.primary_term,
+                                        version,
+                                        deleted: false,
+                                    },
+                                );
+                            }
+                        }
+                        WalDocumentOperation::Delete {
+                            doc_id, version, ..
+                        } => {
+                            let update = wm.sealed_doc_versions.get(doc_id).is_none_or(|prev| {
+                                (entry.seq_no, entry.primary_term)
+                                    >= (prev.seq_no, prev.primary_term)
+                            });
+                            if update {
+                                wm.sealed_doc_versions.insert(
+                                    doc_id.to_string(),
+                                    super::SealedDocVersionEntry {
+                                        seq_no: entry.seq_no,
+                                        primary_term: entry.primary_term,
+                                        version,
+                                        deleted: true,
+                                    },
+                                );
+                            }
+                        }
+                        WalDocumentOperation::NoOp { .. } => {}
+                    }
+                }
+            }
+
+            let live_docs = self.live_documents_with_versions()?;
+            let mut docs_to_retire = Vec::new();
+            for (doc_id, _source, seq_no, term, ver) in live_docs {
+                if seq_no > committed_watermark_seq_no {
+                    continue;
+                }
+                let update = wm
+                    .sealed_doc_versions
+                    .get(&doc_id)
+                    .is_none_or(|prev| (seq_no, term) >= (prev.seq_no, prev.primary_term));
+                if update {
+                    wm.sealed_doc_versions.insert(
+                        doc_id.clone(),
+                        super::SealedDocVersionEntry {
+                            seq_no,
+                            primary_term: term,
+                            version: ver,
+                            deleted: false,
+                        },
+                    );
+                }
+                let newer_in_version_map = self
+                    .version_map_read()?
+                    .map
+                    .lookup(&doc_id)?
+                    .is_some_and(|v| v.seq_no() > committed_watermark_seq_no);
+                if !newer_in_version_map {
+                    docs_to_retire.push(doc_id);
+                }
+            }
+
+            let retired_count = docs_to_retire.len();
+            if !docs_to_retire.is_empty() {
+                let id_field = self
+                    .field_registry
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .id_field;
+                let mut writer_state = self.writer_state_with_replay(tl, "retire sealed delta")?;
+                let writer = writer_state.writer_mut("retire sealed delta")?;
+                for doc_id in &docs_to_retire {
+                    writer.delete_term(Term::from_field_text(id_field, doc_id));
+                }
+                let boundary = self.current_committed_boundary()?;
+                let committed = self.commit_writer_at_boundary(
+                    &mut writer_state,
+                    "retire sealed delta",
+                    boundary,
+                )?;
+                drop(writer_state);
+                self.reload_reader()?;
+                self.persist_committed_boundary(&committed)?;
+            }
+
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(1)
+                .max(1);
+            {
+                let mut state = self
+                    .apply_state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("apply state lock poisoned"))?;
+                let cp = state
+                    .checkpoints
+                    .persisted_checkpoint()
+                    .or_else(|| state.checkpoints.processed_checkpoint());
+                if cp.is_none_or(|c| c <= committed_watermark_seq_no) {
+                    state.first_unsealed_write_epoch_ms = None;
+                } else {
+                    state.first_unsealed_write_epoch_ms = Some(now_ms);
+                }
+            }
+            wm.sealed_through_seq_no = Some(
+                wm.sealed_through_seq_no
+                    .map_or(committed_watermark_seq_no, |s| {
+                        s.max(committed_watermark_seq_no)
+                    }),
+            );
+            wm.retired_through_seq_no = Some(committed_watermark_seq_no);
+            wm.last_sealed_primary_term = Some(self.current_primary_term());
+            wm.last_sealed_generation = Some(
+                wm.last_sealed_generation
+                    .map_or(manifest_generation, |g| g.max(manifest_generation)),
+            );
+            wm.last_seal_timestamp_ms = now_ms;
+            if wm
+                .active_seal
+                .as_ref()
+                .is_some_and(|a| a.through_seq_no <= committed_watermark_seq_no)
+            {
+                wm.active_seal = None;
+            }
+            self.persist_seal_watermark_state(&wm)?;
+            crate::metrics::HOT_DELTA_RETIRED_RANGES_TOTAL.inc();
+            Ok(retired_count)
+        })
+    }
+
+    pub fn unsealed_delta_stats(&self) -> Result<super::UnsealedDeltaStats> {
+        let wm = self.load_seal_watermark_state()?;
+        let (stats, first_unsealed_ms) = {
+            let state = self
+                .apply_state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            (
+                state.checkpoints.stats(),
+                state.first_unsealed_write_epoch_ms,
+            )
+        };
+        let persisted_cp = stats.persisted_checkpoint.or(stats.processed_checkpoint);
+        let start_seq = match wm.sealed_through_seq_no {
+            Some(s) => s.saturating_add(1),
+            None => 0,
+        };
+        let unsealed_ops = match persisted_cp {
+            Some(cp) if cp >= start_seq => cp - start_seq + 1,
+            _ => 0,
+        };
+        let unsealed_bytes = if unsealed_ops == 0 {
+            0
+        } else {
+            self.with_translog("unsealed_delta_stats", |tl| {
+                let entries = tl.read_all()?;
+                let bytes: u64 = entries
+                    .into_iter()
+                    .filter(|e| e.seq_no >= start_seq && Some(e.seq_no) <= persisted_cp)
+                    .map(|e| (e.payload.to_string().len() as u64).saturating_add(64))
+                    .sum();
+                Ok::<u64, anyhow::Error>(bytes)
+            })
+            .unwrap_or_else(|_| self.translog_size_bytes())
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let baseline_ms = wm
+            .last_seal_timestamp_ms
+            .max(first_unsealed_ms.unwrap_or(0));
+        let oldest_unsealed_age_ms = if unsealed_ops == 0 || baseline_ms == 0 {
+            0
+        } else {
+            now_ms.saturating_sub(baseline_ms)
+        };
+        Ok(super::UnsealedDeltaStats {
+            sealed_through_seq_no: wm.sealed_through_seq_no,
+            retired_through_seq_no: wm.retired_through_seq_no,
+            persisted_checkpoint: persisted_cp,
+            unsealed_ops,
+            unsealed_bytes,
+            oldest_unsealed_age_ms,
+            active_seal: wm.active_seal,
+        })
     }
 
     fn processed_coverage_for_vector_rebuild(&self) -> Result<VectorRebuildCoverage> {
@@ -10207,6 +10773,47 @@ impl super::SearchEngine for HotEngine {
 
     fn current_primary_term(&self) -> u64 {
         HotEngine::current_primary_term(self)
+    }
+
+    fn seal_watermark_state(&self) -> Result<super::SealWatermarkState> {
+        HotEngine::load_seal_watermark_state(self)
+    }
+
+    fn record_active_seal_barrier(&self, barrier: Option<super::ActiveSealBarrier>) -> Result<()> {
+        HotEngine::record_active_seal_barrier(self, barrier)
+    }
+
+    fn enumerate_seal_boundary(
+        &self,
+        after_seq_no: Option<u64>,
+        max_docs: usize,
+        max_bytes: u64,
+    ) -> Result<Option<super::SealBatchCandidate>> {
+        HotEngine::enumerate_seal_boundary(self, after_seq_no, max_docs, max_bytes)
+    }
+
+    fn retire_sealed_delta_through(
+        &self,
+        committed_watermark_seq_no: u64,
+        manifest_generation: u64,
+    ) -> Result<usize> {
+        HotEngine::retire_sealed_delta_through(
+            self,
+            committed_watermark_seq_no,
+            manifest_generation,
+        )
+    }
+
+    fn unsealed_delta_stats(&self) -> Result<super::UnsealedDeltaStats> {
+        HotEngine::unsealed_delta_stats(self)
+    }
+
+    fn live_documents_with_versions(&self) -> Result<Vec<super::LiveDocumentVersionTuple>> {
+        HotEngine::live_documents_with_versions(self)
+    }
+
+    fn deleted_documents_with_versions(&self) -> Result<Vec<super::DeletedDocumentVersionTuple>> {
+        HotEngine::deleted_documents_with_versions(self)
     }
 }
 

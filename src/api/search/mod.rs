@@ -96,10 +96,7 @@ async fn count_match_all_fast(state: &AppState, index_name: &str) -> (StatusCode
         }
     };
 
-    if matches!(
-        metadata.settings.engine,
-        crate::cluster::state::IndexEngine::RemoteStore
-    ) {
+    if !metadata.uses_local_shards() {
         return match count_remote_store_docs_from_manifest(state, index_name, &metadata).await {
             Ok((count, successful, failed)) => (
                 StatusCode::OK,
@@ -110,6 +107,30 @@ async fn count_match_all_fast(state: &AppState, index_name: &str) -> (StatusCode
                         "successful": successful,
                         "failed": failed
                     }
+                })),
+            ),
+            Err(err) => err,
+        };
+    }
+
+    if metadata.is_tiered() {
+        let req = crate::search::SearchRequest {
+            query: crate::search::QueryClause::MatchAll(serde_json::json!({})),
+            size: 100_000,
+            from: 0,
+            knn: None,
+            sort: Vec::new(),
+            aggs: HashMap::new(),
+            search_after: None,
+        };
+        return match crate::api::index::execute_distributed_dsl_search(state, index_name, &req)
+            .await
+        {
+            Ok(res) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "count": res.total_hits,
+                    "_shards": shard_stats(res.successful_shards, res.failed_shards, &res.shard_failures)
                 })),
             ),
             Err(err) => err,

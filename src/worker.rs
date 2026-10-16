@@ -254,12 +254,488 @@ impl RequestDeadline {
     }
 }
 
+// ── End-To-End Distributed Tracing & Stable Error Classes (FS-033) ──────────
+
+pub const REQUEST_ID_HEADER: &str = "x-ferris-request-id";
+pub const OPERATION_ID_HEADER: &str = "x-ferris-operation-id";
+pub const SNAPSHOT_ID_HEADER: &str = "x-ferris-snapshot-id";
+pub const ASSIGNMENT_ID_HEADER: &str = "x-ferris-assignment-id";
+pub const TASK_ID_HEADER: &str = "x-ferris-task-id";
+pub const STAGE_TIMINGS_HEADER: &str = "x-ferris-stage-timings";
+pub const ERROR_CLASS_HEADER: &str = "x-ferris-error-class";
+pub const MAX_TRACE_ID_LEN: usize = 128;
+
+/// Sanitize a correlation/trace identifier so secrets, credentials, control
+/// characters, or unbounded strings can never enter spans or headers (`FS-033`).
+pub fn sanitize_trace_id(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > MAX_TRACE_ID_LEN {
+        return None;
+    }
+    if trimmed
+        .chars()
+        .any(|ch| ch.is_control() || matches!(ch, '\n' | '\r' | '\t' | ',' | ';'))
+    {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    for forbidden in [
+        "bearer ",
+        "apikey ",
+        "basic ",
+        "authorization",
+        "password",
+        "secret",
+        "private_key",
+        "aws_secret_access_key",
+    ] {
+        if lower.contains(forbidden) {
+            return None;
+        }
+    }
+    Some(trimmed.to_string())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RequestTraceIds {
+    pub request_id: String,
+    pub operation_id: Option<String>,
+    pub snapshot_id: Option<String>,
+    pub assignment_id: Option<String>,
+    pub task_id: Option<String>,
+}
+
+impl RequestTraceIds {
+    pub fn new_for_context_id(context_id: u64) -> Self {
+        Self {
+            request_id: format!("req-{context_id}"),
+            operation_id: None,
+            snapshot_id: None,
+            assignment_id: None,
+            task_id: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TraceStage {
+    Queue,
+    Search,
+    Sql,
+    Write,
+    Hydration,
+    Retry,
+    PartialMerge,
+    Storage,
+    Replication,
+    Recovery,
+    Maintenance,
+}
+
+impl TraceStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queue => "queue",
+            Self::Search => "search",
+            Self::Sql => "sql",
+            Self::Write => "write",
+            Self::Hydration => "hydration",
+            Self::Retry => "retry",
+            Self::PartialMerge => "partial_merge",
+            Self::Storage => "storage",
+            Self::Replication => "replication",
+            Self::Recovery => "recovery",
+            Self::Maintenance => "maintenance",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StageTimingSnapshot {
+    pub queue_ns: u64,
+    pub search_ns: u64,
+    pub sql_ns: u64,
+    pub write_ns: u64,
+    pub hydration_ns: u64,
+    pub retry_ns: u64,
+    pub partial_merge_ns: u64,
+    pub storage_ns: u64,
+    pub replication_ns: u64,
+    pub recovery_ns: u64,
+    pub maintenance_ns: u64,
+}
+
+impl StageTimingSnapshot {
+    pub fn encode_compact(&self) -> String {
+        format!(
+            "queue_ns={},search_ns={},sql_ns={},write_ns={},hydration_ns={},retry_ns={},partial_merge_ns={},storage_ns={},replication_ns={},recovery_ns={},maintenance_ns={}",
+            self.queue_ns,
+            self.search_ns,
+            self.sql_ns,
+            self.write_ns,
+            self.hydration_ns,
+            self.retry_ns,
+            self.partial_merge_ns,
+            self.storage_ns,
+            self.replication_ns,
+            self.recovery_ns,
+            self.maintenance_ns
+        )
+    }
+
+    pub fn decode_compact(raw: &str) -> Option<Self> {
+        let mut snap = Self::default();
+        let mut matched_any = false;
+        for part in raw.split(',') {
+            let (k, v) = part.trim().split_once('=')?;
+            let val = v.trim().parse::<u64>().ok()?;
+            matched_any = true;
+            match k.trim() {
+                "queue_ns" => snap.queue_ns = val,
+                "search_ns" => snap.search_ns = val,
+                "sql_ns" => snap.sql_ns = val,
+                "write_ns" => snap.write_ns = val,
+                "hydration_ns" => snap.hydration_ns = val,
+                "retry_ns" => snap.retry_ns = val,
+                "partial_merge_ns" => snap.partial_merge_ns = val,
+                "storage_ns" => snap.storage_ns = val,
+                "replication_ns" => snap.replication_ns = val,
+                "recovery_ns" => snap.recovery_ns = val,
+                "maintenance_ns" => snap.maintenance_ns = val,
+                _ => {}
+            }
+        }
+        matched_any.then_some(snap)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct StageTimingLedger {
+    queue_ns: AtomicU64,
+    search_ns: AtomicU64,
+    sql_ns: AtomicU64,
+    write_ns: AtomicU64,
+    hydration_ns: AtomicU64,
+    retry_ns: AtomicU64,
+    partial_merge_ns: AtomicU64,
+    storage_ns: AtomicU64,
+    replication_ns: AtomicU64,
+    recovery_ns: AtomicU64,
+    maintenance_ns: AtomicU64,
+}
+
+impl StageTimingLedger {
+    fn slot(&self, stage: TraceStage) -> &AtomicU64 {
+        match stage {
+            TraceStage::Queue => &self.queue_ns,
+            TraceStage::Search => &self.search_ns,
+            TraceStage::Sql => &self.sql_ns,
+            TraceStage::Write => &self.write_ns,
+            TraceStage::Hydration => &self.hydration_ns,
+            TraceStage::Retry => &self.retry_ns,
+            TraceStage::PartialMerge => &self.partial_merge_ns,
+            TraceStage::Storage => &self.storage_ns,
+            TraceStage::Replication => &self.replication_ns,
+            TraceStage::Recovery => &self.recovery_ns,
+            TraceStage::Maintenance => &self.maintenance_ns,
+        }
+    }
+
+    pub fn record_stage(&self, stage: TraceStage, duration: Duration) {
+        let nanos = u64::try_from(duration.as_nanos())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        self.slot(stage).fetch_add(nanos, Ordering::AcqRel);
+        crate::metrics::STAGE_EXECUTION_DURATION_SECONDS
+            .with_label_values(&[stage.as_str()])
+            .observe(duration.as_secs_f64());
+    }
+
+    pub fn merge_snapshot(&self, other: &StageTimingSnapshot) {
+        if other.queue_ns > 0 {
+            self.queue_ns.fetch_add(other.queue_ns, Ordering::AcqRel);
+        }
+        if other.search_ns > 0 {
+            self.search_ns.fetch_add(other.search_ns, Ordering::AcqRel);
+        }
+        if other.sql_ns > 0 {
+            self.sql_ns.fetch_add(other.sql_ns, Ordering::AcqRel);
+        }
+        if other.write_ns > 0 {
+            self.write_ns.fetch_add(other.write_ns, Ordering::AcqRel);
+        }
+        if other.hydration_ns > 0 {
+            self.hydration_ns
+                .fetch_add(other.hydration_ns, Ordering::AcqRel);
+        }
+        if other.retry_ns > 0 {
+            self.retry_ns.fetch_add(other.retry_ns, Ordering::AcqRel);
+        }
+        if other.partial_merge_ns > 0 {
+            self.partial_merge_ns
+                .fetch_add(other.partial_merge_ns, Ordering::AcqRel);
+        }
+        if other.storage_ns > 0 {
+            self.storage_ns
+                .fetch_add(other.storage_ns, Ordering::AcqRel);
+        }
+        if other.replication_ns > 0 {
+            self.replication_ns
+                .fetch_add(other.replication_ns, Ordering::AcqRel);
+        }
+        if other.recovery_ns > 0 {
+            self.recovery_ns
+                .fetch_add(other.recovery_ns, Ordering::AcqRel);
+        }
+        if other.maintenance_ns > 0 {
+            self.maintenance_ns
+                .fetch_add(other.maintenance_ns, Ordering::AcqRel);
+        }
+    }
+
+    pub fn snapshot(&self) -> StageTimingSnapshot {
+        StageTimingSnapshot {
+            queue_ns: self.queue_ns.load(Ordering::Acquire),
+            search_ns: self.search_ns.load(Ordering::Acquire),
+            sql_ns: self.sql_ns.load(Ordering::Acquire),
+            write_ns: self.write_ns.load(Ordering::Acquire),
+            hydration_ns: self.hydration_ns.load(Ordering::Acquire),
+            retry_ns: self.retry_ns.load(Ordering::Acquire),
+            partial_merge_ns: self.partial_merge_ns.load(Ordering::Acquire),
+            storage_ns: self.storage_ns.load(Ordering::Acquire),
+            replication_ns: self.replication_ns.load(Ordering::Acquire),
+            recovery_ns: self.recovery_ns.load(Ordering::Acquire),
+            maintenance_ns: self.maintenance_ns.load(Ordering::Acquire),
+        }
+    }
+}
+
+pub struct StageTimerGuard {
+    ledger: Option<Arc<StageTimingLedger>>,
+    stage: TraceStage,
+    started_at: Instant,
+}
+
+impl Drop for StageTimerGuard {
+    fn drop(&mut self) {
+        let elapsed = self.started_at.elapsed();
+        if let Some(ref ledger) = self.ledger {
+            ledger.record_stage(self.stage, elapsed);
+        } else {
+            crate::metrics::STAGE_EXECUTION_DURATION_SECONDS
+                .with_label_values(&[self.stage.as_str()])
+                .observe(elapsed.as_secs_f64());
+        }
+    }
+}
+
+/// Stable, low-cardinality error classification across HTTP, gRPC, workers, and storage (`FS-033`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StableErrorClass {
+    Retryable,
+    Terminal,
+    Corruption,
+    Overload,
+}
+
+impl StableErrorClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Retryable => "retryable",
+            Self::Terminal => "terminal",
+            Self::Corruption => "corruption",
+            Self::Overload => "overload",
+        }
+    }
+
+    pub fn from_label(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "retryable" => Some(Self::Retryable),
+            "terminal" => Some(Self::Terminal),
+            "corruption" => Some(Self::Corruption),
+            "overload" => Some(Self::Overload),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for StableErrorClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+pub fn classify_tonic_status(status: &tonic::Status) -> StableErrorClass {
+    let msg = status.message();
+    if msg.contains("checksum mismatch")
+        || msg.contains("corrupt")
+        || msg.contains("fail-stopped")
+        || msg.contains("unsupported")
+        || msg.contains("collision")
+        || msg.contains("invalid compare token")
+    {
+        return StableErrorClass::Corruption;
+    }
+    match status.code() {
+        tonic::Code::ResourceExhausted | tonic::Code::DeadlineExceeded | tonic::Code::Cancelled => {
+            StableErrorClass::Overload
+        }
+        tonic::Code::Unavailable | tonic::Code::Aborted => StableErrorClass::Retryable,
+        tonic::Code::DataLoss => StableErrorClass::Corruption,
+        tonic::Code::InvalidArgument
+        | tonic::Code::NotFound
+        | tonic::Code::AlreadyExists
+        | tonic::Code::PermissionDenied
+        | tonic::Code::Unauthenticated
+        | tonic::Code::Unimplemented
+        | tonic::Code::OutOfRange => StableErrorClass::Terminal,
+        _ => {
+            if crate::transport::state_wait::is_state_wait_timeout(status) {
+                StableErrorClass::Retryable
+            } else {
+                StableErrorClass::Terminal
+            }
+        }
+    }
+}
+
+pub fn classify_anyhow_error(error: &anyhow::Error) -> StableErrorClass {
+    if error.is::<RequestDeadlineExceeded>()
+        || error.is::<RequestCancelledError>()
+        || error.is::<ResourceExhaustedError>()
+        || error.is::<AdmissionError>()
+    {
+        return StableErrorClass::Overload;
+    }
+    if error.is::<crate::wal::WalCorruptionError>()
+        || error.is::<crate::wal::WalFailStoppedError>()
+        || error.is::<crate::common::UnsupportedIndexFormatError>()
+    {
+        return StableErrorClass::Corruption;
+    }
+    if let Some(cond) = error.downcast_ref::<crate::storage::ConditionalStorageError>() {
+        return match cond {
+            crate::storage::ConditionalStorageError::InvalidToken { .. }
+            | crate::storage::ConditionalStorageError::CorruptState { .. } => {
+                StableErrorClass::Corruption
+            }
+            crate::storage::ConditionalStorageError::Conflict { .. }
+            | crate::storage::ConditionalStorageError::Indeterminate { .. } => {
+                StableErrorClass::Retryable
+            }
+            crate::storage::ConditionalStorageError::ImmutableConflict { .. }
+            | crate::storage::ConditionalStorageError::UnsupportedBackend { .. } => {
+                StableErrorClass::Terminal
+            }
+        };
+    }
+    if let Some(pub_err) = error.downcast_ref::<crate::storage::PublicationError>() {
+        return match pub_err {
+            crate::storage::PublicationError::OperationConflict { .. }
+            | crate::storage::PublicationError::NotCommitted { .. } => StableErrorClass::Terminal,
+            crate::storage::PublicationError::StaleWriterEpoch { .. }
+            | crate::storage::PublicationError::UnfencedPointer { .. }
+            | crate::storage::PublicationError::PointerConflict { .. }
+            | crate::storage::PublicationError::Indeterminate { .. }
+            | crate::storage::PublicationError::InjectedCrash { .. } => StableErrorClass::Retryable,
+        };
+    }
+    if let Some(wf) = error.downcast_ref::<crate::transport::write_failure::WriteFailure>() {
+        return classify_http_error(wf.status, &wf.error_type, &wf.reason);
+    }
+    for cause in error.chain() {
+        if let Some(status) = cause.downcast_ref::<tonic::Status>() {
+            return classify_tonic_status(status);
+        }
+        if cause.is::<tonic::transport::Error>() {
+            return StableErrorClass::Retryable;
+        }
+    }
+    let text = format!("{error:#}").to_ascii_lowercase();
+    if text.contains("checksum mismatch")
+        || text.contains("corrupt")
+        || text.contains("fail-stopped")
+        || text.contains("sequence operation collision")
+        || text.contains("unsupported")
+            && (text.contains("format") || text.contains("recreate the index"))
+    {
+        return StableErrorClass::Corruption;
+    }
+    if text.contains("resource pool")
+        || text.contains("admission rejected")
+        || text.contains("deadline budget")
+        || text.contains("capacity exceeded")
+    {
+        return StableErrorClass::Overload;
+    }
+    if text.contains("timed out")
+        || text.contains("indeterminate")
+        || text.contains("shard_not_available")
+        || text.contains("unavailable")
+    {
+        return StableErrorClass::Retryable;
+    }
+    StableErrorClass::Terminal
+}
+
+pub fn classify_http_error(status: u16, error_type: &str, reason: &str) -> StableErrorClass {
+    let lower_reason = reason.to_ascii_lowercase();
+    if error_type.contains("corrupt")
+        || error_type == "unsupported_index_format_exception"
+        || lower_reason.contains("checksum mismatch")
+        || lower_reason.contains("corrupt")
+        || lower_reason.contains("fail-stopped")
+        || lower_reason.contains("sequence operation collision")
+        || (lower_reason.contains("unsupported") && lower_reason.contains("format"))
+    {
+        return StableErrorClass::Corruption;
+    }
+    if status == 429
+        || status == 504
+        || matches!(
+            error_type,
+            "rejected_execution_exception"
+                | "es_rejected_execution_exception"
+                | "deadline_exceeded_exception"
+                | "version_map_capacity_exceeded"
+                | "task_cancelled_exception"
+                | "hot_delta_backpressure_exception"
+        )
+    {
+        return StableErrorClass::Overload;
+    }
+    if status == 503
+        || matches!(
+            error_type,
+            "shard_not_available_exception"
+                | "master_not_discovered_exception"
+                | "remote_store_leaf_unavailable_exception"
+                | "remote_store_publish_indeterminate_exception"
+                | "write_outcome_unknown"
+        )
+    {
+        return StableErrorClass::Retryable;
+    }
+    StableErrorClass::Terminal
+}
+
+pub fn record_classified_error(class: StableErrorClass, stage: ExecutionStage) {
+    crate::metrics::CLASSIFIED_ERRORS_TOTAL
+        .with_label_values(&[class.as_str(), stage.as_str()])
+        .inc();
+}
+
 struct RequestCancellationState {
     id: u64,
     cancelled: AtomicBool,
     reason: Mutex<Option<CancellationReason>>,
     notify: tokio::sync::Notify,
     deadline: Option<RequestDeadline>,
+    default_stage: Mutex<ExecutionStage>,
+    last_error_class: Mutex<Option<StableErrorClass>>,
+    trace_ids: Mutex<RequestTraceIds>,
+    stage_ledger: Arc<StageTimingLedger>,
     children: Mutex<Vec<Weak<RequestCancellationState>>>,
     cleanup_hooks: Mutex<Vec<Box<dyn FnOnce() + Send + 'static>>>,
     metric_recorded: AtomicBool,
@@ -267,7 +743,7 @@ struct RequestCancellationState {
 
 static NEXT_CANCELLATION_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Request-scoped cancellation and deadline context (`FS-028`, `FS-029`).
+/// Request-scoped cancellation, deadline, and distributed trace context (`FS-028`, `FS-029`, `FS-033`).
 #[derive(Clone)]
 pub struct RequestCancellationContext {
     inner: Arc<RequestCancellationState>,
@@ -283,6 +759,7 @@ impl std::fmt::Debug for RequestCancellationContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RequestCancellationContext")
             .field("id", &self.inner.id)
+            .field("trace_ids", &self.trace_ids())
             .field("is_cancelled", &self.is_cancelled())
             .field("deadline", &self.inner.deadline)
             .finish()
@@ -291,13 +768,18 @@ impl std::fmt::Debug for RequestCancellationContext {
 
 impl RequestCancellationContext {
     pub fn new() -> Self {
+        let id = NEXT_CANCELLATION_CONTEXT_ID.fetch_add(1, Ordering::Relaxed);
         Self {
             inner: Arc::new(RequestCancellationState {
-                id: NEXT_CANCELLATION_CONTEXT_ID.fetch_add(1, Ordering::Relaxed),
+                id,
                 cancelled: AtomicBool::new(false),
                 reason: Mutex::new(None),
                 notify: tokio::sync::Notify::new(),
                 deadline: None,
+                default_stage: Mutex::new(ExecutionStage::Search),
+                last_error_class: Mutex::new(None),
+                trace_ids: Mutex::new(RequestTraceIds::new_for_context_id(id)),
+                stage_ledger: Arc::new(StageTimingLedger::default()),
                 children: Mutex::new(Vec::new()),
                 cleanup_hooks: Mutex::new(Vec::new()),
                 metric_recorded: AtomicBool::new(false),
@@ -306,13 +788,18 @@ impl RequestCancellationContext {
     }
 
     pub fn with_deadline(deadline: RequestDeadline) -> Self {
+        let id = NEXT_CANCELLATION_CONTEXT_ID.fetch_add(1, Ordering::Relaxed);
         Self {
             inner: Arc::new(RequestCancellationState {
-                id: NEXT_CANCELLATION_CONTEXT_ID.fetch_add(1, Ordering::Relaxed),
+                id,
                 cancelled: AtomicBool::new(false),
                 reason: Mutex::new(None),
                 notify: tokio::sync::Notify::new(),
                 deadline: Some(deadline),
+                default_stage: Mutex::new(ExecutionStage::Search),
+                last_error_class: Mutex::new(None),
+                trace_ids: Mutex::new(RequestTraceIds::new_for_context_id(id)),
+                stage_ledger: Arc::new(StageTimingLedger::default()),
                 children: Mutex::new(Vec::new()),
                 cleanup_hooks: Mutex::new(Vec::new()),
                 metric_recorded: AtomicBool::new(false),
@@ -326,6 +813,118 @@ impl RequestCancellationContext {
 
     pub fn id(&self) -> u64 {
         self.inner.id
+    }
+
+    pub fn default_stage(&self) -> ExecutionStage {
+        *self
+            .inner
+            .default_stage
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub fn set_default_stage(&self, stage: ExecutionStage) {
+        *self
+            .inner
+            .default_stage
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = stage;
+    }
+
+    pub fn last_error_class(&self) -> Option<StableErrorClass> {
+        *self
+            .inner
+            .last_error_class
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub fn set_last_error_class(&self, class: StableErrorClass) {
+        *self
+            .inner
+            .last_error_class
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(class);
+    }
+
+    pub fn trace_ids(&self) -> RequestTraceIds {
+        self.inner
+            .trace_ids
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    pub fn set_request_id(&self, raw: &str) -> bool {
+        let Some(sanitized) = sanitize_trace_id(raw) else {
+            return false;
+        };
+        self.inner
+            .trace_ids
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .request_id = sanitized;
+        true
+    }
+
+    pub fn set_operation_id(&self, raw: &str) -> bool {
+        let Some(sanitized) = sanitize_trace_id(raw) else {
+            return false;
+        };
+        self.inner
+            .trace_ids
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .operation_id = Some(sanitized);
+        true
+    }
+
+    pub fn set_snapshot_id(&self, raw: &str) -> bool {
+        let Some(sanitized) = sanitize_trace_id(raw) else {
+            return false;
+        };
+        self.inner
+            .trace_ids
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .snapshot_id = Some(sanitized);
+        true
+    }
+
+    pub fn set_assignment_id(&self, raw: &str) -> bool {
+        let Some(sanitized) = sanitize_trace_id(raw) else {
+            return false;
+        };
+        self.inner
+            .trace_ids
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .assignment_id = Some(sanitized);
+        true
+    }
+
+    pub fn set_task_id(&self, raw: &str) -> bool {
+        let Some(sanitized) = sanitize_trace_id(raw) else {
+            return false;
+        };
+        self.inner
+            .trace_ids
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .task_id = Some(sanitized);
+        true
+    }
+
+    pub fn stage_ledger(&self) -> &Arc<StageTimingLedger> {
+        &self.inner.stage_ledger
+    }
+
+    pub fn record_stage_duration(&self, stage: TraceStage, duration: Duration) {
+        self.inner.stage_ledger.record_stage(stage, duration);
+    }
+
+    pub fn stage_snapshot(&self) -> StageTimingSnapshot {
+        self.inner.stage_ledger.snapshot()
     }
 
     pub fn deadline(&self) -> Option<&RequestDeadline> {
@@ -354,13 +953,18 @@ impl RequestCancellationContext {
     }
 
     fn build_child(&self, child_deadline: Option<RequestDeadline>) -> Self {
+        let id = NEXT_CANCELLATION_CONTEXT_ID.fetch_add(1, Ordering::Relaxed);
         let child = Self {
             inner: Arc::new(RequestCancellationState {
-                id: NEXT_CANCELLATION_CONTEXT_ID.fetch_add(1, Ordering::Relaxed),
+                id,
                 cancelled: AtomicBool::new(false),
                 reason: Mutex::new(None),
                 notify: tokio::sync::Notify::new(),
                 deadline: child_deadline,
+                default_stage: Mutex::new(self.default_stage()),
+                last_error_class: Mutex::new(self.last_error_class()),
+                trace_ids: Mutex::new(self.trace_ids()),
+                stage_ledger: Arc::clone(&self.inner.stage_ledger),
                 children: Mutex::new(Vec::new()),
                 cleanup_hooks: Mutex::new(Vec::new()),
                 metric_recorded: AtomicBool::new(false),
@@ -672,7 +1276,66 @@ pub fn check_current_request_active(stage: ExecutionStage) -> crate::common::Res
     Ok(())
 }
 
-// ── Bounded Admission Queues (FS-030) ────────────────────────────────────────
+pub fn record_current_stage_duration(stage: TraceStage, duration: Duration) {
+    if let Some(ctx) = current_request_context() {
+        ctx.record_stage_duration(stage, duration);
+    } else {
+        crate::metrics::STAGE_EXECUTION_DURATION_SECONDS
+            .with_label_values(&[stage.as_str()])
+            .observe(duration.as_secs_f64());
+    }
+}
+
+pub fn start_current_stage_timer(stage: TraceStage) -> StageTimerGuard {
+    let ledger = current_request_context().map(|ctx| Arc::clone(ctx.stage_ledger()));
+    StageTimerGuard {
+        ledger,
+        stage,
+        started_at: Instant::now(),
+    }
+}
+
+pub fn set_current_trace_operation_id(raw: &str) {
+    if let Some(ctx) = current_request_context() {
+        let _ = ctx.set_operation_id(raw);
+    }
+}
+
+pub fn set_current_trace_snapshot_id(raw: &str) {
+    if let Some(ctx) = current_request_context() {
+        let _ = ctx.set_snapshot_id(raw);
+    }
+}
+
+pub fn set_current_trace_assignment_id(raw: &str) {
+    if let Some(ctx) = current_request_context() {
+        let _ = ctx.set_assignment_id(raw);
+    }
+}
+
+pub fn set_current_trace_task_id(raw: &str) {
+    if let Some(ctx) = current_request_context() {
+        let _ = ctx.set_task_id(raw);
+    }
+}
+
+// ── Bounded Admission Queues & Background Work Prioritization (FS-030, FS-032) ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkPriorityTier {
+    Foreground,
+    Background,
+}
+
+impl WorkPriorityTier {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Foreground => "foreground",
+            Self::Background => "background",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WorkClass {
@@ -696,6 +1359,21 @@ impl WorkClass {
         }
     }
 
+    pub const fn priority_tier(self) -> WorkPriorityTier {
+        match self {
+            Self::Search | Self::Sql | Self::Write => WorkPriorityTier::Foreground,
+            Self::Hydration | Self::Recovery | Self::Maintenance => WorkPriorityTier::Background,
+        }
+    }
+
+    pub const fn is_foreground(self) -> bool {
+        matches!(self.priority_tier(), WorkPriorityTier::Foreground)
+    }
+
+    pub const fn is_background(self) -> bool {
+        matches!(self.priority_tier(), WorkPriorityTier::Background)
+    }
+
     pub fn execution_stage(self) -> ExecutionStage {
         match self {
             Self::Search => ExecutionStage::Search,
@@ -704,6 +1382,17 @@ impl WorkClass {
             Self::Hydration => ExecutionStage::Hydration,
             Self::Recovery => ExecutionStage::Recovery,
             Self::Maintenance => ExecutionStage::Maintenance,
+        }
+    }
+
+    pub const fn trace_stage(self) -> TraceStage {
+        match self {
+            Self::Search => TraceStage::Search,
+            Self::Sql => TraceStage::Sql,
+            Self::Write => TraceStage::Write,
+            Self::Hydration => TraceStage::Hydration,
+            Self::Recovery => TraceStage::Recovery,
+            Self::Maintenance => TraceStage::Maintenance,
         }
     }
 
@@ -729,17 +1418,60 @@ pub struct WorkClassLimits {
     pub max_queue_depth: usize,
 }
 
+/// Explicit per-class concurrency, starvation-floor, queue, I/O, and byte budgets (`FS-032`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkClassBudget {
+    pub max_concurrent: usize,
+    pub min_guaranteed_concurrent: usize,
+    pub max_queue_depth: usize,
+    pub max_byte_budget: u64,
+    pub io_bandwidth_bytes_per_sec: u64,
+    pub starvation_aging_ms: u64,
+    pub yield_backoff_ms: u64,
+}
+
+impl WorkClassBudget {
+    pub fn for_limits(work_class: WorkClass, limits: WorkClassLimits) -> Self {
+        let max_concurrent = limits.max_concurrent.max(1);
+        let min_guaranteed_concurrent = if work_class.is_foreground() {
+            max_concurrent
+        } else {
+            1.min(max_concurrent)
+        };
+        Self {
+            max_concurrent,
+            min_guaranteed_concurrent,
+            max_queue_depth: limits.max_queue_depth,
+            max_byte_budget: if work_class.is_foreground() {
+                1024 * 1024 * 1024
+            } else {
+                256 * 1024 * 1024
+            },
+            io_bandwidth_bytes_per_sec: 0,
+            starvation_aging_ms: 200,
+            yield_backoff_ms: 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AdmissionClassSnapshot {
     pub work_class: WorkClass,
+    pub priority_tier: WorkPriorityTier,
     pub active: usize,
     pub queued: usize,
     pub max_concurrent: usize,
+    pub effective_max_concurrent: usize,
+    pub min_guaranteed_concurrent: usize,
     pub max_queue_depth: usize,
+    pub saturation_ratio: f64,
     pub acquired_total: u64,
     pub rejected_queue_full: u64,
     pub rejected_cancelled: u64,
     pub rejected_deadline: u64,
+    pub throttled_total: u64,
+    pub starvation_promoted_total: u64,
+    pub io_bytes_total: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -762,12 +1494,13 @@ pub enum AdmissionError {
 
 struct QueuedWaiter {
     id: u64,
+    enqueued_at: Instant,
     tx: tokio::sync::oneshot::Sender<()>,
     ctx: Option<RequestCancellationContext>,
 }
 
 struct ClassQueueInner {
-    limits: WorkClassLimits,
+    budget: WorkClassBudget,
     active: usize,
     next_waiter_id: u64,
     waiters: VecDeque<QueuedWaiter>,
@@ -775,6 +1508,9 @@ struct ClassQueueInner {
     rejected_queue_full: u64,
     rejected_cancelled: u64,
     rejected_deadline: u64,
+    throttled_total: u64,
+    starvation_promoted_total: u64,
+    io_bytes_total: u64,
 }
 
 struct ClassQueueState {
@@ -784,13 +1520,11 @@ struct ClassQueueState {
 
 impl ClassQueueState {
     fn new(work_class: WorkClass, limits: WorkClassLimits) -> Self {
+        let budget = WorkClassBudget::for_limits(work_class, limits);
         Self {
             work_class,
             inner: Mutex::new(ClassQueueInner {
-                limits: WorkClassLimits {
-                    max_concurrent: limits.max_concurrent.max(1),
-                    max_queue_depth: limits.max_queue_depth,
-                },
+                budget,
                 active: 0,
                 next_waiter_id: 1,
                 waiters: VecDeque::new(),
@@ -798,32 +1532,74 @@ impl ClassQueueState {
                 rejected_queue_full: 0,
                 rejected_cancelled: 0,
                 rejected_deadline: 0,
+                throttled_total: 0,
+                starvation_promoted_total: 0,
+                io_bytes_total: 0,
             }),
         }
     }
 
-    fn update_gauges(&self, active: usize, queued: usize) {
+    fn update_gauges(&self, active: usize, queued: usize, effective_max: usize) {
+        let eff = effective_max.max(1);
+        let ratio = (active as f64) / (eff as f64);
         crate::metrics::ADMISSION_EXECUTING_GAUGE
             .with_label_values(&[self.work_class.as_str()])
             .set(active as i64);
         crate::metrics::ADMISSION_QUEUED_GAUGE
             .with_label_values(&[self.work_class.as_str()])
             .set(queued as i64);
+        crate::metrics::WORK_CLASS_SATURATION_RATIO
+            .with_label_values(&[
+                self.work_class.as_str(),
+                self.work_class.priority_tier().as_str(),
+            ])
+            .set(ratio);
     }
 
-    fn release_slot(&self) {
+    fn release_slot_with_ceiling(&self, foreground_pressure: bool) {
         let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        while let Some(waiter) = inner.waiters.pop_front() {
-            if let Some(ref ctx) = waiter.ctx
+        let base_effective = if self.work_class.is_background() && foreground_pressure {
+            inner
+                .budget
+                .min_guaranteed_concurrent
+                .max(1)
+                .min(inner.budget.max_concurrent)
+        } else {
+            inner.budget.max_concurrent.max(1)
+        };
+        while let Some(front) = inner.waiters.front() {
+            if let Some(ref ctx) = front.ctx
                 && ctx.is_cancelled()
             {
+                inner.waiters.pop_front();
                 continue;
             }
-            if inner.active <= inner.limits.max_concurrent && waiter.tx.send(()).is_ok() {
+            let aged = self.work_class.is_background()
+                && foreground_pressure
+                && front.enqueued_at.elapsed()
+                    >= Duration::from_millis(inner.budget.starvation_aging_ms);
+            let allowed_ceiling = if aged {
+                inner.budget.max_concurrent.max(1)
+            } else {
+                base_effective
+            };
+            // We are releasing 1 active slot; handing it to the next waiter keeps `inner.active` unchanged
+            // as long as the resulting active count is within `allowed_ceiling`.
+            if inner.active > allowed_ceiling {
+                break;
+            }
+            let waiter = inner.waiters.pop_front().expect("checked front");
+            if waiter.tx.send(()).is_ok() {
+                if aged {
+                    inner.starvation_promoted_total += 1;
+                    crate::metrics::BACKGROUND_THROTTLED_TOTAL
+                        .with_label_values(&[self.work_class.as_str(), "starvation_promoted"])
+                        .inc();
+                }
                 let active = inner.active;
                 let queued = inner.waiters.len();
                 drop(inner);
-                self.update_gauges(active, queued);
+                self.update_gauges(active, queued, allowed_ceiling);
                 return;
             }
         }
@@ -831,7 +1607,41 @@ impl ClassQueueState {
         let active = inner.active;
         let queued = inner.waiters.len();
         drop(inner);
-        self.update_gauges(active, queued);
+        self.update_gauges(active, queued, base_effective);
+    }
+
+    fn wake_unthrottled_waiters(&self, foreground_pressure: bool) {
+        let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let effective = if self.work_class.is_background() && foreground_pressure {
+            inner
+                .budget
+                .min_guaranteed_concurrent
+                .max(1)
+                .min(inner.budget.max_concurrent)
+        } else {
+            inner.budget.max_concurrent.max(1)
+        };
+        let mut woke_any = false;
+        while inner.active < effective {
+            let Some(waiter) = inner.waiters.pop_front() else {
+                break;
+            };
+            if let Some(ref ctx) = waiter.ctx
+                && ctx.is_cancelled()
+            {
+                continue;
+            }
+            if waiter.tx.send(()).is_ok() {
+                inner.active += 1;
+                woke_any = true;
+            }
+        }
+        let active = inner.active;
+        let queued = inner.waiters.len();
+        drop(inner);
+        if woke_any || queued == 0 {
+            self.update_gauges(active, queued, effective);
+        }
     }
 }
 
@@ -905,42 +1715,112 @@ impl AdmissionController {
         }
     }
 
+    /// Returns true when foreground classes (`Search`, `Sql`, `Write`) have queued
+    /// waiters or are at/above 50% concurrency utilization (`FS-032`).
+    pub fn has_foreground_pressure(&self) -> bool {
+        for fg in [WorkClass::Search, WorkClass::Sql, WorkClass::Write] {
+            let inner = self
+                .state_for(fg)
+                .inner
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if !inner.waiters.is_empty()
+                || (inner.active > 0 && inner.active * 2 >= inner.budget.max_concurrent.max(1))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn set_limits(&self, work_class: WorkClass, limits: WorkClassLimits) {
         let state = self.state_for(work_class);
         let mut inner = state
             .inner
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        inner.limits = WorkClassLimits {
-            max_concurrent: limits.max_concurrent.max(1),
-            max_queue_depth: limits.max_queue_depth,
+        inner.budget.max_concurrent = limits.max_concurrent.max(1);
+        inner.budget.max_queue_depth = limits.max_queue_depth;
+        if work_class.is_foreground() {
+            inner.budget.min_guaranteed_concurrent = inner.budget.max_concurrent;
+        } else {
+            inner.budget.min_guaranteed_concurrent = inner
+                .budget
+                .min_guaranteed_concurrent
+                .max(1)
+                .min(inner.budget.max_concurrent);
+        }
+    }
+
+    pub fn set_budget(&self, work_class: WorkClass, budget: WorkClassBudget) {
+        let state = self.state_for(work_class);
+        let mut inner = state
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let max_concurrent = budget.max_concurrent.max(1);
+        let min_guaranteed_concurrent = budget.min_guaranteed_concurrent.max(1).min(max_concurrent);
+        inner.budget = WorkClassBudget {
+            max_concurrent,
+            min_guaranteed_concurrent,
+            max_queue_depth: budget.max_queue_depth,
+            max_byte_budget: budget.max_byte_budget,
+            io_bandwidth_bytes_per_sec: budget.io_bandwidth_bytes_per_sec,
+            starvation_aging_ms: budget.starvation_aging_ms,
+            yield_backoff_ms: budget.yield_backoff_ms,
         };
     }
 
-    pub fn limits(&self, work_class: WorkClass) -> WorkClassLimits {
+    pub fn budget(&self, work_class: WorkClass) -> WorkClassBudget {
         self.state_for(work_class)
             .inner
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .limits
+            .budget
+    }
+
+    pub fn limits(&self, work_class: WorkClass) -> WorkClassLimits {
+        let b = self.budget(work_class);
+        WorkClassLimits {
+            max_concurrent: b.max_concurrent,
+            max_queue_depth: b.max_queue_depth,
+        }
     }
 
     pub fn snapshot(&self, work_class: WorkClass) -> AdmissionClassSnapshot {
+        let fg_pressure = self.has_foreground_pressure();
         let inner = self
             .state_for(work_class)
             .inner
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let effective_max = if work_class.is_background() && fg_pressure {
+            inner
+                .budget
+                .min_guaranteed_concurrent
+                .max(1)
+                .min(inner.budget.max_concurrent)
+        } else {
+            inner.budget.max_concurrent.max(1)
+        };
+        let saturation_ratio = (inner.active as f64) / (effective_max as f64);
         AdmissionClassSnapshot {
             work_class,
+            priority_tier: work_class.priority_tier(),
             active: inner.active,
             queued: inner.waiters.len(),
-            max_concurrent: inner.limits.max_concurrent,
-            max_queue_depth: inner.limits.max_queue_depth,
+            max_concurrent: inner.budget.max_concurrent,
+            effective_max_concurrent: effective_max,
+            min_guaranteed_concurrent: inner.budget.min_guaranteed_concurrent,
+            max_queue_depth: inner.budget.max_queue_depth,
+            saturation_ratio,
             acquired_total: inner.acquired_total,
             rejected_queue_full: inner.rejected_queue_full,
             rejected_cancelled: inner.rejected_cancelled,
             rejected_deadline: inner.rejected_deadline,
+            throttled_total: inner.throttled_total,
+            starvation_promoted_total: inner.starvation_promoted_total,
+            io_bytes_total: inner.io_bytes_total,
         }
     }
 
@@ -949,6 +1829,109 @@ impl AdmissionController {
             .into_iter()
             .map(|class| self.snapshot(class).queued)
             .sum()
+    }
+
+    /// Account I/O bytes for `work_class` and optionally pace background I/O
+    /// when `io_bandwidth_bytes_per_sec` is configured or foreground pressure is active (`FS-032`).
+    pub async fn account_io_bytes(
+        &self,
+        work_class: WorkClass,
+        bytes: u64,
+        ctx: Option<&RequestCancellationContext>,
+    ) -> Result<(), AdmissionError> {
+        Self::check_ctx_for_queue(self.state_for(work_class), ctx)?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        crate::metrics::WORK_CLASS_IO_BYTES_TOTAL
+            .with_label_values(&[work_class.as_str()])
+            .inc_by(bytes);
+        let rate_bps = {
+            let state = self.state_for(work_class);
+            let mut inner = state
+                .inner
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            inner.io_bytes_total = inner.io_bytes_total.saturating_add(bytes);
+            inner.budget.io_bandwidth_bytes_per_sec
+        };
+        if work_class.is_background() && rate_bps > 0 {
+            let delay_ms = ((bytes as f64 / rate_bps as f64) * 1000.0)
+                .ceil()
+                .clamp(1.0, 50.0) as u64;
+            crate::metrics::BACKGROUND_THROTTLED_TOTAL
+                .with_label_values(&[work_class.as_str(), "io_budget"])
+                .inc();
+            let sleep_dur = Duration::from_millis(delay_ms);
+            if let Some(ctx) = ctx {
+                tokio::select! {
+                    biased;
+                    _ = ctx.wait_cancelled(work_class.execution_stage()) => {
+                        Self::check_ctx_for_queue(self.state_for(work_class), Some(ctx))?;
+                    }
+                    () = tokio::time::sleep(sleep_dur) => {}
+                }
+            } else {
+                tokio::time::sleep(sleep_dur).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Cooperative background yield under foreground load (`FS-032`).
+    /// Yields the current Tokio task (and sleeps briefly when foreground
+    /// pressure is active) while respecting cancellation.
+    pub async fn cooperative_background_yield(
+        &self,
+        work_class: WorkClass,
+        ctx: Option<&RequestCancellationContext>,
+    ) -> Result<bool, AdmissionError> {
+        let state = self.state_for(work_class);
+        Self::check_ctx_for_queue(state, ctx)?;
+        if !work_class.is_background() || !self.has_foreground_pressure() {
+            tokio::task::yield_now().await;
+            return Ok(false);
+        }
+        let backoff_ms = {
+            let mut inner = state
+                .inner
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            inner.throttled_total += 1;
+            inner.budget.yield_backoff_ms
+        };
+        crate::metrics::BACKGROUND_THROTTLED_TOTAL
+            .with_label_values(&[work_class.as_str(), "foreground_pressure"])
+            .inc();
+        tokio::task::yield_now().await;
+        if backoff_ms > 0 {
+            let sleep_dur = Duration::from_millis(backoff_ms);
+            if let Some(ctx) = ctx {
+                tokio::select! {
+                    biased;
+                    _ = ctx.wait_cancelled(work_class.execution_stage()) => {
+                        Self::check_ctx_for_queue(state, Some(ctx))?;
+                    }
+                    () = tokio::time::sleep(sleep_dur) => {}
+                }
+            } else {
+                tokio::time::sleep(sleep_dur).await;
+            }
+        }
+        Ok(true)
+    }
+
+    fn notify_background_queues_if_unpressured(&self) {
+        let fg_pressure = self.has_foreground_pressure();
+        if !fg_pressure {
+            for bg in [
+                WorkClass::Hydration,
+                WorkClass::Recovery,
+                WorkClass::Maintenance,
+            ] {
+                self.state_for(bg).wake_unthrottled_waiters(false);
+            }
+        }
     }
 
     fn check_ctx_for_queue(
@@ -969,6 +1952,7 @@ impl AdmissionController {
                 crate::metrics::ADMISSION_REJECTED_TOTAL
                     .with_label_values(&[state.work_class.as_str(), "deadline_expired"])
                     .inc();
+                record_classified_error(StableErrorClass::Overload, ExecutionStage::Queue);
                 return Err(AdmissionError::DeadlineExceeded(deadline.clone()));
             }
             if let Some(cancelled) = error.downcast_ref::<RequestCancelledError>() {
@@ -977,6 +1961,7 @@ impl AdmissionController {
                 crate::metrics::ADMISSION_REJECTED_TOTAL
                     .with_label_values(&[state.work_class.as_str(), "cancelled"])
                     .inc();
+                record_classified_error(StableErrorClass::Overload, ExecutionStage::Queue);
                 return Err(AdmissionError::Cancelled(cancelled.clone()));
             }
         }
@@ -984,30 +1969,44 @@ impl AdmissionController {
     }
 
     pub fn try_acquire(
-        &self,
+        self: &Arc<Self>,
         work_class: WorkClass,
         ctx: Option<&RequestCancellationContext>,
     ) -> Result<AdmissionLease, AdmissionError> {
         let state = self.state_for(work_class).clone();
         Self::check_ctx_for_queue(&state, ctx)?;
+        let fg_pressure = self.has_foreground_pressure();
         let mut inner = state
             .inner
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if inner.active < inner.limits.max_concurrent && inner.waiters.is_empty() {
+        let effective_max = if work_class.is_background() && fg_pressure {
+            inner
+                .budget
+                .min_guaranteed_concurrent
+                .max(1)
+                .min(inner.budget.max_concurrent)
+        } else {
+            inner.budget.max_concurrent.max(1)
+        };
+        if inner.active < effective_max && inner.waiters.is_empty() {
             inner.active += 1;
             inner.acquired_total += 1;
             let active = inner.active;
             let queued = inner.waiters.len();
             drop(inner);
-            state.update_gauges(active, queued);
+            state.update_gauges(active, queued, effective_max);
             crate::metrics::ADMISSION_ACQUIRED_TOTAL
                 .with_label_values(&[work_class.as_str()])
                 .inc();
             crate::metrics::ADMISSION_QUEUE_WAIT_SECONDS
                 .with_label_values(&[work_class.as_str()])
                 .observe(0.0);
+            if let Some(ctx) = ctx {
+                ctx.record_stage_duration(TraceStage::Queue, Duration::from_nanos(1));
+            }
             return Ok(AdmissionLease {
+                controller: Arc::clone(self),
                 state,
                 started_at: Instant::now(),
             });
@@ -1016,19 +2015,20 @@ impl AdmissionController {
         let err = AdmissionError::QueueFull {
             work_class,
             active: inner.active,
-            max_concurrent: inner.limits.max_concurrent,
+            max_concurrent: inner.budget.max_concurrent,
             queued: inner.waiters.len(),
-            max_queue_depth: inner.limits.max_queue_depth,
+            max_queue_depth: inner.budget.max_queue_depth,
         };
         drop(inner);
         crate::metrics::ADMISSION_REJECTED_TOTAL
             .with_label_values(&[work_class.as_str(), "queue_full"])
             .inc();
+        record_classified_error(StableErrorClass::Overload, ExecutionStage::Queue);
         Err(err)
     }
 
     pub async fn acquire(
-        &self,
+        self: &Arc<Self>,
         work_class: WorkClass,
         ctx: Option<&RequestCancellationContext>,
     ) -> Result<AdmissionLease, AdmissionError> {
@@ -1036,60 +2036,88 @@ impl AdmissionController {
         Self::check_ctx_for_queue(&state, ctx)?;
 
         let enqueued_at = Instant::now();
-        let (waiter_id, mut rx) = {
+        let fg_pressure = self.has_foreground_pressure();
+        let (waiter_id, mut rx, starvation_aging_ms) = {
             let mut inner = state
                 .inner
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            if inner.active < inner.limits.max_concurrent && inner.waiters.is_empty() {
+            let effective_max = if work_class.is_background() && fg_pressure {
+                inner
+                    .budget
+                    .min_guaranteed_concurrent
+                    .max(1)
+                    .min(inner.budget.max_concurrent)
+            } else {
+                inner.budget.max_concurrent.max(1)
+            };
+            if inner.active < effective_max && inner.waiters.is_empty() {
                 inner.active += 1;
                 inner.acquired_total += 1;
                 let active = inner.active;
                 let queued = inner.waiters.len();
                 drop(inner);
-                state.update_gauges(active, queued);
+                state.update_gauges(active, queued, effective_max);
                 crate::metrics::ADMISSION_ACQUIRED_TOTAL
                     .with_label_values(&[work_class.as_str()])
                     .inc();
                 crate::metrics::ADMISSION_QUEUE_WAIT_SECONDS
                     .with_label_values(&[work_class.as_str()])
                     .observe(0.0);
+                if let Some(ctx) = ctx {
+                    ctx.record_stage_duration(TraceStage::Queue, Duration::from_nanos(1));
+                }
                 return Ok(AdmissionLease {
+                    controller: Arc::clone(self),
                     state,
                     started_at: Instant::now(),
                 });
             }
-            if inner.waiters.len() >= inner.limits.max_queue_depth {
+            if work_class.is_background()
+                && fg_pressure
+                && inner.active >= effective_max
+                && inner.active < inner.budget.max_concurrent
+            {
+                inner.throttled_total += 1;
+                crate::metrics::BACKGROUND_THROTTLED_TOTAL
+                    .with_label_values(&[work_class.as_str(), "foreground_pressure"])
+                    .inc();
+            }
+            if inner.waiters.len() >= inner.budget.max_queue_depth {
                 inner.rejected_queue_full += 1;
                 let err = AdmissionError::QueueFull {
                     work_class,
                     active: inner.active,
-                    max_concurrent: inner.limits.max_concurrent,
+                    max_concurrent: inner.budget.max_concurrent,
                     queued: inner.waiters.len(),
-                    max_queue_depth: inner.limits.max_queue_depth,
+                    max_queue_depth: inner.budget.max_queue_depth,
                 };
                 drop(inner);
                 crate::metrics::ADMISSION_REJECTED_TOTAL
                     .with_label_values(&[work_class.as_str(), "queue_full"])
                     .inc();
+                record_classified_error(StableErrorClass::Overload, ExecutionStage::Queue);
                 return Err(err);
             }
             let waiter_id = inner.next_waiter_id;
             inner.next_waiter_id += 1;
+            let aging_ms = inner.budget.starvation_aging_ms;
             let (tx, rx) = tokio::sync::oneshot::channel();
             inner.waiters.push_back(QueuedWaiter {
                 id: waiter_id,
+                enqueued_at,
                 tx,
                 ctx: ctx.cloned(),
             });
             let active = inner.active;
             let queued = inner.waiters.len();
             drop(inner);
-            state.update_gauges(active, queued);
-            (waiter_id, rx)
+            state.update_gauges(active, queued, effective_max);
+            (waiter_id, rx, aging_ms)
         };
 
         struct QueuedWaiterGuard<'a> {
+            controller: &'a Arc<AdmissionController>,
             state: &'a Arc<ClassQueueState>,
             waiter_id: u64,
             rx: &'a mut tokio::sync::oneshot::Receiver<()>,
@@ -1101,59 +2129,138 @@ impl AdmissionController {
                 if self.disarmed {
                     return;
                 }
+                let fg_pressure = self.controller.has_foreground_pressure();
                 let removed = {
                     let mut inner = self
                         .state
                         .inner
                         .lock()
                         .unwrap_or_else(|error| error.into_inner());
+                    let eff = if self.state.work_class.is_background() && fg_pressure {
+                        inner
+                            .budget
+                            .min_guaranteed_concurrent
+                            .max(1)
+                            .min(inner.budget.max_concurrent)
+                    } else {
+                        inner.budget.max_concurrent.max(1)
+                    };
                     if let Some(pos) = inner.waiters.iter().position(|w| w.id == self.waiter_id) {
                         inner.waiters.remove(pos);
                         let active = inner.active;
                         let queued = inner.waiters.len();
                         drop(inner);
-                        self.state.update_gauges(active, queued);
+                        self.state.update_gauges(active, queued, eff);
                         true
                     } else {
                         false
                     }
                 };
                 if !removed && self.rx.try_recv().is_ok() {
-                    self.state.release_slot();
+                    self.state.release_slot_with_ceiling(fg_pressure);
+                    if self.state.work_class.is_foreground() {
+                        self.controller.notify_background_queues_if_unpressured();
+                    }
                 }
             }
         }
 
         let mut guard = QueuedWaiterGuard {
+            controller: self,
             state: &state,
             waiter_id,
             rx: &mut rx,
             disarmed: false,
         };
 
-        let granted = match ctx {
-            Some(ctx) => {
-                tokio::select! {
-                    biased;
-                    res = &mut *guard.rx => res.is_ok(),
-                    _ = ctx.wait_cancelled(ExecutionStage::Queue) => false,
+        let try_starvation_promote = || -> bool {
+            if !work_class.is_background() {
+                return false;
+            }
+            let mut inner = state
+                .inner
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if inner.active >= inner.budget.max_concurrent {
+                return false;
+            }
+            if let Some(pos) = inner.waiters.iter().position(|w| w.id == waiter_id) {
+                inner.waiters.remove(pos);
+                inner.active += 1;
+                inner.starvation_promoted_total += 1;
+                let active = inner.active;
+                let queued = inner.waiters.len();
+                let max_conc = inner.budget.max_concurrent.max(1);
+                drop(inner);
+                crate::metrics::BACKGROUND_THROTTLED_TOTAL
+                    .with_label_values(&[work_class.as_str(), "starvation_promoted"])
+                    .inc();
+                state.update_gauges(active, queued, max_conc);
+                return true;
+            }
+            false
+        };
+
+        let granted = if work_class.is_background() && starvation_aging_ms > 0 {
+            let aging_sleep = tokio::time::sleep(Duration::from_millis(starvation_aging_ms));
+            tokio::pin!(aging_sleep);
+            let mut aging_checked = false;
+            loop {
+                match ctx {
+                    Some(ctx) => {
+                        tokio::select! {
+                            biased;
+                            res = &mut *guard.rx => break res.is_ok(),
+                            _ = ctx.wait_cancelled(ExecutionStage::Queue) => break false,
+                            () = &mut aging_sleep, if !aging_checked => {
+                                aging_checked = true;
+                                if try_starvation_promote() {
+                                    break true;
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        tokio::select! {
+                            biased;
+                            res = &mut *guard.rx => break res.is_ok(),
+                            () = &mut aging_sleep, if !aging_checked => {
+                                aging_checked = true;
+                                if try_starvation_promote() {
+                                    break true;
+                                }
+                            }
+                        }
+                    }
                 }
             }
-            None => (&mut *guard.rx).await.is_ok(),
+        } else {
+            match ctx {
+                Some(ctx) => {
+                    tokio::select! {
+                        biased;
+                        res = &mut *guard.rx => res.is_ok(),
+                        _ = ctx.wait_cancelled(ExecutionStage::Queue) => false,
+                    }
+                }
+                None => (&mut *guard.rx).await.is_ok(),
+            }
         };
 
         if !granted {
             drop(guard);
             let queue_wait = enqueued_at.elapsed();
-            if let Some(ctx) = ctx
-                && let Some(deadline) = ctx.deadline()
-            {
-                deadline.charge_queue_time(queue_wait);
+            if let Some(ctx) = ctx {
+                ctx.record_stage_duration(TraceStage::Queue, queue_wait);
+                if let Some(deadline) = ctx.deadline() {
+                    deadline.charge_queue_time(queue_wait);
+                }
             }
             crate::metrics::ADMISSION_QUEUE_WAIT_SECONDS
                 .with_label_values(&[work_class.as_str()])
                 .observe(queue_wait.as_secs_f64());
             Self::check_ctx_for_queue(&state, ctx)?;
+            record_classified_error(StableErrorClass::Overload, ExecutionStage::Queue);
             return Err(AdmissionError::Cancelled(RequestCancelledError {
                 stage: ExecutionStage::Queue,
                 reason: CancellationReason::ClientDisconnected,
@@ -1164,17 +2271,21 @@ impl AdmissionController {
         drop(guard);
 
         let queue_wait = enqueued_at.elapsed();
-        if let Some(ctx) = ctx
-            && let Some(deadline) = ctx.deadline()
-        {
-            deadline.charge_queue_time(queue_wait);
+        if let Some(ctx) = ctx {
+            ctx.record_stage_duration(TraceStage::Queue, queue_wait);
+            if let Some(deadline) = ctx.deadline() {
+                deadline.charge_queue_time(queue_wait);
+            }
         }
         crate::metrics::ADMISSION_QUEUE_WAIT_SECONDS
             .with_label_values(&[work_class.as_str()])
             .observe(queue_wait.as_secs_f64());
 
         if let Err(err) = Self::check_ctx_for_queue(&state, ctx) {
-            state.release_slot();
+            state.release_slot_with_ceiling(self.has_foreground_pressure());
+            if work_class.is_foreground() {
+                self.notify_background_queues_if_unpressured();
+            }
             return Err(err);
         }
 
@@ -1190,6 +2301,7 @@ impl AdmissionController {
             .inc();
 
         Ok(AdmissionLease {
+            controller: Arc::clone(self),
             state,
             started_at: Instant::now(),
         })
@@ -1197,6 +2309,7 @@ impl AdmissionController {
 }
 
 pub struct AdmissionLease {
+    controller: Arc<AdmissionController>,
     state: Arc<ClassQueueState>,
     started_at: Instant,
 }
@@ -1213,7 +2326,11 @@ impl Drop for AdmissionLease {
         crate::metrics::ADMISSION_EXECUTION_SECONDS
             .with_label_values(&[self.state.work_class.as_str()])
             .observe(elapsed);
-        self.state.release_slot();
+        let fg_pressure = self.controller.has_foreground_pressure();
+        self.state.release_slot_with_ceiling(fg_pressure);
+        if self.state.work_class.is_foreground() {
+            self.controller.notify_background_queues_if_unpressured();
+        }
     }
 }
 
@@ -1599,6 +2716,7 @@ where
     }
     let ctx_for_blocking = ctx.clone();
     let handle = tokio::task::spawn_blocking(move || {
+        let _stage_timer = start_current_stage_timer(TraceStage::Maintenance);
         if let Some(ref ctx) = ctx_for_blocking {
             ctx.check_active(ExecutionStage::Maintenance)?;
         }
@@ -1724,6 +2842,7 @@ impl WorkerPools {
         R: Send + 'static,
     {
         let stage = work_class.execution_stage();
+        let trace_stage = work_class.trace_stage();
         let ctx = current_request_context();
         let lease = self.admission.acquire(work_class, ctx.as_ref()).await?;
         let pool = self.search_pool.clone();
@@ -1738,6 +2857,8 @@ impl WorkerPools {
                 let _ = tx.send(Err(error));
                 return;
             }
+            let started = Instant::now();
+            let ctx_for_timing = worker_ctx.clone();
             let result = catch_unwind(AssertUnwindSafe(|| {
                 with_thread_request_context(worker_ctx, f)
             }))
@@ -1747,6 +2868,14 @@ impl WorkerPools {
                     message: panic_message(payload.as_ref()).to_string(),
                 })
             });
+            let elapsed = started.elapsed();
+            if let Some(ref ctx_for_timing) = ctx_for_timing {
+                ctx_for_timing.record_stage_duration(trace_stage, elapsed);
+            } else {
+                crate::metrics::STAGE_EXECUTION_DURATION_SECONDS
+                    .with_label_values(&[trace_stage.as_str()])
+                    .observe(elapsed.as_secs_f64());
+            }
             let _ = tx.send(result);
         });
         match ctx {
@@ -1795,12 +2924,22 @@ impl WorkerPools {
         let worker_ctx = ctx;
         pool.spawn(move || {
             let _lease = lease;
+            let started = Instant::now();
+            let ctx_for_timing = worker_ctx.clone();
             let result = match catch_unwind(AssertUnwindSafe(|| {
                 with_thread_request_context(worker_ctx, f)
             })) {
                 Ok(result) => result,
                 Err(payload) => abort_write_panic(operation, payload.as_ref()),
             };
+            let elapsed = started.elapsed();
+            if let Some(ref ctx_for_timing) = ctx_for_timing {
+                ctx_for_timing.record_stage_duration(TraceStage::Write, elapsed);
+            } else {
+                crate::metrics::STAGE_EXECUTION_DURATION_SECONDS
+                    .with_label_values(&[TraceStage::Write.as_str()])
+                    .observe(elapsed.as_secs_f64());
+            }
             let _ = tx.send(result);
         });
         #[cfg(test)]
@@ -1808,6 +2947,28 @@ impl WorkerPools {
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         rx.await
             .map_err(|_| anyhow::anyhow!("write task was cancelled"))
+    }
+
+    /// Run blocking maintenance work under `WorkClass::Maintenance` admission
+    /// with foreground-pressure throttling and cooperative yielding (`FS-032`).
+    pub async fn spawn_maintenance<F, R>(
+        &self,
+        operation: &'static str,
+        f: F,
+    ) -> crate::common::Result<R>
+    where
+        F: FnOnce() -> crate::common::Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        let ctx = current_request_context();
+        self.admission
+            .cooperative_background_yield(WorkClass::Maintenance, ctx.as_ref())
+            .await?;
+        let _lease = self
+            .admission
+            .acquire(WorkClass::Maintenance, ctx.as_ref())
+            .await?;
+        spawn_engine_maintenance(operation, f).await
     }
 
     #[cfg(test)]
@@ -2146,5 +3307,198 @@ mod tests {
                 governor.capacity_bytes(pool)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn fs032_background_work_prioritization_throttles_under_foreground_load_and_prevents_starvation()
+     {
+        let admission = Arc::new(AdmissionController::new(2, 2));
+        admission.set_limits(
+            WorkClass::Search,
+            WorkClassLimits {
+                max_concurrent: 2,
+                max_queue_depth: 8,
+            },
+        );
+        admission.set_budget(
+            WorkClass::Maintenance,
+            WorkClassBudget {
+                max_concurrent: 3,
+                min_guaranteed_concurrent: 1,
+                max_queue_depth: 8,
+                max_byte_budget: 16 * 1024 * 1024,
+                io_bandwidth_bytes_per_sec: 1_000_000,
+                starvation_aging_ms: 40,
+                yield_backoff_ms: 2,
+            },
+        );
+
+        assert_eq!(
+            WorkClass::Search.priority_tier(),
+            WorkPriorityTier::Foreground
+        );
+        assert_eq!(
+            WorkClass::Maintenance.priority_tier(),
+            WorkPriorityTier::Background
+        );
+        assert!(!admission.has_foreground_pressure());
+
+        // Acquire 1 foreground Search slot -> utilization is 1/2 (50%), triggering foreground pressure!
+        let fg_lease = admission.acquire(WorkClass::Search, None).await.unwrap();
+        assert!(admission.has_foreground_pressure());
+
+        // Under foreground pressure, Maintenance effective concurrency is clamped to min_guaranteed_concurrent (1).
+        let bg_snap_initial = admission.snapshot(WorkClass::Maintenance);
+        assert_eq!(bg_snap_initial.effective_max_concurrent, 1);
+        assert_eq!(bg_snap_initial.max_concurrent, 3);
+
+        // First background task acquires the 1 guaranteed slot immediately.
+        let bg_lease_1 = admission
+            .acquire(WorkClass::Maintenance, None)
+            .await
+            .unwrap();
+        let bg_snap_busy = admission.snapshot(WorkClass::Maintenance);
+        assert_eq!(bg_snap_busy.active, 1);
+        assert!((bg_snap_busy.saturation_ratio - 1.0).abs() < f64::EPSILON);
+
+        // Second background task arrives while foreground pressure is active:
+        // It is throttled by foreground pressure, then promoted after starvation_aging_ms (40ms)
+        // even though fg_lease and bg_lease_1 are still held!
+        let adm_for_bg2 = admission.clone();
+        let bg2_start = Instant::now();
+        let bg_lease_2 = tokio::spawn(async move {
+            adm_for_bg2
+                .acquire(WorkClass::Maintenance, None)
+                .await
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        let bg2_elapsed = bg2_start.elapsed();
+        assert!(
+            bg2_elapsed >= Duration::from_millis(30),
+            "expected background task 2 to be throttled until starvation aging (took {bg2_elapsed:?})"
+        );
+        let bg_snap_promoted = admission.snapshot(WorkClass::Maintenance);
+        assert_eq!(bg_snap_promoted.active, 2);
+        assert!(bg_snap_promoted.throttled_total >= 1);
+        assert!(bg_snap_promoted.starvation_promoted_total >= 1);
+
+        // Cooperative yield and I/O byte accounting under foreground pressure:
+        let yielded = admission
+            .cooperative_background_yield(WorkClass::Maintenance, None)
+            .await
+            .unwrap();
+        assert!(
+            yielded,
+            "background work must yield under foreground pressure"
+        );
+        admission
+            .account_io_bytes(WorkClass::Maintenance, 4096, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            admission.snapshot(WorkClass::Maintenance).io_bytes_total,
+            4096
+        );
+
+        // Release foreground pressure -> effective ceiling returns to max_concurrent (3)
+        drop(fg_lease);
+        assert!(!admission.has_foreground_pressure());
+        assert_eq!(
+            admission
+                .snapshot(WorkClass::Maintenance)
+                .effective_max_concurrent,
+            3
+        );
+        drop(bg_lease_1);
+        drop(bg_lease_2);
+        assert_eq!(admission.snapshot(WorkClass::Maintenance).active, 0);
+    }
+
+    #[tokio::test]
+    async fn fs033_distributed_tracing_stage_ledger_and_stable_error_classes() {
+        // 1. Secret and malformed trace IDs are rejected
+        assert_eq!(
+            sanitize_trace_id("req-valid-123"),
+            Some("req-valid-123".into())
+        );
+        assert_eq!(sanitize_trace_id("Bearer secret-jwt"), None);
+        assert_eq!(sanitize_trace_id("ApiKey my-secret-key"), None);
+        assert_eq!(sanitize_trace_id("has\nnewline"), None);
+        assert_eq!(sanitize_trace_id(&"x".repeat(200)), None);
+
+        // 2. Correlation IDs and stage timing ledger propagate across child contexts and gRPC metadata
+        let ctx = RequestCancellationContext::with_budget(Duration::from_secs(5));
+        assert!(ctx.set_request_id("req-trace-42"));
+        assert!(ctx.set_operation_id("op-publish-7"));
+        assert!(ctx.set_snapshot_id("snap-uuid-g3"));
+        assert!(ctx.set_assignment_id("assign-g3-r0-node1"));
+        assert!(ctx.set_task_id("task-fm-9"));
+
+        ctx.record_stage_duration(TraceStage::Queue, Duration::from_micros(200));
+        let child = ctx.child();
+        child.record_stage_duration(TraceStage::Hydration, Duration::from_micros(800));
+        child.record_stage_duration(TraceStage::Storage, Duration::from_micros(500));
+        child.record_stage_duration(TraceStage::Search, Duration::from_micros(400));
+        child.record_stage_duration(TraceStage::Retry, Duration::from_micros(100));
+        child.record_stage_duration(TraceStage::PartialMerge, Duration::from_micros(150));
+
+        let snap = ctx.stage_snapshot();
+        assert!(snap.queue_ns >= 200_000);
+        assert!(snap.hydration_ns >= 800_000);
+        assert!(snap.storage_ns >= 500_000);
+        assert!(snap.search_ns >= 400_000);
+        assert!(snap.retry_ns >= 100_000);
+        assert!(snap.partial_merge_ns >= 150_000);
+
+        let encoded = snap.encode_compact();
+        let decoded = StageTimingSnapshot::decode_compact(&encoded).unwrap();
+        assert_eq!(decoded, snap);
+
+        let mut grpc_req = tonic::Request::new(());
+        crate::transport::state_wait::attach_context_deadline_metadata(
+            &mut grpc_req,
+            &child,
+            ExecutionStage::Search,
+        )
+        .unwrap();
+        let (extracted, mut guard) = crate::transport::state_wait::extract_grpc_request_context(
+            &grpc_req,
+            ExecutionStage::Search,
+        )
+        .unwrap();
+        guard.disarm();
+        let extracted_ids = extracted.trace_ids();
+        assert_eq!(extracted_ids.request_id, "req-trace-42");
+        assert_eq!(extracted_ids.operation_id.as_deref(), Some("op-publish-7"));
+        assert_eq!(extracted_ids.snapshot_id.as_deref(), Some("snap-uuid-g3"));
+        assert_eq!(
+            extracted_ids.assignment_id.as_deref(),
+            Some("assign-g3-r0-node1")
+        );
+        assert_eq!(extracted_ids.task_id.as_deref(), Some("task-fm-9"));
+
+        // 3. StableErrorClass classifies overload, corruption, retryable, and terminal errors
+        assert_eq!(
+            classify_http_error(429, "rejected_execution_exception", "queue full"),
+            StableErrorClass::Overload
+        );
+        assert_eq!(
+            classify_http_error(503, "shard_not_available_exception", "primary promoting"),
+            StableErrorClass::Retryable
+        );
+        assert_eq!(
+            classify_http_error(
+                500,
+                "remote_store_manifest_exception",
+                "bundle checksum mismatch"
+            ),
+            StableErrorClass::Corruption
+        );
+        assert_eq!(
+            classify_http_error(400, "mapper_parsing_exception", "invalid field"),
+            StableErrorClass::Terminal
+        );
     }
 }

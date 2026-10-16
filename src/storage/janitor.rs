@@ -242,6 +242,19 @@ impl StorageManager {
     ///   to prevent false positives from delayed readers/pins or concurrent
     ///   commits, and rate-limits deletions by object count and bytes.
     pub async fn run_janitor(&self, options: &JanitorOptions) -> Result<JanitorRunReport> {
+        let current_ctx = crate::worker::current_request_context();
+        self.admission
+            .cooperative_background_yield(
+                crate::worker::WorkClass::Maintenance,
+                current_ctx.as_ref(),
+            )
+            .await?;
+        let _maintenance_lease = self
+            .admission
+            .acquire(crate::worker::WorkClass::Maintenance, current_ctx.as_ref())
+            .await?;
+        let _maint_timer =
+            crate::worker::start_current_stage_timer(crate::worker::TraceStage::Maintenance);
         let mode_label = if options.dry_run {
             "dry_run"
         } else {

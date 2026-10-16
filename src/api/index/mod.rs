@@ -114,6 +114,42 @@ fn validate_document_source_for_api(source: &Value) -> Result<(), (StatusCode, J
     crate::common::validate_document_source(source).map_err(mapper_parsing_error_response)
 }
 
+pub(crate) fn check_tiered_hot_delta_backpressure(
+    state: &AppState,
+    index_name: &str,
+    metadata: &IndexMetadata,
+    shard_id: u32,
+) -> Option<(StatusCode, Json<Value>)> {
+    if !metadata.is_tiered() {
+        return None;
+    }
+    if metadata.primary_node(shard_id) != Some(&state.local_node_id) {
+        return None;
+    }
+    let policy = metadata.effective_hot_delta_seal_policy()?;
+    let engine = state.shard_manager.get_shard(index_name, shard_id)?;
+    let stats = engine.unsealed_delta_stats().ok()?;
+    if stats.unsealed_ops >= policy.effective_max_unsealed_ops()
+        || stats.unsealed_bytes >= policy.effective_max_unsealed_bytes()
+    {
+        crate::metrics::HOT_DELTA_SEALS_TOTAL
+            .with_label_values(&["auto_bytes", "backpressure"])
+            .inc();
+        return Some(crate::api::error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "hot_delta_backpressure_exception",
+            format!(
+                "hot delta unsealed backlog for [{index_name}][{shard_id}] exceeded configured limit (unsealed_ops={}/{}, unsealed_bytes={}/{}); seal delta before writing more documents",
+                stats.unsealed_ops,
+                policy.effective_max_unsealed_ops(),
+                stats.unsealed_bytes,
+                policy.effective_max_unsealed_bytes()
+            ),
+        ));
+    }
+    None
+}
+
 mod bulk;
 #[cfg(test)]
 mod forwarding_tests;
@@ -917,6 +953,11 @@ pub async fn index_document(
 
     // Route document to the correct shard
     let shard_id = crate::engine::routing::calculate_shard(&doc_id, metadata.number_of_shards);
+    if let Some(backpressure_resp) =
+        check_tiered_hot_delta_backpressure(&state, &index_name, &metadata, shard_id)
+    {
+        return backpressure_resp;
+    }
     let target_node_id = match metadata.primary_node(shard_id) {
         Some(id) => id.clone(),
         None => {
@@ -1022,6 +1063,11 @@ pub async fn index_document_with_id(
 
     // Route document to the correct shard
     let shard_id = crate::engine::routing::calculate_shard(&doc_id, metadata.number_of_shards);
+    if let Some(backpressure_resp) =
+        check_tiered_hot_delta_backpressure(&state, &index_name, &metadata, shard_id)
+    {
+        return backpressure_resp;
+    }
     let target_node_id = match metadata.primary_node(shard_id) {
         Some(id) => id.clone(),
         None => {
@@ -1127,13 +1173,27 @@ pub(crate) async fn execute_distributed_dsl_search(
         }
     };
 
-    // remote_store engine: shardless, splits are read from object storage.
-    if matches!(
-        metadata.settings.engine,
-        crate::cluster::state::IndexEngine::RemoteStore
-    ) {
+    // remote_store engine (shardless ImmutableOnly): splits are read from object storage.
+    if !metadata.uses_local_shards() {
         return crate::engine::remote_store::search(state, index_name, &metadata, search_req).await;
     }
+
+    let tiered_manifest = if metadata.is_tiered() {
+        let expected_schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
+        state
+            .storage_manager
+            .load_current_manifest(metadata.uuid.as_str(), Some(&expected_schema_hash))
+            .await
+            .map_err(|error| {
+                crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "remote_store_manifest_exception",
+                    format!("failed to load manifest for tiered index [{index_name}]: {error}"),
+                )
+            })?
+    } else {
+        None
+    };
 
     let mut shard_hit_lists: Vec<Vec<serde_json::Value>> = Vec::new();
     let mut knn_hits = Vec::new();
@@ -1324,6 +1384,131 @@ pub(crate) async fn execute_distributed_dsl_search(
         return Err(error);
     }
 
+    let merge_started = std::time::Instant::now();
+    let mut remote_store_stats = None;
+    if let Some(ref manifest) = tiered_manifest {
+        let remote_res =
+            crate::engine::remote_store::search(state, index_name, &metadata, search_req).await?;
+        remote_store_stats = remote_res.remote_store_stats;
+
+        // Build per-document winner across published splits and hot-delta (> published_watermark).
+        // Winner value: (seq_no, primary_term, is_tombstone, owner_tag)
+        let mut doc_winners: HashMap<String, (u64, u64, bool, String)> = HashMap::new();
+        for split in manifest.published_splits() {
+            if let Ok(Some(range)) = split.seal_range() {
+                for dv in &range.doc_versions {
+                    let update = doc_winners
+                        .get(&dv.doc_id)
+                        .is_none_or(|(s, t, _, _)| (dv.seq_no, dv.primary_term) >= (*s, *t));
+                    if update {
+                        doc_winners.insert(
+                            dv.doc_id.clone(),
+                            (dv.seq_no, dv.primary_term, false, split.split_id.clone()),
+                        );
+                    }
+                }
+                for ts in &range.tombstones {
+                    let update = doc_winners
+                        .get(&ts.doc_id)
+                        .is_none_or(|(s, t, _, _)| (ts.seq_no, ts.primary_term) >= (*s, *t));
+                    if update {
+                        doc_winners.insert(
+                            ts.doc_id.clone(),
+                            (ts.seq_no, ts.primary_term, true, split.split_id.clone()),
+                        );
+                    }
+                }
+            }
+        }
+
+        // Inspect hot-delta versions on local shards:
+        // - `hot_overlap_excluded_ids` records documents on local shards whose live version
+        //   has `seq_no <= wm_seq` (i.e. already covered by the committed manifest before local retirement).
+        // - `doc_winners` records versions > wm_seq that supersede or tombstone split versions.
+        let mut hot_overlap_excluded_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for (shard_id, engine) in &local_shards {
+            let wm_seq = manifest
+                .published_watermarks
+                .get(shard_id)
+                .map(|w| w.sealed_through_seq_no);
+            if let Ok(live_docs) = engine.live_documents_with_versions() {
+                for (doc_id, _src, seq_no, term, _ver) in live_docs {
+                    if wm_seq.is_none_or(|w| seq_no > w) {
+                        hot_overlap_excluded_ids.remove(&doc_id);
+                        let update = doc_winners
+                            .get(&doc_id)
+                            .is_none_or(|(s, t, _, _)| (seq_no, term) >= (*s, *t));
+                        if update {
+                            doc_winners.insert(doc_id, (seq_no, term, false, "hot".to_string()));
+                        }
+                    } else {
+                        hot_overlap_excluded_ids.insert(doc_id);
+                    }
+                }
+            }
+            if let Ok(del_docs) = engine.deleted_documents_with_versions() {
+                for (doc_id, seq_no, term, _ver) in del_docs {
+                    if wm_seq.is_none_or(|w| seq_no > w) {
+                        let update = doc_winners
+                            .get(&doc_id)
+                            .is_none_or(|(s, t, _, _)| (seq_no, term) >= (*s, *t));
+                        if update {
+                            doc_winners.insert(doc_id, (seq_no, term, true, "hot".to_string()));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Filter hot-delta hits so already-published versions <= W are not double-counted
+        // even if a crash occurred after pointer commit before local delta retirement,
+        // while preserving hits from remote shards!
+        let raw_hot_hits_count: usize = shard_hit_lists.iter().map(Vec::len).sum();
+        let mut surviving_hot_hits = Vec::new();
+        for list in shard_hit_lists {
+            let mut filtered = Vec::new();
+            for hit in list {
+                let doc_id = hit.get("_id").and_then(|v| v.as_str()).unwrap_or("");
+                if !hot_overlap_excluded_ids.contains(doc_id)
+                    && doc_winners
+                        .get(doc_id)
+                        .is_none_or(|(_, _, is_ts, owner)| !*is_ts && owner == "hot")
+                {
+                    filtered.push(hit);
+                }
+            }
+            if !filtered.is_empty() {
+                surviving_hot_hits.push(filtered);
+            }
+        }
+
+        let raw_split_hits_count = remote_res.all_hits.len();
+        let mut surviving_split_hits = Vec::new();
+        for hit in remote_res.all_hits {
+            let doc_id = hit.get("_id").and_then(|v| v.as_str()).unwrap_or("");
+            let split_id = hit.get("_split").and_then(|v| v.as_str()).unwrap_or("");
+            let keep = match doc_winners.get(doc_id) {
+                Some((_, _, is_ts, owner)) => !*is_ts && owner == split_id,
+                None => true,
+            };
+            if keep {
+                surviving_split_hits.push(hit);
+            }
+        }
+        let surviving_hot_count: usize = surviving_hot_hits.iter().map(Vec::len).sum();
+        let suppressed_hot = raw_hot_hits_count.saturating_sub(surviving_hot_count);
+        let suppressed_split = raw_split_hits_count.saturating_sub(surviving_split_hits.len());
+        total_hits = total_hits
+            .saturating_add(remote_res.total_hits)
+            .saturating_sub(suppressed_hot.saturating_add(suppressed_split));
+        if !surviving_split_hits.is_empty() {
+            surviving_hot_hits.push(surviving_split_hits);
+        }
+        shard_hit_lists = surviving_hot_hits;
+        all_partial_aggs.extend(remote_res.partial_aggs);
+    }
+
     let mut all_hits = if is_hybrid {
         // Hybrid search: flatten shard lists, merge with kNN via RRF
         let text_hits: Vec<serde_json::Value> = shard_hit_lists.into_iter().flatten().collect();
@@ -1341,6 +1526,10 @@ pub(crate) async fn execute_distributed_dsl_search(
     } else {
         HashMap::new()
     };
+    crate::worker::record_current_stage_duration(
+        crate::worker::TraceStage::PartialMerge,
+        merge_started.elapsed(),
+    );
 
     Ok(DistributedDslSearchResult {
         all_hits,
@@ -1350,7 +1539,7 @@ pub(crate) async fn execute_distributed_dsl_search(
         shard_failures,
         aggregations: merged_aggs,
         partial_aggs: all_partial_aggs,
-        remote_store_stats: None,
+        remote_store_stats,
     })
 }
 
@@ -1540,13 +1729,46 @@ pub async fn get_document(
                     "_version": document.version
                 })),
             ),
-            None => (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "_index": index_name, "_index_uuid": read.index_uuid,
-                    "_id": doc_id, "found": false
-                })),
-            ),
+            None => {
+                if metadata.is_tiered() {
+                    let deleted_in_hot = state
+                        .shard_manager
+                        .get_shard(&index_name, shard_id)
+                        .and_then(|eng| {
+                            let wm_seq = eng.seal_watermark_state().ok()?.sealed_through_seq_no;
+                            let dels = eng.deleted_documents_with_versions().ok()?;
+                            Some(dels.into_iter().any(|(id, seq, _, _)| {
+                                id == doc_id && wm_seq.is_none_or(|w| seq > w)
+                            }))
+                        })
+                        .unwrap_or(false);
+                    if !deleted_in_hot
+                        && let Ok(Some(split_doc)) =
+                            crate::engine::remote_store::get_document_from_published_splits(
+                                &state, &metadata, shard_id, &doc_id,
+                            )
+                            .await
+                    {
+                        return (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "_index": index_name, "_index_uuid": read.index_uuid,
+                                "_id": doc_id, "_shard": shard_id, "found": true,
+                                "_source": split_doc.source, "_seq_no": split_doc.seq_no,
+                                "_primary_term": split_doc.primary_term,
+                                "_version": split_doc.version
+                            })),
+                        );
+                    }
+                }
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "_index": index_name, "_index_uuid": read.index_uuid,
+                        "_id": doc_id, "found": false
+                    })),
+                )
+            }
         },
         Err(error)
             if error
@@ -1738,11 +1960,16 @@ async fn execute_update_cancellable(
         if let Some(response) = cancelled_update(cancelled) {
             return response;
         }
-        let (_, shard_id, target_node) =
+        let (metadata, shard_id, target_node) =
             match resolve_document_primary(state, index_name, doc_id).await {
                 Ok(target) => target,
                 Err(response) => return response,
             };
+        if let Some(backpressure_resp) =
+            check_tiered_hot_delta_backpressure(state, index_name, &metadata, shard_id)
+        {
+            return backpressure_resp;
+        }
         let read = match state
             .transport_client
             .forward_get_with_index_uuid_to_shard(&target_node, index_name, shard_id, doc_id, true)
@@ -1796,7 +2023,30 @@ async fn execute_update_cancellable(
             Ok(operation) => operation,
             Err(response) => return response,
         };
-        let existing = read.document;
+        let mut existing = read.document;
+        if existing.is_none() && metadata.is_tiered() {
+            let deleted_in_hot = state
+                .shard_manager
+                .get_shard(index_name, shard_id)
+                .and_then(|eng| {
+                    let wm_seq = eng.seal_watermark_state().ok()?.sealed_through_seq_no;
+                    let dels = eng.deleted_documents_with_versions().ok()?;
+                    Some(
+                        dels.into_iter()
+                            .any(|(id, seq, _, _)| id == doc_id && wm_seq.is_none_or(|w| seq > w)),
+                    )
+                })
+                .unwrap_or(false);
+            if !deleted_in_hot
+                && let Ok(Some(split_doc)) =
+                    crate::engine::remote_store::get_document_from_published_splits(
+                        state, &metadata, shard_id, doc_id,
+                    )
+                    .await
+            {
+                existing = Some(split_doc);
+            }
+        }
         if let Err(error) = requested.check(
             doc_id,
             existing
@@ -2116,6 +2366,7 @@ pub async fn get_index_settings(
                         "number_of_replicas": metadata.number_of_replicas,
                         "minimum_durable_copies": metadata.settings.minimum_durable_copies,
                         "engine": metadata.settings.engine.to_string(),
+                        "lifecycle_mode": metadata.lifecycle_mode().as_str(),
                         "refresh_interval_ms": metadata.settings.refresh_interval_ms,
                         "flush_threshold_bytes": metadata.settings.flush_threshold_bytes,
                         "dynamic": metadata.dynamic.to_string(),
@@ -2363,6 +2614,35 @@ pub async fn run_remote_store_janitor(
         );
     };
     match crate::engine::remote_store::run_janitor(
+        &state,
+        index_name.as_str(),
+        &metadata,
+        body.map(|Json(v)| v),
+    )
+    .await
+    {
+        Ok(response) => (StatusCode::OK, Json(response)),
+        Err(err_resp) => err_resp,
+    }
+}
+
+/// POST /{index}/_remote_store/seal or POST /{index}/_seal — Seal eligible
+/// hot-delta sequence ranges into immutable splits and advance the committed
+/// publication visibility watermark (`FS-034`, `FS-035`, `FS-036`).
+pub async fn seal_remote_store_delta(
+    State(state): State<AppState>,
+    Path(index_name): Path<crate::common::IndexName>,
+    body: Option<Json<Value>>,
+) -> (StatusCode, Json<Value>) {
+    let cluster_state = state.cluster_manager.get_state();
+    let Some(metadata) = cluster_state.indices.get(index_name.as_str()).cloned() else {
+        return crate::api::error_response(
+            StatusCode::NOT_FOUND,
+            "index_not_found_exception",
+            format!("no such index [{}]", index_name.as_str()),
+        );
+    };
+    match crate::engine::remote_store::seal_hot_delta(
         &state,
         index_name.as_str(),
         &metadata,

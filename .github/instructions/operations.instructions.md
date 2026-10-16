@@ -80,11 +80,13 @@ or provide global/tenant resource accounting.
   on Tokio's blocking pool, not the fixed foreground write/search pools.
 
 The current search/write pools isolate CPU threads, and `WorkerPools` pairs
-them with `RequestCancellationContext`, `RequestDeadline`, bounded per-class
-`AdmissionController` queues (`Search`, `Sql`, `Write`, `Hydration`,
-`Recovery`, `Maintenance`), and `ResourceGovernor` byte reservations (`Memory`,
-`TempDisk`, `PersistentCache`, `ObjectStoreInflight`). Tenant quotas and
-background I/O prioritization (FS-032, FS-049) remain future work.
+them with `RequestCancellationContext`, `RequestDeadline`, `RequestTraceIds`,
+`StageTimingLedger`, `StableErrorClass` (`Retryable`, `Terminal`, `Corruption`,
+`Overload`, FS-033), bounded per-class `AdmissionController` queues (`Search`,
+`Sql`, `Write`, `Hydration`, `Recovery`, `Maintenance`) with foreground-pressure
+throttling and starvation-free aging promotion (FS-032), and `ResourceGovernor`
+byte reservations (`Memory`, `TempDisk`, `PersistentCache`,
+`ObjectStoreInflight`). Tenant quotas (FS-049) remain future work.
 
 ## Tasks And Maintenance
 

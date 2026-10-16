@@ -425,6 +425,166 @@ impl std::fmt::Display for IndexEngine {
     }
 }
 
+/// Explicit index lifecycle mode (ADR 0004 section 3.3, `FS-034`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexLifecycleMode {
+    MutableOnly,
+    ImmutableOnly,
+    Tiered,
+}
+
+impl IndexLifecycleMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MutableOnly => "mutable_only",
+            Self::ImmutableOnly => "immutable_only",
+            Self::Tiered => "tiered",
+        }
+    }
+
+    pub fn parse_name(name: &str) -> Result<Self, String> {
+        match name.trim() {
+            "mutable_only" => Ok(Self::MutableOnly),
+            "immutable_only" => Ok(Self::ImmutableOnly),
+            "tiered" => Ok(Self::Tiered),
+            other => Err(format!(
+                "unknown lifecycle_mode [{other}]; supported values are [mutable_only, immutable_only, tiered]"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for IndexLifecycleMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+pub const DEFAULT_HOT_DELTA_MIN_SEAL_DOCS: usize = 100;
+pub const DEFAULT_HOT_DELTA_MAX_SEAL_DOCS: usize = 10_000;
+pub const DEFAULT_HOT_DELTA_MIN_SEAL_BYTES: u64 = 64 * 1024;
+pub const DEFAULT_HOT_DELTA_MAX_SEAL_BYTES: u64 = 64 * 1024 * 1024;
+pub const DEFAULT_HOT_DELTA_MAX_SEAL_AGE_MS: u64 = 30_000;
+pub const DEFAULT_HOT_DELTA_MAX_UNSEALED_BYTES: u64 = 512 * 1024 * 1024;
+pub const DEFAULT_HOT_DELTA_MAX_UNSEALED_OPS: u64 = 100_000;
+
+/// Hot-delta and automatic bounded split sealing policy (`FS-034`, `FS-035`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HotDeltaSealPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_seal_docs: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_seal_docs: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_seal_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_seal_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_seal_age_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_unsealed_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_unsealed_ops: Option<u64>,
+}
+
+impl Default for HotDeltaSealPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_seal_docs: None,
+            max_seal_docs: None,
+            min_seal_bytes: None,
+            max_seal_bytes: None,
+            max_seal_age_ms: None,
+            max_unsealed_bytes: None,
+            max_unsealed_ops: None,
+        }
+    }
+}
+
+impl HotDeltaSealPolicy {
+    pub fn effective_min_seal_docs(&self) -> usize {
+        self.min_seal_docs
+            .unwrap_or(DEFAULT_HOT_DELTA_MIN_SEAL_DOCS)
+            .max(1)
+    }
+
+    pub fn effective_max_seal_docs(&self) -> usize {
+        self.max_seal_docs
+            .unwrap_or(DEFAULT_HOT_DELTA_MAX_SEAL_DOCS)
+            .max(self.effective_min_seal_docs())
+    }
+
+    pub fn effective_min_seal_bytes(&self) -> u64 {
+        self.min_seal_bytes
+            .unwrap_or(DEFAULT_HOT_DELTA_MIN_SEAL_BYTES)
+            .max(1)
+    }
+
+    pub fn effective_max_seal_bytes(&self) -> u64 {
+        self.max_seal_bytes
+            .unwrap_or(DEFAULT_HOT_DELTA_MAX_SEAL_BYTES)
+            .max(self.effective_min_seal_bytes())
+    }
+
+    pub fn effective_max_seal_age_ms(&self) -> u64 {
+        self.max_seal_age_ms
+            .unwrap_or(DEFAULT_HOT_DELTA_MAX_SEAL_AGE_MS)
+    }
+
+    pub fn effective_max_unsealed_bytes(&self) -> u64 {
+        self.max_unsealed_bytes
+            .unwrap_or(DEFAULT_HOT_DELTA_MAX_UNSEALED_BYTES)
+            .max(1)
+    }
+
+    pub fn effective_max_unsealed_ops(&self) -> u64 {
+        self.max_unsealed_ops
+            .unwrap_or(DEFAULT_HOT_DELTA_MAX_UNSEALED_OPS)
+            .max(1)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(0) = self.min_seal_docs {
+            return Err("hot_delta.min_seal_docs must be greater than zero".into());
+        }
+        if let Some(0) = self.max_seal_docs {
+            return Err("hot_delta.max_seal_docs must be greater than zero".into());
+        }
+        if let (Some(min_d), Some(max_d)) = (self.min_seal_docs, self.max_seal_docs)
+            && min_d > max_d
+        {
+            return Err(format!(
+                "hot_delta.min_seal_docs ({min_d}) cannot exceed hot_delta.max_seal_docs ({max_d})"
+            ));
+        }
+        if let Some(0) = self.min_seal_bytes {
+            return Err("hot_delta.min_seal_bytes must be greater than zero".into());
+        }
+        if let Some(0) = self.max_seal_bytes {
+            return Err("hot_delta.max_seal_bytes must be greater than zero".into());
+        }
+        if let (Some(min_b), Some(max_b)) = (self.min_seal_bytes, self.max_seal_bytes)
+            && min_b > max_b
+        {
+            return Err(format!(
+                "hot_delta.min_seal_bytes ({min_b}) cannot exceed hot_delta.max_seal_bytes ({max_b})"
+            ));
+        }
+        if let Some(0) = self.max_unsealed_bytes {
+            return Err("hot_delta.max_unsealed_bytes must be greater than zero".into());
+        }
+        if let Some(0) = self.max_unsealed_ops {
+            return Err("hot_delta.max_unsealed_ops must be greater than zero".into());
+        }
+        Ok(())
+    }
+}
+
 /// Engine-specific metadata and cache settings for `remote_store`.
 ///
 /// These values do not alter `local_shards`. The current remote read path uses
@@ -453,6 +613,9 @@ pub struct RemoteStoreSettings {
     /// Disk budget reserved for hydrated split bundles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub split_cache_bytes: Option<u64>,
+    /// Optional mutable hot-delta and bounded split-sealing policy (`FS-034`, `FS-035`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hot_delta: Option<HotDeltaSealPolicy>,
 }
 
 impl RemoteStoreSettings {
@@ -464,20 +627,62 @@ impl RemoteStoreSettings {
             && self.manifest_refresh_ms.is_none()
             && self.hotcache_bytes.is_none()
             && self.split_cache_bytes.is_none()
+            && self.hot_delta.is_none()
+    }
+
+    pub fn has_enabled_hot_delta(&self) -> bool {
+        self.hot_delta.as_ref().is_some_and(|hd| hd.enabled)
     }
 
     fn from_create_request_body(
         body: &serde_json::Value,
     ) -> Result<Option<Self>, CreateIndexMetadataError> {
-        let Some(value) = body.pointer("/settings/remote_store") else {
-            return Ok(None);
+        let mut parsed = if let Some(value) = body.pointer("/settings/remote_store") {
+            serde_json::from_value::<Self>(value.clone()).map_err(|error| {
+                CreateIndexMetadataError::InvalidArgument(format!(
+                    "invalid remote_store settings: {error}"
+                ))
+            })?
+        } else {
+            Self::default()
         };
 
-        let parsed: Self = serde_json::from_value(value.clone()).map_err(|error| {
-            CreateIndexMetadataError::InvalidArgument(format!(
-                "invalid remote_store settings: {error}"
-            ))
-        })?;
+        if let Some(hot_delta_val) = body
+            .pointer("/settings/hot_delta")
+            .or_else(|| body.get("hot_delta"))
+        {
+            let mut hd: HotDeltaSealPolicy = serde_json::from_value(hot_delta_val.clone())
+                .map_err(|error| {
+                    CreateIndexMetadataError::InvalidArgument(format!(
+                        "invalid hot_delta settings: {error}"
+                    ))
+                })?;
+            if hot_delta_val.get("enabled").is_none() {
+                hd.enabled = true;
+            }
+            parsed.hot_delta = Some(hd);
+        }
+
+        if let Some(mode_val) = body
+            .pointer("/settings/lifecycle_mode")
+            .or_else(|| body.get("lifecycle_mode"))
+        {
+            let Some(mode_str) = mode_val.as_str() else {
+                return Err(CreateIndexMetadataError::InvalidArgument(
+                    "lifecycle_mode must be a string".into(),
+                ));
+            };
+            let mode = IndexLifecycleMode::parse_name(mode_str)
+                .map_err(CreateIndexMetadataError::InvalidArgument)?;
+            if mode == IndexLifecycleMode::Tiered && parsed.hot_delta.is_none() {
+                parsed.hot_delta = Some(HotDeltaSealPolicy::default());
+            }
+        }
+
+        if let Some(ref hd) = parsed.hot_delta {
+            hd.validate()
+                .map_err(CreateIndexMetadataError::InvalidArgument)?;
+        }
 
         if parsed.is_empty() {
             Ok(None)
@@ -911,6 +1116,49 @@ pub struct IndexMetadata {
 }
 
 impl IndexMetadata {
+    pub fn uses_local_shards(&self) -> bool {
+        self.settings.engine.uses_local_shards() || self.number_of_shards > 0
+    }
+
+    pub fn supports_writes(&self) -> bool {
+        self.settings.engine.supports_writes() || self.number_of_shards > 0
+    }
+
+    pub fn uses_remote_store(&self) -> bool {
+        matches!(self.settings.engine, IndexEngine::RemoteStore)
+            || self
+                .settings
+                .remote_store
+                .as_ref()
+                .is_some_and(RemoteStoreSettings::has_enabled_hot_delta)
+    }
+
+    pub fn is_tiered(&self) -> bool {
+        self.number_of_shards > 0 && self.uses_remote_store()
+    }
+
+    pub fn lifecycle_mode(&self) -> IndexLifecycleMode {
+        if self.is_tiered() {
+            IndexLifecycleMode::Tiered
+        } else if self.uses_local_shards() {
+            IndexLifecycleMode::MutableOnly
+        } else {
+            IndexLifecycleMode::ImmutableOnly
+        }
+    }
+
+    pub fn effective_hot_delta_seal_policy(&self) -> Option<HotDeltaSealPolicy> {
+        if let Some(policy) = self
+            .settings
+            .remote_store
+            .as_ref()
+            .and_then(|rs| rs.hot_delta.clone())
+        {
+            return policy.enabled.then_some(policy);
+        }
+        self.is_tiered().then(HotDeltaSealPolicy::default)
+    }
+
     pub fn validate_write_policy(&self) -> Result<(), String> {
         let minimum = self.settings.minimum_durable_copies;
         let capacity = u64::from(self.number_of_replicas) + 1;
@@ -919,7 +1167,7 @@ impl IndexMetadata {
                 "minimum_durable_copies must be between 1 and configured primary-plus-replica capacity {capacity}; got {minimum}",
             ));
         }
-        if !self.settings.engine.uses_local_shards() {
+        if !self.uses_local_shards() {
             if minimum != 1 {
                 return Err("minimum_durable_copies applies only to local_shards indices".into());
             }
@@ -932,6 +1180,14 @@ impl IndexMetadata {
                 return Err("replica_policy applies only to local_shards indices".into());
             }
             return Ok(());
+        }
+        if let Some(hd) = self
+            .settings
+            .remote_store
+            .as_ref()
+            .and_then(|rs| rs.hot_delta.as_ref())
+        {
+            hd.validate()?;
         }
         if let Some(policy) = &self.settings.replica_policy {
             if policy.max_lag_ops == Some(0) {
@@ -999,7 +1255,7 @@ impl IndexMetadata {
             }
         }
         if let Some(value) = body.pointer("/index/minimum_durable_copies") {
-            if !self.settings.engine.uses_local_shards() {
+            if !self.uses_local_shards() {
                 return Err("minimum_durable_copies applies only to local_shards indices".into());
             }
             updated.settings.minimum_durable_copies =
@@ -1019,10 +1275,24 @@ impl IndexMetadata {
                 updated.settings.flush_threshold_bytes = Some(value);
             }
         }
+        if let Some(hd_val) = body
+            .pointer("/index/hot_delta")
+            .or_else(|| body.pointer("/index/remote_store/hot_delta"))
+        {
+            let mut hd: HotDeltaSealPolicy = serde_json::from_value(hd_val.clone())
+                .map_err(|e| format!("invalid hot_delta settings: {e}"))?;
+            if hd_val.get("enabled").is_none() {
+                hd.enabled = true;
+            }
+            hd.validate()?;
+            let mut rs = updated.settings.remote_store.clone().unwrap_or_default();
+            rs.hot_delta = Some(hd);
+            updated.settings.remote_store = (!rs.is_empty()).then_some(rs);
+        }
         if let Some(index_scope) = body.get("index") {
             let mut policy = updated.settings.replica_policy.clone().unwrap_or_default();
             if apply_replica_policy_fields(&mut policy, index_scope, "index")? {
-                if !self.settings.engine.uses_local_shards() && !policy.is_empty() {
+                if !self.uses_local_shards() && !policy.is_empty() {
                     return Err("replica_policy applies only to local_shards indices".into());
                 }
                 updated.settings.replica_policy = (!policy.is_empty()).then_some(policy);
@@ -1045,9 +1315,16 @@ impl IndexMetadata {
         body: &serde_json::Value,
         data_nodes: &[String],
     ) -> Result<Self, CreateIndexMetadataError> {
-        let engine = IndexEngine::from_create_request_body(body)?;
+        let mut engine = IndexEngine::from_create_request_body(body)?;
+        let remote_store_settings = RemoteStoreSettings::from_create_request_body(body)?;
+        let hot_delta_enabled = remote_store_settings
+            .as_ref()
+            .is_some_and(RemoteStoreSettings::has_enabled_hot_delta);
+        if hot_delta_enabled {
+            engine = IndexEngine::RemoteStore;
+        }
         let remote_store_settings = if matches!(engine, IndexEngine::RemoteStore) {
-            RemoteStoreSettings::from_create_request_body(body)?
+            remote_store_settings
         } else {
             None
         };
@@ -1059,7 +1336,8 @@ impl IndexMetadata {
             .pointer("/settings/flush_threshold_bytes")
             .and_then(|v| v.as_u64());
 
-        let mut metadata = if engine.uses_local_shards() {
+        let allocate_shards = engine.uses_local_shards() || hot_delta_enabled;
+        let mut metadata = if allocate_shards {
             if data_nodes.is_empty() {
                 return Err(CreateIndexMetadataError::NoDataNodes);
             }
@@ -1068,12 +1346,17 @@ impl IndexMetadata {
                 .pointer("/settings/number_of_shards")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(1) as u32;
+            let default_replicas = if hot_delta_enabled && data_nodes.len() == 1 {
+                0
+            } else {
+                1
+            };
             let num_replicas = body
                 .pointer("/settings/number_of_replicas")
                 .map(|value| parse_u32_setting(value, "settings.number_of_replicas"))
                 .transpose()
                 .map_err(CreateIndexMetadataError::InvalidArgument)?
-                .unwrap_or(1);
+                .unwrap_or(default_replicas);
 
             Self::build_shard_routing(index_name, num_shards, num_replicas, data_nodes)
         } else {
@@ -1094,7 +1377,7 @@ impl IndexMetadata {
         metadata.settings.flush_threshold_bytes = flush_threshold_bytes;
         metadata.settings.remote_store = remote_store_settings;
         if let Some(value) = body.pointer("/settings/minimum_durable_copies") {
-            if !metadata.settings.engine.uses_local_shards() {
+            if !metadata.uses_local_shards() {
                 return Err(CreateIndexMetadataError::InvalidArgument(
                     "minimum_durable_copies applies only to local_shards indices".into(),
                 ));
@@ -1108,7 +1391,7 @@ impl IndexMetadata {
             if apply_replica_policy_fields(&mut policy, settings_scope, "settings")
                 .map_err(CreateIndexMetadataError::InvalidArgument)?
             {
-                if !metadata.settings.engine.uses_local_shards() && !policy.is_empty() {
+                if !metadata.uses_local_shards() && !policy.is_empty() {
                     return Err(CreateIndexMetadataError::InvalidArgument(
                         "replica_policy applies only to local_shards indices".into(),
                     ));
@@ -3052,6 +3335,7 @@ mod tests {
                 manifest_refresh_ms: Some(1500),
                 hotcache_bytes: Some(8 * 1024 * 1024),
                 split_cache_bytes: Some(256 * 1024 * 1024),
+                hot_delta: None,
             }),
             ..Default::default()
         };

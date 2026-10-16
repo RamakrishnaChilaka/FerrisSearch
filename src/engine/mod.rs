@@ -520,6 +520,193 @@ pub type ProtocolTraceCopyEvidence = (
     Vec<crate::protocol_trace::TraceWalEntry>,
 );
 
+pub const SEAL_WATERMARK_FILE: &str = "seal.watermark.json";
+pub const SEAL_WATERMARK_FORMAT_VERSION: u32 = 1;
+
+/// Durable in-flight seal barrier persisted in `seal.watermark.json` (`FS-035`, `FS-036`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActiveSealBarrier {
+    pub seal_id: String,
+    pub operation_id: String,
+    pub start_seq_no: u64,
+    pub through_seq_no: u64,
+    pub primary_term: u64,
+    pub live_doc_count: u64,
+    pub tombstone_count: u64,
+    pub estimated_bytes: u64,
+    pub created_at_epoch_ms: u64,
+}
+
+/// Sealed document version entry retained across hot-delta retirement so OCC,
+/// `_update`, `DELETE`, and version numbers remain accurate (`FS-034`, `FS-036`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SealedDocVersionEntry {
+    pub seq_no: u64,
+    pub primary_term: u64,
+    pub version: u64,
+    pub deleted: bool,
+}
+
+/// Durable shard-local seal and visibility watermark state (`FS-034`, `FS-035`, `FS-036`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SealWatermarkState {
+    pub format_version: u32,
+    pub sealed_through_seq_no: Option<u64>,
+    pub retired_through_seq_no: Option<u64>,
+    pub last_sealed_primary_term: Option<u64>,
+    pub last_sealed_generation: Option<u64>,
+    pub last_seal_timestamp_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_seal: Option<ActiveSealBarrier>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub sealed_doc_versions: std::collections::BTreeMap<String, SealedDocVersionEntry>,
+}
+
+impl Default for SealWatermarkState {
+    fn default() -> Self {
+        Self {
+            format_version: SEAL_WATERMARK_FORMAT_VERSION,
+            sealed_through_seq_no: None,
+            retired_through_seq_no: None,
+            last_sealed_primary_term: None,
+            last_sealed_generation: None,
+            last_seal_timestamp_ms: 0,
+            active_seal: None,
+            sealed_doc_versions: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+impl SealWatermarkState {
+    pub fn validate(&self) -> Result<()> {
+        if self.format_version != SEAL_WATERMARK_FORMAT_VERSION {
+            return Err(crate::common::unsupported_index_format(
+                "shard seal watermark",
+                format!(
+                    "format_version {} is not supported; expected {}",
+                    self.format_version, SEAL_WATERMARK_FORMAT_VERSION
+                ),
+            ));
+        }
+        if let (Some(retired), Some(sealed)) =
+            (self.retired_through_seq_no, self.sealed_through_seq_no)
+            && retired > sealed
+        {
+            anyhow::bail!(
+                "invalid seal watermark state: retired_through_seq_no ({retired}) > sealed_through_seq_no ({sealed})"
+            );
+        }
+        if self.retired_through_seq_no.is_some() && self.sealed_through_seq_no.is_none() {
+            anyhow::bail!(
+                "invalid seal watermark state: retired_through_seq_no is set while sealed_through_seq_no is None"
+            );
+        }
+        if let Some(ref active) = self.active_seal {
+            if active.through_seq_no < active.start_seq_no || active.primary_term == 0 {
+                anyhow::bail!(
+                    "invalid active seal barrier: start_seq_no={} through_seq_no={} primary_term={}",
+                    active.start_seq_no,
+                    active.through_seq_no,
+                    active.primary_term
+                );
+            }
+            if active.operation_id.is_empty() || active.seal_id.is_empty() {
+                anyhow::bail!("invalid active seal barrier: empty seal_id or operation_id");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Coalesced logical document state within a contiguous hot-delta seal range (`FS-034`, `FS-035`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum SealedDocumentRecord {
+    Live {
+        doc_id: String,
+        source: serde_json::Value,
+        seq_no: u64,
+        primary_term: u64,
+        version: u64,
+    },
+    Tombstone {
+        doc_id: String,
+        seq_no: u64,
+        primary_term: u64,
+        version: u64,
+    },
+}
+
+impl SealedDocumentRecord {
+    pub fn doc_id(&self) -> &str {
+        match self {
+            Self::Live { doc_id, .. } | Self::Tombstone { doc_id, .. } => doc_id,
+        }
+    }
+
+    pub fn seq_no(&self) -> u64 {
+        match self {
+            Self::Live { seq_no, .. } | Self::Tombstone { seq_no, .. } => *seq_no,
+        }
+    }
+
+    pub fn primary_term(&self) -> u64 {
+        match self {
+            Self::Live { primary_term, .. } | Self::Tombstone { primary_term, .. } => *primary_term,
+        }
+    }
+
+    pub fn version(&self) -> u64 {
+        match self {
+            Self::Live { version, .. } | Self::Tombstone { version, .. } => *version,
+        }
+    }
+}
+
+/// Contiguous, gap-free hot-delta batch selected for immutable split sealing (`FS-034`, `FS-035`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SealBatchCandidate {
+    pub start_seq_no: u64,
+    pub through_seq_no: u64,
+    pub primary_term: u64,
+    pub operation_count: usize,
+    pub estimated_bytes: u64,
+    pub records: Vec<SealedDocumentRecord>,
+}
+
+impl SealBatchCandidate {
+    pub fn live_doc_count(&self) -> u64 {
+        self.records
+            .iter()
+            .filter(|r| matches!(r, SealedDocumentRecord::Live { .. }))
+            .count() as u64
+    }
+
+    pub fn tombstone_count(&self) -> u64 {
+        self.records
+            .iter()
+            .filter(|r| matches!(r, SealedDocumentRecord::Tombstone { .. }))
+            .count() as u64
+    }
+}
+
+/// Snapshot of unsealed hot-delta backlog and seal watermarks on a shard (`FS-034`, `FS-035`, `FS-036`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsealedDeltaStats {
+    pub sealed_through_seq_no: Option<u64>,
+    pub retired_through_seq_no: Option<u64>,
+    pub persisted_checkpoint: Option<u64>,
+    pub unsealed_ops: u64,
+    pub unsealed_bytes: u64,
+    pub oldest_unsealed_age_ms: u64,
+    pub active_seal: Option<ActiveSealBarrier>,
+}
+
+pub type LiveDocumentVersionTuple = (String, serde_json::Value, u64, u64, u64);
+pub type DeletedDocumentVersionTuple = (String, u64, u64, u64);
+
 /// Trait abstracting a search engine backend.
 /// Each shard/split is backed by one `SearchEngine` implementation.
 /// Implementations handle both text and vector indexing/search.
@@ -889,6 +1076,51 @@ pub trait SearchEngine: Send + Sync {
 
     fn current_primary_term(&self) -> u64 {
         1
+    }
+
+    fn seal_watermark_state(&self) -> Result<SealWatermarkState> {
+        Ok(SealWatermarkState::default())
+    }
+
+    fn record_active_seal_barrier(&self, _barrier: Option<ActiveSealBarrier>) -> Result<()> {
+        anyhow::bail!("seal barriers are not supported by this engine")
+    }
+
+    fn enumerate_seal_boundary(
+        &self,
+        _after_seq_no: Option<u64>,
+        _max_docs: usize,
+        _max_bytes: u64,
+    ) -> Result<Option<SealBatchCandidate>> {
+        Ok(None)
+    }
+
+    fn retire_sealed_delta_through(
+        &self,
+        _committed_watermark_seq_no: u64,
+        _manifest_generation: u64,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
+    fn unsealed_delta_stats(&self) -> Result<UnsealedDeltaStats> {
+        Ok(UnsealedDeltaStats {
+            sealed_through_seq_no: None,
+            retired_through_seq_no: None,
+            persisted_checkpoint: None,
+            unsealed_ops: 0,
+            unsealed_bytes: 0,
+            oldest_unsealed_age_ms: 0,
+            active_seal: None,
+        })
+    }
+
+    fn live_documents_with_versions(&self) -> Result<Vec<LiveDocumentVersionTuple>> {
+        Ok(Vec::new())
+    }
+
+    fn deleted_documents_with_versions(&self) -> Result<Vec<DeletedDocumentVersionTuple>> {
+        Ok(Vec::new())
     }
 
     /// Get the monotonic minimum persisted checkpoint across authoritative copies.

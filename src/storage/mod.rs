@@ -65,6 +65,7 @@ pub use publication::{
     PublicationIntentRecord, PublicationPhase, PublicationPreparedRecord, PublicationResolution,
     REMOTE_MANIFEST_FORMAT_CAPABILITY, REMOTE_MANIFEST_POINTER_FORMAT_CAPABILITY,
     SPLIT_BUNDLE_FORMAT_CAPABILITY, SPLIT_BUNDLE_FORMAT_VERSION, SequencerCommitRequest,
+    ShardPublishedWatermark, SplitDocVersionRecord, SplitSealRangeMetadata, SplitTombstoneRecord,
     compute_publication_request_fingerprint, deterministic_publication_doc_id,
     deterministic_publication_split_id, is_canonical_manifest_path, is_canonical_split_bundle_path,
     manifest_operation_key, publication_attempt_key, publication_committed_key,
@@ -706,6 +707,8 @@ impl StorageManager {
         }
 
         let current_ctx = crate::worker::current_request_context();
+        let _hydration_timer =
+            crate::worker::start_current_stage_timer(crate::worker::TraceStage::Hydration);
         let _hydration_lease = self
             .admission
             .acquire(crate::worker::WorkClass::Hydration, current_ctx.as_ref())
@@ -977,6 +980,14 @@ impl StorageManager {
             if next_len > inflight_reservation.reserved_bytes() {
                 inflight_reservation.reconcile(next_len)?;
             }
+            let current_ctx = crate::worker::current_request_context();
+            self.admission
+                .account_io_bytes(
+                    crate::worker::WorkClass::Hydration,
+                    chunk.len() as u64,
+                    current_ctx.as_ref(),
+                )
+                .await?;
             hasher.update(&chunk);
             buf.extend_from_slice(&chunk);
         }
@@ -1014,6 +1025,8 @@ impl StorageManager {
     }
 
     pub async fn put(&self, location: &ObjectPath, payload: impl Into<PutPayload>) -> Result<()> {
+        let _storage_timer =
+            crate::worker::start_current_stage_timer(crate::worker::TraceStage::Storage);
         let payload = payload.into();
         let content_length = payload.content_length();
         match self.object_store().put(location, payload).await {
@@ -1030,6 +1043,8 @@ impl StorageManager {
     }
 
     async fn get_object(&self, location: &ObjectPath) -> object_store::Result<GetResult> {
+        let _storage_timer =
+            crate::worker::start_current_stage_timer(crate::worker::TraceStage::Storage);
         match self.object_store().get(location).await {
             Ok(result) => Ok(result),
             Err(error @ object_store::Error::NotFound { .. }) => {
@@ -1407,6 +1422,7 @@ impl StorageManager {
             writer_epoch,
             mut splits,
             existing_settings,
+            mut published_watermarks,
             expected_pointer,
         ) = match current {
             Some((Some(existing), pointer, token)) => {
@@ -1424,6 +1440,7 @@ impl StorageManager {
                     pointer.writer_epoch.max(existing.writer_epoch).max(1),
                     existing.splits,
                     existing.settings,
+                    existing.published_watermarks,
                     Some((pointer, token)),
                 )
             }
@@ -1434,9 +1451,10 @@ impl StorageManager {
                 pointer.writer_epoch.max(1),
                 Vec::new(),
                 None,
+                BTreeMap::new(),
                 Some((pointer, token)),
             ),
-            None => (1, 0, None, 1, Vec::new(), None, None),
+            None => (1, 0, None, 1, Vec::new(), None, BTreeMap::new(), None),
         };
 
         // Reject duplicate split_id within the same manifest — `published_splits`
@@ -1460,6 +1478,15 @@ impl StorageManager {
             .tags
             .entry("operation_id".into())
             .or_insert_with(|| operation_id.clone());
+        if let Some(range) = new_split.seal_range()? {
+            publication::advance_shard_watermark(
+                &mut published_watermarks,
+                &range,
+                &new_split.split_id,
+                &operation_id,
+                generation,
+            )?;
+        }
         splits.push(new_split);
 
         let manifest = RemoteStoreManifest {
@@ -1477,6 +1504,7 @@ impl StorageManager {
             request_fingerprint,
             published_at: chrono::Utc::now().to_rfc3339(),
             settings: settings.cloned().or(existing_settings),
+            published_watermarks,
             splits,
         };
 
@@ -2115,6 +2143,9 @@ pub struct RemoteStoreManifest {
     pub published_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<crate::cluster::state::RemoteStoreSettings>,
+    /// Contiguous per-shard hot-delta publication visibility watermarks (`FS-036`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub published_watermarks: BTreeMap<u32, ShardPublishedWatermark>,
     #[serde(default)]
     pub splits: Vec<RemoteSplitManifest>,
 }
@@ -2198,6 +2229,31 @@ impl RemoteStoreManifest {
                     split.split_id,
                     self.generation,
                     self.index_uuid
+                );
+            }
+            let _ = split.seal_range()?;
+        }
+        for (shard_id, wm) in &self.published_watermarks {
+            if *shard_id != wm.shard_id {
+                anyhow::bail!(
+                    "manifest generation {} for index '{}' has mismatched published_watermarks key {} != shard_id {}",
+                    self.generation,
+                    self.index_uuid,
+                    shard_id,
+                    wm.shard_id
+                );
+            }
+            if wm.primary_term == 0
+                || wm.updated_at_generation == 0
+                || wm.updated_at_generation > self.generation
+                || wm.last_split_id.is_empty()
+                || wm.last_operation_id.is_empty()
+            {
+                anyhow::bail!(
+                    "manifest generation {} for index '{}' has invalid published watermark for shard {}",
+                    self.generation,
+                    self.index_uuid,
+                    shard_id
                 );
             }
         }
@@ -2305,6 +2361,108 @@ pub struct RemoteSplitManifest {
     pub field_terms: BTreeMap<String, SplitFieldTerms>,
 }
 
+impl RemoteSplitManifest {
+    pub fn set_seal_range(&mut self, range: &SplitSealRangeMetadata) {
+        self.tags
+            .insert("seal_shard_id".into(), range.shard_id.to_string());
+        self.tags
+            .insert("seal_start_seq_no".into(), range.start_seq_no.to_string());
+        self.tags
+            .insert("seal_end_seq_no".into(), range.end_seq_no.to_string());
+        self.tags
+            .insert("seal_primary_term".into(), range.primary_term.to_string());
+        if !range.doc_versions.is_empty() {
+            let versions_json =
+                serde_json::to_string(&range.doc_versions).expect("doc_versions must serialize");
+            self.tags
+                .insert("seal_doc_versions_json".into(), versions_json);
+        } else {
+            self.tags.remove("seal_doc_versions_json");
+        }
+        if !range.tombstones.is_empty() {
+            let tombstones_json =
+                serde_json::to_string(&range.tombstones).expect("tombstones must serialize");
+            self.tags
+                .insert("seal_tombstones_json".into(), tombstones_json);
+        } else {
+            self.tags.remove("seal_tombstones_json");
+        }
+    }
+
+    pub fn seal_range(&self) -> Result<Option<SplitSealRangeMetadata>> {
+        let shard_raw = self.tags.get("seal_shard_id");
+        let start_raw = self.tags.get("seal_start_seq_no");
+        let end_raw = self.tags.get("seal_end_seq_no");
+        let term_raw = self.tags.get("seal_primary_term");
+        if shard_raw.is_none() && start_raw.is_none() && end_raw.is_none() && term_raw.is_none() {
+            return Ok(None);
+        }
+        let (Some(shard_raw), Some(start_raw), Some(end_raw), Some(term_raw)) =
+            (shard_raw, start_raw, end_raw, term_raw)
+        else {
+            anyhow::bail!(
+                "split '{}' has incomplete seal range metadata tags",
+                self.split_id
+            );
+        };
+        let shard_id = shard_raw.parse::<u32>().with_context(|| {
+            format!(
+                "split '{}' has invalid seal_shard_id '{shard_raw}'",
+                self.split_id
+            )
+        })?;
+        let start_seq_no = start_raw.parse::<u64>().with_context(|| {
+            format!(
+                "split '{}' has invalid seal_start_seq_no '{start_raw}'",
+                self.split_id
+            )
+        })?;
+        let end_seq_no = end_raw.parse::<u64>().with_context(|| {
+            format!(
+                "split '{}' has invalid seal_end_seq_no '{end_raw}'",
+                self.split_id
+            )
+        })?;
+        let primary_term = term_raw.parse::<u64>().with_context(|| {
+            format!(
+                "split '{}' has invalid seal_primary_term '{term_raw}'",
+                self.split_id
+            )
+        })?;
+        if end_seq_no < start_seq_no || primary_term == 0 {
+            anyhow::bail!(
+                "split '{}' has invalid seal range ({start_seq_no}..={end_seq_no}, primary_term={primary_term})",
+                self.split_id
+            );
+        }
+        let doc_versions = match self.tags.get("seal_doc_versions_json") {
+            Some(raw) if !raw.is_empty() => serde_json::from_str::<Vec<SplitDocVersionRecord>>(raw)
+                .with_context(|| {
+                    format!(
+                        "split '{}' has invalid seal_doc_versions_json",
+                        self.split_id
+                    )
+                })?,
+            _ => Vec::new(),
+        };
+        let tombstones = match self.tags.get("seal_tombstones_json") {
+            Some(raw) if !raw.is_empty() => serde_json::from_str::<Vec<SplitTombstoneRecord>>(raw)
+                .with_context(|| {
+                    format!("split '{}' has invalid seal_tombstones_json", self.split_id)
+                })?,
+            _ => Vec::new(),
+        };
+        Ok(Some(SplitSealRangeMetadata {
+            shard_id,
+            start_seq_no,
+            end_seq_no,
+            primary_term,
+            doc_versions,
+            tombstones,
+        }))
+    }
+}
+
 /// Optional timestamp range summary used for split pruning.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SplitTimeRange {
@@ -2378,7 +2536,9 @@ mod tests {
                 manifest_refresh_ms: Some(1000),
                 hotcache_bytes: Some(4096),
                 split_cache_bytes: Some(8192),
+                hot_delta: None,
             }),
+            published_watermarks: BTreeMap::new(),
             splits: vec![
                 RemoteSplitManifest {
                     split_id: "split-a".into(),
@@ -2559,6 +2719,7 @@ mod tests {
             request_fingerprint: format!("sha256:{}", "1".repeat(64)),
             published_at: "2026-04-16T00:00:00Z".into(),
             settings: None,
+            published_watermarks: BTreeMap::new(),
             splits: vec![RemoteSplitManifest {
                 split_id: "split-a".into(),
                 state: RemoteSplitState::Published,

@@ -237,6 +237,7 @@ async fn fs017_manifest_and_pointer_version_window_and_broken_lineage_rejection(
         request_fingerprint: format!("sha256:{}", "b".repeat(64)),
         published_at: "2026-10-16T00:00:00Z".into(),
         settings: None,
+        published_watermarks: std::collections::BTreeMap::new(),
         splits: vec![make_split(idx_broken, "split-2", "op-2", 'b')],
     };
     manager.publish_manifest(&broken_gen2).await.unwrap();

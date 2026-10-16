@@ -26,12 +26,20 @@ impl ShardFailure {
         error_type: &str,
         reason: impl std::fmt::Display,
     ) -> Self {
+        let reason_str = reason.to_string();
+        let error_class =
+            crate::worker::classify_http_error(status.as_u16(), error_type, &reason_str);
+        crate::worker::record_classified_error(error_class, crate::worker::ExecutionStage::Search);
         Self::with_reason(
             index,
             shard,
             node,
             status,
-            json!({"type": error_type, "reason": reason.to_string()}),
+            json!({
+                "type": error_type,
+                "reason": reason_str,
+                "error_class": error_class.as_str(),
+            }),
         )
     }
 

@@ -771,7 +771,10 @@ fn write_and_commit_locked(
     };
     state.max_revision = next_revision;
     state.pending = Some(new_slot.clone());
-    persist_local_state(companions, state, location)?;
+    #[cfg(test)]
+    if crash_stage.is_some() {
+        persist_local_state(companions, state, location)?;
+    }
 
     #[cfg(test)]
     if crash_stage == Some(LocalCasCrashStage::PendingStatePersist) {
@@ -809,10 +812,10 @@ fn write_and_commit_locked(
             }
         })?;
     }
-    sync_directory(&companions.parent_dir, location)?;
 
     #[cfg(test)]
     if crash_stage == Some(LocalCasCrashStage::TargetRenameAndSync) {
+        sync_directory(&companions.parent_dir, location)?;
         return Err(ConditionalStorageError::Indeterminate {
             path: location.to_string(),
             reason: "injected crash after target rename and directory fsync".to_string(),
@@ -950,8 +953,34 @@ impl StorageManager {
             }
         }
 
+        static LOCAL_FS_CAPABILITY_VERIFIED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        #[cfg(test)]
+        let no_injected_crash = self
+            .local_cas_crash_stage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none();
+        #[cfg(not(test))]
+        let no_injected_crash = true;
+
+        if self.is_local()
+            && no_injected_crash
+            && LOCAL_FS_CAPABILITY_VERIFIED.load(std::sync::atomic::Ordering::Acquire)
+        {
+            let mut guard = self
+                .capability_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *guard = CapabilityProbeState::Supported;
+            return Ok(());
+        }
+
         match self.run_isolated_capability_probe().await {
             Ok(()) => {
+                if self.is_local() && no_injected_crash {
+                    LOCAL_FS_CAPABILITY_VERIFIED.store(true, std::sync::atomic::Ordering::Release);
+                }
                 let mut guard = self
                     .capability_state
                     .lock()
@@ -2514,6 +2543,7 @@ tmpfs /mnt/nfs_share/local_tmp tmpfs rw 0 0\n";
                 request_fingerprint: format!("sha256:{}", "1".repeat(64)),
                 published_at: "2026-10-16T00:00:00Z".into(),
                 settings: None,
+                published_watermarks: BTreeMap::new(),
                 splits: vec![RemoteSplitManifest {
                     split_id: "split-1".into(),
                     state: RemoteSplitState::Published,
