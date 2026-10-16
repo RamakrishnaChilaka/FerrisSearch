@@ -6,8 +6,13 @@ use std::time::Instant;
 pub type NodeId = String;
 /// Monotonic identity of one routed shard-copy assignment.
 pub type AllocationId = u64;
-pub const CLUSTER_STATE_FORMAT_VERSION: u32 = 2;
+pub const CLUSTER_STATE_FORMAT_VERSION: u32 = 3;
 
+pub use super::manifest_writer::{
+    DEFAULT_MANIFEST_WRITER_LEASE_DURATION_MS, ExpectedManifestWriterAuthority,
+    ManifestLeaseAcquireReason, ManifestWriterAuthority, ManifestWriterIdentity,
+    ManifestWriterMutation, ManifestWriterPhase,
+};
 pub use super::write_authority::{
     CanonicalHistory, FailedCopyExclusion, PrimaryActivationFinish, PrimaryAuthority,
     PrimaryAuthorityPhase, ShardCopyAllocation, WriteAuthorityIdentity,
@@ -1141,6 +1146,8 @@ pub struct ClusterState {
     pub indices: HashMap<String, IndexMetadata>,
     /// Per-index, per-shard allocation identities and first-activation state.
     pub shard_allocations: HashMap<String, HashMap<u32, ShardAllocationIds>>,
+    /// Per-index manifest writer authority and monotonic epoch for `remote_store` indices.
+    pub manifest_writer_authorities: HashMap<String, ManifestWriterAuthority>,
     /// Dynamically-managed API keys, keyed by key id.
     pub api_keys: HashMap<String, SecurityApiKeyRecord>,
     /// Dynamically-managed custom roles, keyed by role name.
@@ -1159,6 +1166,7 @@ impl ClusterState {
             nodes: HashMap::new(),
             indices: HashMap::new(),
             shard_allocations: HashMap::new(),
+            manifest_writer_authorities: HashMap::new(),
             api_keys: HashMap::new(),
             roles: HashMap::new(),
             last_seen: HashMap::new(),
@@ -1182,6 +1190,11 @@ impl ClusterState {
             // If the master was removed, we need a new election (simplified here)
             if self.master_node.as_ref() == Some(node_id) {
                 self.master_node = None;
+            }
+            for authority in self.manifest_writer_authorities.values_mut() {
+                if authority.phase.holder_node() == Some(node_id.as_str()) {
+                    authority.revoke_to_unassigned();
+                }
             }
         }
         removed
@@ -1214,10 +1227,128 @@ impl ClusterState {
             );
         }
         let index_name = metadata.name.clone();
+        let index_uuid = metadata.uuid.to_string();
+        let is_remote_store = matches!(metadata.settings.engine, IndexEngine::RemoteStore);
         self.indices.insert(metadata.name.clone(), metadata);
-        self.shard_allocations.insert(index_name, allocations);
+        self.shard_allocations
+            .insert(index_name.clone(), allocations);
+        if is_remote_store {
+            self.manifest_writer_authorities.insert(
+                index_name.clone(),
+                ManifestWriterAuthority::unassigned(index_name, index_uuid),
+            );
+        } else {
+            self.manifest_writer_authorities.remove(&index_name);
+        }
         self.version += 1;
         Ok(())
+    }
+
+    pub fn manifest_writer_authority(&self, index_name: &str) -> Option<&ManifestWriterAuthority> {
+        self.manifest_writer_authorities.get(index_name)
+    }
+
+    pub fn validate_manifest_writer_authorities(&self) -> Result<(), String> {
+        for (key, authority) in &self.manifest_writer_authorities {
+            if key != &authority.index_name {
+                return Err(format!(
+                    "manifest writer authority key '{key}' does not match record index_name '{}'",
+                    authority.index_name
+                ));
+            }
+            authority.validate()?;
+            let Some(metadata) = self.indices.get(key) else {
+                return Err(format!(
+                    "manifest writer authority references unknown index '{key}'"
+                ));
+            };
+            if !matches!(metadata.settings.engine, IndexEngine::RemoteStore) {
+                return Err(format!(
+                    "manifest writer authority for '{key}' is invalid because engine is '{}', not remote_store",
+                    metadata.settings.engine
+                ));
+            }
+            if metadata.uuid.as_str() != authority.index_uuid {
+                return Err(format!(
+                    "manifest writer authority UUID mismatch for index '{key}'"
+                ));
+            }
+        }
+        for metadata in self.indices.values() {
+            if matches!(metadata.settings.engine, IndexEngine::RemoteStore)
+                && !self
+                    .manifest_writer_authorities
+                    .contains_key(&metadata.name)
+            {
+                return Err(format!(
+                    "remote_store index '{}' is missing manifest writer authority metadata",
+                    metadata.name
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates that `identity` currently holds an unexpired `Active` manifest
+    /// writer lease for `index_name`, optionally requiring agreement with the
+    /// current Raft `leader_term` so leader changes conservatively pause
+    /// publication until renewed or replaced.
+    pub fn validate_active_manifest_writer(
+        &self,
+        index_name: &str,
+        identity: &ManifestWriterIdentity,
+        now_millis: u64,
+        current_leader_term: Option<u64>,
+    ) -> Result<&ManifestWriterAuthority, String> {
+        identity.validate()?;
+        let metadata = self
+            .indices
+            .get(index_name)
+            .ok_or_else(|| format!("index '{index_name}' does not exist"))?;
+        if !matches!(metadata.settings.engine, IndexEngine::RemoteStore) {
+            return Err(format!(
+                "index '{index_name}' uses engine '{}', not remote_store",
+                metadata.settings.engine
+            ));
+        }
+        if metadata.uuid.as_str() != identity.index_uuid {
+            return Err(format!("index '{index_name}' UUID mismatch"));
+        }
+        if !self.nodes.contains_key(&identity.holder_node) {
+            return Err(format!(
+                "manifest writer holder '{}' is no longer a registered cluster member",
+                identity.holder_node
+            ));
+        }
+        let authority = self
+            .manifest_writer_authorities
+            .get(index_name)
+            .ok_or_else(|| format!("index '{index_name}' has no manifest writer authority"))?;
+        if authority.index_uuid != identity.index_uuid
+            || authority.last_writer_epoch != identity.writer_epoch
+            || !authority.phase.is_active()
+            || !authority.phase.matches_identity(identity)
+        {
+            return Err(format!(
+                "manifest writer authority for '{index_name}' does not match active identity (epoch={}, lease_id={}, holder='{}')",
+                identity.writer_epoch, identity.lease_id, identity.holder_node
+            ));
+        }
+        if now_millis >= authority.lease_expires_at_millis {
+            return Err(format!(
+                "manifest writer lease for '{index_name}' expired at {} (now={now_millis})",
+                authority.lease_expires_at_millis
+            ));
+        }
+        if let Some(expected_leader_term) = current_leader_term
+            && authority.leader_term != expected_leader_term
+        {
+            return Err(format!(
+                "manifest writer lease for '{index_name}' was issued in Raft term {} but current leader term is {expected_leader_term}; renewal or re-acquisition is required",
+                authority.leader_term
+            ));
+        }
+        Ok(authority)
     }
 
     pub fn shard_allocation_ids(

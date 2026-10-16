@@ -4106,6 +4106,30 @@ impl InternalTransport for TransportService {
         .await
     }
 
+    async fn mutate_manifest_writer_authority(
+        &self,
+        request: Request<ShardAuthorityMutationRequest>,
+    ) -> Result<Response<ShardAuthorityMutationResponse>, Status> {
+        let req = request.into_inner();
+        if req.index_name.is_empty() {
+            return Err(Status::invalid_argument(
+                "manifest writer authority mutation requires a non-empty index_name",
+            ));
+        }
+        let mutation: crate::cluster::state::ManifestWriterMutation =
+            serde_json::from_slice(&req.record_json).map_err(|error| {
+                Status::invalid_argument(format!("invalid manifest writer mutation: {error}"))
+            })?;
+        mutation.validate().map_err(Status::invalid_argument)?;
+        self.apply_shard_authority_command(
+            crate::consensus::types::ClusterCommand::MutateManifestWriterAuthority {
+                index_name: req.index_name,
+                mutation,
+            },
+        )
+        .await
+    }
+
     async fn mark_primary_unavailable(
         &self,
         request: Request<MarkPrimaryUnavailableRequest>,

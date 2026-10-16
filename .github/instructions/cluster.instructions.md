@@ -24,9 +24,10 @@ ShardCopy { node_id: Option<NodeId>, state: ShardState }
 ShardRoutingEntry { primary, primary_term, replicas, in_sync_replicas, unassigned_replicas }
 ShardAllocationIds { primary, replicas, initial_allocation_id, primary_initialized }
 IndexMetadata { name, uuid, number_of_shards, number_of_replicas, shard_routing, mappings, dynamic, settings }
+ManifestWriterAuthority { index_name, index_uuid, last_writer_epoch, last_lease_id, renewal_seq, leader_term, lease_expires_at_millis, phase }
 SecurityApiKeyRecord { id, name, hash_sha256, roles, indices, created_at_millis }   // hash only, never plaintext
 SecurityRoleDefinition { name, cluster, indices, index_privileges }                 // custom role
-ClusterState { cluster_name, version, master_node, nodes, indices, shard_allocations, last_seen, api_keys, roles }
+ClusterState { format_version, cluster_name, version, master_node, nodes, indices, shard_allocations, manifest_writer_authorities, last_seen, api_keys, roles }
 ```
 
 ### Control-Plane Config Fields (snapshotted for free)

@@ -3129,7 +3129,8 @@ fn roundtrip_unknown_field_type_returns_error() {
         }],
         api_keys_json: vec![],
         roles_json: vec![],
-        format_version: 2,
+        format_version: 3,
+        manifest_writer_authorities_json: vec![],
     };
 
     let err = proto_to_cluster_state(&proto).unwrap_err();
@@ -3311,12 +3312,86 @@ fn roundtrip_rejects_unknown_non_empty_engine() {
         }],
         api_keys_json: vec![],
         roles_json: vec![],
-        format_version: 2,
+        format_version: 3,
+        manifest_writer_authorities_json: vec![],
     };
 
     let err = proto_to_cluster_state(&proto).unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
     assert!(err.message().contains("unknown engine 'alien_store'"));
+}
+
+#[test]
+fn roundtrip_preserves_manifest_writer_authorities_and_rejects_malformed_or_missing_entries() {
+    let mut cs = DomainClusterState::new("writer-auth-test".into());
+    cs.add_node(DomainNodeInfo {
+        id: "node-1".into(),
+        name: "node-1".into(),
+        host: "127.0.0.1".into(),
+        transport_port: 9300,
+        http_port: 9200,
+        roles: vec![NodeRole::Master, NodeRole::Data],
+        raft_node_id: 1,
+    });
+    let meta = DomainIndexMetadata {
+        name: "remote-idx".into(),
+        uuid: crate::cluster::state::IndexUuid::new("remote-uuid"),
+        number_of_shards: 0,
+        number_of_replicas: 0,
+        shard_routing: std::collections::HashMap::new(),
+        mappings: std::collections::HashMap::new(),
+        dynamic: crate::cluster::state::DynamicMapping::False,
+        settings: crate::cluster::state::IndexSettings {
+            engine: crate::cluster::state::IndexEngine::RemoteStore,
+            ..Default::default()
+        },
+    };
+    cs.add_index(meta);
+    {
+        let auth = cs
+            .manifest_writer_authorities
+            .get_mut("remote-idx")
+            .unwrap();
+        auth.last_writer_epoch = 3;
+        auth.last_lease_id = 14;
+        auth.renewal_seq = 2;
+        auth.leader_term = 5;
+        auth.lease_expires_at_millis = 90_000;
+        auth.phase = crate::cluster::state::ManifestWriterPhase::Active {
+            holder_node: "node-1".into(),
+            writer_epoch: 3,
+            lease_id: 14,
+            fenced_pointer_revision: 8,
+            fenced_pointer_token: "fs1:s3:aa:-:bb".into(),
+        };
+    }
+
+    let proto = cluster_state_to_proto(&cs);
+    let restored = proto_to_cluster_state(&proto).unwrap();
+    assert_eq!(
+        restored.manifest_writer_authorities,
+        cs.manifest_writer_authorities
+    );
+
+    // Missing authority for a remote_store index must be rejected.
+    let mut missing = proto.clone();
+    missing.manifest_writer_authorities_json.clear();
+    let err = proto_to_cluster_state(&missing).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message()
+            .contains("missing manifest writer authority metadata")
+    );
+
+    // Malformed authority JSON must be rejected.
+    let mut malformed = proto;
+    malformed.manifest_writer_authorities_json = vec!["{not-valid-json".into()];
+    let err = proto_to_cluster_state(&malformed).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message()
+            .contains("invalid manifest writer authority in cluster state snapshot")
+    );
 }
 
 #[tokio::test]

@@ -103,6 +103,7 @@ message ClusterState {
     repeated string api_keys_json = 6;
     repeated string roles_json = 7;
     uint32 format_version = 8;
+    repeated string manifest_writer_authorities_json = 9;
 }
 
 message JoinRequest {
@@ -909,6 +910,7 @@ service InternalTransport {
     rpc FinishPrimaryActivation(ShardAuthorityMutationRequest) returns (ShardAuthorityMutationResponse);
     rpc ReconcilePrimaryHistory(ReconcilePrimaryHistoryRequest) returns (ReconcilePrimaryHistoryResponse);
     rpc ExcludeFailedShardCopies(ShardAuthorityMutationRequest) returns (ShardAuthorityMutationResponse);
+    rpc MutateManifestWriterAuthority(ShardAuthorityMutationRequest) returns (ShardAuthorityMutationResponse);
     rpc MarkPrimaryUnavailable(MarkPrimaryUnavailableRequest) returns (MarkPrimaryUnavailableResponse);
     rpc FailShardCopy(FailShardCopyRequest) returns (FailShardCopyResponse);
 

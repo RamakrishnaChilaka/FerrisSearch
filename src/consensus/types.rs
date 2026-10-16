@@ -4,8 +4,9 @@ use openraft::BasicNode;
 use serde::{Deserialize, Serialize};
 
 use crate::cluster::state::{
-    DynamicMapping, FailedCopyExclusion, FieldMapping, IndexMetadata, NodeInfo,
-    PrimaryActivationFinish, SecurityApiKeyRecord, SecurityRoleDefinition,
+    DynamicMapping, FailedCopyExclusion, FieldMapping, IndexMetadata, ManifestWriterAuthority,
+    ManifestWriterMutation, NodeInfo, PrimaryActivationFinish, SecurityApiKeyRecord,
+    SecurityRoleDefinition,
 };
 
 // ─── Raft Type Config ───────────────────────────────────────────────────────
@@ -110,6 +111,12 @@ pub enum ClusterCommand {
     PutRole { role: SecurityRoleDefinition },
     /// Remove a custom role definition by name.
     DeleteRole { name: String },
+    /// Conditionally acquire, activate, renew, transfer, or release a
+    /// `remote_store` index's manifest writer lease and monotonic epoch.
+    MutateManifestWriterAuthority {
+        index_name: String,
+        mutation: ManifestWriterMutation,
+    },
 }
 
 impl std::fmt::Display for ClusterCommand {
@@ -198,6 +205,35 @@ impl std::fmt::Display for ClusterCommand {
             }
             ClusterCommand::PutRole { role } => write!(f, "PutRole({})", role.name),
             ClusterCommand::DeleteRole { name } => write!(f, "DeleteRole({name})"),
+            ClusterCommand::MutateManifestWriterAuthority {
+                index_name,
+                mutation,
+            } => {
+                let kind = match mutation {
+                    ManifestWriterMutation::Acquire { candidate_node, .. } => {
+                        format!("acquire:{candidate_node}")
+                    }
+                    ManifestWriterMutation::Activate { identity, .. } => {
+                        format!(
+                            "activate:{}:epoch={}",
+                            identity.holder_node, identity.writer_epoch
+                        )
+                    }
+                    ManifestWriterMutation::Renew { identity, .. } => {
+                        format!(
+                            "renew:{}:epoch={}",
+                            identity.holder_node, identity.writer_epoch
+                        )
+                    }
+                    ManifestWriterMutation::Release { identity } => {
+                        format!(
+                            "release:{}:epoch={}",
+                            identity.holder_node, identity.writer_epoch
+                        )
+                    }
+                };
+                write!(f, "MutateManifestWriterAuthority({index_name}, {kind})")
+            }
         }
     }
 }
@@ -212,11 +248,19 @@ pub enum ClusterResponse {
     IndexAlreadyExists { index_name: String },
     WriteAuthorityRejected { reason: String },
     ExclusionApplied { transition_id: String },
+    ManifestWriterAuthorityApplied { authority: ManifestWriterAuthority },
+    ManifestWriterAuthorityRejected { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("write authority rejected: {reason}")]
 pub struct WriteAuthorityRejectedError {
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("manifest writer authority rejected: {reason}")]
+pub struct ManifestWriterAuthorityRejectedError {
     pub reason: String,
 }
 
@@ -238,6 +282,10 @@ impl ClusterResponse {
                 Err(WriteAuthorityRejectedError { reason }.into())
             }
             Self::ExclusionApplied { .. } => Ok(()),
+            Self::ManifestWriterAuthorityApplied { .. } => Ok(()),
+            Self::ManifestWriterAuthorityRejected { reason } => {
+                Err(ManifestWriterAuthorityRejectedError { reason }.into())
+            }
         }
     }
 }
@@ -565,5 +613,70 @@ mod tests {
             .remove("expected_primary_term");
 
         assert!(serde_json::from_value::<ClusterCommand>(value).is_err());
+    }
+
+    #[test]
+    fn manifest_writer_authority_commands_serde_roundtrip_and_display() {
+        use crate::cluster::state::{
+            ExpectedManifestWriterAuthority, ManifestLeaseAcquireReason, ManifestWriterIdentity,
+            ManifestWriterMutation, ManifestWriterPhase,
+        };
+
+        let identity = ManifestWriterIdentity {
+            index_uuid: "uuid-1".into(),
+            holder_node: "node-1".into(),
+            writer_epoch: 3,
+            lease_id: 9,
+        };
+        let commands = [
+            ClusterCommand::MutateManifestWriterAuthority {
+                index_name: "events".into(),
+                mutation: ManifestWriterMutation::Acquire {
+                    expected: ExpectedManifestWriterAuthority {
+                        index_uuid: "uuid-1".into(),
+                        last_writer_epoch: 2,
+                        last_lease_id: 8,
+                        phase: ManifestWriterPhase::Unassigned,
+                    },
+                    candidate_node: "node-1".into(),
+                    reason: ManifestLeaseAcquireReason::Unassigned,
+                    now_millis: 1_000,
+                    lease_duration_ms: 15_000,
+                    leader_term: 1,
+                },
+            },
+            ClusterCommand::MutateManifestWriterAuthority {
+                index_name: "events".into(),
+                mutation: ManifestWriterMutation::Activate {
+                    identity: identity.clone(),
+                    fenced_pointer_revision: 4,
+                    fenced_pointer_token: "tok-4".into(),
+                    now_millis: 1_100,
+                    lease_duration_ms: 15_000,
+                    leader_term: 1,
+                },
+            },
+            ClusterCommand::MutateManifestWriterAuthority {
+                index_name: "events".into(),
+                mutation: ManifestWriterMutation::Renew {
+                    identity: identity.clone(),
+                    expected_fenced_pointer_revision: 4,
+                    expected_fenced_pointer_token: "tok-4".into(),
+                    now_millis: 5_000,
+                    lease_duration_ms: 15_000,
+                    leader_term: 2,
+                },
+            },
+            ClusterCommand::MutateManifestWriterAuthority {
+                index_name: "events".into(),
+                mutation: ManifestWriterMutation::Release { identity },
+            },
+        ];
+
+        for command in commands {
+            let json = serde_json::to_string(&command).unwrap();
+            let restored: ClusterCommand = serde_json::from_str(&json).unwrap();
+            assert_eq!(format!("{restored}"), format!("{command}"));
+        }
     }
 }
