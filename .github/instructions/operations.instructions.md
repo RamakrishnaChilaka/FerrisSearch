@@ -79,9 +79,12 @@ or provide global/tenant resource accounting.
   bounded operation responses. Filesystem/Tantivy install and suffix apply run
   on Tokio's blocking pool, not the fixed foreground write/search pools.
 
-The current search/write pools isolate CPU threads, but FerrisSearch does not
-yet provide complete admission control, cancellation propagation, tenant
-quotas, or unified memory/I/O accounting. Do not claim those properties.
+The current search/write pools isolate CPU threads, and `WorkerPools` pairs
+them with `RequestCancellationContext`, `RequestDeadline`, bounded per-class
+`AdmissionController` queues (`Search`, `Sql`, `Write`, `Hydration`,
+`Recovery`, `Maintenance`), and `ResourceGovernor` byte reservations (`Memory`,
+`TempDisk`, `PersistentCache`, `ObjectStoreInflight`). Tenant quotas and
+background I/O prioritization (FS-032, FS-049) remain future work.
 
 ## Tasks And Maintenance
 

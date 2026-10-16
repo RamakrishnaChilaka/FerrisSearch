@@ -658,6 +658,7 @@ impl RemoteSplitReaderCache {
         metadata: &IndexMetadata,
         split: &AssignedRemoteSplit,
     ) -> anyhow::Result<Arc<CachedRemoteSplitReader>> {
+        crate::worker::check_current_request_active(crate::worker::ExecutionStage::Hydration)?;
         let key = reader_cache_key(metadata.uuid.as_str(), &split.split_id, &split.checksum);
         if let Some(reader) = self
             .readers
@@ -674,6 +675,7 @@ impl RemoteSplitReaderCache {
             .storage_manager
             .fetch_split_into_cache(metadata.uuid.as_str(), &split.as_manifest())
             .await?;
+        crate::worker::check_current_request_active(crate::worker::ExecutionStage::Hydration)?;
         let index_uuid = metadata.uuid.to_string();
         let split_id = split.split_id.clone();
         let size_bytes = context
@@ -688,6 +690,9 @@ impl RemoteSplitReaderCache {
             .worker_pools
             .spawn_search(
                 move || -> anyhow::Result<Arc<crate::engine::tantivy::HotEngine>> {
+                    crate::worker::check_current_request_active(
+                        crate::worker::ExecutionStage::Hydration,
+                    )?;
                     let column_cache =
                         Arc::new(crate::engine::column_cache::ColumnCache::new(0, 0));
                     let engine = crate::engine::tantivy::HotEngine::new_remote_split_with_mappings(
@@ -700,6 +705,7 @@ impl RemoteSplitReaderCache {
                 },
             )
             .await??;
+        crate::worker::check_current_request_active(crate::worker::ExecutionStage::Hydration)?;
 
         let entry = Arc::new(CachedRemoteSplitReader {
             index_uuid: index_uuid.clone(),
@@ -785,6 +791,13 @@ pub(crate) async fn execute_leaf_search_batch(
 
     let mut outcomes = Vec::with_capacity(assigned_splits.len());
     for split in assigned_splits {
+        crate::worker::check_current_request_active(crate::worker::ExecutionStage::Search)?;
+        let estimated_query_bytes =
+            ((search_req.size.saturating_add(search_req.from)).max(1) as u64).saturating_mul(256);
+        let _query_memory_reservation = context.worker_pools.resource_governor().try_reserve(
+            crate::worker::ResourcePoolKind::Memory,
+            estimated_query_bytes,
+        )?;
         let outcome = match context
             .reader_cache
             .get_or_open(context, metadata, split)
@@ -806,8 +819,12 @@ pub(crate) async fn execute_leaf_search_batch(
                         error: None,
                     },
                     Ok(Err(error))
-                        if crate::search::query_string::query_error_is_client(&error) =>
+                        if crate::search::query_string::query_error_is_client(&error)
+                            || crate::worker::is_cancellation_or_deadline_error(&error) =>
                     {
+                        return Err(error);
+                    }
+                    Err(error) if crate::worker::is_cancellation_or_deadline_error(&error) => {
                         return Err(error);
                     }
                     Ok(Err(error)) | Err(error) => LeafSplitSearchOutcome {
@@ -818,6 +835,13 @@ pub(crate) async fn execute_leaf_search_batch(
                         error: Some(format!("{error:#}")),
                     },
                 }
+            }
+            Err(error)
+                if crate::worker::is_cancellation_or_deadline_error(&error)
+                    || error.is::<crate::worker::ResourceExhaustedError>()
+                    || error.is::<crate::worker::AdmissionError>() =>
+            {
+                return Err(error);
             }
             Err(error) => LeafSplitSearchOutcome {
                 split_id: split.split_id.clone(),
@@ -872,10 +896,13 @@ async fn collect_leaf_statuses(
         let index_name = index_name.to_string();
         let index_uuid = index_uuid.to_string();
         let splits = splits.to_vec();
+        let child_ctx = crate::worker::current_request_context().map(|ctx| ctx.child());
         futures.push(tokio::spawn(async move {
-            let status = client
-                .get_remote_store_leaf_status(&node, &index_name, &index_uuid, &splits)
-                .await;
+            let fut = client.get_remote_store_leaf_status(&node, &index_name, &index_uuid, &splits);
+            let status = match child_ctx {
+                Some(ctx) => crate::worker::with_task_request_context(ctx, fut).await,
+                None => fut.await,
+            };
             (node.id.clone(), status)
         }));
     }

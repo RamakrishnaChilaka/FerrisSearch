@@ -22,6 +22,41 @@ const VECTOR_DOC_IDS_FILE: &str = "vectors.docids.bin";
 const VECTORS_STALE_FILE: &str = "vectors.stale";
 const VECTORS_STALE_TEMP_FILE: &str = "vectors.stale.tmp";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorRecoveryMode {
+    NotApplicable,
+    SnapshotRestored,
+    SegmentScanRebuilt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VectorRecoveryProgress {
+    pub mode: VectorRecoveryMode,
+    pub segments_total: usize,
+    pub segments_scanned: usize,
+    pub batches_processed: usize,
+    pub documents_scanned: usize,
+    pub vectors_recovered: usize,
+    pub completed: bool,
+    pub last_error: Option<String>,
+}
+
+impl VectorRecoveryProgress {
+    pub fn not_applicable() -> Self {
+        Self {
+            mode: VectorRecoveryMode::NotApplicable,
+            segments_total: 0,
+            segments_scanned: 0,
+            batches_processed: 0,
+            documents_scanned: 0,
+            vectors_recovered: 0,
+            completed: true,
+            last_error: None,
+        }
+    }
+}
+
 /// A composite engine that owns both a text index (Tantivy) and an optional
 /// vector index (USearch). All document operations go through here — vector
 /// fields are auto-detected and indexed into USearch transparently.
@@ -35,6 +70,7 @@ pub struct CompositeEngine {
     replica_persisted_cp: Mutex<Option<u64>>,
     /// Serializes text recovery with vector rebuild and stale-marker updates.
     vector_recovery: Mutex<()>,
+    vector_recovery_progress: Mutex<Option<VectorRecoveryProgress>>,
     has_vector_mappings: bool,
     /// Shared column cache for fast-field Arrow arrays.
     #[allow(dead_code)]
@@ -146,6 +182,7 @@ impl CompositeEngine {
             global_cp: Mutex::new(None),
             replica_persisted_cp: Mutex::new(None),
             vector_recovery: Mutex::new(()),
+            vector_recovery_progress: Mutex::new(None),
             has_vector_mappings,
             column_cache,
         }
@@ -596,6 +633,11 @@ impl CompositeEngine {
                     index.ok_or_else(|| anyhow::anyhow!("prepared vector index disappeared"))?;
                 index.apply_index(doc_id, vector, seq_no, primary_term)?;
             }
+            (PreparedVectorMutation::None, WalOperation::Index, Some(doc_id)) => {
+                if let Some(index) = index {
+                    index.apply_delete(doc_id, seq_no, primary_term)?;
+                }
+            }
             (PreparedVectorMutation::Delete, WalOperation::Delete, Some(doc_id)) => {
                 if let Some(index) = index {
                     index.apply_delete(doc_id, seq_no, primary_term)?;
@@ -617,6 +659,9 @@ impl CompositeEngine {
                     actual,
                     "Skipping vector mutation because the numeric array dimension does not match"
                 );
+                if let Some(index) = index {
+                    index.apply_delete(doc_id, seq_no, primary_term)?;
+                }
             }
             _ => {}
         }
@@ -688,10 +733,23 @@ impl CompositeEngine {
     }
 
     fn persist_vector_index(&self, index: &VectorIndex) -> Result<()> {
+        let coverage = self.text.persisted_vector_coverage()?;
+        self.persist_vector_index_with_coverage(index, Some(coverage))
+    }
+
+    fn persist_vector_index_with_coverage(
+        &self,
+        index: &VectorIndex,
+        coverage: Option<super::vector::PersistedVectorCoverage>,
+    ) -> Result<()> {
+        let saving_marker = self.data_dir.join("vectors.saving");
+        std::fs::write(&saving_marker, b"saving\n")?;
+        File::open(&self.data_dir)?.sync_all()?;
         let vector_path = self.vector_index_path();
-        index.save(&vector_path)?;
+        index.save_with_coverage(&vector_path, coverage)?;
         File::open(&vector_path)?.sync_all()?;
         File::open(self.vector_doc_ids_path())?.sync_all()?;
+        let _ = std::fs::remove_file(&saving_marker);
         File::open(&self.data_dir)?.sync_all()?;
         Ok(())
     }
@@ -733,51 +791,248 @@ impl CompositeEngine {
         Ok(true)
     }
 
-    fn rebuild_vectors_locked(&self) -> Result<()> {
-        self.mark_vectors_stale()?;
-        let mut rebuilt = None;
-        let mut vector_count = 0;
-        self.text
-            .for_each_committed_vector_rebuild_batch(|documents| {
-                for (doc_id, source, seq_no, primary_term) in documents {
-                    let expected_dimensions = rebuilt.as_ref().map(VectorIndex::dimensions);
-                    let prepared = self.detect_vector_mutation(&source, expected_dimensions)?;
-                    if let PreparedVectorMutation::Index { vector } = &prepared
-                        && rebuilt.is_none()
-                    {
-                        rebuilt = Some(VectorIndex::new(
-                            vector.len(),
-                            usearch::ffi::MetricKind::Cos,
-                        )?);
-                    }
-                    Self::apply_prepared_vector_mutation_to_index(
-                        rebuilt.as_ref(),
-                        WalOperation::Index,
-                        Some(&doc_id),
-                        seq_no,
-                        primary_term,
-                        &prepared,
-                    )?;
-                }
-                Ok(())
-            })?;
+    pub fn has_persisted_or_stale_vector_state(&self) -> Result<bool> {
+        self.vector_state_is_relevant()
+    }
 
-        if let Some(index) = rebuilt.as_ref() {
-            vector_count = index.len();
-            self.persist_vector_index(index)?;
-        } else {
-            self.remove_persisted_vector_index()?;
-        }
+    pub fn vector_recovery_progress(&self) -> Option<VectorRecoveryProgress> {
+        self.vector_recovery_progress
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    fn set_vector_recovery_progress(&self, progress: VectorRecoveryProgress) {
         *self
-            .vector
-            .write()
-            .unwrap_or_else(|error| error.into_inner()) = rebuilt;
-        self.clear_vectors_stale()?;
+            .vector_recovery_progress
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(progress);
+    }
 
-        if vector_count > 0 {
-            tracing::info!("Rebuilt vector index: {} vectors recovered", vector_count);
+    fn try_restore_vectors_from_snapshot_or_disk_locked(
+        &self,
+    ) -> Result<Option<VectorRecoveryProgress>> {
+        if self.vectors_are_stale()?
+            || self.text.writer_requires_rebuild()
+            || self.data_dir.join("vectors.saving").try_exists()?
+            || self.data_dir.join("vectors.usearch.tmp").try_exists()?
+            || self.data_dir.join("vectors.docids.bin.tmp").try_exists()?
+        {
+            return Ok(None);
         }
-        Ok(())
+        let expected_coverage = self.text.persisted_vector_coverage()?;
+        let vector_path = self.vector_index_path();
+        let doc_ids_path = self.vector_doc_ids_path();
+        if (!vector_path.try_exists()? || !doc_ids_path.try_exists()?)
+            && let Some(manifest) = self.latest_persisted_shard_snapshot()?
+        {
+            let snapshot_coverage = super::vector::PersistedVectorCoverage {
+                processed_checkpoint: manifest.committed_boundary.persisted_checkpoint,
+                max_seq_no: manifest.committed_boundary.persisted_checkpoint,
+                missing_intervals: Vec::new(),
+            };
+            if snapshot_coverage == expected_coverage {
+                if !manifest.vector_state.present {
+                    *self
+                        .vector
+                        .write()
+                        .unwrap_or_else(|error| error.into_inner()) = None;
+                    let progress = VectorRecoveryProgress {
+                        mode: VectorRecoveryMode::SnapshotRestored,
+                        segments_total: 0,
+                        segments_scanned: 0,
+                        batches_processed: 0,
+                        documents_scanned: 0,
+                        vectors_recovered: 0,
+                        completed: true,
+                        last_error: None,
+                    };
+                    self.set_vector_recovery_progress(progress.clone());
+                    return Ok(Some(progress));
+                }
+                let latest_dir = self.data_dir.join(super::PERSISTED_SHARD_SNAPSHOT_DIR);
+                let snap_vector = latest_dir.join(VECTOR_INDEX_FILE);
+                let snap_docids = latest_dir.join(VECTOR_DOC_IDS_FILE);
+                if snap_vector.is_file() && snap_docids.is_file() {
+                    std::fs::copy(&snap_vector, &vector_path)?;
+                    std::fs::copy(&snap_docids, &doc_ids_path)?;
+                    File::open(&vector_path)?.sync_all()?;
+                    File::open(&doc_ids_path)?.sync_all()?;
+                    File::open(&self.data_dir)?.sync_all()?;
+                }
+            }
+        }
+        if let Some(restored) = VectorIndex::open_verified_with_coverage(
+            &vector_path,
+            &expected_coverage,
+            usearch::ffi::MetricKind::Cos,
+        )? {
+            let vectors_recovered = restored.len();
+            *self
+                .vector
+                .write()
+                .unwrap_or_else(|error| error.into_inner()) = Some(restored);
+            let progress = VectorRecoveryProgress {
+                mode: VectorRecoveryMode::SnapshotRestored,
+                segments_total: 0,
+                segments_scanned: 0,
+                batches_processed: 0,
+                documents_scanned: 0,
+                vectors_recovered,
+                completed: true,
+                last_error: None,
+            };
+            self.set_vector_recovery_progress(progress.clone());
+            tracing::info!(
+                "Restored vector index from verified persisted snapshot ({vectors_recovered} vectors)"
+            );
+            return Ok(Some(progress));
+        }
+        if expected_coverage.max_seq_no.is_none()
+            && !vector_path.try_exists()?
+            && !doc_ids_path.try_exists()?
+        {
+            *self
+                .vector
+                .write()
+                .unwrap_or_else(|error| error.into_inner()) = None;
+            let progress = VectorRecoveryProgress {
+                mode: VectorRecoveryMode::SnapshotRestored,
+                segments_total: 0,
+                segments_scanned: 0,
+                batches_processed: 0,
+                documents_scanned: 0,
+                vectors_recovered: 0,
+                completed: true,
+                last_error: None,
+            };
+            self.set_vector_recovery_progress(progress.clone());
+            return Ok(Some(progress));
+        }
+        Ok(None)
+    }
+
+    fn rebuild_vectors_locked(&self) -> Result<()> {
+        let mut progress = VectorRecoveryProgress {
+            mode: VectorRecoveryMode::SegmentScanRebuilt,
+            segments_total: 0,
+            segments_scanned: 0,
+            batches_processed: 0,
+            documents_scanned: 0,
+            vectors_recovered: 0,
+            completed: false,
+            last_error: None,
+        };
+        self.set_vector_recovery_progress(progress.clone());
+
+        let outcome = (|| -> Result<()> {
+            self.mark_vectors_stale()?;
+            let mut rebuilt = None;
+            let (covered, segments_total) = self.text.for_each_committed_vector_rebuild_batch(
+                |segments_total, segments_scanned, documents| {
+                    progress.segments_total = segments_total;
+                    progress.segments_scanned = segments_scanned;
+                    progress.batches_processed = progress.batches_processed.saturating_add(1);
+                    progress.documents_scanned =
+                        progress.documents_scanned.saturating_add(documents.len());
+                    for (doc_id, source, seq_no, primary_term) in documents {
+                        let expected_dimensions = rebuilt.as_ref().map(VectorIndex::dimensions);
+                        let prepared = self.detect_vector_mutation(&source, expected_dimensions)?;
+                        if let PreparedVectorMutation::Index { vector } = &prepared
+                            && rebuilt.is_none()
+                        {
+                            rebuilt = Some(VectorIndex::new(
+                                vector.len(),
+                                usearch::ffi::MetricKind::Cos,
+                            )?);
+                        }
+                        Self::apply_prepared_vector_mutation_to_index(
+                            rebuilt.as_ref(),
+                            WalOperation::Index,
+                            Some(&doc_id),
+                            seq_no,
+                            primary_term,
+                            &prepared,
+                        )?;
+                    }
+                    progress.vectors_recovered = rebuilt.as_ref().map_or(0, VectorIndex::len);
+                    self.set_vector_recovery_progress(progress.clone());
+                    Ok(())
+                },
+            )?;
+            progress.segments_total = segments_total;
+            progress.segments_scanned = segments_total;
+
+            let vector_count = if let Some(index) = rebuilt.as_ref() {
+                let count = index.len();
+                self.persist_vector_index_with_coverage(index, Some(covered))?;
+                count
+            } else {
+                self.remove_persisted_vector_index()?;
+                0
+            };
+            *self
+                .vector
+                .write()
+                .unwrap_or_else(|error| error.into_inner()) = rebuilt;
+            self.clear_vectors_stale()?;
+            progress.vectors_recovered = vector_count;
+            progress.completed = true;
+            self.set_vector_recovery_progress(progress.clone());
+
+            if vector_count > 0 {
+                tracing::info!(
+                    "Rebuilt vector index: {} vectors recovered across {} segments ({} batches)",
+                    vector_count,
+                    segments_total,
+                    progress.batches_processed
+                );
+            }
+            Ok(())
+        })();
+
+        if let Err(ref error) = outcome {
+            progress.completed = false;
+            progress.last_error = Some(format!("{error:#}"));
+            self.set_vector_recovery_progress(progress);
+        }
+        outcome
+    }
+
+    /// Recover vectors either by restoring verified snapshot/persisted state or
+    /// by running an unbounded streaming segment-by-segment scan.
+    pub fn recover_vectors(&self) -> Result<VectorRecoveryProgress> {
+        let _vector_recovery = self
+            .vector_recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !self.vector_state_is_relevant()? {
+            let progress = VectorRecoveryProgress::not_applicable();
+            self.set_vector_recovery_progress(progress.clone());
+            return Ok(progress);
+        }
+        match self.try_restore_vectors_from_snapshot_or_disk_locked() {
+            Ok(Some(progress)) => return Ok(progress),
+            Ok(None) => {}
+            Err(error) => {
+                let progress = VectorRecoveryProgress {
+                    mode: VectorRecoveryMode::SnapshotRestored,
+                    segments_total: 0,
+                    segments_scanned: 0,
+                    batches_processed: 0,
+                    documents_scanned: 0,
+                    vectors_recovered: 0,
+                    completed: false,
+                    last_error: Some(format!("{error:#}")),
+                };
+                self.set_vector_recovery_progress(progress);
+                return Err(error);
+            }
+        }
+        self.rebuild_vectors_locked()?;
+        Ok(self
+            .vector_recovery_progress()
+            .unwrap_or_else(VectorRecoveryProgress::not_applicable))
     }
 
     /// Rebuild vectors from a covering commit without publishing a text reader.
@@ -856,18 +1111,14 @@ impl CompositeEngine {
                 {
                     let vector_path = staging_dir.join(VECTOR_INDEX_FILE);
                     let doc_ids_path = staging_dir.join(VECTOR_DOC_IDS_FILE);
-                    if self.vector_index_path().try_exists()?
-                        && self.vector_doc_ids_path().try_exists()?
-                    {
-                        std::fs::copy(self.vector_index_path(), &vector_path)?;
-                        std::fs::copy(self.vector_doc_ids_path(), &doc_ids_path)?;
-                        File::open(&vector_path)?.sync_all()?;
-                        File::open(&doc_ids_path)?.sync_all()?;
-                    } else {
-                        vi.save(&vector_path)?;
-                        File::open(&vector_path)?.sync_all()?;
-                        File::open(&doc_ids_path)?.sync_all()?;
-                    }
+                    let snapshot_coverage = super::vector::PersistedVectorCoverage {
+                        processed_checkpoint: committed_boundary.persisted_checkpoint,
+                        max_seq_no: committed_boundary.persisted_checkpoint,
+                        missing_intervals: Vec::new(),
+                    };
+                    vi.save_with_coverage(&vector_path, Some(snapshot_coverage))?;
+                    File::open(&vector_path)?.sync_all()?;
+                    File::open(&doc_ids_path)?.sync_all()?;
                     file_names.push(VECTOR_INDEX_FILE.to_string());
                     file_names.push(VECTOR_DOC_IDS_FILE.to_string());
                     vector_state = super::snapshot::ShardSnapshotVectorMetadata {
@@ -1730,7 +1981,12 @@ impl SearchEngine for CompositeEngine {
             {
                 let vector_path = snapshot_dir.join(VECTOR_INDEX_FILE);
                 let doc_ids_path = snapshot_dir.join(VECTOR_DOC_IDS_FILE);
-                vi.save(&vector_path)?;
+                let snapshot_coverage = super::vector::PersistedVectorCoverage {
+                    processed_checkpoint: preparation.committed_boundary.persisted_checkpoint,
+                    max_seq_no: preparation.committed_boundary.persisted_checkpoint,
+                    missing_intervals: Vec::new(),
+                };
+                vi.save_with_coverage(&vector_path, Some(snapshot_coverage))?;
                 File::open(&vector_path)?.sync_all()?;
                 File::open(&doc_ids_path)?.sync_all()?;
                 File::open(snapshot_dir)?.sync_all()?;
@@ -1771,6 +2027,14 @@ impl SearchEngine for CompositeEngine {
         Ok(Some(
             super::snapshot::ShardSnapshotManifest::load_and_verify(&latest_dir)?,
         ))
+    }
+
+    fn recover_vectors(&self) -> Result<VectorRecoveryProgress> {
+        CompositeEngine::recover_vectors(self)
+    }
+
+    fn vector_recovery_progress(&self) -> Option<VectorRecoveryProgress> {
+        CompositeEngine::vector_recovery_progress(self)
     }
 
     fn release_peer_recovery_pin(&self, pin_id: u64) -> Result<()> {
@@ -3916,5 +4180,190 @@ mod tests {
         let source = reopened.get_document("healthy").unwrap().unwrap();
         assert_eq!(source["body"], "body remains a supported source field");
         assert_eq!(source["value"], 1);
+    }
+
+    fn brute_force_cosine_oracle(
+        docs: &std::collections::BTreeMap<String, Vec<f32>>,
+        query: &[f32],
+        k: usize,
+    ) -> Vec<String> {
+        let query_norm = query.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let mut scored: Vec<(f32, String)> = docs
+            .iter()
+            .map(|(doc_id, vec)| {
+                let dot: f32 = vec.iter().zip(query).map(|(a, b)| a * b).sum();
+                let doc_norm = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+                let denom = (query_norm * doc_norm).max(1e-12);
+                let cos_dist = 1.0 - (dot / denom);
+                (cos_dist, doc_id.clone())
+            })
+            .collect();
+        scored.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        scored.into_iter().take(k).map(|(_, id)| id).collect()
+    }
+
+    #[test]
+    fn fs027_vector_recovery_restores_snapshot_and_rebuilds_wal_suffix_matching_brute_force_oracle()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let mut oracle_docs: std::collections::BTreeMap<String, Vec<f32>> =
+            std::collections::BTreeMap::new();
+
+        {
+            let engine = vector_engine(dir.path());
+            for i in 0..24 {
+                let angle = (i as f32) * 0.19;
+                let vec = vec![angle.cos(), angle.sin(), ((i % 5) as f32) * 0.25 + 0.1];
+                let doc_id = format!("doc-{i:02}");
+                engine
+                    .add_document(&doc_id, json!({"emb": vec, "group": i % 3}))
+                    .unwrap();
+                oracle_docs.insert(doc_id, vec);
+            }
+            // Update doc-03 with a new vector
+            let updated_vec = vec![0.1, 0.95, 0.2];
+            engine
+                .add_document("doc-03", json!({"emb": updated_vec, "group": 99}))
+                .unwrap();
+            oracle_docs.insert("doc-03".to_string(), updated_vec);
+
+            // Update doc-07 to remove its vector field completely — must remove old vector!
+            engine
+                .add_document("doc-07", json!({"title": "vector removed"}))
+                .unwrap();
+            oracle_docs.remove("doc-07");
+
+            // Delete doc-11
+            engine.delete_document("doc-11").unwrap();
+            oracle_docs.remove("doc-11");
+
+            engine.flush().unwrap();
+            engine.persist_latest_shard_snapshot().unwrap();
+        }
+
+        // Phase 1: Reopen after clean flush — must restore from verified persisted snapshot
+        // without scanning segments, and match brute-force oracle.
+        {
+            let reopened = vector_engine(dir.path());
+            let progress = reopened.recover_vectors().unwrap();
+            assert_eq!(progress.mode, VectorRecoveryMode::SnapshotRestored);
+            assert_eq!(progress.segments_scanned, 0);
+            assert_eq!(progress.vectors_recovered, oracle_docs.len());
+            assert!(progress.completed);
+            assert!(progress.last_error.is_none());
+
+            for query in [
+                [1.0f32, 0.0, 0.1],
+                [0.0, 1.0, 0.2],
+                [-0.5, 0.8, 0.3],
+                [0.7, -0.7, 0.5],
+            ] {
+                let hits = reopened.search_knn("emb", &query, 5).unwrap();
+                let actual_ids: Vec<String> = hits
+                    .iter()
+                    .map(|h| h["_id"].as_str().unwrap().to_string())
+                    .collect();
+                let expected_ids = brute_force_cosine_oracle(&oracle_docs, &query, 5);
+                assert_eq!(actual_ids, expected_ids, "query={query:?}");
+            }
+
+            // Now add unflushed writes + replica failover updates without flushing
+            let new_vec = vec![-0.9, 0.1, 0.4];
+            reopened
+                .add_document("doc-24", json!({"emb": new_vec}))
+                .unwrap();
+            oracle_docs.insert("doc-24".to_string(), new_vec);
+            reopened.delete_document("doc-05").unwrap();
+            oracle_docs.remove("doc-05");
+        }
+
+        // Phase 2: Reopen with uncompacted WAL ops — coverage changed beyond persisted
+        // vector sidecar, so recover_vectors() must run streaming SegmentScanRebuilt!
+        {
+            let _batch_size = super::super::tantivy::override_vector_rebuild_batch_size_for_test(5);
+            let reopened = vector_engine(dir.path());
+            let progress = reopened.recover_vectors().unwrap();
+            assert_eq!(progress.mode, VectorRecoveryMode::SegmentScanRebuilt);
+            assert!(progress.segments_total >= 1);
+            assert_eq!(progress.segments_scanned, progress.segments_total);
+            assert!(progress.batches_processed >= 4);
+            assert_eq!(progress.vectors_recovered, oracle_docs.len());
+            assert!(progress.completed);
+
+            // Simulate primary promotion failover at term 2
+            reopened.prepare_primary_activation(2).unwrap();
+
+            for query in [[1.0f32, 0.0, 0.1], [-0.9, 0.1, 0.4], [0.0, 1.0, 0.2]] {
+                let hits = reopened.search_knn("emb", &query, 5).unwrap();
+                let actual_ids: Vec<String> = hits
+                    .iter()
+                    .map(|h| h["_id"].as_str().unwrap().to_string())
+                    .collect();
+                let expected_ids = brute_force_cosine_oracle(&oracle_docs, &query, 5);
+                assert_eq!(actual_ids, expected_ids, "post-failover query={query:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fs027_corrupted_persisted_vector_index_fails_recovery_and_keeps_shard_unavailable() {
+        use crate::cluster::state::{FieldMapping, FieldType, IndexSettings};
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = crate::shard::ShardManager::new(dir.path(), Duration::from_secs(60));
+        let mappings = std::collections::HashMap::from([(
+            "emb".to_string(),
+            FieldMapping {
+                field_type: FieldType::KnnVector,
+                dimension: Some(3),
+            },
+        )]);
+
+        let engine = mgr
+            .open_shard_with_settings(
+                "vec-idx",
+                0,
+                &mappings,
+                &IndexSettings::default(),
+                "vec-uuid",
+            )
+            .unwrap();
+        engine
+            .add_document("d1", json!({"emb": [1.0, 0.0, 0.0]}))
+            .unwrap();
+        engine.flush().unwrap();
+        drop(engine);
+        drop(mgr);
+
+        // Corrupt vectors.usearch so its SHA-256 no longer matches vectors.docids.bin
+        let shard_dir = dir.path().join("vec-uuid").join("shard_0");
+        std::fs::write(
+            shard_dir.join("vectors.usearch"),
+            b"corrupted-usearch-bytes",
+        )
+        .unwrap();
+
+        let mgr = crate::shard::ShardManager::new(dir.path(), Duration::from_secs(60));
+        let err = mgr
+            .open_shard_with_settings(
+                "vec-idx",
+                0,
+                &mappings,
+                &IndexSettings::default(),
+                "vec-uuid",
+            )
+            .err()
+            .expect("corrupted vector index must fail shard open");
+        assert!(
+            err.to_string().contains("checksum mismatch"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            mgr.get_shard("vec-idx", 0).is_none(),
+            "failed vector recovery must keep the shard unavailable"
+        );
     }
 }

@@ -38,6 +38,10 @@ impl RefreshDeadline {
     }
 }
 
+pub(crate) fn parse_grpc_timeout(value: &str) -> Result<Duration, Status> {
+    parse_timeout(value)
+}
+
 fn parse_timeout(value: &str) -> Result<Duration, Status> {
     let invalid = || Status::invalid_argument(format!("invalid grpc-timeout [{value}]"));
     let (unit, digits) = value.as_bytes().split_last().ok_or_else(invalid)?;
