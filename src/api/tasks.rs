@@ -214,6 +214,7 @@ pub async fn get_task(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
 ) -> (StatusCode, Json<Value>) {
+    crate::worker::set_current_trace_task_id(&task_id);
     if let Some(task) = state.task_manager.get_local_force_merge(&task_id) {
         return (StatusCode::OK, Json(local_task_response(&task)));
     }

@@ -1047,7 +1047,7 @@ within configured tolerances.
 
 ### FS-032 — Classify And Prioritize Background Work
 
-**Class:** Scale blocker | **Gate:** 1 | **Depends on:** FS-030, FS-031
+**Status:** Implemented (`WorkPriorityTier`, `WorkClassBudget`, foreground-pressure throttling, starvation-aging promotion, cooperative background yields, I/O byte accounting, and `ferrissearch_work_class_saturation_ratio` / `ferrissearch_background_throttled_total` metrics) | **Class:** Scale blocker | **Gate:** 1 | **Depends on:** FS-030, FS-031
 
 **Evidence:** refresh, flush, recovery, hydration, force merge, future
 compaction, and GC can compete with foreground work despite separate rayon
@@ -1062,7 +1062,7 @@ background progress, no Tokio starvation, and per-class saturation metrics.
 
 ### FS-033 — Add End-To-End Distributed Tracing And Stable Error Classes
 
-**Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-029
+**Status:** Implemented (`RequestTraceIds`, `StageTimingLedger`, `StableErrorClass`, header/gRPC propagation, secret sanitization, and `ferrissearch_classified_errors_total` / `ferrissearch_stage_execution_duration_seconds` metrics) | **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-029
 
 **Evidence:** metrics exist, but request/operation identity and stage-level
 causality are incomplete across HTTP, gRPC, worker pools, and object storage.
@@ -1077,7 +1077,7 @@ labels; bulk items retain diagnosable underlying causes.
 
 ### FS-034 — Implement The Searchable Mutable Delta
 
-**Class:** Release blocker | **Gate:** 2 | **Depends on:** FS-004, FS-009, FS-013
+**Status:** Implemented (`IndexLifecycleMode::Tiered`, `HotDeltaSealPolicy`, durable replicated hot-delta shards, `enumerate_seal_boundary`, and CRUD/search visibility before sealing) | **Class:** Release blocker | **Gate:** 2 | **Depends on:** FS-004, FS-009, FS-013
 
 **Evidence:** mutable `local_shards` and immutable `remote_store` are separate
 index engines rather than stages of one index lifecycle.
@@ -1092,7 +1092,7 @@ for a consistent seal boundary.
 
 ### FS-035 — Add Automatic Bounded Sealing Into Immutable Splits
 
-**Class:** Release blocker | **Gate:** 2 | **Depends on:** FS-018, FS-031, FS-034
+**Status:** Implemented (`seal_hot_delta`, `ActiveSealBarrier`, policy & manual triggers, backpressure rejection, `ResourceGovernor` reservations, and deterministic retryable `operation_id`) | **Class:** Release blocker | **Gate:** 2 | **Depends on:** FS-018, FS-031, FS-034
 
 **Evidence:** remote splits are manually published from request documents; no
 automatic hot-delta lifecycle exists.
@@ -1107,7 +1107,7 @@ accidentally published into unbounded tiny splits.
 
 ### FS-036 — Commit A Publication Visibility Watermark
 
-**Class:** Release blocker | **Gate:** 2 | **Depends on:** FS-003, FS-035
+**Status:** Implemented (`ShardPublishedWatermark`, `SplitSealRangeMetadata`, `RemoteStoreManifest.published_watermarks`, contiguous sequencer validation, and idempotent post-commit `retire_sealed_delta_through`) | **Class:** Release blocker | **Gate:** 2 | **Depends on:** FS-003, FS-035
 
 **Evidence:** no durable boundary says which hot-delta versions are fully
 represented by an accepted manifest generation.

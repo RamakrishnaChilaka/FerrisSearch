@@ -379,21 +379,33 @@ impl CompositeEngine {
 
     fn safe_truncation_checkpoint(&self) -> Result<Option<u64>> {
         let copy = self.text.copy_write_state();
-        if copy.enforces_primary_authority() {
-            return Ok(self
-                .global_checkpoint()
+        let base = if copy.enforces_primary_authority() {
+            self.global_checkpoint()
                 .zip(
                     copy.canonical_history()?
                         .and_then(|history| history.max_seq_no),
                 )
-                .map(|(global, canonical)| global.min(canonical)));
+                .map(|(global, canonical)| global.min(canonical))
+        } else {
+            self.global_checkpoint().or_else(|| {
+                *self
+                    .replica_persisted_cp
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+            })
+        };
+        if self
+            .data_dir
+            .join(super::SEAL_WATERMARK_FILE)
+            .try_exists()?
+        {
+            let wm = self.text.load_seal_watermark_state()?;
+            return Ok(match (base, wm.retired_through_seq_no) {
+                (Some(b), Some(r)) => Some(b.min(r)),
+                _ => None,
+            });
         }
-        Ok(self.global_checkpoint().or_else(|| {
-            *self
-                .replica_persisted_cp
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-        }))
+        Ok(base)
     }
 
     fn vector_index_path(&self) -> std::path::PathBuf {
@@ -1901,6 +1913,45 @@ impl SearchEngine for CompositeEngine {
 
     fn current_primary_term(&self) -> u64 {
         self.text.current_primary_term()
+    }
+
+    fn seal_watermark_state(&self) -> Result<super::SealWatermarkState> {
+        self.text.load_seal_watermark_state()
+    }
+
+    fn record_active_seal_barrier(&self, barrier: Option<super::ActiveSealBarrier>) -> Result<()> {
+        self.text.record_active_seal_barrier(barrier)
+    }
+
+    fn enumerate_seal_boundary(
+        &self,
+        after_seq_no: Option<u64>,
+        max_docs: usize,
+        max_bytes: u64,
+    ) -> Result<Option<super::SealBatchCandidate>> {
+        self.text
+            .enumerate_seal_boundary(after_seq_no, max_docs, max_bytes)
+    }
+
+    fn retire_sealed_delta_through(
+        &self,
+        committed_watermark_seq_no: u64,
+        manifest_generation: u64,
+    ) -> Result<usize> {
+        self.text
+            .retire_sealed_delta_through(committed_watermark_seq_no, manifest_generation)
+    }
+
+    fn unsealed_delta_stats(&self) -> Result<super::UnsealedDeltaStats> {
+        self.text.unsealed_delta_stats()
+    }
+
+    fn live_documents_with_versions(&self) -> Result<Vec<super::LiveDocumentVersionTuple>> {
+        self.text.live_documents_with_versions()
+    }
+
+    fn deleted_documents_with_versions(&self) -> Result<Vec<super::DeletedDocumentVersionTuple>> {
+        self.text.deleted_documents_with_versions()
     }
 
     fn global_checkpoint(&self) -> Option<u64> {

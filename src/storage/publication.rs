@@ -343,7 +343,13 @@ impl PublicationPreparedRecord {
                 self.split.checksum
             );
         }
-        if self.split.size_bytes == 0 || self.split.doc_count == 0 {
+        if self.split.size_bytes == 0
+            || (self.split.doc_count == 0
+                && !self
+                    .split
+                    .seal_range()?
+                    .is_some_and(|r| !r.tombstones.is_empty()))
+        {
             anyhow::bail!(
                 "publication prepared record split '{}' has zero size_bytes or doc_count",
                 self.split.split_id
@@ -351,6 +357,116 @@ impl PublicationPreparedRecord {
         }
         Ok(())
     }
+}
+
+/// Live document version entry recorded inside a sealed split's metadata (`FS-034`, `FS-035`, `FS-036`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SplitDocVersionRecord {
+    pub doc_id: String,
+    pub seq_no: u64,
+    pub primary_term: u64,
+    pub version: u64,
+}
+
+/// Tombstone entry recorded inside a sealed split's metadata (`FS-034`, `FS-035`, `FS-036`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SplitTombstoneRecord {
+    pub doc_id: String,
+    pub seq_no: u64,
+    pub primary_term: u64,
+    pub version: u64,
+}
+
+/// Logical hot-delta sequence range covered by a sealed split (`FS-034`, `FS-035`, `FS-036`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SplitSealRangeMetadata {
+    pub shard_id: u32,
+    pub start_seq_no: u64,
+    pub end_seq_no: u64,
+    pub primary_term: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub doc_versions: Vec<SplitDocVersionRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tombstones: Vec<SplitTombstoneRecord>,
+}
+
+/// Contiguous per-shard publication visibility watermark committed in a manifest generation (`FS-036`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ShardPublishedWatermark {
+    pub shard_id: u32,
+    pub sealed_through_seq_no: u64,
+    pub primary_term: u64,
+    pub last_split_id: String,
+    pub last_operation_id: String,
+    pub updated_at_generation: u64,
+}
+
+pub(crate) fn advance_shard_watermark(
+    watermarks: &mut std::collections::BTreeMap<u32, ShardPublishedWatermark>,
+    range: &SplitSealRangeMetadata,
+    split_id: &str,
+    operation_id: &str,
+    generation: u64,
+) -> Result<()> {
+    if range.end_seq_no < range.start_seq_no || range.primary_term == 0 {
+        anyhow::bail!(
+            "invalid seal range for shard {}: start_seq_no={} end_seq_no={} primary_term={}",
+            range.shard_id,
+            range.start_seq_no,
+            range.end_seq_no,
+            range.primary_term
+        );
+    }
+    match watermarks.get(&range.shard_id) {
+        None => {
+            if range.start_seq_no != 0 {
+                anyhow::bail!(
+                    "non-contiguous initial seal watermark for shard {}: expected start_seq_no 0, got {}",
+                    range.shard_id,
+                    range.start_seq_no
+                );
+            }
+        }
+        Some(prev) => {
+            let expected_start = prev
+                .sealed_through_seq_no
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("shard watermark sequence number overflow"))?;
+            if range.start_seq_no != expected_start {
+                anyhow::bail!(
+                    "non-contiguous seal watermark for shard {}: parent sealed_through_seq_no={}, candidate start_seq_no={} (expected {})",
+                    range.shard_id,
+                    prev.sealed_through_seq_no,
+                    range.start_seq_no,
+                    expected_start
+                );
+            }
+            if range.primary_term < prev.primary_term {
+                anyhow::bail!(
+                    "regressing primary_term in seal watermark for shard {}: parent term {}, candidate term {}",
+                    range.shard_id,
+                    prev.primary_term,
+                    range.primary_term
+                );
+            }
+        }
+    }
+    watermarks.insert(
+        range.shard_id,
+        ShardPublishedWatermark {
+            shard_id: range.shard_id,
+            sealed_through_seq_no: range.end_seq_no,
+            primary_term: range.primary_term,
+            last_split_id: split_id.to_string(),
+            last_operation_id: operation_id.to_string(),
+            updated_at_generation: generation,
+        },
+    );
+    Ok(())
 }
 
 /// Immutable committed record written at `<index_uuid>/publications/<operation_id>/committed.json`.
@@ -379,6 +495,8 @@ pub struct PublicationCommittedRecord {
     pub committed_at: String,
     #[serde(default)]
     pub committed_at_epoch_ms: u64,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub published_watermarks: std::collections::BTreeMap<u32, ShardPublishedWatermark>,
 }
 
 impl PublicationCommittedRecord {
@@ -482,6 +600,8 @@ pub struct PublicationCommitOutcome {
     pub writer_epoch: u64,
     pub pointer_revision: u64,
     pub replayed: bool,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub published_watermarks: std::collections::BTreeMap<u32, ShardPublishedWatermark>,
 }
 
 /// Result of resolving an operation ID against the committed manifest chain and
@@ -1174,6 +1294,7 @@ impl StorageManager {
                             observed_compare_token: token.as_str().to_string(),
                             committed_at: chrono::Utc::now().to_rfc3339(),
                             committed_at_epoch_ms: now_ms,
+                            published_watermarks: manifest.published_watermarks.clone(),
                         };
                         let _ = self.write_publication_committed(&repair).await;
                     }
@@ -1193,6 +1314,7 @@ impl StorageManager {
                         writer_epoch: manifest.writer_epoch,
                         pointer_revision,
                         replayed: true,
+                        published_watermarks: manifest.published_watermarks,
                     }));
                 }
 
@@ -1368,24 +1490,36 @@ impl StorageManager {
                     .into());
                 }
 
-                let (parent_generation, parent_manifest_path, mut splits, existing_settings) =
-                    if pointer.current_generation == 0 {
-                        (0u64, None, Vec::new(), None)
-                    } else {
-                        let parent = self
-                            .load_manifest_for_pointer(
-                                &req.index_uuid,
-                                &pointer,
-                                Some(&req.schema_hash),
-                            )
-                            .await?;
-                        (
-                            parent.generation,
-                            Some(pointer.manifest_path.clone()),
-                            parent.splits,
-                            parent.settings,
+                let (
+                    parent_generation,
+                    parent_manifest_path,
+                    mut splits,
+                    existing_settings,
+                    mut published_watermarks,
+                ) = if pointer.current_generation == 0 {
+                    (
+                        0u64,
+                        None,
+                        Vec::new(),
+                        None,
+                        std::collections::BTreeMap::new(),
+                    )
+                } else {
+                    let parent = self
+                        .load_manifest_for_pointer(
+                            &req.index_uuid,
+                            &pointer,
+                            Some(&req.schema_hash),
                         )
-                    };
+                        .await?;
+                    (
+                        parent.generation,
+                        Some(pointer.manifest_path.clone()),
+                        parent.splits,
+                        parent.settings,
+                        parent.published_watermarks,
+                    )
+                };
 
                 if splits
                     .iter()
@@ -1399,6 +1533,7 @@ impl StorageManager {
                     );
                 }
 
+                let candidate_generation = parent_generation + 1;
                 let mut split_entry = prepared.split.clone();
                 split_entry
                     .tags
@@ -1410,11 +1545,19 @@ impl StorageManager {
                     "schema_generation".into(),
                     req.schema_generation.to_string(),
                 );
+                if let Some(range) = split_entry.seal_range()? {
+                    advance_shard_watermark(
+                        &mut published_watermarks,
+                        &range,
+                        &split_entry.split_id,
+                        &req.operation_id,
+                        candidate_generation,
+                    )?;
+                }
                 splits.push(split_entry.clone());
 
                 // Step 7: Create candidate immutable manifest at manifests/<gen>/<operation_id>.json
                 // (or disambiguate with --epoch-<epoch> if a crashed earlier epoch left a candidate at the same generation).
-                let candidate_generation = parent_generation + 1;
                 let mut candidate_manifest_key = manifest_operation_key(
                     &req.index_uuid,
                     candidate_generation,
@@ -1435,6 +1578,7 @@ impl StorageManager {
                     request_fingerprint: req.request_fingerprint.clone(),
                     published_at: prepared.prepared_at.clone(),
                     settings: req.settings.clone().or(existing_settings),
+                    published_watermarks: published_watermarks.clone(),
                     splits,
                 };
                 candidate_manifest.validate_for_read(
@@ -1584,6 +1728,7 @@ impl StorageManager {
                             observed_compare_token: token.as_str().to_string(),
                             committed_at: now_iso.clone(),
                             committed_at_epoch_ms: now_ms,
+                            published_watermarks: published_watermarks.clone(),
                         };
                         let _ = self.write_publication_committed(&committed_record).await;
                         let _ = self
@@ -1633,6 +1778,7 @@ impl StorageManager {
                             writer_epoch: req.writer_epoch,
                             pointer_revision: next_pointer_revision,
                             replayed: false,
+                            published_watermarks,
                         })
                     }
                     Ok(CompareAndSwapOutcome::Conflict) => {

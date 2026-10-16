@@ -129,9 +129,16 @@ fn bulk_error_item(
     error_type: &str,
     reason: impl std::fmt::Display,
 ) -> Value {
+    let reason_str = reason.to_string();
+    let error_class = crate::worker::classify_http_error(status.as_u16(), error_type, &reason_str);
+    crate::worker::record_classified_error(error_class, crate::worker::ExecutionStage::Write);
     let mut result = serde_json::json!({
         "_id": doc_id, "status": status.as_u16(),
-        "error": {"type": error_type, "reason": reason.to_string()}
+        "error": {
+            "type": error_type,
+            "reason": reason_str,
+            "error_class": error_class.as_str(),
+        }
     });
     if let Some(index_name) = index_name {
         result["_index"] = serde_json::json!(index_name);
@@ -153,7 +160,14 @@ fn wire_item_json(index: &str, shard: u32, item: ShardBulkItemResponse) -> Value
                 .expect("successful bulk items have validated data-copy acknowledgement reports"),
         );
     } else {
-        result["error"] = serde_json::json!({"type": item.error_type, "reason": item.error});
+        let error_class =
+            crate::worker::classify_http_error(item.status as u16, &item.error_type, &item.error);
+        crate::worker::record_classified_error(error_class, crate::worker::ExecutionStage::Write);
+        result["error"] = serde_json::json!({
+            "type": item.error_type,
+            "reason": item.error,
+            "error_class": error_class.as_str(),
+        });
     }
     if let Some(seq_no) = item.seq_no {
         result["_seq_no"] = serde_json::json!(seq_no);

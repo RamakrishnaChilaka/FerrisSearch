@@ -136,6 +136,56 @@ pub fn attach_context_deadline_metadata<T>(
     if let Err(error) = ctx.check_active(stage) {
         return Err(status_from_worker_error(&error, stage));
     }
+    let trace_ids = ctx.trace_ids();
+    if !request
+        .metadata()
+        .contains_key(crate::worker::REQUEST_ID_HEADER)
+        && let Ok(val) = trace_ids.request_id.parse()
+    {
+        request
+            .metadata_mut()
+            .insert(crate::worker::REQUEST_ID_HEADER, val);
+    }
+    if let Some(ref op_id) = trace_ids.operation_id
+        && !request
+            .metadata()
+            .contains_key(crate::worker::OPERATION_ID_HEADER)
+        && let Ok(val) = op_id.parse()
+    {
+        request
+            .metadata_mut()
+            .insert(crate::worker::OPERATION_ID_HEADER, val);
+    }
+    if let Some(ref snap_id) = trace_ids.snapshot_id
+        && !request
+            .metadata()
+            .contains_key(crate::worker::SNAPSHOT_ID_HEADER)
+        && let Ok(val) = snap_id.parse()
+    {
+        request
+            .metadata_mut()
+            .insert(crate::worker::SNAPSHOT_ID_HEADER, val);
+    }
+    if let Some(ref assign_id) = trace_ids.assignment_id
+        && !request
+            .metadata()
+            .contains_key(crate::worker::ASSIGNMENT_ID_HEADER)
+        && let Ok(val) = assign_id.parse()
+    {
+        request
+            .metadata_mut()
+            .insert(crate::worker::ASSIGNMENT_ID_HEADER, val);
+    }
+    if let Some(ref task_id) = trace_ids.task_id
+        && !request
+            .metadata()
+            .contains_key(crate::worker::TASK_ID_HEADER)
+        && let Ok(val) = task_id.parse()
+    {
+        request
+            .metadata_mut()
+            .insert(crate::worker::TASK_ID_HEADER, val);
+    }
     if let Some(deadline) = ctx.deadline() {
         let remaining = deadline.remaining();
         let remaining_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
@@ -233,6 +283,41 @@ pub fn extract_grpc_request_context<T>(
         ),
         None => crate::worker::RequestCancellationContext::new(),
     };
+    if let Some(req_id) = request
+        .metadata()
+        .get(crate::worker::REQUEST_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
+        let _ = ctx.set_request_id(req_id);
+    }
+    if let Some(op_id) = request
+        .metadata()
+        .get(crate::worker::OPERATION_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
+        let _ = ctx.set_operation_id(op_id);
+    }
+    if let Some(snap_id) = request
+        .metadata()
+        .get(crate::worker::SNAPSHOT_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
+        let _ = ctx.set_snapshot_id(snap_id);
+    }
+    if let Some(assign_id) = request
+        .metadata()
+        .get(crate::worker::ASSIGNMENT_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
+        let _ = ctx.set_assignment_id(assign_id);
+    }
+    if let Some(task_id) = request
+        .metadata()
+        .get(crate::worker::TASK_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
+        let _ = ctx.set_task_id(task_id);
+    }
     let guard = ctx.drop_guard(crate::worker::CancellationReason::ClientDisconnected);
     Ok((ctx, guard))
 }

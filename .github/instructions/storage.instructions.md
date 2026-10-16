@@ -45,9 +45,15 @@ Do not collapse these responsibilities into API handlers.
   and a conservative dry-run-first janitor (`run_janitor`, FS-021). However,
   general optimistic multi-writer manifest merging, split compaction, and
   versioned document deletion are not implemented yet.
-- Standard `_doc`, `_bulk`, `_update`, and `_delete` APIs do not mutate a
-  remote-store index. The dedicated publish endpoint is not near-real-time
-  ingest.
+- Standard `_doc`, `_bulk`, `_update`, and `_delete` APIs remain rejected with
+  `501` on `ImmutableOnly` shardless `remote_store` indices. Tiered indices
+  (`lifecycle_mode: "tiered"` / `hot_delta` enabled, FS-034..FS-036) own routed
+  mutable hot-delta shards, enumerate contiguous seal boundaries, seal bounded
+  ranges into immutable splits via `POST /{index}/_remote_store/seal` under
+  `ResourceGovernor` and `WorkClass::Maintenance` limits, record contiguous
+  per-shard `published_watermarks` (`ShardPublishedWatermark`) in the committed
+  manifest generation, and retire sealed hot-delta ranges idempotently only
+  after manifest commit and queryability.
 - There is no object-store split compactor or tombstone lifecycle yet. The
   FS-021 janitor defaults to `dry_run = true` and in destructive mode reclaims
   only unpinned `Abandoned` and `Superseded` objects outside the active-lease

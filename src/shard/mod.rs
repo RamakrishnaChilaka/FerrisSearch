@@ -3078,6 +3078,20 @@ impl ShardManager {
             engine
                 .reconcile_term_sequence_state(identity.replica_fence, identity.fence_max_seq_no)?;
         }
+        if (settings
+            .remote_store
+            .as_ref()
+            .is_some_and(|rs| rs.has_enabled_hot_delta())
+            || matches!(
+                settings.engine,
+                crate::cluster::state::IndexEngine::RemoteStore
+            ))
+            && !shard_dir.join(crate::engine::SEAL_WATERMARK_FILE).is_file()
+        {
+            engine
+                .text_engine()
+                .persist_seal_watermark_state(&crate::engine::SealWatermarkState::default())?;
+        }
         CompositeEngine::start_refresh_loop_reactive(
             engine.clone(),
             refresh_rx,
@@ -5092,7 +5106,7 @@ impl ShardManager {
     /// channels and `IsrTracker` policies without requiring request ingress or reopen.
     pub fn reconcile_applied_settings(&self, state: &crate::cluster::state::ClusterState) {
         for (index_name, metadata) in &state.indices {
-            if !metadata.settings.engine.uses_local_shards() {
+            if !metadata.uses_local_shards() {
                 continue;
             }
             self.apply_settings(index_name, &metadata.settings);
@@ -5103,7 +5117,7 @@ impl ShardManager {
     pub fn get_settings_manager(&self, index: &str) -> Option<Arc<SettingsManager>> {
         self.with_applied_state(|state| {
             if let Some(metadata) = state.and_then(|state| state.indices.get(index))
-                && metadata.settings.engine.uses_local_shards()
+                && metadata.uses_local_shards()
                 && self
                     .settings_managers
                     .read()

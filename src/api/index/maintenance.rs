@@ -34,16 +34,25 @@ pub async fn refresh_index(
     // IndexName is validated at extraction time
 
     let cluster_state = state.cluster_manager.get_state();
-    if !cluster_state.indices.contains_key(index_name.as_str()) {
+    let Some(metadata) = cluster_state.indices.get(index_name.as_str()).cloned() else {
         return crate::api::error_response(
             StatusCode::NOT_FOUND,
             "index_not_found_exception",
             format!("no such index [{index_name}]"),
         );
-    }
+    };
 
     let (successful, failed) =
         fan_out_maintenance(&state, &index_name, MaintenanceDispatchOp::Refresh).await;
+
+    if metadata.is_tiered() {
+        let _ = crate::engine::remote_store::reconcile_published_watermark_retirement(
+            &state,
+            index_name.as_str(),
+            &metadata,
+        )
+        .await;
+    }
 
     (
         StatusCode::OK,
@@ -109,6 +118,7 @@ pub async fn force_merge_index(
         dispatch.node_tasks.clone(),
         dispatch.dispatch_failures.clone(),
     );
+    crate::worker::set_current_trace_task_id(&task_id);
     let started = dispatch.node_tasks.len() as u32;
     let failed = dispatch.dispatch_failures.len() as u32;
     let task_status = if failed > 0 {

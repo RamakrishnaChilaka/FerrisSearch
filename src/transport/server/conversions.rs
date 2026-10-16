@@ -104,6 +104,10 @@ pub(super) fn index_settings_to_proto(
                 manifest_refresh_ms: remote_store.manifest_refresh_ms,
                 hotcache_bytes: remote_store.hotcache_bytes,
                 split_cache_bytes: remote_store.split_cache_bytes,
+                hot_delta_json: remote_store
+                    .hot_delta
+                    .as_ref()
+                    .map(|hd| serde_json::to_string(hd).expect("hot_delta policy must serialize")),
             }
         }),
     }
@@ -111,8 +115,22 @@ pub(super) fn index_settings_to_proto(
 
 fn proto_to_remote_store_settings(
     settings: Option<&crate::transport::proto::RemoteStoreSettings>,
-) -> Option<crate::cluster::state::RemoteStoreSettings> {
-    let settings = settings?;
+) -> Result<Option<crate::cluster::state::RemoteStoreSettings>, Status> {
+    let Some(settings) = settings else {
+        return Ok(None);
+    };
+    let hot_delta = match settings.hot_delta_json.as_deref() {
+        Some(raw) if !raw.is_empty() => Some(
+            serde_json::from_str::<crate::cluster::state::HotDeltaSealPolicy>(raw).map_err(
+                |error| {
+                    Status::invalid_argument(format!(
+                        "unsupported cluster-state wire format: invalid hot_delta_json: {error}"
+                    ))
+                },
+            )?,
+        ),
+        _ => None,
+    };
     let remote_store = crate::cluster::state::RemoteStoreSettings {
         object_store_uri: settings.object_store_uri.clone(),
         manifest_path: settings.manifest_path.clone(),
@@ -121,12 +139,13 @@ fn proto_to_remote_store_settings(
         manifest_refresh_ms: settings.manifest_refresh_ms,
         hotcache_bytes: settings.hotcache_bytes,
         split_cache_bytes: settings.split_cache_bytes,
+        hot_delta,
     };
 
     if remote_store.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(remote_store)
+        Ok(Some(remote_store))
     }
 }
 
@@ -173,7 +192,7 @@ pub(super) fn proto_to_index_settings(
             )
         })?,
         replica_policy,
-        remote_store: proto_to_remote_store_settings(settings.remote_store.as_ref()),
+        remote_store: proto_to_remote_store_settings(settings.remote_store.as_ref())?,
     })
 }
 

@@ -3266,6 +3266,7 @@ fn roundtrip_preserves_remote_store_engine() {
                 manifest_refresh_ms: Some(1000),
                 hotcache_bytes: Some(4 * 1024 * 1024),
                 split_cache_bytes: Some(64 * 1024 * 1024),
+                hot_delta: None,
             }),
             ..Default::default()
         },

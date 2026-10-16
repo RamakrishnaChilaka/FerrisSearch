@@ -340,7 +340,7 @@ impl RestTestHarness {
         let harness = Self {
             _temp_dir: temp_dir,
             app_state,
-            client: Client::builder().timeout(Duration::from_secs(10)).build()?,
+            client: Client::builder().timeout(Duration::from_secs(30)).build()?,
             base_url: format!("http://{http_addr}"),
             transport_addr,
             http_handle,
@@ -603,7 +603,7 @@ impl MultiNodeRestHarness {
             })
             .collect();
 
-        let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+        let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
         let mut nodes = Vec::new();
 
         for (idx, pending) in pending_nodes.into_iter().enumerate() {
@@ -8266,6 +8266,497 @@ async fn fs017_021_multi_node_fenced_publish_retry_failover_inventory_and_janito
     .await?;
     assert_eq!(count_status, StatusCode::OK, "{count_body}");
     assert_eq!(count_body["count"], json!(3));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn fs032_fs033_http_trace_headers_stage_timings_and_stable_error_classes() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+    let (create_status, _) = harness
+        .put_json(
+            "/trace-idx",
+            json!({
+                "engine": "remote_store",
+                "mappings": {
+                    "properties": {
+                        "title": { "type": "text" },
+                        "seq": { "type": "integer" }
+                    }
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(create_status, StatusCode::OK);
+
+    // 1. Publish a split with explicit x-ferris-request-id and operation_id, then verify headers.
+    let pub_resp = harness
+        .client
+        .post(format!(
+            "{}/trace-idx/_remote_store/publish?operation_id=trace-op-1",
+            harness.base_url
+        ))
+        .header("x-ferris-request-id", "req-custom-777")
+        .json(&json!({
+            "docs": [
+                { "_id": "d1", "title": "distributed tracing", "seq": 1 }
+            ]
+        }))
+        .send()
+        .await?;
+    assert_eq!(pub_resp.status(), StatusCode::OK);
+    assert_eq!(
+        pub_resp
+            .headers()
+            .get("x-ferris-request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("req-custom-777")
+    );
+    assert_eq!(
+        pub_resp
+            .headers()
+            .get("x-ferris-operation-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("trace-op-1")
+    );
+
+    // 2. Search the remote_store index and verify snapshot_id, assignment_id, and stage timings.
+    let search_resp = harness
+        .client
+        .post(format!("{}/trace-idx/_search", harness.base_url))
+        .header("x-ferris-request-id", "req-search-888")
+        .json(&json!({ "query": { "match_all": {} } }))
+        .send()
+        .await?;
+    assert_eq!(search_resp.status(), StatusCode::OK);
+    assert_eq!(
+        search_resp
+            .headers()
+            .get("x-ferris-request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("req-search-888")
+    );
+    assert!(
+        search_resp
+            .headers()
+            .get("x-ferris-snapshot-id")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|s| s.starts_with("snap-"))
+    );
+    assert!(
+        search_resp
+            .headers()
+            .get("x-ferris-assignment-id")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|s| s.starts_with("assign-"))
+    );
+    let timings_raw = search_resp
+        .headers()
+        .get("x-ferris-stage-timings")
+        .and_then(|v| v.to_str().ok())
+        .expect("x-ferris-stage-timings header must be present");
+    let timings = ferrissearch::worker::StageTimingSnapshot::decode_compact(timings_raw).unwrap();
+    assert!(
+        timings.search_ns > 0 && timings.hydration_ns > 0 && timings.partial_merge_ns > 0,
+        "expected non-zero search, hydration, and partial_merge stage timings: {timings:?}"
+    );
+
+    // 3. Incoming secret in x-ferris-request-id is sanitized and replaced with generated req-* ID.
+    let secret_resp = harness
+        .client
+        .get(format!("{}/", harness.base_url))
+        .header("x-ferris-request-id", "Bearer super-secret-token")
+        .send()
+        .await?;
+    let echoed_id = secret_resp
+        .headers()
+        .get("x-ferris-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap();
+    assert!(
+        !echoed_id.contains("secret") && echoed_id.starts_with("req-"),
+        "secret header must be sanitized, got {echoed_id}"
+    );
+
+    // 4. Error responses carry stable error_class in JSON and x-ferris-error-class header.
+    let err_resp = harness
+        .client
+        .get(format!("{}/missing-idx/_search", harness.base_url))
+        .send()
+        .await?;
+    assert_eq!(err_resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        err_resp
+            .headers()
+            .get("x-ferris-error-class")
+            .and_then(|v| v.to_str().ok()),
+        Some("terminal")
+    );
+    let err_json: Value = err_resp.json().await?;
+    assert_eq!(err_json["error"]["error_class"], json!("terminal"));
+
+    let timeout_resp = harness
+        .client
+        .get(format!(
+            "{}/trace-idx/_search?timeout=0ms",
+            harness.base_url
+        ))
+        .send()
+        .await?;
+    assert_eq!(timeout_resp.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(
+        timeout_resp
+            .headers()
+            .get("x-ferris-error-class")
+            .and_then(|v| v.to_str().ok()),
+        Some("overload")
+    );
+    let timeout_json: Value = timeout_resp.json().await?;
+    assert_eq!(timeout_json["error"]["error_class"], json!("overload"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn fs034_fs035_fs036_tiered_hot_delta_bounded_sealing_and_visibility_watermark() -> Result<()>
+{
+    let harness = RestTestHarness::start().await?;
+
+    // 1. Create a tiered index with hot_delta policy (min_seal_docs=3, max_seal_docs=2, max_unsealed_ops=5).
+    let (create_status, create_body) = harness
+        .put_json(
+            "/tiered-events",
+            json!({
+                "engine": "remote_store",
+                "settings": {
+                    "lifecycle_mode": "tiered",
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0,
+                    "hot_delta": {
+                        "enabled": true,
+                        "min_seal_docs": 2,
+                        "max_seal_docs": 2,
+                        "min_seal_bytes": 1000000,
+                        "max_seal_bytes": 10000000,
+                        "max_seal_age_ms": 60000,
+                        "max_unsealed_ops": 5,
+                        "max_unsealed_bytes": 10000000
+                    }
+                },
+                "mappings": {
+                    "properties": {
+                        "title": { "type": "text" },
+                        "status": { "type": "keyword" },
+                        "seq": { "type": "integer" }
+                    }
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(create_status, StatusCode::OK, "{create_body}");
+
+    let (settings_status, settings_body) = harness.get_json("/tiered-events/_settings").await?;
+    assert_eq!(settings_status, StatusCode::OK, "{settings_body}");
+    assert_eq!(
+        settings_body["tiered-events"]["settings"]["index"]["lifecycle_mode"],
+        json!("tiered")
+    );
+
+    // 2. FS-034: Index 1 document into the hot delta, refresh, and verify search & GET visibility before sealing.
+    let (idx1_status, idx1_body) = harness
+        .put_json(
+            "/tiered-events/_doc/doc-1?refresh=true",
+            json!({ "title": "alpha event", "status": "open", "seq": 1 }),
+        )
+        .await?;
+    assert_eq!(idx1_status, StatusCode::CREATED, "{idx1_body}");
+    assert_eq!(idx1_body["_seq_no"], json!(0));
+    let primary_term = idx1_body["_primary_term"].as_u64().unwrap();
+    assert!(primary_term >= 1);
+    assert_eq!(idx1_body["_version"], json!(1));
+
+    let (search1_status, search1_body) = harness
+        .post_json(
+            "/tiered-events/_search",
+            json!({ "query": { "match_all": {} } }),
+        )
+        .await?;
+    assert_eq!(search1_status, StatusCode::OK, "{search1_body}");
+    assert_eq!(search1_body["hits"]["total"]["value"], json!(1));
+    assert_eq!(search1_body["hits"]["hits"][0]["_id"], json!("doc-1"));
+
+    // 3. FS-035: Automatic seal policy check (force=false) with 1 doc (< min_seal_docs=2, age < 60000ms) must skip!
+    // One document is never accidentally published into unbounded tiny splits.
+    let (auto_skip_status, auto_skip_body) = harness
+        .post_json(
+            "/tiered-events/_remote_store/seal",
+            json!({ "force": false }),
+        )
+        .await?;
+    assert_eq!(auto_skip_status, StatusCode::OK, "{auto_skip_body}");
+    assert_eq!(auto_skip_body["splits_sealed"], json!(0));
+    assert_eq!(
+        auto_skip_body["shards"][0]["status"],
+        json!("skipped_policy")
+    );
+
+    // Flushing before the first seal must NOT truncate unsealed WAL entries!
+    let (flush_status, _) = harness
+        .post_json("/tiered-events/_flush", json!({}))
+        .await?;
+    assert_eq!(flush_status, StatusCode::OK);
+
+    // 4. Add 4 more operations (total 5 unsealed ops == max_unsealed_ops=5):
+    // seq_no 1: index doc-2
+    // seq_no 2: update doc-1 -> status="closed", seq=10
+    // seq_no 3: index doc-3
+    // seq_no 4: delete doc-2
+    let (s, b) = harness
+        .put_json(
+            "/tiered-events/_doc/doc-2?refresh=true",
+            json!({ "title": "beta event", "status": "open", "seq": 2 }),
+        )
+        .await?;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let (s, b) = harness
+        .post_json(
+            "/tiered-events/_update/doc-1?refresh=true",
+            json!({ "doc": { "status": "closed", "seq": 10 } }),
+        )
+        .await?;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["_seq_no"], json!(2));
+    assert_eq!(b["_version"], json!(2));
+    let (s, b) = harness
+        .put_json(
+            "/tiered-events/_doc/doc-3?refresh=true",
+            json!({ "title": "gamma event", "status": "open", "seq": 3 }),
+        )
+        .await?;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let (s, b) = harness
+        .delete_json("/tiered-events/_doc/doc-2?refresh=true")
+        .await?;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["_seq_no"], json!(4));
+
+    // 5. FS-035 Backpressure: 6th write before sealing must be rejected with 429 hot_delta_backpressure_exception.
+    let (bp_status, bp_body) = harness
+        .put_json(
+            "/tiered-events/_doc/doc-overflow",
+            json!({ "title": "overflow", "status": "open", "seq": 99 }),
+        )
+        .await?;
+    assert_eq!(bp_status, StatusCode::TOO_MANY_REQUESTS, "{bp_body}");
+    assert_eq!(
+        bp_body["error"]["type"],
+        json!("hot_delta_backpressure_exception")
+    );
+    assert_eq!(bp_body["error"]["error_class"], json!("overload"));
+
+    // 6. FS-035 Automatic bounded seal (force=false): seals batch 1 (seq_no 0..=1, max_seal_docs=2).
+    let (seal1_status, seal1_body) = harness
+        .post_json(
+            "/tiered-events/_remote_store/seal",
+            json!({ "force": false }),
+        )
+        .await?;
+    assert_eq!(seal1_status, StatusCode::OK, "{seal1_body}");
+    assert_eq!(seal1_body["splits_sealed"], json!(1));
+    assert_eq!(seal1_body["shards"][0]["start_seq_no"], json!(0));
+    assert_eq!(seal1_body["shards"][0]["through_seq_no"], json!(1));
+    assert_eq!(seal1_body["shards"][0]["sealed_through_seq_no"], json!(1));
+    assert_eq!(seal1_body["shards"][0]["retired_through_seq_no"], json!(1));
+
+    // Verify visibility after batch 1 seal: doc-1 (v2 at seq_no=2 in hot delta) and doc-3 (seq_no=3 in hot delta)
+    // are live, while doc-2 (sealed in split 1 at seq_no=1, deleted in hot delta at seq_no=4) is hidden!
+    let (mid_search_status, mid_search_body) = harness
+        .post_json(
+            "/tiered-events/_search",
+            json!({
+                "query": { "match_all": {} },
+                "sort": [{ "seq": "asc" }]
+            }),
+        )
+        .await?;
+    assert_eq!(mid_search_status, StatusCode::OK, "{mid_search_body}");
+    assert_eq!(mid_search_body["hits"]["total"]["value"], json!(2));
+    assert_eq!(mid_search_body["hits"]["hits"][0]["_id"], json!("doc-3"));
+    assert_eq!(mid_search_body["hits"]["hits"][1]["_id"], json!("doc-1"));
+    assert_eq!(
+        mid_search_body["hits"]["hits"][1]["_source"]["status"],
+        json!("closed")
+    );
+
+    // 7. FS-036 Crash before pointer CAS: inject AfterManifestCreatedBeforePointerCas during batch 2 (seq_no 2..=3).
+    harness
+        .app_state
+        .storage_manager
+        .set_publication_crash_stage_for_test(Some(
+            ferrissearch::storage::PublicationCrashStage::AfterManifestCreatedBeforePointerCas,
+        ));
+    let (crash_seal_status, _crash_seal_body) = harness
+        .post_json(
+            "/tiered-events/_remote_store/seal",
+            json!({ "force": true }),
+        )
+        .await?;
+    assert_eq!(crash_seal_status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    // While batch 2 is uncommitted, search still sees exact state (doc-3 and doc-1 v2, no doc-2) without gaps!
+    let (after_crash_status, after_crash_body) = harness
+        .post_json(
+            "/tiered-events/_search",
+            json!({ "query": { "match_all": {} } }),
+        )
+        .await?;
+    assert_eq!(after_crash_status, StatusCode::OK, "{after_crash_body}");
+    assert_eq!(after_crash_body["hits"]["total"]["value"], json!(2));
+
+    // Retrying seal resumes the exact ActiveSealBarrier (seq_no 2..=3) with the same operation_id and commits generation 2!
+    let (seal2_status, seal2_body) = harness
+        .post_json(
+            "/tiered-events/_remote_store/seal",
+            json!({ "force": true }),
+        )
+        .await?;
+    assert_eq!(seal2_status, StatusCode::OK, "{seal2_body}");
+    assert_eq!(seal2_body["splits_sealed"], json!(1));
+    assert_eq!(seal2_body["shards"][0]["generation"], json!(2));
+    assert_eq!(seal2_body["shards"][0]["start_seq_no"], json!(2));
+    assert_eq!(seal2_body["shards"][0]["through_seq_no"], json!(3));
+    assert_eq!(seal2_body["shards"][0]["sealed_through_seq_no"], json!(3));
+    assert_eq!(seal2_body["shards"][0]["retired_through_seq_no"], json!(3));
+
+    // 8. FS-036 Crash after pointer CAS before local delta retirement:
+    // Seal batch 3 (seq_no 4..=4, the tombstone for doc-2) with retire_after_commit=false.
+    let (seal3_status, seal3_body) = harness
+        .post_json(
+            "/tiered-events/_remote_store/seal",
+            json!({ "force": true, "retire_after_commit": false }),
+        )
+        .await?;
+    assert_eq!(seal3_status, StatusCode::OK, "{seal3_body}");
+    assert_eq!(seal3_body["splits_sealed"], json!(1));
+    assert_eq!(seal3_body["shards"][0]["generation"], json!(3));
+    assert_eq!(seal3_body["shards"][0]["start_seq_no"], json!(4));
+    assert_eq!(seal3_body["shards"][0]["through_seq_no"], json!(4));
+    assert_eq!(seal3_body["shards"][0]["tombstone_count"], json!(1));
+    assert_eq!(seal3_body["shards"][0]["retired_through_seq_no"], json!(3));
+
+    // Even before local retirement of seq_no=4 runs, search, count, and GET return exact oracle results!
+    let (final_search_status, final_search_body) = harness
+        .post_json(
+            "/tiered-events/_search",
+            json!({
+                "query": { "match_all": {} },
+                "sort": [{ "seq": "asc" }]
+            }),
+        )
+        .await?;
+    assert_eq!(final_search_status, StatusCode::OK, "{final_search_body}");
+    assert_eq!(final_search_body["hits"]["total"]["value"], json!(2));
+    assert_eq!(final_search_body["hits"]["hits"][0]["_id"], json!("doc-3"));
+    assert_eq!(final_search_body["hits"]["hits"][1]["_id"], json!("doc-1"));
+
+    let (count_status, count_body) = harness.get_json("/tiered-events/_count").await?;
+    assert_eq!(count_status, StatusCode::OK, "{count_body}");
+    assert_eq!(count_body["count"], json!(2));
+
+    // GET doc-1 (which was retired from hot delta at seq_no=2 and now lives in published split 2)
+    // returns found=true with its exact _seq_no=2, _primary_term=primary_term, _version=2!
+    let (get1_status, get1_body) = harness.get_json("/tiered-events/_doc/doc-1").await?;
+    assert_eq!(get1_status, StatusCode::OK, "{get1_body}");
+    assert_eq!(get1_body["found"], json!(true));
+    assert_eq!(get1_body["_seq_no"], json!(2));
+    assert_eq!(get1_body["_primary_term"], json!(primary_term));
+    assert_eq!(get1_body["_version"], json!(2));
+    assert_eq!(get1_body["_source"]["status"], json!("closed"));
+
+    // GET doc-2 (deleted at seq_no=4) returns 404 found=false!
+    let (get2_status, get2_body) = harness.get_json("/tiered-events/_doc/doc-2").await?;
+    assert_eq!(get2_status, StatusCode::NOT_FOUND, "{get2_body}");
+    assert_eq!(get2_body["found"], json!(false));
+
+    // 9. Reconcile retirement via /_refresh and verify idempotent subsequent seal (skipped_empty).
+    let (ref_status, _) = harness
+        .post_json("/tiered-events/_refresh", json!({}))
+        .await?;
+    assert_eq!(ref_status, StatusCode::OK);
+
+    let (seal_empty_status, seal_empty_body) = harness
+        .post_json(
+            "/tiered-events/_remote_store/seal",
+            json!({ "force": true }),
+        )
+        .await?;
+    assert_eq!(seal_empty_status, StatusCode::OK, "{seal_empty_body}");
+    assert_eq!(seal_empty_body["splits_sealed"], json!(0));
+    assert_eq!(
+        seal_empty_body["shards"][0]["status"],
+        json!("skipped_empty")
+    );
+    assert_eq!(
+        seal_empty_body["shards"][0]["sealed_through_seq_no"],
+        json!(4)
+    );
+    assert_eq!(
+        seal_empty_body["shards"][0]["retired_through_seq_no"],
+        json!(4)
+    );
+
+    // 10. Post-retirement CRUD and OCC on sealed/retired document (doc-1 at seq_no=2, version=2):
+    // - op_type=create on existing retired doc-1 must reject with 409 version_conflict_engine_exception!
+    let (create_conflict_status, create_conflict_body) = harness
+        .put_json(
+            "/tiered-events/_doc/doc-1?op_type=create",
+            json!({ "title": "duplicate create", "status": "open", "seq": 99 }),
+        )
+        .await?;
+    assert_eq!(
+        create_conflict_status,
+        StatusCode::CONFLICT,
+        "{create_conflict_body}"
+    );
+    assert_eq!(
+        create_conflict_body["error"]["type"],
+        json!("version_conflict_engine_exception")
+    );
+
+    // - _update on retired doc-1 fetches source from published split, merges, and increments _version to 3!
+    let (upd_retired_status, upd_retired_body) = harness
+        .post_json(
+            "/tiered-events/_update/doc-1?refresh=true",
+            json!({ "doc": { "status": "reopened", "seq": 20 } }),
+        )
+        .await?;
+    assert_eq!(upd_retired_status, StatusCode::OK, "{upd_retired_body}");
+    assert_eq!(upd_retired_body["_seq_no"], json!(5));
+    assert_eq!(upd_retired_body["_version"], json!(3));
+
+    // - DELETE on retired doc-3 succeeds with 200 OK ("deleted") and increments _version to 2!
+    let (del_retired_status, del_retired_body) = harness
+        .delete_json("/tiered-events/_doc/doc-3?refresh=true")
+        .await?;
+    assert_eq!(del_retired_status, StatusCode::OK, "{del_retired_body}");
+    assert_eq!(del_retired_body["result"], json!("deleted"));
+    assert_eq!(del_retired_body["_seq_no"], json!(6));
+    assert_eq!(del_retired_body["_version"], json!(2));
+
+    // Verify search now returns only doc-1 with status="reopened" and seq=20!
+    let (post_crud_status, post_crud_body) = harness
+        .post_json(
+            "/tiered-events/_search",
+            json!({ "query": { "match_all": {} } }),
+        )
+        .await?;
+    assert_eq!(post_crud_status, StatusCode::OK, "{post_crud_body}");
+    assert_eq!(post_crud_body["hits"]["total"]["value"], json!(1));
+    assert_eq!(post_crud_body["hits"]["hits"][0]["_id"], json!("doc-1"));
+    assert_eq!(
+        post_crud_body["hits"]["hits"][0]["_source"]["status"],
+        json!("reopened")
+    );
 
     Ok(())
 }

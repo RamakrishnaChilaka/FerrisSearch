@@ -381,7 +381,7 @@ async fn activate_local_primaries(
     activation_service: &crate::transport::server::TransportService,
 ) {
     for (index_name, metadata) in &state.indices {
-        if !metadata.settings.engine.uses_local_shards() {
+        if !metadata.uses_local_shards() {
             continue;
         }
         for (shard_id, routing) in &metadata.shard_routing {
