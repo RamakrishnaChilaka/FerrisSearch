@@ -103,7 +103,8 @@ pub(super) fn canonicalize_query_clause_fields(
         }
         crate::search::QueryClause::MatchAll(_)
         | crate::search::QueryClause::MatchNone(_)
-        | crate::search::QueryClause::QueryString(_) => Ok(()),
+        | crate::search::QueryClause::QueryString(_)
+        | crate::search::QueryClause::SnapshotFilter(_) => Ok(()),
     }
 }
 

@@ -204,17 +204,22 @@ fn classify_key_shape(
         }
     }
     let splits_prefix = format!("{index_uuid}/splits/");
-    if let Some(rest) = path.strip_prefix(&splits_prefix)
-        && let Some(split_id) = rest.strip_suffix("/bundle")
-        && !split_id.is_empty()
-        && !split_id.contains('/')
-    {
-        return (
-            InventoryObjectKind::SplitBundle,
-            None,
-            Some(split_id.to_string()),
-            None,
-        );
+    if let Some(rest) = path.strip_prefix(&splits_prefix) {
+        let split_id_opt = rest
+            .strip_suffix("/bundle")
+            .or_else(|| rest.strip_suffix("/hotcache"))
+            .or_else(|| rest.strip_suffix("/hotcache.bin"));
+        if let Some(split_id) = split_id_opt
+            && !split_id.is_empty()
+            && !split_id.contains('/')
+        {
+            return (
+                InventoryObjectKind::SplitBundle,
+                None,
+                Some(split_id.to_string()),
+                None,
+            );
+        }
     }
     let staged_prefix = format!("{index_uuid}/staged/");
     if let Some(rest) = path.strip_prefix(&staged_prefix)
@@ -352,6 +357,13 @@ impl StorageManager {
 
         let mut pinned_splits = options.pinned_split_ids.clone();
         pinned_splits.extend(self.locally_pinned_splits_for_index(index_uuid));
+        let mut effective_pinned_generations = options.pinned_generations.clone();
+        for lease in self.active_snapshot_leases_for_index(index_uuid, options.now_epoch_ms) {
+            if lease.manifest_generation > 0 {
+                effective_pinned_generations.insert(lease.manifest_generation);
+            }
+            pinned_splits.extend(lease.pinned_split_ids);
+        }
 
         // 1. Load and validate current pointer + walk ancestor manifest lineage.
         let pointer_key = manifest_pointer_key(index_uuid);
@@ -363,6 +375,7 @@ impl StorageManager {
         let mut expired_ancestor_manifest_paths: HashMap<String, u64> = HashMap::new();
         let mut committed_split_paths: HashSet<String> = HashSet::new();
         let mut retained_split_paths: HashSet<String> = HashSet::new();
+        let mut compacted_split_paths: HashSet<String> = HashSet::new();
         let mut pinned_generation_split_paths: HashSet<String> = HashSet::new();
         let mut committed_operation_ids: HashSet<String> = HashSet::new();
         let mut retained_operation_ids: HashSet<String> = HashSet::new();
@@ -409,8 +422,7 @@ impl StorageManager {
                                     let within_retention = depth == 1
                                         || depth <= options.retention_generations.saturating_add(1)
                                         || age_ms <= options.retention_horizon_ms
-                                        || options
-                                            .pinned_generations
+                                        || effective_pinned_generations
                                             .contains(&manifest.generation);
 
                                     if depth == 1 {
@@ -419,10 +431,34 @@ impl StorageManager {
                                                 .insert(manifest.operation_id.clone());
                                         }
                                         for split in &manifest.splits {
-                                            committed_split_paths.insert(split.bundle_path.clone());
-                                            if let Some(op_id) = split.tags.get("operation_id") {
-                                                committed_operation_ids.insert(op_id.clone());
+                                            if matches!(
+                                                split.state,
+                                                super::RemoteSplitState::Published
+                                            ) {
+                                                committed_split_paths
+                                                    .insert(split.bundle_path.clone());
+                                                if let Some(ref hc) = split.hotcache_path {
+                                                    committed_split_paths.insert(hc.clone());
+                                                }
+                                                if let Some(op_id) = split.tags.get("operation_id")
+                                                {
+                                                    committed_operation_ids.insert(op_id.clone());
+                                                }
+                                            } else {
+                                                compacted_split_paths
+                                                    .insert(split.bundle_path.clone());
+                                                if let Some(ref hc) = split.hotcache_path {
+                                                    compacted_split_paths.insert(hc.clone());
+                                                }
+                                                if let Some(op_id) = split.tags.get("operation_id")
+                                                {
+                                                    retained_operation_ids.insert(op_id.clone());
+                                                }
                                             }
+                                        }
+                                        for lineage_rec in &manifest.compaction_lineage {
+                                            retained_operation_ids
+                                                .insert(lineage_rec.operation_id.clone());
                                         }
                                     } else if within_retention {
                                         retained_manifest_paths
@@ -432,17 +468,39 @@ impl StorageManager {
                                                 .insert(manifest.operation_id.clone());
                                         }
                                         for split in &manifest.splits {
-                                            retained_split_paths.insert(split.bundle_path.clone());
-                                            if options
-                                                .pinned_generations
-                                                .contains(&manifest.generation)
-                                            {
-                                                pinned_generation_split_paths
+                                            if matches!(
+                                                split.state,
+                                                super::RemoteSplitState::Published
+                                            ) {
+                                                retained_split_paths
                                                     .insert(split.bundle_path.clone());
+                                                if let Some(ref hc) = split.hotcache_path {
+                                                    retained_split_paths.insert(hc.clone());
+                                                }
+                                                if effective_pinned_generations
+                                                    .contains(&manifest.generation)
+                                                {
+                                                    pinned_generation_split_paths
+                                                        .insert(split.bundle_path.clone());
+                                                    if let Some(ref hc) = split.hotcache_path {
+                                                        pinned_generation_split_paths
+                                                            .insert(hc.clone());
+                                                    }
+                                                }
+                                            } else {
+                                                compacted_split_paths
+                                                    .insert(split.bundle_path.clone());
+                                                if let Some(ref hc) = split.hotcache_path {
+                                                    compacted_split_paths.insert(hc.clone());
+                                                }
                                             }
                                             if let Some(op_id) = split.tags.get("operation_id") {
                                                 retained_operation_ids.insert(op_id.clone());
                                             }
+                                        }
+                                        for lineage_rec in &manifest.compaction_lineage {
+                                            retained_operation_ids
+                                                .insert(lineage_rec.operation_id.clone());
                                         }
                                     } else {
                                         expired_ancestor_manifest_paths
@@ -452,9 +510,17 @@ impl StorageManager {
                                                 .insert(manifest.operation_id.clone());
                                         }
                                         for split in &manifest.splits {
+                                            compacted_split_paths.insert(split.bundle_path.clone());
+                                            if let Some(ref hc) = split.hotcache_path {
+                                                compacted_split_paths.insert(hc.clone());
+                                            }
                                             if let Some(op_id) = split.tags.get("operation_id") {
                                                 retained_operation_ids.insert(op_id.clone());
                                             }
+                                        }
+                                        for lineage_rec in &manifest.compaction_lineage {
+                                            retained_operation_ids
+                                                .insert(lineage_rec.operation_id.clone());
                                         }
                                     }
 
@@ -763,7 +829,8 @@ impl StorageManager {
                 .as_ref()
                 .is_some_and(|sid| pinned_splits.contains(sid))
                 || pinned_generation_split_paths.contains(&obj.path);
-            let is_gen_pinned = generation.is_some_and(|g| options.pinned_generations.contains(&g));
+            let is_gen_pinned =
+                generation.is_some_and(|g| effective_pinned_generations.contains(&g));
             let pinned = is_split_pinned || is_gen_pinned;
 
             let (classification, reclaimable, reason) = if let Some(corrupt_reason) =
@@ -914,6 +981,20 @@ impl StorageManager {
                                 false,
                                 "split bundle is actively pinned by a local reader or snapshot lease"
                                     .to_string(),
+                            )
+                        } else if compacted_split_paths.contains(&obj.path) {
+                            let beyond_horizon = obj_age_ms > options.retention_horizon_ms;
+                            let can_reclaim = index_safe_for_reclaim && beyond_horizon;
+                            (
+                                ObjectReachabilityClass::Superseded,
+                                can_reclaim,
+                                if can_reclaim {
+                                    "compacted split bundle no longer referenced by any retained or pinned manifest generation"
+                                        .to_string()
+                                } else {
+                                    "compacted split bundle retained until retention horizon expires"
+                                        .to_string()
+                                },
                             )
                         } else if let Some(ref op) = op_id
                             && unresolved_ops.contains(op)

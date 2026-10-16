@@ -79,6 +79,7 @@ fn sample_manifest(index_uuid: &str, generation: u64) -> RemoteStoreManifest {
         published_at: "2026-04-21T00:00:00Z".into(),
         settings: None,
         published_watermarks: BTreeMap::new(),
+        compaction_lineage: Vec::new(),
         splits: vec![RemoteSplitManifest {
             split_id: format!("split-{generation}"),
             state: RemoteSplitState::Published,

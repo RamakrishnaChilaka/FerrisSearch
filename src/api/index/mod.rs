@@ -1178,22 +1178,32 @@ pub(crate) async fn execute_distributed_dsl_search(
         return crate::engine::remote_store::search(state, index_name, &metadata, search_req).await;
     }
 
-    let tiered_manifest = if metadata.is_tiered() {
-        let expected_schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
-        state
-            .storage_manager
-            .load_current_manifest(metadata.uuid.as_str(), Some(&expected_schema_hash))
-            .await
-            .map_err(|error| {
-                crate::api::error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "remote_store_manifest_exception",
-                    format!("failed to load manifest for tiered index [{index_name}]: {error}"),
-                )
-            })?
+    let local_shards =
+        ensure_local_index_shards_open(state, index_name, &metadata, "DSL search").await;
+
+    let resolved_snapshot = if metadata.is_tiered() || search_req.snapshot_generation().is_some() {
+        Some(
+            crate::engine::remote_store::resolve_index_read_snapshot(
+                state,
+                index_name,
+                &metadata,
+                search_req.snapshot_generation(),
+                &local_shards,
+            )
+            .await?,
+        )
     } else {
         None
     };
+
+    if let Some(ref resolved) = resolved_snapshot
+        && resolved.snapshot.pinned_historical_generation
+    {
+        return crate::engine::remote_store::search_with_resolved_snapshot(
+            state, index_name, &metadata, search_req, resolved,
+        )
+        .await;
+    }
 
     let mut shard_hit_lists: Vec<Vec<serde_json::Value>> = Vec::new();
     let mut knn_hits = Vec::new();
@@ -1205,16 +1215,19 @@ pub(crate) async fn execute_distributed_dsl_search(
 
     let mut all_partial_aggs: Vec<HashMap<String, crate::search::PartialAggResult>> = Vec::new();
 
-    let local_shards =
-        ensure_local_index_shards_open(state, index_name, &metadata, "DSL search").await;
-
     // Dispatch all local shard searches in parallel
     let search_futures: Vec<_> = local_shards
         .iter()
         .map(|(shard_id, engine)| {
             let engine = engine.clone();
-            let search_req = search_req.clone();
             let shard_id = *shard_id;
+            let search_req = match resolved_snapshot
+                .as_ref()
+                .and_then(|r| r.shard_filters.get(&shard_id))
+            {
+                Some(filter) => search_req.with_snapshot_filter(filter.clone()),
+                None => search_req.without_noop_snapshot_filter(),
+            };
             let pools = state.worker_pools.clone();
             async move {
                 let result = pools
@@ -1301,7 +1314,13 @@ pub(crate) async fn execute_distributed_dsl_search(
             let node_info = node_info.clone();
             let index = index_name.to_string();
             let sid = *shard_id;
-            let req_clone = search_req.clone();
+            let req_clone = match resolved_snapshot
+                .as_ref()
+                .and_then(|r| r.shard_filters.get(&sid))
+            {
+                Some(filter) => search_req.with_snapshot_filter(filter.clone()),
+                None => search_req.without_noop_snapshot_filter(),
+            };
             let node_id = node_info.id.clone();
             let child_ctx = crate::worker::current_request_context().map(|ctx| ctx.child());
             let handle = tokio::spawn(async move {
@@ -1386,126 +1405,43 @@ pub(crate) async fn execute_distributed_dsl_search(
 
     let merge_started = std::time::Instant::now();
     let mut remote_store_stats = None;
-    if let Some(ref manifest) = tiered_manifest {
-        let remote_res =
-            crate::engine::remote_store::search(state, index_name, &metadata, search_req).await?;
+    if let Some(ref resolved) = resolved_snapshot
+        && resolved.manifest.is_some()
+    {
+        let remote_res = crate::engine::remote_store::search_with_resolved_snapshot(
+            state, index_name, &metadata, search_req, resolved,
+        )
+        .await?;
         remote_store_stats = remote_res.remote_store_stats;
 
-        // Build per-document winner across published splits and hot-delta (> published_watermark).
-        // Winner value: (seq_no, primary_term, is_tombstone, owner_tag)
-        let mut doc_winners: HashMap<String, (u64, u64, bool, String)> = HashMap::new();
-        for split in manifest.published_splits() {
-            if let Ok(Some(range)) = split.seal_range() {
-                for dv in &range.doc_versions {
-                    let update = doc_winners
-                        .get(&dv.doc_id)
-                        .is_none_or(|(s, t, _, _)| (dv.seq_no, dv.primary_term) >= (*s, *t));
-                    if update {
-                        doc_winners.insert(
-                            dv.doc_id.clone(),
-                            (dv.seq_no, dv.primary_term, false, split.split_id.clone()),
-                        );
-                    }
-                }
-                for ts in &range.tombstones {
-                    let update = doc_winners
-                        .get(&ts.doc_id)
-                        .is_none_or(|(s, t, _, _)| (ts.seq_no, ts.primary_term) >= (*s, *t));
-                    if update {
-                        doc_winners.insert(
-                            ts.doc_id.clone(),
-                            (ts.seq_no, ts.primary_term, true, split.split_id.clone()),
-                        );
-                    }
-                }
-            }
-        }
-
-        // Inspect hot-delta versions on local shards:
-        // - `hot_overlap_excluded_ids` records documents on local shards whose live version
-        //   has `seq_no <= wm_seq` (i.e. already covered by the committed manifest before local retirement).
-        // - `doc_winners` records versions > wm_seq that supersede or tombstone split versions.
-        let mut hot_overlap_excluded_ids: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        for (shard_id, engine) in &local_shards {
-            let wm_seq = manifest
-                .published_watermarks
-                .get(shard_id)
-                .map(|w| w.sealed_through_seq_no);
-            if let Ok(live_docs) = engine.live_documents_with_versions() {
-                for (doc_id, _src, seq_no, term, _ver) in live_docs {
-                    if wm_seq.is_none_or(|w| seq_no > w) {
-                        hot_overlap_excluded_ids.remove(&doc_id);
-                        let update = doc_winners
-                            .get(&doc_id)
-                            .is_none_or(|(s, t, _, _)| (seq_no, term) >= (*s, *t));
-                        if update {
-                            doc_winners.insert(doc_id, (seq_no, term, false, "hot".to_string()));
-                        }
-                    } else {
-                        hot_overlap_excluded_ids.insert(doc_id);
-                    }
-                }
-            }
-            if let Ok(del_docs) = engine.deleted_documents_with_versions() {
-                for (doc_id, seq_no, term, _ver) in del_docs {
-                    if wm_seq.is_none_or(|w| seq_no > w) {
-                        let update = doc_winners
-                            .get(&doc_id)
-                            .is_none_or(|(s, t, _, _)| (seq_no, term) >= (*s, *t));
-                        if update {
-                            doc_winners.insert(doc_id, (seq_no, term, true, "hot".to_string()));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Filter hot-delta hits so already-published versions <= W are not double-counted
-        // even if a crash occurred after pointer commit before local delta retirement,
-        // while preserving hits from remote shards!
-        let raw_hot_hits_count: usize = shard_hit_lists.iter().map(Vec::len).sum();
-        let mut surviving_hot_hits = Vec::new();
-        for list in shard_hit_lists {
-            let mut filtered = Vec::new();
-            for hit in list {
-                let doc_id = hit.get("_id").and_then(|v| v.as_str()).unwrap_or("");
-                if !hot_overlap_excluded_ids.contains(doc_id)
-                    && doc_winners
-                        .get(doc_id)
-                        .is_none_or(|(_, _, is_ts, owner)| !*is_ts && owner == "hot")
-                {
-                    filtered.push(hit);
-                }
-            }
-            if !filtered.is_empty() {
-                surviving_hot_hits.push(filtered);
-            }
-        }
-
-        let raw_split_hits_count = remote_res.all_hits.len();
-        let mut surviving_split_hits = Vec::new();
-        for hit in remote_res.all_hits {
-            let doc_id = hit.get("_id").and_then(|v| v.as_str()).unwrap_or("");
-            let split_id = hit.get("_split").and_then(|v| v.as_str()).unwrap_or("");
-            let keep = match doc_winners.get(doc_id) {
-                Some((_, _, is_ts, owner)) => !*is_ts && owner == split_id,
-                None => true,
-            };
-            if keep {
-                surviving_split_hits.push(hit);
-            }
-        }
-        let surviving_hot_count: usize = surviving_hot_hits.iter().map(Vec::len).sum();
-        let suppressed_hot = raw_hot_hits_count.saturating_sub(surviving_hot_count);
-        let suppressed_split = raw_split_hits_count.saturating_sub(surviving_split_hits.len());
+        // Defense-in-depth for remote shards not open locally on this coordinator:
+        // any hit returned from a hot shard (already filtered to _seq_no > W) supersedes
+        // an older split hit with the same _id.
+        let hot_hit_ids: std::collections::HashSet<String> = shard_hit_lists
+            .iter()
+            .flatten()
+            .filter_map(|h| {
+                h.get("_id")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string)
+            })
+            .collect();
+        let raw_split_hits_len = remote_res.all_hits.len();
+        let surviving_split_hits: Vec<serde_json::Value> = remote_res
+            .all_hits
+            .into_iter()
+            .filter(|h| {
+                let id = h.get("_id").and_then(|v| v.as_str()).unwrap_or("");
+                !hot_hit_ids.contains(id)
+            })
+            .collect();
+        let extra_suppressed = raw_split_hits_len.saturating_sub(surviving_split_hits.len());
         total_hits = total_hits
             .saturating_add(remote_res.total_hits)
-            .saturating_sub(suppressed_hot.saturating_add(suppressed_split));
+            .saturating_sub(extra_suppressed);
         if !surviving_split_hits.is_empty() {
-            surviving_hot_hits.push(surviving_split_hits);
+            shard_hit_lists.push(surviving_split_hits);
         }
-        shard_hit_lists = surviving_hot_hits;
         all_partial_aggs.extend(remote_res.partial_aggs);
     }
 
@@ -1550,7 +1486,20 @@ pub async fn search_documents_dsl(
 ) -> (StatusCode, Json<Value>) {
     let _timer = crate::metrics::SEARCH_LATENCY_SECONDS.start_timer();
 
-    let search_req: crate::search::SearchRequest = match serde_json::from_value(req) {
+    let requested_snapshot_gen = match req.get("snapshot_generation") {
+        Some(v) if !v.is_null() => match v.as_u64() {
+            Some(g) => Some(g),
+            None => {
+                return crate::api::error_response(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    "Invalid query DSL: 'snapshot_generation' must be a non-negative integer",
+                );
+            }
+        },
+        _ => None,
+    };
+    let mut search_req: crate::search::SearchRequest = match serde_json::from_value(req) {
         Ok(r) => r,
         Err(e) => {
             return crate::api::error_response(
@@ -1560,6 +1509,9 @@ pub async fn search_documents_dsl(
             );
         }
     };
+    if let Some(generation) = requested_snapshot_gen {
+        search_req = search_req.with_snapshot_generation(generation);
+    }
 
     // Validate search_after request shape before dispatching to shards.
     if let Some(cursor) = &search_req.search_after {
@@ -2460,33 +2412,68 @@ pub async fn publish_remote_store_documents(
         (None, b) => b,
     };
 
-    let docs_value = match body.get("docs") {
-        Some(v) => v,
+    let docs: Vec<Value> = match body.get("docs") {
+        Some(v) => match v.as_array() {
+            Some(arr) => arr.to_vec(),
+            None => {
+                return crate::api::error_response(
+                    StatusCode::BAD_REQUEST,
+                    "illegal_argument_exception",
+                    "'docs' must be a JSON array",
+                );
+            }
+        },
         None => {
-            return crate::api::error_response(
-                StatusCode::BAD_REQUEST,
-                "illegal_argument_exception",
-                "publish body must contain a 'docs' array",
-            );
+            if body.get("tombstones").is_none() {
+                return crate::api::error_response(
+                    StatusCode::BAD_REQUEST,
+                    "illegal_argument_exception",
+                    "publish body must contain a 'docs' array",
+                );
+            }
+            Vec::new()
         }
     };
-    let docs_array = match docs_value.as_array() {
-        Some(arr) => arr,
-        None => {
-            return crate::api::error_response(
-                StatusCode::BAD_REQUEST,
-                "illegal_argument_exception",
-                "'docs' must be a JSON array",
-            );
-        }
-    };
-    let docs: Vec<Value> = docs_array.to_vec();
 
-    match crate::engine::remote_store::publish_docs_with_operation(
+    let tombstones: Vec<String> = match body.get("tombstones") {
+        Some(v) => match v.as_array() {
+            Some(arr) => {
+                let mut ids = Vec::with_capacity(arr.len());
+                for item in arr {
+                    let id_opt = item
+                        .as_str()
+                        .or_else(|| item.get("doc_id").and_then(Value::as_str))
+                        .filter(|s| !s.is_empty());
+                    match id_opt {
+                        Some(id) => ids.push(id.to_string()),
+                        None => {
+                            return crate::api::error_response(
+                                StatusCode::BAD_REQUEST,
+                                "illegal_argument_exception",
+                                "each entry in 'tombstones' must be a non-empty string or object with non-empty 'doc_id'",
+                            );
+                        }
+                    }
+                }
+                ids
+            }
+            None => {
+                return crate::api::error_response(
+                    StatusCode::BAD_REQUEST,
+                    "illegal_argument_exception",
+                    "'tombstones' must be a JSON array",
+                );
+            }
+        },
+        None => Vec::new(),
+    };
+
+    match crate::engine::remote_store::publish_docs_with_tombstones(
         &state,
         index_name.as_str(),
         &metadata,
         docs,
+        tombstones,
         requested_operation_id,
     )
     .await
@@ -2647,6 +2634,62 @@ pub async fn seal_remote_store_delta(
         index_name.as_str(),
         &metadata,
         body.map(|Json(v)| v),
+    )
+    .await
+    {
+        Ok(response) => (StatusCode::OK, Json(response)),
+        Err(err_resp) => err_resp,
+    }
+}
+
+/// POST /{index}/_remote_store/compact or POST /{index}/_compact — Execute
+/// fenced, idempotent split compaction (`FS-039`, `FS-040`).
+pub async fn compact_remote_store_splits(
+    State(state): State<AppState>,
+    Path(index_name): Path<crate::common::IndexName>,
+    body: Option<Json<Value>>,
+) -> (StatusCode, Json<Value>) {
+    let cluster_state = state.cluster_manager.get_state();
+    let Some(metadata) = cluster_state.indices.get(index_name.as_str()).cloned() else {
+        return crate::api::error_response(
+            StatusCode::NOT_FOUND,
+            "index_not_found_exception",
+            format!("no such index [{}]", index_name.as_str()),
+        );
+    };
+    match crate::engine::remote_store::compact_splits(
+        &state,
+        index_name.as_str(),
+        &metadata,
+        body.map(|Json(v)| v),
+    )
+    .await
+    {
+        Ok(response) => (StatusCode::OK, Json(response)),
+        Err(err_resp) => err_resp,
+    }
+}
+
+/// POST /{index}/_remote_store/rollback — Forward-only manifest rollback to a
+/// retained generation (`FS-041`).
+pub async fn rollback_remote_store_manifest(
+    State(state): State<AppState>,
+    Path(index_name): Path<crate::common::IndexName>,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    let cluster_state = state.cluster_manager.get_state();
+    let Some(metadata) = cluster_state.indices.get(index_name.as_str()).cloned() else {
+        return crate::api::error_response(
+            StatusCode::NOT_FOUND,
+            "index_not_found_exception",
+            format!("no such index [{}]", index_name.as_str()),
+        );
+    };
+    match crate::engine::remote_store::rollback_manifest(
+        &state,
+        index_name.as_str(),
+        &metadata,
+        body,
     )
     .await
     {

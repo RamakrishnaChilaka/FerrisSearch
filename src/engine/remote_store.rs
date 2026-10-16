@@ -805,7 +805,7 @@ pub(crate) async fn execute_leaf_search_batch(
         {
             Ok(reader) => {
                 let engine = Arc::clone(&reader.engine);
-                let search_req = search_req.clone();
+                let search_req = search_req.for_remote_split(&split.split_id);
                 match context
                     .worker_pools
                     .spawn_search(move || engine.search_query(&search_req))
@@ -1065,13 +1065,17 @@ fn apply_remote_store_batch_results(
                     let hit_list = hits
                         .into_iter()
                         .map(|hit| {
-                            serde_json::json!({
+                            let mut enriched = serde_json::json!({
                                 "_index": index_name,
                                 "_split": split_id,
                                 "_id": hit.get("_id").and_then(|v| v.as_str()).unwrap_or(""),
                                 "_score": hit.get("_score"),
                                 "_source": hit.get("_source").unwrap_or(&hit),
-                            })
+                            });
+                            if let Some(sort_vals) = hit.get("sort") {
+                                enriched["sort"] = sort_vals.clone();
+                            }
+                            enriched
                         })
                         .collect::<Vec<_>>();
                     accumulator.split_hit_lists.push(hit_list);
@@ -1129,6 +1133,319 @@ async fn validate_empty_search_request(
         .map_err(query_error_response)
 }
 
+pub(crate) struct ResolvedIndexSnapshot {
+    pub snapshot: crate::storage::ReadSnapshot,
+    pub manifest: Option<crate::storage::RemoteStoreManifest>,
+    pub split_excluded_doc_ids: BTreeMap<String, Vec<String>>,
+    pub shard_filters: HashMap<u32, crate::search::SnapshotFilterParams>,
+    pub _lease_guard: Option<crate::storage::SnapshotLeaseGuard>,
+}
+
+/// Resolve and pin one `ReadSnapshot` across immutable splits and mutable hot-delta
+/// shards (`FS-037`, `FS-038`, ADR 0003 section 3.2).
+pub(crate) async fn resolve_index_read_snapshot(
+    state: &AppState,
+    index_name: &str,
+    metadata: &IndexMetadata,
+    requested_generation: Option<u64>,
+    local_shards: &[(u32, Arc<dyn crate::engine::SearchEngine>)],
+) -> Result<ResolvedIndexSnapshot, (StatusCode, Json<Value>)> {
+    let expected_schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
+    let loaded = state
+        .storage_manager
+        .load_manifest_for_snapshot(
+            metadata.uuid.as_str(),
+            requested_generation,
+            Some(&expected_schema_hash),
+        )
+        .await
+        .map_err(|error| {
+            let msg = format!("{error:#}");
+            if requested_generation.is_some()
+                && (msg.contains("does not exist")
+                    || msg.contains("exceeds current committed generation")
+                    || msg.contains("is not available"))
+            {
+                crate::api::error_response(
+                    StatusCode::BAD_REQUEST,
+                    "illegal_argument_exception",
+                    format!(
+                        "cannot resolve pinned snapshot_generation for index [{index_name}]: {msg}"
+                    ),
+                )
+            } else {
+                tracing::error!(
+                    "remote_store: failed to resolve manifest snapshot for {} ({}): {}",
+                    index_name,
+                    metadata.uuid.as_str(),
+                    msg
+                );
+                crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "remote_store_manifest_exception",
+                    format!("failed to load manifest: {msg}"),
+                )
+            }
+        })?;
+
+    let now_ms = now_epoch_ms();
+    let expires_at_epoch_ms = now_ms.saturating_add(300_000);
+    let (
+        manifest_opt,
+        manifest_generation,
+        manifest_path,
+        manifest_checksum,
+        writer_epoch,
+        pointer_revision,
+        published_watermarks,
+    ) = match loaded {
+        Some((manifest, path, checksum, ptr_rev)) => {
+            let generation = manifest.generation;
+            let epoch = manifest.writer_epoch;
+            let wms = manifest.published_watermarks.clone();
+            (
+                Some(manifest),
+                generation,
+                Some(path),
+                Some(checksum),
+                epoch,
+                ptr_rev,
+                wms,
+            )
+        }
+        None => (None, 0, None, None, 0, 0, BTreeMap::new()),
+    };
+
+    let snapshot_id = format!(
+        "snap-{}-g{}-e{}-r{}",
+        metadata.uuid, manifest_generation, writer_epoch, pointer_revision
+    );
+    crate::worker::set_current_trace_snapshot_id(&snapshot_id);
+    if let Some(ref m) = manifest_opt
+        && !m.operation_id.is_empty()
+    {
+        crate::worker::set_current_trace_operation_id(&m.operation_id);
+    }
+
+    let lease_guard = manifest_opt.as_ref().map(|m| {
+        let pinned_split_ids: HashSet<String> =
+            m.published_splits().map(|s| s.split_id.clone()).collect();
+        state.storage_manager.acquire_snapshot_retention_lease(
+            crate::storage::SnapshotRetentionLease {
+                snapshot_id: snapshot_id.clone(),
+                index_uuid: metadata.uuid.to_string(),
+                manifest_generation: m.generation,
+                pinned_split_ids,
+                acquired_at_epoch_ms: now_ms,
+                expires_at_epoch_ms,
+            },
+        )
+    });
+
+    // Compute per-document version and tombstone winners across published splits
+    // and (when not pinned to a historical manifest generation) hot-delta shards.
+    // Winner tuple: (seq_no, primary_term, version, split_order, is_tombstone, owner_tag)
+    let mut doc_winners: HashMap<String, (u64, u64, u64, usize, bool, String)> = HashMap::new();
+    let mut split_doc_membership: HashMap<String, HashSet<String>> = HashMap::new();
+
+    if let Some(ref manifest) = manifest_opt {
+        for (split_idx, split) in manifest.published_splits().enumerate() {
+            let entry = split_doc_membership
+                .entry(split.split_id.clone())
+                .or_default();
+            if let Ok(dvs) = split.doc_versions() {
+                for dv in dvs {
+                    entry.insert(dv.doc_id.clone());
+                    let cand = (
+                        dv.seq_no,
+                        dv.primary_term,
+                        dv.version,
+                        split_idx,
+                        false,
+                        split.split_id.clone(),
+                    );
+                    let update = doc_winners
+                        .get(&dv.doc_id)
+                        .is_none_or(|(s, t, v, idx, _, _)| {
+                            (cand.0, cand.1, cand.2, cand.3) >= (*s, *t, *v, *idx)
+                        });
+                    if update {
+                        doc_winners.insert(dv.doc_id, cand);
+                    }
+                }
+            }
+            if let Ok(tss) = split.tombstones() {
+                for ts in tss {
+                    let cand = (
+                        ts.seq_no,
+                        ts.primary_term,
+                        ts.version,
+                        split_idx,
+                        true,
+                        split.split_id.clone(),
+                    );
+                    let update = doc_winners
+                        .get(&ts.doc_id)
+                        .is_none_or(|(s, t, v, idx, _, _)| {
+                            (cand.0, cand.1, cand.2, cand.3) >= (*s, *t, *v, *idx)
+                        });
+                    if update {
+                        doc_winners.insert(ts.doc_id, cand);
+                    }
+                }
+            }
+        }
+    }
+
+    let pinned_historical_generation = requested_generation.is_some();
+    let mut shard_max_visible_seq_no = BTreeMap::new();
+    let mut shard_filters: HashMap<u32, crate::search::SnapshotFilterParams> = HashMap::new();
+
+    if metadata.is_tiered() && !pinned_historical_generation {
+        for (shard_id, engine) in local_shards {
+            let wm_seq = published_watermarks
+                .get(shard_id)
+                .map(|w| w.sealed_through_seq_no);
+            let mut max_vis: Option<u64> = wm_seq;
+            let mut shard_excluded: BTreeSet<String> = BTreeSet::new();
+            let hot_owner = format!("hot:{shard_id}");
+
+            let engine_for_versions = engine.clone();
+            let (live_res, del_res) = state
+                .worker_pools
+                .spawn_search(move || {
+                    (
+                        engine_for_versions.live_documents_with_versions(),
+                        engine_for_versions.deleted_documents_with_versions(),
+                    )
+                })
+                .await
+                .unwrap_or_else(|e| (Err(anyhow::anyhow!(e)), Ok(Vec::new())));
+
+            if let Ok(live_docs) = live_res {
+                for (doc_id, _src, seq_no, term, ver) in live_docs {
+                    max_vis = Some(max_vis.map_or(seq_no, |m| m.max(seq_no)));
+                    if wm_seq.is_none_or(|w| seq_no > w) {
+                        shard_excluded.remove(&doc_id);
+                        let cand = (seq_no, term, ver, usize::MAX, false, hot_owner.clone());
+                        let update = doc_winners.get(&doc_id).is_none_or(|(s, t, v, idx, _, _)| {
+                            (cand.0, cand.1, cand.2, cand.3) >= (*s, *t, *v, *idx)
+                        });
+                        if update {
+                            doc_winners.insert(doc_id, cand);
+                        }
+                    } else {
+                        shard_excluded.insert(doc_id);
+                    }
+                }
+            }
+            if let Ok(del_docs) = del_res {
+                for (doc_id, seq_no, term, ver) in del_docs {
+                    max_vis = Some(max_vis.map_or(seq_no, |m| m.max(seq_no)));
+                    if wm_seq.is_none_or(|w| seq_no > w) {
+                        let cand = (seq_no, term, ver, usize::MAX, true, hot_owner.clone());
+                        let update = doc_winners.get(&doc_id).is_none_or(|(s, t, v, idx, _, _)| {
+                            (cand.0, cand.1, cand.2, cand.3) >= (*s, *t, *v, *idx)
+                        });
+                        if update {
+                            doc_winners.insert(doc_id.clone(), cand);
+                        }
+                        shard_excluded.insert(doc_id);
+                    }
+                }
+            }
+
+            shard_max_visible_seq_no.insert(*shard_id, max_vis);
+            shard_filters.insert(
+                *shard_id,
+                crate::search::SnapshotFilterParams {
+                    snapshot_id: Some(snapshot_id.clone()),
+                    snapshot_generation: Some(manifest_generation),
+                    excluded_doc_ids: shard_excluded.into_iter().collect(),
+                    split_excluded_doc_ids: BTreeMap::new(),
+                    min_exclusive_seq_no: wm_seq,
+                    max_inclusive_seq_no: max_vis,
+                },
+            );
+        }
+        // Also populate min_exclusive_seq_no for any remote shard not in local_shards.
+        for shard_id in metadata.shard_routing.keys() {
+            shard_filters.entry(*shard_id).or_insert_with(|| {
+                let wm_seq = published_watermarks
+                    .get(shard_id)
+                    .map(|w| w.sealed_through_seq_no);
+                crate::search::SnapshotFilterParams {
+                    snapshot_id: Some(snapshot_id.clone()),
+                    snapshot_generation: Some(manifest_generation),
+                    excluded_doc_ids: Vec::new(),
+                    split_excluded_doc_ids: BTreeMap::new(),
+                    min_exclusive_seq_no: wm_seq,
+                    max_inclusive_seq_no: None,
+                }
+            });
+        }
+    }
+
+    let mut split_excluded_doc_ids: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    if let Some(ref manifest) = manifest_opt
+        && !doc_winners.is_empty()
+    {
+        for split in manifest.published_splits() {
+            let mut excluded = BTreeSet::new();
+            if let Some(members) = split_doc_membership.get(&split.split_id)
+                && !members.is_empty()
+            {
+                for doc_id in members {
+                    let is_winner_here =
+                        doc_winners
+                            .get(doc_id)
+                            .is_none_or(|(_, _, _, _, is_ts, owner)| {
+                                !*is_ts && owner == &split.split_id
+                            });
+                    if !is_winner_here {
+                        excluded.insert(doc_id.clone());
+                    }
+                }
+            } else {
+                for (doc_id, (_, _, _, _, is_ts, owner)) in &doc_winners {
+                    if *is_ts || owner != &split.split_id {
+                        excluded.insert(doc_id.clone());
+                    }
+                }
+            }
+            if !excluded.is_empty() {
+                split_excluded_doc_ids
+                    .insert(split.split_id.clone(), excluded.into_iter().collect());
+            }
+        }
+    }
+
+    let snapshot = crate::storage::ReadSnapshot {
+        snapshot_id,
+        index_uuid: metadata.uuid.to_string(),
+        index_name: index_name.to_string(),
+        schema_hash: expected_schema_hash,
+        resolved_at_epoch_ms: now_ms,
+        expires_at_epoch_ms,
+        pinned_historical_generation,
+        manifest_generation,
+        manifest_path,
+        manifest_checksum,
+        writer_epoch,
+        pointer_revision,
+        published_watermarks,
+        shard_max_visible_seq_no,
+    };
+
+    Ok(ResolvedIndexSnapshot {
+        snapshot,
+        manifest: manifest_opt,
+        split_excluded_doc_ids,
+        shard_filters,
+        _lease_guard: lease_guard,
+    })
+}
+
 /// Entry point invoked from `execute_distributed_dsl_search` when an index's
 /// engine is `IndexEngine::RemoteStore`.
 pub(crate) async fn search(
@@ -1136,6 +1453,24 @@ pub(crate) async fn search(
     index_name: &str,
     metadata: &IndexMetadata,
     search_req: &SearchRequest,
+) -> Result<DistributedDslSearchResult, (StatusCode, Json<Value>)> {
+    let resolved = resolve_index_read_snapshot(
+        state,
+        index_name,
+        metadata,
+        search_req.snapshot_generation(),
+        &[],
+    )
+    .await?;
+    search_with_resolved_snapshot(state, index_name, metadata, search_req, &resolved).await
+}
+
+pub(crate) async fn search_with_resolved_snapshot(
+    state: &AppState,
+    index_name: &str,
+    metadata: &IndexMetadata,
+    search_req: &SearchRequest,
+    resolved: &ResolvedIndexSnapshot,
 ) -> Result<DistributedDslSearchResult, (StatusCode, Json<Value>)> {
     if search_req.knn.is_some() {
         return Err(crate::api::error_response(
@@ -1145,61 +1480,22 @@ pub(crate) async fn search(
         ));
     }
 
-    // Load the current manifest. A missing pointer is not an error — it just
-    // means the index has no published splits yet, so the query returns zero
-    // hits and zero shards.
-    //
-    // Pass the computed schema_hash so `load_manifest` fails closed if the
-    // published manifest was built against a different mapping shape. Safe
-    // today because `remote_store` rejects writes (including `AddMappings`),
-    // so mappings are immutable post-create and the hashes should always
-    // line up — but we want the guard in place before dynamic mapping or
-    // non-backward-compatible schema changes ever land.
-    let expected_schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
-    let manifest = match state
-        .storage_manager
-        .load_current_manifest(metadata.uuid.as_str(), Some(&expected_schema_hash))
-        .await
-    {
-        Ok(Some(m)) => m,
-        Ok(None) => {
-            validate_empty_search_request(state, metadata, search_req).await?;
-            return Ok(DistributedDslSearchResult {
-                all_hits: Vec::new(),
-                total_hits: 0,
-                successful_shards: 0,
-                failed_shards: 0,
-                shard_failures: Vec::new(),
-                aggregations: HashMap::new(),
-                partial_aggs: Vec::new(),
-                remote_store_stats: Some(RemoteStoreSearchStats::default()),
-            });
-        }
-        Err(e) => {
-            tracing::error!(
-                "remote_store: failed to load current manifest for {} ({}): {}",
-                index_name,
-                metadata.uuid.as_str(),
-                e
-            );
-            return Err(crate::api::error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "remote_store_manifest_exception",
-                format!("failed to load manifest: {e}"),
-            ));
-        }
+    let clean_req = search_req.without_snapshot_filters();
+    let Some(ref manifest) = resolved.manifest else {
+        validate_empty_search_request(state, metadata, &clean_req).await?;
+        return Ok(DistributedDslSearchResult {
+            all_hits: Vec::new(),
+            total_hits: 0,
+            successful_shards: 0,
+            failed_shards: 0,
+            shard_failures: Vec::new(),
+            aggregations: HashMap::new(),
+            partial_aggs: Vec::new(),
+            remote_store_stats: Some(RemoteStoreSearchStats::default()),
+        });
     };
 
-    let snapshot_id = format!(
-        "snap-{}-g{}-e{}",
-        metadata.uuid, manifest.generation, manifest.writer_epoch
-    );
-    crate::worker::set_current_trace_snapshot_id(&snapshot_id);
-    if !manifest.operation_id.is_empty() {
-        crate::worker::set_current_trace_operation_id(&manifest.operation_id);
-    }
-
-    let pruning_predicate = build_split_pruning_predicate(&search_req.query, &metadata.mappings);
+    let pruning_predicate = build_split_pruning_predicate(&clean_req.query, &metadata.mappings);
     let published_split_count = manifest.published_splits().count();
     let split_plans: Vec<_> = manifest
         .published_splits()
@@ -1213,7 +1509,7 @@ pub(crate) async fn search(
         assigned_splits: 0,
     };
     if split_plans.is_empty() {
-        validate_empty_search_request(state, metadata, search_req).await?;
+        validate_empty_search_request(state, metadata, &clean_req).await?;
         return Ok(DistributedDslSearchResult {
             all_hits: Vec::new(),
             total_hits: 0,
@@ -1225,6 +1521,17 @@ pub(crate) async fn search(
             remote_store_stats: Some(remote_store_stats),
         });
     }
+
+    let search_req_with_exclusions =
+        clean_req.with_snapshot_filter(crate::search::SnapshotFilterParams {
+            snapshot_id: Some(resolved.snapshot.snapshot_id.clone()),
+            snapshot_generation: Some(manifest.generation),
+            excluded_doc_ids: Vec::new(),
+            split_excluded_doc_ids: resolved.split_excluded_doc_ids.clone(),
+            min_exclusive_seq_no: None,
+            max_inclusive_seq_no: None,
+        });
+    let search_req = &search_req_with_exclusions;
 
     let live_split_ids: HashSet<String> = split_plans
         .iter()
@@ -1977,6 +2284,7 @@ pub(crate) async fn publish_docs(
 
 /// Publish a batch of JSON documents as a new split on this index using the
 /// ADR 0002 fenced single-sequencer commit protocol.
+#[cfg(test)]
 pub(crate) async fn publish_docs_with_operation(
     state: &AppState,
     index_name: &str,
@@ -1984,7 +2292,26 @@ pub(crate) async fn publish_docs_with_operation(
     docs: Vec<serde_json::Value>,
     requested_operation_id: Option<String>,
 ) -> Result<serde_json::Value, (StatusCode, Json<Value>)> {
-    if docs.is_empty() {
+    publish_docs_with_tombstones(
+        state,
+        index_name,
+        metadata,
+        docs,
+        Vec::new(),
+        requested_operation_id,
+    )
+    .await
+}
+
+pub(crate) async fn publish_docs_with_tombstones(
+    state: &AppState,
+    index_name: &str,
+    metadata: &IndexMetadata,
+    docs: Vec<serde_json::Value>,
+    tombstone_doc_ids: Vec<String>,
+    requested_operation_id: Option<String>,
+) -> Result<serde_json::Value, (StatusCode, Json<Value>)> {
+    if docs.is_empty() && tombstone_doc_ids.is_empty() {
         return Err(crate::api::error_response(
             StatusCode::BAD_REQUEST,
             "illegal_argument_exception",
@@ -1996,13 +2323,13 @@ pub(crate) async fn publish_docs_with_operation(
     // client that wants more should send multiple publishes; each publish
     // produces one split which matches the Quickwit granularity model.
     const MAX_DOCS_PER_PUBLISH: usize = 100_000;
-    if docs.len() > MAX_DOCS_PER_PUBLISH {
+    if docs.len() + tombstone_doc_ids.len() > MAX_DOCS_PER_PUBLISH {
         return Err(crate::api::error_response(
             StatusCode::BAD_REQUEST,
             "illegal_argument_exception",
             format!(
                 "too many documents in one publish: got {}, max is {}",
-                docs.len(),
+                docs.len() + tombstone_doc_ids.len(),
                 MAX_DOCS_PER_PUBLISH
             ),
         ));
@@ -2063,6 +2390,8 @@ pub(crate) async fn publish_docs_with_operation(
     // Extract or deterministically derive _id per doc from (index_uuid, operation_id, ordinal),
     // then strip _id from payload so stored source stays clean and retries produce identical splits.
     let mut prepared: Vec<(String, serde_json::Value)> = Vec::with_capacity(docs.len());
+    let mut doc_versions: Vec<crate::storage::SplitDocVersionRecord> =
+        Vec::with_capacity(docs.len());
     for (ordinal, mut doc) in docs.into_iter().enumerate() {
         let doc_id = if let Some(id) = doc.get("_id").and_then(|v| v.as_str()) {
             id.to_string()
@@ -2072,24 +2401,62 @@ pub(crate) async fn publish_docs_with_operation(
         if let Some(obj) = doc.as_object_mut() {
             obj.remove("_id");
         }
+        doc_versions.push(crate::storage::SplitDocVersionRecord {
+            doc_id: doc_id.clone(),
+            seq_no: 0,
+            primary_term: 1,
+            version: 1,
+        });
         prepared.push((doc_id, doc));
     }
+    let tombstones: Vec<crate::storage::SplitTombstoneRecord> = tombstone_doc_ids
+        .into_iter()
+        .filter(|id| !id.is_empty())
+        .map(|doc_id| crate::storage::SplitTombstoneRecord {
+            doc_id,
+            seq_no: 0,
+            primary_term: 1,
+            version: 1,
+        })
+        .collect();
 
     let schema_generation = 1u64;
     let schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
-    let request_fingerprint = match crate::storage::compute_publication_request_fingerprint(
-        &index_uuid,
-        schema_generation,
-        &schema_hash,
-        &prepared,
-    ) {
-        Ok(fp) => fp,
-        Err(error) => {
-            return Err(crate::api::error_response(
-                StatusCode::BAD_REQUEST,
-                "illegal_argument_exception",
-                error,
-            ));
+    let request_fingerprint = if tombstones.is_empty() {
+        match crate::storage::compute_publication_request_fingerprint(
+            &index_uuid,
+            schema_generation,
+            &schema_hash,
+            &prepared,
+        ) {
+            Ok(fp) => fp,
+            Err(error) => {
+                return Err(crate::api::error_response(
+                    StatusCode::BAD_REQUEST,
+                    "illegal_argument_exception",
+                    error,
+                ));
+            }
+        }
+    } else {
+        let canonical = serde_json::json!({
+            "kind": "remote_store_publish_v1",
+            "index_uuid": index_uuid,
+            "schema_generation": schema_generation,
+            "schema_hash": schema_hash,
+            "docs": prepared,
+            "tombstones": tombstones,
+        });
+        match crate::engine::ClientOperationIntent::fingerprint_json(&canonical) {
+            Ok(raw) if raw.starts_with("sha256:") => raw,
+            Ok(raw) => format!("sha256:{raw}"),
+            Err(error) => {
+                return Err(crate::api::error_response(
+                    StatusCode::BAD_REQUEST,
+                    "illegal_argument_exception",
+                    error,
+                ));
+            }
         }
     };
 
@@ -2127,6 +2494,7 @@ pub(crate) async fn publish_docs_with_operation(
     };
 
     let doc_count = prepared.len() as u64;
+    let intent_doc_count = (doc_count + tombstones.len() as u64).max(1);
     let planned_bundle_path =
         crate::storage::StorageManager::split_bundle_key(&index_uuid, &split_id);
 
@@ -2143,7 +2511,7 @@ pub(crate) async fn publish_docs_with_operation(
             schema_hash: schema_hash.clone(),
             split_id: split_id.clone(),
             planned_bundle_path: planned_bundle_path.clone(),
-            doc_count,
+            doc_count: intent_doc_count,
             producer_node_id: state.local_node_id.clone(),
             created_at: chrono::Utc::now().to_rfc3339(),
             created_at_epoch_ms: now_ms,
@@ -2197,94 +2565,64 @@ pub(crate) async fn publish_docs_with_operation(
     };
 
     if !prepared_already_valid {
-        let mappings_arc = Arc::new(metadata.mappings.clone());
-        let staging_for_build = staging_dir.clone();
-        let mappings_for_build = Arc::clone(&mappings_arc);
+        let resumed_bundle = if existing_intent.is_some() {
+            state
+                .storage_manager
+                .inspect_existing_split_bundle(&index_uuid, &split_id)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        let (bundle_key, checksum, size_bytes) = if let Some(triple) = resumed_bundle {
+            triple
+        } else {
+            let mappings_arc = Arc::new(metadata.mappings.clone());
+            let staging_for_build = staging_dir.clone();
+            let mappings_for_build = Arc::clone(&mappings_arc);
 
-        // Build the split on the write worker pool — it's blocking I/O.
-        let build_result = state
-            .worker_pools
-            .spawn_write(move || -> anyhow::Result<()> {
-                if staging_for_build.exists() {
-                    std::fs::remove_dir_all(&staging_for_build)?;
-                }
-                std::fs::create_dir_all(&staging_for_build)?;
-                let column_cache = Arc::new(crate::engine::column_cache::ColumnCache::new(0, 0));
-                let engine = crate::engine::tantivy::HotEngine::new_remote_split_with_mappings(
-                    &staging_for_build,
-                    Duration::from_secs(60),
-                    mappings_for_build.as_ref(),
-                    column_cache,
-                )?;
-                use crate::engine::SearchEngine;
-                if !prepared.is_empty() {
-                    engine.bulk_add_documents(prepared)?;
-                }
-                engine.flush()?;
-                Ok(())
-            })
-            .await;
+            // Build the split on the write worker pool — it's blocking I/O.
+            let build_result = state
+                .worker_pools
+                .spawn_write(move || -> anyhow::Result<()> {
+                    if staging_for_build.exists() {
+                        std::fs::remove_dir_all(&staging_for_build)?;
+                    }
+                    std::fs::create_dir_all(&staging_for_build)?;
+                    let column_cache =
+                        Arc::new(crate::engine::column_cache::ColumnCache::new(0, 0));
+                    let engine = crate::engine::tantivy::HotEngine::new_remote_split_with_mappings(
+                        &staging_for_build,
+                        Duration::from_secs(60),
+                        mappings_for_build.as_ref(),
+                        column_cache,
+                    )?;
+                    use crate::engine::SearchEngine;
+                    if !prepared.is_empty() {
+                        engine.bulk_add_documents(prepared)?;
+                    }
+                    engine.flush()?;
+                    Ok(())
+                })
+                .await;
 
-        if let Err(e) = match build_result {
-            Ok(inner) => inner,
-            Err(join_err) => Err(anyhow::anyhow!(join_err)),
-        } {
-            let _ = std::fs::remove_dir_all(&staging_dir);
-            if e.is::<DocumentValidationError>()
-                || e.is::<crate::common::ReservedDocumentFieldError>()
-            {
-                return Err(crate::api::error_response(
-                    StatusCode::BAD_REQUEST,
-                    "mapper_parsing_exception",
-                    e,
-                ));
-            }
-            tracing::error!(
-                "remote_store: split build failed for {} split_id {}: {}",
-                index_name,
-                split_id,
-                e
-            );
-            return Err(crate::api::error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "remote_store_build_exception",
-                format!("split build failed: {e}"),
-            ));
-        }
-
-        // Immutable bundles cannot retain mutable WAL checkpoints without their WAL.
-        let staging_for_strip = staging_dir.clone();
-        let strip_result = state
-            .worker_pools
-            .spawn_write(move || strip_split_wal(&staging_for_strip))
-            .await;
-        if let Err(e) = match strip_result {
-            Ok(inner) => inner,
-            Err(join_err) => Err(anyhow::anyhow!(join_err)),
-        } {
-            tracing::error!(
-                "remote_store: failed to strip mutable WAL state from split {} of {}: {:#}",
-                split_id,
-                index_name,
-                e
-            );
-            return Err(crate::api::error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "remote_store_build_exception",
-                format!("failed to remove mutable WAL state before split publication: {e:#}"),
-            ));
-        }
-
-        let (bundle_key, checksum, size_bytes) = match state
-            .storage_manager
-            .upload_split_bundle(&index_uuid, &split_id, &staging_dir)
-            .await
-        {
-            Ok(triple) => triple,
-            Err(e) => {
+            if let Err(e) = match build_result {
+                Ok(inner) => inner,
+                Err(join_err) => Err(anyhow::anyhow!(join_err)),
+            } {
                 let _ = std::fs::remove_dir_all(&staging_dir);
+                if e.is::<DocumentValidationError>()
+                    || e.is::<crate::common::ReservedDocumentFieldError>()
+                {
+                    return Err(crate::api::error_response(
+                        StatusCode::BAD_REQUEST,
+                        "mapper_parsing_exception",
+                        e,
+                    ));
+                }
                 tracing::error!(
-                    "remote_store: bundle upload failed for {} split_id {}: {}",
+                    "remote_store: split build failed for {} split_id {}: {}",
                     index_name,
                     split_id,
                     e
@@ -2292,12 +2630,58 @@ pub(crate) async fn publish_docs_with_operation(
                 return Err(crate::api::error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "remote_store_build_exception",
-                    format!("bundle upload failed: {e}"),
+                    format!("split build failed: {e}"),
                 ));
             }
-        };
 
-        let _ = std::fs::remove_dir_all(&staging_dir);
+            // Immutable bundles cannot retain mutable WAL checkpoints without their WAL.
+            let staging_for_strip = staging_dir.clone();
+            let strip_result = state
+                .worker_pools
+                .spawn_write(move || strip_split_wal(&staging_for_strip))
+                .await;
+            if let Err(e) = match strip_result {
+                Ok(inner) => inner,
+                Err(join_err) => Err(anyhow::anyhow!(join_err)),
+            } {
+                tracing::error!(
+                    "remote_store: failed to strip mutable WAL state from split {} of {}: {:#}",
+                    split_id,
+                    index_name,
+                    e
+                );
+                return Err(crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "remote_store_build_exception",
+                    format!("failed to remove mutable WAL state before split publication: {e:#}"),
+                ));
+            }
+
+            let triple = match state
+                .storage_manager
+                .upload_split_bundle(&index_uuid, &split_id, &staging_dir)
+                .await
+            {
+                Ok(triple) => triple,
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&staging_dir);
+                    tracing::error!(
+                        "remote_store: bundle upload failed for {} split_id {}: {}",
+                        index_name,
+                        split_id,
+                        e
+                    );
+                    return Err(crate::api::error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "remote_store_build_exception",
+                        format!("bundle upload failed: {e}"),
+                    ));
+                }
+            };
+
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            triple
+        };
 
         if state
             .storage_manager
@@ -2316,7 +2700,7 @@ pub(crate) async fn publish_docs_with_operation(
 
         let mut tags = std::collections::BTreeMap::new();
         tags.insert("operation_id".to_string(), operation_id.clone());
-        let new_split = crate::storage::RemoteSplitManifest {
+        let mut new_split = crate::storage::RemoteSplitManifest {
             split_id: split_id.clone(),
             state: crate::storage::RemoteSplitState::Published,
             bundle_path: bundle_key,
@@ -2332,6 +2716,7 @@ pub(crate) async fn publish_docs_with_operation(
             field_ranges,
             field_terms,
         };
+        new_split.set_doc_versions_and_tombstones(&doc_versions, &tombstones);
         let now_ms = now_epoch_ms();
         let prepared_record = crate::storage::PublicationPreparedRecord {
             format_version: crate::storage::PUBLICATION_RECORD_FORMAT_VERSION,
@@ -2429,7 +2814,8 @@ pub(crate) async fn inspect_inventory(
     if !matches!(
         metadata.settings.engine,
         crate::cluster::state::IndexEngine::RemoteStore
-    ) {
+    ) && !metadata.is_tiered()
+    {
         return Err(crate::api::error_response(
             StatusCode::BAD_REQUEST,
             "illegal_argument_exception",
@@ -2482,6 +2868,36 @@ pub(crate) async fn inspect_inventory(
         }
     }
 
+    if let Ok(Some(current_manifest)) = state
+        .storage_manager
+        .load_current_manifest(metadata.uuid.as_str(), None)
+        .await
+    {
+        let mut keep_split_ids: HashSet<String> = current_manifest
+            .published_splits()
+            .map(|s| s.split_id.clone())
+            .collect();
+        keep_split_ids.extend(options.pinned_split_ids.iter().cloned());
+        for lease in state
+            .storage_manager
+            .active_snapshot_leases_for_index(metadata.uuid.as_str(), options.now_epoch_ms)
+        {
+            keep_split_ids.extend(lease.pinned_split_ids);
+        }
+        if options.pinned_generations.is_empty() {
+            let budget_bytes = metadata
+                .settings
+                .remote_store
+                .as_ref()
+                .and_then(|s| s.split_cache_bytes);
+            state.remote_store_reader_cache.evict_for_index(
+                metadata.uuid.as_str(),
+                &keep_split_ids,
+                budget_bytes,
+            );
+        }
+    }
+
     let report = state
         .storage_manager
         .build_reachability_inventory(&options)
@@ -2511,7 +2927,8 @@ pub(crate) async fn run_janitor(
     if !matches!(
         metadata.settings.engine,
         crate::cluster::state::IndexEngine::RemoteStore
-    ) {
+    ) && !metadata.is_tiered()
+    {
         return Err(crate::api::error_response(
             StatusCode::BAD_REQUEST,
             "illegal_argument_exception",
@@ -2576,6 +2993,42 @@ pub(crate) async fn run_janitor(
         }
     }
 
+    if let Ok(Some(current_manifest)) = state
+        .storage_manager
+        .load_current_manifest(metadata.uuid.as_str(), None)
+        .await
+    {
+        let mut keep_split_ids: HashSet<String> = current_manifest
+            .published_splits()
+            .map(|s| s.split_id.clone())
+            .collect();
+        keep_split_ids.extend(
+            janitor_opts
+                .inventory_options
+                .pinned_split_ids
+                .iter()
+                .cloned(),
+        );
+        for lease in state.storage_manager.active_snapshot_leases_for_index(
+            metadata.uuid.as_str(),
+            janitor_opts.inventory_options.now_epoch_ms,
+        ) {
+            keep_split_ids.extend(lease.pinned_split_ids);
+        }
+        if janitor_opts.inventory_options.pinned_generations.is_empty() {
+            let budget_bytes = metadata
+                .settings
+                .remote_store
+                .as_ref()
+                .and_then(|s| s.split_cache_bytes);
+            state.remote_store_reader_cache.evict_for_index(
+                metadata.uuid.as_str(),
+                &keep_split_ids,
+                budget_bytes,
+            );
+        }
+    }
+
     let report = state
         .storage_manager
         .run_janitor(&janitor_opts)
@@ -2616,7 +3069,8 @@ pub(crate) async fn verify_splits(
     if !matches!(
         metadata.settings.engine,
         crate::cluster::state::IndexEngine::RemoteStore
-    ) {
+    ) && !metadata.is_tiered()
+    {
         return Err(crate::api::error_response(
             StatusCode::BAD_REQUEST,
             "illegal_argument_exception",
@@ -3646,7 +4100,7 @@ pub(crate) async fn seal_hot_delta(
 }
 
 /// Resolve a document by `_id` from the committed manifest's published splits,
-/// respecting split-recorded operation versions and tombstones (`FS-034`, `FS-036`).
+/// respecting split-recorded operation versions and tombstones (`FS-034`, `FS-036`, `FS-038`).
 pub(crate) async fn get_document_from_published_splits(
     state: &AppState,
     metadata: &IndexMetadata,
@@ -3663,38 +4117,58 @@ pub(crate) async fn get_document_from_published_splits(
     };
 
     // Find the winning version across published splits for this shard.
-    // Tuple: (seq_no, primary_term, version, is_tombstone, split_manifest)
-    let mut winner: Option<(u64, u64, u64, bool, crate::storage::RemoteSplitManifest)> = None;
-    for split in manifest.published_splits() {
-        let Some(range) = split.seal_range()? else {
-            continue;
-        };
-        if range.shard_id != shard_id {
+    // Tuple: (seq_no, primary_term, version, split_idx, is_tombstone, split_manifest)
+    let mut winner: Option<(
+        u64,
+        u64,
+        u64,
+        usize,
+        bool,
+        crate::storage::RemoteSplitManifest,
+    )> = None;
+    for (split_idx, split) in manifest.published_splits().enumerate() {
+        if let Some(range) = split.seal_range()?
+            && range.shard_id != shard_id
+        {
             continue;
         }
-        for dv in &range.doc_versions {
+        for dv in split.doc_versions()? {
             if dv.doc_id == doc_id {
-                let replace = winner
-                    .as_ref()
-                    .is_none_or(|(s, t, _, _, _)| (dv.seq_no, dv.primary_term) >= (*s, *t));
+                let replace = winner.as_ref().is_none_or(|(s, t, v, idx, _, _)| {
+                    (dv.seq_no, dv.primary_term, dv.version, split_idx) >= (*s, *t, *v, *idx)
+                });
                 if replace {
-                    winner = Some((dv.seq_no, dv.primary_term, dv.version, false, split.clone()));
+                    winner = Some((
+                        dv.seq_no,
+                        dv.primary_term,
+                        dv.version,
+                        split_idx,
+                        false,
+                        split.clone(),
+                    ));
                 }
             }
         }
-        for ts in &range.tombstones {
+        for ts in split.tombstones()? {
             if ts.doc_id == doc_id {
-                let replace = winner
-                    .as_ref()
-                    .is_none_or(|(s, t, _, _, _)| (ts.seq_no, ts.primary_term) >= (*s, *t));
+                let replace = winner.as_ref().is_none_or(|(s, t, v, idx, _, _)| {
+                    (ts.seq_no, ts.primary_term, ts.version, split_idx) >= (*s, *t, *v, *idx)
+                });
                 if replace {
-                    winner = Some((ts.seq_no, ts.primary_term, ts.version, true, split.clone()));
+                    winner = Some((
+                        ts.seq_no,
+                        ts.primary_term,
+                        ts.version,
+                        split_idx,
+                        true,
+                        split.clone(),
+                    ));
                 }
             }
         }
     }
 
-    let Some((seq_no, primary_term, version, is_tombstone, winning_split)) = winner else {
+    let Some((seq_no, primary_term, version, _, is_tombstone, winning_split)) = winner else {
         return Ok(None);
     };
     if is_tombstone {
@@ -3722,6 +4196,1185 @@ pub(crate) async fn get_document_from_published_splits(
         seq_no,
         primary_term,
         version,
+    }))
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RemoteStoreCompactionOptions {
+    #[serde(default = "default_compact_force")]
+    pub force: bool,
+    #[serde(default)]
+    pub operation_id: Option<String>,
+    #[serde(default)]
+    pub split_ids: Vec<String>,
+    #[serde(default)]
+    pub shard_id: Option<u32>,
+    #[serde(default)]
+    pub min_input_splits: Option<usize>,
+    #[serde(default)]
+    pub max_input_splits: Option<usize>,
+    #[serde(default)]
+    pub max_output_bytes: Option<u64>,
+    #[serde(default)]
+    pub min_tombstone_ratio: Option<f64>,
+    #[serde(default)]
+    pub min_overlap_docs: Option<usize>,
+    #[serde(default)]
+    pub drop_tombstones: bool,
+}
+
+const fn default_compact_force() -> bool {
+    true
+}
+
+impl Default for RemoteStoreCompactionOptions {
+    fn default() -> Self {
+        Self {
+            force: true,
+            operation_id: None,
+            split_ids: Vec::new(),
+            shard_id: None,
+            min_input_splits: None,
+            max_input_splits: None,
+            max_output_bytes: None,
+            min_tombstone_ratio: None,
+            min_overlap_docs: None,
+            drop_tombstones: false,
+        }
+    }
+}
+
+pub fn deterministic_compaction_operation_id(
+    index_uuid: &str,
+    input_split_ids: &[String],
+    drop_tombstones: bool,
+) -> String {
+    use sha2::Digest;
+    let mut sorted_ids = input_split_ids.to_vec();
+    sorted_ids.sort();
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"ferris-compact-op-v1\0");
+    hasher.update(index_uuid.as_bytes());
+    hasher.update(b"\0");
+    for id in &sorted_ids {
+        hasher.update(id.as_bytes());
+        hasher.update(b",");
+    }
+    hasher.update(if drop_tombstones {
+        b":drop1"
+    } else {
+        b":drop0"
+    });
+    let hex: String = hasher
+        .finalize()
+        .iter()
+        .take(16)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("compact-{hex}")
+}
+
+/// Fenced, idempotent split compactor (`FS-039`, `FS-040`).
+///
+/// Selects eligible splits by count, size, document overlap, and tombstone density;
+/// merges live document winners and retained tombstones under `ResourceGovernor` +
+/// `WorkClass::Maintenance` limits; and atomically commits replacement lineage
+/// through the single-sequencer manifest protocol while keeping retained snapshots
+/// readable.
+pub(crate) async fn compact_splits(
+    state: &AppState,
+    index_name: &str,
+    metadata: &IndexMetadata,
+    body: Option<Value>,
+) -> Result<Value, (StatusCode, Json<Value>)> {
+    if metadata.uses_local_shards() && !metadata.is_tiered() {
+        return Err(crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            format!(
+                "index [{}] has lifecycle_mode [{}] which does not support split compaction",
+                index_name,
+                metadata.lifecycle_mode()
+            ),
+        ));
+    }
+
+    let options: RemoteStoreCompactionOptions = match body {
+        Some(v) if !v.is_null() => serde_json::from_value(v).map_err(|error| {
+            crate::api::error_response(
+                StatusCode::BAD_REQUEST,
+                "illegal_argument_exception",
+                format!("invalid compaction request body: {error}"),
+            )
+        })?,
+        _ => RemoteStoreCompactionOptions::default(),
+    };
+
+    if let Some(ref op_id) = options.operation_id
+        && let Err(error) = crate::storage::validate_publication_operation_id(op_id)
+    {
+        return Err(crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            error,
+        ));
+    }
+
+    if let Err(error) = state.storage_manager.ensure_publication_supported().await {
+        return Err(crate::api::error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "remote_store_publish_exception",
+            error,
+        ));
+    }
+
+    let index_uuid = metadata.uuid.as_str().to_string();
+    let expected_schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
+    let Some(current_manifest) = state
+        .storage_manager
+        .load_current_manifest(&index_uuid, Some(&expected_schema_hash))
+        .await
+        .map_err(|error| {
+            crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "remote_store_manifest_exception",
+                format!("failed to load current manifest before compaction: {error:#}"),
+            )
+        })?
+    else {
+        return Ok(serde_json::json!({
+            "index": index_name,
+            "index_uuid": index_uuid,
+            "status": "skipped_empty",
+            "splits_compacted": 0,
+        }));
+    };
+
+    let min_input_splits = options.min_input_splits.unwrap_or(2).max(1);
+    let max_input_splits = options.max_input_splits.unwrap_or(16).max(min_input_splits);
+    let max_output_bytes = options.max_output_bytes.unwrap_or(256 * 1024 * 1024).max(1);
+    let min_tombstone_ratio = options.min_tombstone_ratio.unwrap_or(0.10);
+    let min_overlap_docs = options.min_overlap_docs.unwrap_or(1);
+
+    // Resolve candidate input splits.
+    let selected_inputs: Vec<(usize, crate::storage::RemoteSplitManifest)> = if !options
+        .split_ids
+        .is_empty()
+    {
+        // Check if this exact operation_id was already committed (idempotent retry!).
+        let op_id = options.operation_id.clone().unwrap_or_else(|| {
+            deterministic_compaction_operation_id(
+                &index_uuid,
+                &options.split_ids,
+                options.drop_tombstones,
+            )
+        });
+        if let Some(lineage) = current_manifest
+            .compaction_lineage
+            .iter()
+            .find(|l| l.operation_id == op_id)
+        {
+            if lineage.input_split_ids != options.split_ids {
+                return Err(crate::api::error_response(
+                    StatusCode::CONFLICT,
+                    "operation_id_conflict",
+                    format!(
+                        "compaction operation_id [{op_id}] was already committed with different input splits"
+                    ),
+                ));
+            }
+            let out_split_id = lineage
+                .output_split_ids
+                .first()
+                .cloned()
+                .unwrap_or_default();
+            return Ok(serde_json::json!({
+                "index": index_name,
+                "index_uuid": index_uuid,
+                "status": "replayed",
+                "replayed": true,
+                "operation_id": op_id,
+                "generation": lineage.committed_at_generation,
+                "input_split_ids": lineage.input_split_ids,
+                "output_split_id": out_split_id,
+                "splits_compacted": lineage.input_split_ids.len(),
+                "retained_live_docs": lineage.retained_live_docs,
+                "retained_tombstones": lineage.retained_tombstones,
+                "dropped_superseded_versions": lineage.dropped_superseded_versions,
+            }));
+        }
+
+        let mut list = Vec::with_capacity(options.split_ids.len());
+        let mut seen = HashSet::new();
+        for req_id in &options.split_ids {
+            if !seen.insert(req_id.as_str()) {
+                return Err(crate::api::error_response(
+                    StatusCode::BAD_REQUEST,
+                    "illegal_argument_exception",
+                    format!("duplicate split_id [{req_id}] in compaction request"),
+                ));
+            }
+            let Some((idx, split)) = current_manifest
+                .splits
+                .iter()
+                .enumerate()
+                .find(|(_, s)| &s.split_id == req_id)
+            else {
+                return Err(crate::api::error_response(
+                    StatusCode::BAD_REQUEST,
+                    "illegal_argument_exception",
+                    format!("compaction input split [{req_id}] does not exist in manifest"),
+                ));
+            };
+            if !matches!(split.state, crate::storage::RemoteSplitState::Published) {
+                return Err(crate::api::error_response(
+                    StatusCode::CONFLICT,
+                    "operation_id_conflict",
+                    format!(
+                        "compaction input split [{req_id}] was already replaced (state: {:?})",
+                        split.state
+                    ),
+                ));
+            }
+            list.push((idx, split.clone()));
+        }
+        list.sort_by_key(|(idx, _)| *idx);
+        list
+    } else {
+        // Group published splits by shard_id (or None for unsharded remote_store).
+        let mut groups: BTreeMap<Option<u32>, Vec<(usize, crate::storage::RemoteSplitManifest)>> =
+            BTreeMap::new();
+        for (idx, split) in current_manifest.splits.iter().enumerate() {
+            if !matches!(split.state, crate::storage::RemoteSplitState::Published) {
+                continue;
+            }
+            let sid = split.seal_range().ok().flatten().map(|r| r.shard_id);
+            if let Some(target_sid) = options.shard_id
+                && sid != Some(target_sid)
+            {
+                continue;
+            }
+            groups.entry(sid).or_default().push((idx, split.clone()));
+        }
+
+        let mut chosen: Option<Vec<(usize, crate::storage::RemoteSplitManifest)>> = None;
+        for (_sid, mut group) in groups {
+            group.sort_by_key(|(idx, s)| {
+                (
+                    s.seal_range()
+                        .ok()
+                        .flatten()
+                        .map(|r| r.start_seq_no)
+                        .unwrap_or(*idx as u64),
+                    *idx,
+                )
+            });
+            let mut window = Vec::new();
+            let mut acc_bytes = 0u64;
+            for item in group {
+                if !window.is_empty()
+                    && (window.len() >= max_input_splits
+                        || acc_bytes.saturating_add(item.1.size_bytes) > max_output_bytes)
+                {
+                    break;
+                }
+                acc_bytes = acc_bytes.saturating_add(item.1.size_bytes);
+                window.push(item);
+            }
+            if window.is_empty() {
+                continue;
+            }
+            // Compute overlap and tombstone density for policy check.
+            let mut seen_docs = HashSet::new();
+            let mut overlap_docs = 0usize;
+            let mut total_live = 0usize;
+            let mut total_tombstones = 0usize;
+            for (_, sp) in &window {
+                let dvs = sp.doc_versions().unwrap_or_default();
+                let tss = sp.tombstones().unwrap_or_default();
+                total_live += dvs.len();
+                total_tombstones += tss.len();
+                for dv in dvs {
+                    if !seen_docs.insert(dv.doc_id) {
+                        overlap_docs += 1;
+                    }
+                }
+                for ts in tss {
+                    if !seen_docs.insert(ts.doc_id) {
+                        overlap_docs += 1;
+                    }
+                }
+            }
+            let total_records = (total_live + total_tombstones).max(1);
+            let tombstone_ratio = (total_tombstones as f64) / (total_records as f64);
+            let policy_eligible = options.force
+                || window.len() >= min_input_splits
+                || overlap_docs >= min_overlap_docs
+                || tombstone_ratio >= min_tombstone_ratio;
+            if policy_eligible
+                && (window.len() >= min_input_splits || (options.force && !window.is_empty()))
+            {
+                chosen = Some(window);
+                break;
+            }
+        }
+
+        let Some(chosen) = chosen else {
+            let status = if current_manifest.published_splits().count() == 0 {
+                "skipped_empty"
+            } else {
+                "skipped_policy"
+            };
+            return Ok(serde_json::json!({
+                "index": index_name,
+                "index_uuid": index_uuid,
+                "status": status,
+                "splits_compacted": 0,
+            }));
+        };
+        chosen
+    };
+
+    let input_split_ids: Vec<String> = selected_inputs
+        .iter()
+        .map(|(_, s)| s.split_id.clone())
+        .collect();
+    let operation_id = options.operation_id.unwrap_or_else(|| {
+        deterministic_compaction_operation_id(
+            &index_uuid,
+            &input_split_ids,
+            options.drop_tombstones,
+        )
+    });
+    crate::worker::set_current_trace_operation_id(&operation_id);
+
+    let estimated_bytes: u64 = selected_inputs
+        .iter()
+        .map(|(_, s)| s.size_bytes)
+        .sum::<u64>()
+        .max(1024);
+
+    let current_ctx = crate::worker::current_request_context();
+    state
+        .worker_pools
+        .admission()
+        .cooperative_background_yield(crate::worker::WorkClass::Maintenance, current_ctx.as_ref())
+        .await
+        .map_err(|error| {
+            crate::api::error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rejected_execution_exception",
+                error,
+            )
+        })?;
+    let mut mem_reservation = state
+        .worker_pools
+        .resource_governor()
+        .try_reserve(crate::worker::ResourcePoolKind::Memory, estimated_bytes)
+        .map_err(|error| {
+            crate::api::error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rejected_execution_exception",
+                error,
+            )
+        })?;
+    let mut temp_disk_reservation = state
+        .worker_pools
+        .resource_governor()
+        .try_reserve(crate::worker::ResourcePoolKind::TempDisk, estimated_bytes)
+        .map_err(|error| {
+            crate::api::error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rejected_execution_exception",
+                error,
+            )
+        })?;
+
+    // Hydrate and read all input splits to compute exact live document winners and tombstones.
+    let leaf_ctx = LeafExecutionContext {
+        worker_pools: state.worker_pools.clone(),
+        storage_manager: state.storage_manager.clone(),
+        reader_cache: state.remote_store_reader_cache.clone(),
+    };
+
+    // Map doc_id -> (seq_no, primary_term, version, manifest_idx, Option<source_json>)
+    let mut merged_state: BTreeMap<String, (u64, u64, u64, usize, Option<Value>)> = BTreeMap::new();
+    let mut input_ranges = Vec::new();
+    let mut total_input_records = 0u64;
+
+    for (manifest_idx, split) in &selected_inputs {
+        if let Some(range) = split.seal_range().map_err(|error| {
+            crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "remote_store_manifest_exception",
+                error,
+            )
+        })? {
+            input_ranges.push(range);
+        }
+        let assigned = AssignedRemoteSplit::from_manifest(split);
+        let reader = leaf_ctx
+            .reader_cache
+            .get_or_open(&leaf_ctx, metadata, &assigned)
+            .await
+            .map_err(|error| {
+                crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "remote_store_build_exception",
+                    format!(
+                        "failed to open input split '{}' for compaction: {error:#}",
+                        split.split_id
+                    ),
+                )
+            })?;
+        let engine = reader.engine.clone();
+        let split_live_docs = state
+            .worker_pools
+            .spawn_maintenance("read_compaction_input_split", move || {
+                engine.live_documents_with_versions()
+            })
+            .await
+            .map_err(|error| {
+                crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "remote_store_build_exception",
+                    format!(
+                        "failed to read documents from input split '{}': {error:#}",
+                        split.split_id
+                    ),
+                )
+            })?;
+
+        let dvs_by_id: HashMap<String, crate::storage::SplitDocVersionRecord> = split
+            .doc_versions()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|dv| (dv.doc_id.clone(), dv))
+            .collect();
+
+        for (doc_id, source, eng_seq, eng_term, eng_ver) in split_live_docs {
+            total_input_records += 1;
+            let (seq_no, primary_term, version) = match dvs_by_id.get(&doc_id) {
+                Some(dv) => (dv.seq_no, dv.primary_term, dv.version),
+                None => (eng_seq, eng_term, eng_ver),
+            };
+            let cand_key = (seq_no, primary_term, version, *manifest_idx);
+            let update = merged_state
+                .get(&doc_id)
+                .is_none_or(|(s, t, v, idx, _)| cand_key >= (*s, *t, *v, *idx));
+            if update {
+                merged_state.insert(
+                    doc_id,
+                    (seq_no, primary_term, version, *manifest_idx, Some(source)),
+                );
+            }
+        }
+
+        for ts in split.tombstones().unwrap_or_default() {
+            total_input_records += 1;
+            let cand_key = (ts.seq_no, ts.primary_term, ts.version, *manifest_idx);
+            let update = merged_state
+                .get(&ts.doc_id)
+                .is_none_or(|(s, t, v, idx, _)| cand_key >= (*s, *t, *v, *idx));
+            if update {
+                merged_state.insert(
+                    ts.doc_id,
+                    (ts.seq_no, ts.primary_term, ts.version, *manifest_idx, None),
+                );
+            }
+        }
+    }
+
+    // Check if there are any earlier Published splits before the first compacted input split;
+    // if so, tombstones cannot be dropped even when drop_tombstones is requested.
+    let first_input_idx = selected_inputs.first().map(|(i, _)| *i).unwrap_or(0);
+    let selected_id_set: HashSet<&str> = input_split_ids.iter().map(String::as_str).collect();
+    let has_earlier_published_splits =
+        current_manifest
+            .splits
+            .iter()
+            .take(first_input_idx)
+            .any(|s| {
+                matches!(s.state, crate::storage::RemoteSplitState::Published)
+                    && !selected_id_set.contains(s.split_id.as_str())
+            });
+    let allow_drop_tombstones = options.drop_tombstones && !has_earlier_published_splits;
+
+    let mut live_docs: Vec<(String, Value)> = Vec::new();
+    let mut raw_docs_for_summaries: Vec<Value> = Vec::new();
+    let mut out_doc_versions: Vec<crate::storage::SplitDocVersionRecord> = Vec::new();
+    let mut out_tombstones: Vec<crate::storage::SplitTombstoneRecord> = Vec::new();
+
+    for (doc_id, (seq_no, primary_term, version, _, source_opt)) in merged_state {
+        match source_opt {
+            Some(source) => {
+                live_docs.push((doc_id.clone(), source.clone()));
+                raw_docs_for_summaries.push(source);
+                out_doc_versions.push(crate::storage::SplitDocVersionRecord {
+                    doc_id,
+                    seq_no,
+                    primary_term,
+                    version,
+                });
+            }
+            None => {
+                if !allow_drop_tombstones {
+                    out_tombstones.push(crate::storage::SplitTombstoneRecord {
+                        doc_id,
+                        seq_no,
+                        primary_term,
+                        version,
+                    });
+                }
+            }
+        }
+    }
+
+    let out_seal_range = if !input_ranges.is_empty() {
+        input_ranges.sort_by_key(|r| r.start_seq_no);
+        let shard_id = input_ranges[0].shard_id;
+        let start_seq_no = input_ranges[0].start_seq_no;
+        let end_seq_no = input_ranges.last().unwrap().end_seq_no;
+        let primary_term = input_ranges
+            .iter()
+            .map(|r| r.primary_term)
+            .max()
+            .unwrap_or(1);
+        Some(crate::storage::SplitSealRangeMetadata {
+            shard_id,
+            start_seq_no,
+            end_seq_no,
+            primary_term,
+            doc_versions: out_doc_versions.clone(),
+            tombstones: out_tombstones.clone(),
+        })
+    } else {
+        None
+    };
+
+    let (field_ranges, field_terms) = build_split_field_summaries(
+        &raw_docs_for_summaries,
+        &metadata.mappings,
+    )
+    .map_err(|error| {
+        crate::api::error_response(StatusCode::BAD_REQUEST, "mapper_parsing_exception", error)
+    })?;
+
+    let schema_generation = 1u64;
+    let schema_hash = expected_schema_hash.clone();
+    let fingerprint_payload = serde_json::json!({
+        "kind": "remote_store_compact_v1",
+        "index_uuid": index_uuid,
+        "input_split_ids": input_split_ids,
+        "drop_tombstones": allow_drop_tombstones,
+        "schema_generation": schema_generation,
+        "schema_hash": schema_hash,
+        "live_docs": live_docs,
+        "tombstones": out_tombstones,
+    });
+    let raw_fp = crate::engine::ClientOperationIntent::fingerprint_json(&fingerprint_payload)
+        .map_err(|error| {
+            crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "remote_store_publish_exception",
+                error,
+            )
+        })?;
+    let request_fingerprint = if raw_fp.starts_with("sha256:") {
+        raw_fp
+    } else {
+        format!("sha256:{raw_fp}")
+    };
+
+    let split_id = crate::storage::deterministic_publication_split_id(&index_uuid, &operation_id);
+    let staging_dir = state.storage_manager.staging_dir(&index_uuid, &split_id);
+
+    let (existing_intent, existing_prepared) = match state
+        .storage_manager
+        .resolve_publication_operation(&index_uuid, &operation_id, &request_fingerprint)
+        .await
+    {
+        Ok(crate::storage::PublicationResolution::Committed(outcome)) => {
+            let live_doc_count = out_doc_versions.len() as u64;
+            let tombstone_count = out_tombstones.len() as u64;
+            let dropped = total_input_records.saturating_sub(live_doc_count + tombstone_count);
+            return Ok(serde_json::json!({
+                "index": index_name,
+                "index_uuid": index_uuid,
+                "status": "replayed",
+                "replayed": true,
+                "operation_id": operation_id,
+                "generation": outcome.generation,
+                "input_split_ids": input_split_ids,
+                "output_split_id": outcome.split_id,
+                "splits_compacted": input_split_ids.len(),
+                "retained_live_docs": live_doc_count,
+                "retained_tombstones": tombstone_count,
+                "dropped_superseded_versions": dropped,
+            }));
+        }
+        Ok(crate::storage::PublicationResolution::Conflict {
+            operation_id,
+            reason,
+        }) => {
+            return Err(crate::api::error_response(
+                StatusCode::CONFLICT,
+                "operation_id_conflict",
+                format!("compaction operation_id [{operation_id}] conflict: {reason}"),
+            ));
+        }
+        Ok(crate::storage::PublicationResolution::NotCommitted { intent, prepared }) => {
+            (intent, prepared)
+        }
+        Err(error) => {
+            return Err(crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "remote_store_publish_exception",
+                format!("failed to resolve compaction operation '{operation_id}': {error:#}"),
+            ));
+        }
+    };
+
+    let live_doc_count = live_docs.len() as u64;
+    let tombstone_count = out_tombstones.len() as u64;
+    let intent_doc_count = (live_doc_count + tombstone_count).max(1);
+    let planned_bundle_path =
+        crate::storage::StorageManager::split_bundle_key(&index_uuid, &split_id);
+
+    if existing_intent.is_none() {
+        let now_ms = now_epoch_ms();
+        let intent = crate::storage::PublicationIntentRecord {
+            format_version: crate::storage::PUBLICATION_RECORD_FORMAT_VERSION,
+            index_uuid: index_uuid.clone(),
+            index_name: index_name.to_string(),
+            operation_id: operation_id.clone(),
+            request_fingerprint: request_fingerprint.clone(),
+            schema_generation,
+            schema_hash: schema_hash.clone(),
+            split_id: split_id.clone(),
+            planned_bundle_path: planned_bundle_path.clone(),
+            doc_count: intent_doc_count,
+            producer_node_id: state.local_node_id.clone(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            created_at_epoch_ms: now_ms,
+        };
+        state
+            .storage_manager
+            .stage_publication_intent(&intent)
+            .await
+            .map_err(|error| {
+                if let Some(crate::storage::PublicationError::OperationConflict {
+                    operation_id,
+                    reason,
+                }) = error.downcast_ref::<crate::storage::PublicationError>()
+                {
+                    return crate::api::error_response(
+                        StatusCode::CONFLICT,
+                        "operation_id_conflict",
+                        format!("compaction operation_id [{operation_id}] conflict: {reason}"),
+                    );
+                }
+                crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "remote_store_publish_exception",
+                    format!("failed to stage compaction intent: {error:#}"),
+                )
+            })?;
+    }
+
+    if state
+        .storage_manager
+        .take_publication_crash_stage_if_matches(
+            crate::storage::PublicationCrashStage::AfterIntentBeforeBundleUpload,
+        )
+    {
+        return Err(crate::api::error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "remote_store_publish_exception",
+            format!(
+                "injected crash for operation_id [{operation_id}] after intent creation before bundle upload"
+            ),
+        ));
+    }
+
+    let prepared_already_valid = match existing_prepared.as_ref() {
+        Some(prep) => state
+            .storage_manager
+            .verify_prepared_split_bundle(&index_uuid, prep)
+            .await
+            .is_ok(),
+        None => false,
+    };
+
+    if !prepared_already_valid {
+        let resumed_bundle = if existing_intent.is_some() {
+            state
+                .storage_manager
+                .inspect_existing_split_bundle(&index_uuid, &split_id)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        let (bundle_key, checksum, size_bytes) = if let Some(triple) = resumed_bundle {
+            triple
+        } else {
+            let mappings_for_build = Arc::new(metadata.mappings.clone());
+            let staging_for_build = staging_dir.clone();
+            let seal_meta_for_build = out_seal_range.clone();
+            let build_res = state
+                .worker_pools
+                .spawn_maintenance("build_compacted_split", move || {
+                    if staging_for_build.exists() {
+                        std::fs::remove_dir_all(&staging_for_build)?;
+                    }
+                    std::fs::create_dir_all(&staging_for_build)?;
+                    let column_cache =
+                        Arc::new(crate::engine::column_cache::ColumnCache::new(0, 0));
+                    let split_engine =
+                        crate::engine::tantivy::HotEngine::new_remote_split_with_mappings(
+                            &staging_for_build,
+                            Duration::from_secs(60),
+                            mappings_for_build.as_ref(),
+                            column_cache,
+                        )?;
+                    if !live_docs.is_empty() {
+                        split_engine.bulk_add_documents(live_docs)?;
+                    }
+                    split_engine.flush()?;
+                    strip_split_wal(&staging_for_build)?;
+                    if let Some(ref seal_meta) = seal_meta_for_build {
+                        let versions_bytes = serde_json::to_vec_pretty(seal_meta)?;
+                        std::fs::write(
+                            staging_for_build.join("seal.versions.json"),
+                            versions_bytes,
+                        )?;
+                    }
+                    Ok(())
+                })
+                .await;
+
+            if let Err(error) = build_res {
+                let _ = std::fs::remove_dir_all(&staging_dir);
+                return Err(crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "remote_store_build_exception",
+                    format!("compacted split build failed: {error:#}"),
+                ));
+            }
+
+            let triple = state
+                .storage_manager
+                .upload_split_bundle(&index_uuid, &split_id, &staging_dir)
+                .await
+                .map_err(|error| {
+                    let _ = std::fs::remove_dir_all(&staging_dir);
+                    crate::api::error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "remote_store_build_exception",
+                        format!("compacted bundle upload failed: {error:#}"),
+                    )
+                })?;
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            triple
+        };
+        let _ = mem_reservation.reconcile(size_bytes.max(1));
+        let _ = temp_disk_reservation.reconcile(size_bytes.max(1));
+
+        if state
+            .storage_manager
+            .take_publication_crash_stage_if_matches(
+                crate::storage::PublicationCrashStage::AfterBundleUploadBeforePreparedRecord,
+            )
+        {
+            return Err(crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "remote_store_publish_exception",
+                format!(
+                    "injected crash for operation_id [{operation_id}] after bundle upload before prepared record"
+                ),
+            ));
+        }
+
+        let mut tags = BTreeMap::new();
+        tags.insert("operation_id".to_string(), operation_id.clone());
+        if allow_drop_tombstones {
+            tags.insert("compaction_drop_tombstones".to_string(), "true".to_string());
+        }
+        let mut new_split = crate::storage::RemoteSplitManifest {
+            split_id: split_id.clone(),
+            state: crate::storage::RemoteSplitState::Published,
+            bundle_path: bundle_key,
+            bundle_etag: None,
+            hotcache_path: None,
+            checksum,
+            doc_count: live_doc_count,
+            size_bytes,
+            uncompressed_bytes: size_bytes,
+            hotcache_bytes: None,
+            time_range: None,
+            tags,
+            field_ranges,
+            field_terms,
+        };
+        if let Some(ref seal_meta) = out_seal_range {
+            new_split.set_seal_range(seal_meta);
+        } else {
+            new_split.set_doc_versions_and_tombstones(&out_doc_versions, &out_tombstones);
+        }
+        new_split.set_parent_split_ids(&input_split_ids);
+
+        let now_ms = now_epoch_ms();
+        let prepared_record = crate::storage::PublicationPreparedRecord {
+            format_version: crate::storage::PUBLICATION_RECORD_FORMAT_VERSION,
+            index_uuid: index_uuid.clone(),
+            index_name: index_name.to_string(),
+            operation_id: operation_id.clone(),
+            request_fingerprint: request_fingerprint.clone(),
+            schema_generation,
+            schema_hash: schema_hash.clone(),
+            producer_node_id: state.local_node_id.clone(),
+            prepared_at: chrono::Utc::now().to_rfc3339(),
+            prepared_at_epoch_ms: now_ms,
+            split: new_split,
+        };
+        state
+            .storage_manager
+            .write_publication_prepared(&prepared_record)
+            .await
+            .map_err(|error| {
+                if let Some(crate::storage::PublicationError::OperationConflict {
+                    operation_id,
+                    reason,
+                }) = error.downcast_ref::<crate::storage::PublicationError>()
+                {
+                    return crate::api::error_response(
+                        StatusCode::CONFLICT,
+                        "operation_id_conflict",
+                        format!("compaction operation_id [{operation_id}] conflict: {reason}"),
+                    );
+                }
+                crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "remote_store_publish_exception",
+                    format!("failed to write prepared compaction record: {error:#}"),
+                )
+            })?;
+    }
+    drop(mem_reservation);
+    drop(temp_disk_reservation);
+
+    let sequencer_req = ForwardedSequencerCommitRequest {
+        operation_id: operation_id.clone(),
+        request_fingerprint,
+        schema_generation,
+        schema_hash: schema_hash.clone(),
+        settings: metadata.settings.remote_store.clone(),
+        known_authority: None,
+    };
+
+    match coordinate_sequencer_commit(state, index_name, &index_uuid, &sequencer_req).await {
+        ForwardedSequencerCommitResponse::Committed(outcome) => {
+            let dropped = total_input_records.saturating_sub(live_doc_count + tombstone_count);
+            Ok(serde_json::json!({
+                "index": index_name,
+                "index_uuid": index_uuid,
+                "status": if outcome.replayed { "replayed" } else { "committed" },
+                "replayed": outcome.replayed,
+                "operation_id": outcome.operation_id,
+                "generation": outcome.generation,
+                "parent_generation": outcome.parent_generation,
+                "input_split_ids": input_split_ids,
+                "output_split_id": outcome.split_id,
+                "splits_compacted": input_split_ids.len(),
+                "retained_live_docs": live_doc_count,
+                "retained_tombstones": tombstone_count,
+                "dropped_superseded_versions": dropped,
+                "size_bytes": outcome.size_bytes,
+                "published_watermarks": outcome.published_watermarks,
+            }))
+        }
+        ForwardedSequencerCommitResponse::Conflict {
+            operation_id,
+            reason,
+        } => Err(crate::api::error_response(
+            StatusCode::CONFLICT,
+            "operation_id_conflict",
+            format!("compaction operation_id [{operation_id}] conflict: {reason}"),
+        )),
+        ForwardedSequencerCommitResponse::Indeterminate {
+            operation_id,
+            reason,
+        } => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "remote_store_publish_indeterminate_exception",
+                    "reason": format!("compaction outcome for operation_id [{operation_id}] is indeterminate; retry with the same operation_id: {reason}"),
+                    "error_class": "retryable",
+                    "operation_id": operation_id,
+                },
+                "status": StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+            })),
+        )),
+        ForwardedSequencerCommitResponse::RetryableAuthority { reason } => {
+            Err(crate::api::error_response(
+                StatusCode::CONFLICT,
+                "remote_store_publish_exception",
+                format!("compaction commit failed after sequencer authority contention: {reason}"),
+            ))
+        }
+        ForwardedSequencerCommitResponse::Fatal { reason } => Err(crate::api::error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "remote_store_publish_exception",
+            format!("compaction commit failed: {reason}"),
+        )),
+    }
+}
+
+/// Forward-only manifest rollback to a retained generation (`FS-041`, ADR 0003 section 3.8).
+pub(crate) async fn rollback_manifest(
+    state: &AppState,
+    index_name: &str,
+    metadata: &IndexMetadata,
+    body: Value,
+) -> Result<Value, (StatusCode, Json<Value>)> {
+    if metadata.uses_local_shards() && !metadata.is_tiered() {
+        return Err(crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            format!(
+                "index [{}] has lifecycle_mode [{}] which does not support manifest rollback",
+                index_name,
+                metadata.lifecycle_mode()
+            ),
+        ));
+    }
+
+    let target_generation = body
+        .get("target_generation")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            crate::api::error_response(
+                StatusCode::BAD_REQUEST,
+                "illegal_argument_exception",
+                "rollback body must contain positive integer 'target_generation'",
+            )
+        })?;
+    if target_generation == 0 {
+        return Err(crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            "target_generation must be >= 1",
+        ));
+    }
+
+    let index_uuid = metadata.uuid.as_str().to_string();
+    let expected_schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
+    let lock_arc = state.storage_manager.sequencer_lock(&index_uuid).await;
+    let _sequencer_guard = lock_arc.lock().await;
+
+    let Some((current_manifest, current_path, _, current_rev)) = state
+        .storage_manager
+        .load_manifest_for_snapshot(&index_uuid, None, Some(&expected_schema_hash))
+        .await
+        .map_err(|error| {
+            crate::api::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "remote_store_manifest_exception",
+                format!("failed to load current manifest for rollback: {error:#}"),
+            )
+        })?
+    else {
+        return Err(crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            "index has no committed manifest to roll back from",
+        ));
+    };
+
+    if target_generation >= current_manifest.generation {
+        return Err(crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            format!(
+                "target_generation [{target_generation}] must be strictly less than current generation [{}]",
+                current_manifest.generation
+            ),
+        ));
+    }
+
+    let Some((target_manifest, _, _, _)) = state
+        .storage_manager
+        .load_manifest_for_snapshot(
+            &index_uuid,
+            Some(target_generation),
+            Some(&expected_schema_hash),
+        )
+        .await
+        .map_err(|error| {
+            crate::api::error_response(
+                StatusCode::BAD_REQUEST,
+                "illegal_argument_exception",
+                format!(
+                    "cannot load target_generation [{target_generation}] for rollback: {error:#}"
+                ),
+            )
+        })?
+    else {
+        return Err(crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            format!("target_generation [{target_generation}] does not exist"),
+        ));
+    };
+
+    if metadata.is_tiered() {
+        for (shard_id, current_wm) in &current_manifest.published_watermarks {
+            let target_seq = target_manifest
+                .published_watermarks
+                .get(shard_id)
+                .map(|w| w.sealed_through_seq_no);
+            if target_seq != Some(current_wm.sealed_through_seq_no) {
+                return Err(crate::api::error_response(
+                    StatusCode::CONFLICT,
+                    "remote_store_publish_exception",
+                    format!(
+                        "cannot roll back tiered index [{index_name}] to generation {target_generation}: shard {shard_id} published watermark would regress from {:?} to {:?}",
+                        current_wm.sealed_through_seq_no, target_seq
+                    ),
+                ));
+            }
+        }
+    }
+
+    let now_ms = now_epoch_ms();
+    let _rollback_lease = state.storage_manager.acquire_snapshot_retention_lease(
+        crate::storage::SnapshotRetentionLease {
+            snapshot_id: format!("rollback-{index_uuid}-g{target_generation}"),
+            index_uuid: index_uuid.clone(),
+            manifest_generation: target_generation,
+            pinned_split_ids: target_manifest
+                .published_splits()
+                .map(|s| s.split_id.clone())
+                .collect(),
+            acquired_at_epoch_ms: now_ms,
+            expires_at_epoch_ms: now_ms.saturating_add(300_000),
+        },
+    );
+
+    // Verify all published split bundles in target_manifest exist and match checksums.
+    for split in target_manifest.published_splits() {
+        let actual_checksum = state
+            .storage_manager
+            .hash_split_bundle(&index_uuid, split)
+            .await
+            .map_err(|error| {
+                crate::api::error_response(
+                    StatusCode::CONFLICT,
+                    "remote_store_manifest_exception",
+                    format!(
+                        "cannot roll back to generation {target_generation}: split '{}' bundle is missing or unreadable: {error:#}",
+                        split.split_id
+                    ),
+                )
+            })?;
+        if actual_checksum != split.checksum {
+            return Err(crate::api::error_response(
+                StatusCode::CONFLICT,
+                "remote_store_manifest_exception",
+                format!(
+                    "cannot roll back to generation {target_generation}: split '{}' checksum mismatch",
+                    split.split_id
+                ),
+            ));
+        }
+    }
+
+    let next_generation = current_manifest.generation + 1;
+    let operation_id = body
+        .get("operation_id")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "rollback-g{}-to-g{}",
+                current_manifest.generation, target_generation
+            )
+        });
+    if let Err(error) = crate::storage::validate_publication_operation_id(&operation_id) {
+        return Err(crate::api::error_response(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            error,
+        ));
+    }
+
+    let new_splits = target_manifest.splits.clone();
+
+    let writer_epoch = current_manifest.writer_epoch.max(1);
+    let fp_payload = serde_json::json!({
+        "kind": "remote_store_rollback_v1",
+        "index_uuid": index_uuid,
+        "from_generation": current_manifest.generation,
+        "target_generation": target_generation,
+        "operation_id": operation_id,
+    });
+    let raw_fp =
+        crate::engine::ClientOperationIntent::fingerprint_json(&fp_payload).unwrap_or_default();
+    let request_fingerprint = if raw_fp.starts_with("sha256:") {
+        raw_fp
+    } else {
+        format!("sha256:{raw_fp}")
+    };
+
+    let rollback_manifest = crate::storage::RemoteStoreManifest {
+        version: crate::storage::REMOTE_MANIFEST_FORMAT_VERSION,
+        engine: crate::cluster::state::IndexEngine::RemoteStore,
+        index_uuid: index_uuid.clone(),
+        index_name: index_name.to_string(),
+        schema_generation: current_manifest
+            .schema_generation
+            .max(target_manifest.schema_generation),
+        schema_hash: expected_schema_hash,
+        generation: next_generation,
+        parent_generation: current_manifest.generation,
+        parent_manifest_path: Some(current_path),
+        writer_epoch,
+        operation_id: operation_id.clone(),
+        request_fingerprint,
+        published_at: chrono::Utc::now().to_rfc3339(),
+        settings: target_manifest.settings.clone(),
+        published_watermarks: target_manifest.published_watermarks.clone(),
+        compaction_lineage: target_manifest.compaction_lineage.clone(),
+        splits: new_splits,
+    };
+
+    let pointer = state
+        .storage_manager
+        .publish_manifest(&rollback_manifest)
+        .await
+        .map_err(|error| {
+            crate::api::error_response(
+                StatusCode::CONFLICT,
+                "remote_store_publish_exception",
+                format!("manifest rollback publish failed: {error:#}"),
+            )
+        })?;
+
+    Ok(serde_json::json!({
+        "index": index_name,
+        "index_uuid": index_uuid,
+        "status": "committed",
+        "operation_id": operation_id,
+        "previous_generation": current_manifest.generation,
+        "previous_pointer_revision": current_rev,
+        "target_generation": target_generation,
+        "generation": pointer.current_generation,
+        "pointer_revision": pointer.pointer_revision,
+        "manifest_path": pointer.manifest_path,
+        "published_splits": rollback_manifest.published_splits().count(),
     }))
 }
 

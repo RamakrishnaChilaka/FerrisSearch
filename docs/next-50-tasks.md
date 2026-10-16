@@ -1121,7 +1121,7 @@ restart.
 
 ### FS-037 — Query One Snapshot Across Hot And Immutable Layers
 
-**Class:** Release blocker | **Gate:** 2 | **Depends on:** FS-003, FS-036
+**Status:** Implemented (`ReadSnapshot`, `ResolvedIndexSnapshot`, `resolve_index_read_snapshot`, `QueryClause::SnapshotFilter`, and cross-layer version/tombstone exclusion across Search DSL, `_count`, aggregations, and SQL) | **Class:** Release blocker | **Gate:** 2 | **Depends on:** FS-003, FS-036
 
 **Evidence:** current coordinator paths query one engine mode at a time.
 
@@ -1135,7 +1135,7 @@ or missing logical document.
 
 ### FS-038 — Add Versioned Tombstones And Supersession
 
-**Class:** Release blocker | **Gate:** 2 | **Depends on:** FS-010, FS-037
+**Status:** Implemented (split-level `doc_versions` and `tombstones`, deterministic `(seq_no, primary_term, version, split_order)` winner selection across hot delta and splits, and pinned `snapshot_generation` reads) | **Class:** Release blocker | **Gate:** 2 | **Depends on:** FS-010, FS-037
 
 **Evidence:** immutable remote splits have no update/delete model.
 
@@ -1148,7 +1148,7 @@ IDs across splits, and delayed publication return oracle-correct results.
 
 ### FS-039 — Model Split Lineage And Replacement
 
-**Class:** Release blocker | **Gate:** 2 | **Depends on:** FS-017, FS-038
+**Status:** Implemented (`CompactionLineageRecord`, `RemoteSplitState::Compacted`, `parent_split_ids`, `replaced_by_split_ids`, `validate_compaction_lineage`, and `apply_compaction_replacement`) | **Class:** Release blocker | **Gate:** 2 | **Depends on:** FS-017, FS-038
 
 **Evidence:** manifests append splits but cannot express that new outputs
 replace compacted inputs while preserving old snapshots.
@@ -1162,7 +1162,7 @@ readable.
 
 ### FS-040 — Build A Fenced, Idempotent Split Compactor
 
-**Class:** Release blocker | **Gate:** 2 | **Depends on:** FS-031, FS-039
+**Status:** Implemented (`compact_splits`, `RemoteStoreCompactionOptions`, `deterministic_compaction_operation_id`, `POST /{index}/_remote_store/compact`, `ResourceGovernor` reservations, and fenced sequencer lineage commit) | **Class:** Release blocker | **Gate:** 2 | **Depends on:** FS-031, FS-039
 
 **Evidence:** there is no object-store compaction or merge lifecycle.
 
@@ -1178,7 +1178,7 @@ before retention expiry.
 
 ### FS-041 — Implement Snapshot-Safe Mark-And-Sweep GC
 
-**Class:** Release blocker | **Gate:** 2 | **Depends on:** FS-021, FS-039, FS-040
+**Status:** Implemented (`SnapshotRetentionLease`, `SnapshotLeaseGuard`, compacted-split reachability in `build_reachability_inventory`, pre-delete lease re-verification in `run_janitor`, and forward-only `rollback_manifest`) | **Class:** Release blocker | **Gate:** 2 | **Depends on:** FS-021, FS-039, FS-040
 
 **Evidence:** a janitor can classify simple orphans, but compaction creates
 previously published objects that require snapshot-aware retention.

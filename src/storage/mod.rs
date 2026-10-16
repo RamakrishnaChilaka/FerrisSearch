@@ -24,7 +24,7 @@ use object_store::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex as StdMutex,
@@ -59,17 +59,19 @@ pub use janitor::{
     JanitorRunReport, janitor_marks_key,
 };
 pub use publication::{
-    FormatCapability, MAX_LINEAGE_WALK_GENERATIONS, PUBLICATION_RECORD_FORMAT_CAPABILITY,
-    PUBLICATION_RECORD_FORMAT_VERSION, PublicationAttemptOutcome, PublicationAttemptRecord,
-    PublicationCommitOutcome, PublicationCommittedRecord, PublicationCrashStage, PublicationError,
-    PublicationIntentRecord, PublicationPhase, PublicationPreparedRecord, PublicationResolution,
-    REMOTE_MANIFEST_FORMAT_CAPABILITY, REMOTE_MANIFEST_POINTER_FORMAT_CAPABILITY,
+    CompactionLineageRecord, FormatCapability, MAX_LINEAGE_WALK_GENERATIONS,
+    PUBLICATION_RECORD_FORMAT_CAPABILITY, PUBLICATION_RECORD_FORMAT_VERSION,
+    PublicationAttemptOutcome, PublicationAttemptRecord, PublicationCommitOutcome,
+    PublicationCommittedRecord, PublicationCrashStage, PublicationError, PublicationIntentRecord,
+    PublicationPhase, PublicationPreparedRecord, PublicationResolution,
+    REMOTE_MANIFEST_FORMAT_CAPABILITY, REMOTE_MANIFEST_POINTER_FORMAT_CAPABILITY, ReadSnapshot,
     SPLIT_BUNDLE_FORMAT_CAPABILITY, SPLIT_BUNDLE_FORMAT_VERSION, SequencerCommitRequest,
-    ShardPublishedWatermark, SplitDocVersionRecord, SplitSealRangeMetadata, SplitTombstoneRecord,
-    compute_publication_request_fingerprint, deterministic_publication_doc_id,
-    deterministic_publication_split_id, is_canonical_manifest_path, is_canonical_split_bundle_path,
-    manifest_operation_key, publication_attempt_key, publication_committed_key,
-    publication_intent_key, publication_prepared_key, validate_publication_operation_id,
+    ShardPublishedWatermark, SnapshotLeaseGuard, SnapshotRetentionLease, SplitDocVersionRecord,
+    SplitSealRangeMetadata, SplitTombstoneRecord, compute_publication_request_fingerprint,
+    deterministic_publication_doc_id, deterministic_publication_split_id,
+    is_canonical_manifest_path, is_canonical_split_bundle_path, manifest_operation_key,
+    publication_attempt_key, publication_committed_key, publication_intent_key,
+    publication_prepared_key, validate_publication_operation_id,
 };
 
 /// Directory name used under `<data_dir>/` for the node-local remote_store root.
@@ -216,6 +218,7 @@ pub struct StorageManager {
     capability_probe_lock: Arc<Mutex<()>>,
     cached_writer_authorities:
         Arc<StdMutex<HashMap<String, crate::cluster::state::ManifestWriterAuthority>>>,
+    active_snapshot_leases: Arc<StdMutex<HashMap<String, SnapshotRetentionLease>>>,
     publication_crash_stage: Arc<StdMutex<Option<PublicationCrashStage>>>,
     janitor_fail_delete_paths: Arc<StdMutex<HashSet<String>>>,
     resource_governor: Arc<crate::worker::ResourceGovernor>,
@@ -307,6 +310,7 @@ impl StorageManager {
             capability_state: Arc::new(StdMutex::new(initial_capability)),
             capability_probe_lock: Arc::new(Mutex::new(())),
             cached_writer_authorities: Arc::new(StdMutex::new(HashMap::new())),
+            active_snapshot_leases: Arc::new(StdMutex::new(HashMap::new())),
             publication_crash_stage: Arc::new(StdMutex::new(None)),
             janitor_fail_delete_paths: Arc::new(StdMutex::new(HashSet::new())),
             resource_governor: Arc::new(crate::worker::ResourceGovernor::default()),
@@ -366,6 +370,7 @@ impl StorageManager {
             capability_state: Arc::new(StdMutex::new(initial_capability)),
             capability_probe_lock: Arc::new(Mutex::new(())),
             cached_writer_authorities: Arc::new(StdMutex::new(HashMap::new())),
+            active_snapshot_leases: Arc::new(StdMutex::new(HashMap::new())),
             publication_crash_stage: Arc::new(StdMutex::new(None)),
             janitor_fail_delete_paths: Arc::new(StdMutex::new(HashSet::new())),
             resource_governor: Arc::new(crate::worker::ResourceGovernor::default()),
@@ -934,6 +939,24 @@ impl StorageManager {
         Ok((bundle_key, checksum, size_bytes))
     }
 
+    /// Inspect an already-uploaded split bundle when resuming a publication
+    /// whose `intent.json` fingerprint was already verified (`FS-019`, `FS-040`).
+    pub async fn inspect_existing_split_bundle(
+        &self,
+        index_uuid: &str,
+        split_id: &str,
+    ) -> Result<Option<(String, String, u64)>> {
+        let bundle_key = Self::split_bundle_key(index_uuid, split_id);
+        let object_path = self.object_path(&bundle_key)?;
+        match self.download_and_hash(&object_path).await {
+            Ok((bytes, checksum)) if bytes.starts_with(BUNDLE_MAGIC) => {
+                Ok(Some((bundle_key, checksum, bytes.len() as u64)))
+            }
+            Ok(_) => anyhow::bail!("existing split bundle at {bundle_key} has invalid header"),
+            Err(_) => Ok(None),
+        }
+    }
+
     /// Stream-download an object into a `Vec<u8>` and compute its sha256 in
     /// the same pass. For MVP we buffer the whole bundle in memory; a
     /// future PR can switch to a file-backed staging buffer for very large
@@ -1260,6 +1283,56 @@ impl StorageManager {
         generation: u64,
         expected_schema_hash: Option<&str>,
     ) -> Result<RemoteStoreManifest> {
+        if generation == 0 {
+            anyhow::bail!("manifest generation 0 is not a valid committed manifest");
+        }
+        if let Ok(Some(pointer)) = self.load_manifest_pointer(index_uuid).await {
+            if pointer.current_generation == 0 || generation > pointer.current_generation {
+                anyhow::bail!(
+                    "manifest generation {generation} is not committed (current generation is {})",
+                    pointer.current_generation
+                );
+            }
+            if pointer.current_generation == generation && !pointer.manifest_path.is_empty() {
+                return self
+                    .load_manifest_for_pointer(index_uuid, &pointer, expected_schema_hash)
+                    .await;
+            }
+            if !pointer.manifest_path.is_empty() {
+                let mut next_path = Some(pointer.manifest_path.clone());
+                let mut expected_gen = pointer.current_generation;
+                let mut steps = 0usize;
+                while let Some(m_path) = next_path.take() {
+                    steps += 1;
+                    if steps > MAX_LINEAGE_WALK_GENERATIONS {
+                        break;
+                    }
+                    let (manifest, _) = self
+                        .load_manifest_at_path(
+                            index_uuid,
+                            &m_path,
+                            expected_gen,
+                            expected_schema_hash,
+                        )
+                        .await?;
+                    if manifest.generation == generation {
+                        return Ok(manifest);
+                    }
+                    if manifest.parent_generation == 0 || manifest.parent_generation < generation {
+                        break;
+                    }
+                    expected_gen = manifest.parent_generation;
+                    next_path = manifest.parent_manifest_path;
+                }
+                if pointer.version >= 3 {
+                    anyhow::bail!(
+                        "manifest generation {generation} is not reachable along the committed lineage chain from generation {}",
+                        pointer.current_generation
+                    );
+                }
+            }
+        }
+
         let legacy_key = manifest_generation_key(index_uuid, generation);
         let legacy_loc = self.object_path(&legacy_key)?;
         match self.get_object(&legacy_loc).await {
@@ -1287,40 +1360,6 @@ impl StorageManager {
             Err(err) => return Err(anyhow::Error::from(err)),
         }
 
-        if let Ok(Some(pointer)) = self.load_manifest_pointer(index_uuid).await
-            && pointer.current_generation >= generation
-            && !pointer.manifest_path.is_empty()
-        {
-            if pointer.current_generation == generation {
-                return self
-                    .load_manifest_for_pointer(index_uuid, &pointer, expected_schema_hash)
-                    .await;
-            }
-            let mut next_path = Some(pointer.manifest_path.clone());
-            let mut expected_gen = pointer.current_generation;
-            let mut steps = 0usize;
-            while let Some(m_path) = next_path.take() {
-                steps += 1;
-                if steps > MAX_LINEAGE_WALK_GENERATIONS {
-                    break;
-                }
-                let Ok((manifest, _)) = self
-                    .load_manifest_at_path(index_uuid, &m_path, expected_gen, expected_schema_hash)
-                    .await
-                else {
-                    break;
-                };
-                if manifest.generation == generation {
-                    return Ok(manifest);
-                }
-                if manifest.parent_generation == 0 || manifest.parent_generation < generation {
-                    break;
-                }
-                expected_gen = manifest.parent_generation;
-                next_path = manifest.parent_manifest_path;
-            }
-        }
-
         let gen_prefix = format!("{index_uuid}/manifests/{generation:012}");
         let prefix_path = self.object_path(&gen_prefix)?;
         let mut list_stream = self.object_store().list(Some(&prefix_path));
@@ -1339,6 +1378,139 @@ impl StorageManager {
         }
 
         anyhow::bail!("manifest generation {generation} not found")
+    }
+
+    /// Resolve a manifest for a query snapshot (`requested_generation = None` for
+    /// the current pointer, or `Some(g)` to pin a retained generation `g`).
+    /// Returns `Ok(None)` when the index has no published manifest yet (or `g == 0`).
+    pub async fn load_manifest_for_snapshot(
+        &self,
+        index_uuid: &str,
+        requested_generation: Option<u64>,
+        expected_schema_hash: Option<&str>,
+    ) -> Result<Option<(RemoteStoreManifest, String, String, u64)>> {
+        match requested_generation {
+            Some(0) => Ok(None),
+            Some(target_gen) => {
+                let Some(pointer) = self.load_manifest_pointer(index_uuid).await? else {
+                    anyhow::bail!(
+                        "requested snapshot_generation {target_gen} does not exist (no manifest pointer for index '{index_uuid}')"
+                    );
+                };
+                if pointer.current_generation == 0 || target_gen > pointer.current_generation {
+                    anyhow::bail!(
+                        "requested snapshot_generation {target_gen} exceeds current committed generation {}",
+                        pointer.current_generation
+                    );
+                }
+                let mut next_path = Some(pointer.manifest_path.clone());
+                let mut expected_gen = pointer.current_generation;
+                let mut steps = 0usize;
+                while let Some(m_path) = next_path.take() {
+                    steps += 1;
+                    if steps > MAX_LINEAGE_WALK_GENERATIONS {
+                        anyhow::bail!(
+                            "manifest lineage walk exceeded {MAX_LINEAGE_WALK_GENERATIONS} generations"
+                        );
+                    }
+                    let (manifest, checksum) = self
+                        .load_manifest_at_path(
+                            index_uuid,
+                            &m_path,
+                            expected_gen,
+                            expected_schema_hash,
+                        )
+                        .await?;
+                    if steps == 1 {
+                        pointer.validate_manifest_agreement(&manifest, &checksum)?;
+                    }
+                    if manifest.generation == target_gen {
+                        return Ok(Some((manifest, m_path, checksum, pointer.pointer_revision)));
+                    }
+                    if manifest.parent_generation == 0 || manifest.parent_generation < target_gen {
+                        break;
+                    }
+                    expected_gen = manifest.parent_generation;
+                    next_path = manifest.parent_manifest_path;
+                }
+                anyhow::bail!(
+                    "requested snapshot_generation {target_gen} is not available in committed manifest lineage for index '{index_uuid}'"
+                )
+            }
+            None => {
+                let Some(pointer) = self.load_manifest_pointer(index_uuid).await? else {
+                    return Ok(None);
+                };
+                if pointer.current_generation == 0 {
+                    return Ok(None);
+                }
+                let (manifest, checksum) = self
+                    .load_manifest_at_path(
+                        index_uuid,
+                        &pointer.manifest_path,
+                        pointer.current_generation,
+                        expected_schema_hash,
+                    )
+                    .await?;
+                pointer.validate_manifest_agreement(&manifest, &checksum)?;
+                self.verify_manifest_lineage_chain(index_uuid, &manifest, expected_schema_hash)
+                    .await?;
+                Ok(Some((
+                    manifest,
+                    pointer.manifest_path,
+                    checksum,
+                    pointer.pointer_revision,
+                )))
+            }
+        }
+    }
+
+    pub fn acquire_snapshot_retention_lease(
+        &self,
+        lease: SnapshotRetentionLease,
+    ) -> SnapshotLeaseGuard {
+        let lease_key = format!("{}::{}", lease.snapshot_id, uuid::Uuid::new_v4());
+        self.active_snapshot_leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(lease_key.clone(), lease);
+        SnapshotLeaseGuard {
+            snapshot_id: Some(lease_key),
+            leases: Arc::clone(&self.active_snapshot_leases),
+        }
+    }
+
+    pub fn register_named_snapshot_lease(&self, lease: SnapshotRetentionLease) {
+        self.active_snapshot_leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(lease.snapshot_id.clone(), lease);
+    }
+
+    pub fn release_named_snapshot_lease(&self, snapshot_id: &str) -> bool {
+        self.active_snapshot_leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(snapshot_id)
+            .is_some()
+    }
+
+    pub fn active_snapshot_leases_for_index(
+        &self,
+        index_uuid: &str,
+        now_epoch_ms: u64,
+    ) -> Vec<SnapshotRetentionLease> {
+        let guard = self
+            .active_snapshot_leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard
+            .values()
+            .filter(|lease| {
+                lease.index_uuid == index_uuid && now_epoch_ms <= lease.expires_at_epoch_ms
+            })
+            .cloned()
+            .collect()
     }
 
     /// Convenience: resolve the pointer, validate pointer-manifest agreement and
@@ -1423,6 +1595,7 @@ impl StorageManager {
             mut splits,
             existing_settings,
             mut published_watermarks,
+            compaction_lineage,
             expected_pointer,
         ) = match current {
             Some((Some(existing), pointer, token)) => {
@@ -1441,6 +1614,7 @@ impl StorageManager {
                     existing.splits,
                     existing.settings,
                     existing.published_watermarks,
+                    existing.compaction_lineage,
                     Some((pointer, token)),
                 )
             }
@@ -1452,9 +1626,20 @@ impl StorageManager {
                 Vec::new(),
                 None,
                 BTreeMap::new(),
+                Vec::new(),
                 Some((pointer, token)),
             ),
-            None => (1, 0, None, 1, Vec::new(), None, BTreeMap::new(), None),
+            None => (
+                1,
+                0,
+                None,
+                1,
+                Vec::new(),
+                None,
+                BTreeMap::new(),
+                Vec::new(),
+                None,
+            ),
         };
 
         // Reject duplicate split_id within the same manifest — `published_splits`
@@ -1505,6 +1690,7 @@ impl StorageManager {
             published_at: chrono::Utc::now().to_rfc3339(),
             settings: settings.cloned().or(existing_settings),
             published_watermarks,
+            compaction_lineage,
             splits,
         };
 
@@ -2146,6 +2332,9 @@ pub struct RemoteStoreManifest {
     /// Contiguous per-shard hot-delta publication visibility watermarks (`FS-036`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub published_watermarks: BTreeMap<u32, ShardPublishedWatermark>,
+    /// Compaction replacement lineage committed at or before this generation (`FS-039`, `FS-040`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compaction_lineage: Vec<CompactionLineageRecord>,
     #[serde(default)]
     pub splits: Vec<RemoteSplitManifest>,
 }
@@ -2232,7 +2421,13 @@ impl RemoteStoreManifest {
                 );
             }
             let _ = split.seal_range()?;
+            let _ = split.doc_versions()?;
+            let _ = split.tombstones()?;
+            let _ = split.parent_split_ids()?;
+            let _ = split.replaced_by_split_ids()?;
+            let _ = split.replaced_at_generation()?;
         }
+        self.validate_compaction_lineage()?;
         for (shard_id, wm) in &self.published_watermarks {
             if *shard_id != wm.shard_id {
                 anyhow::bail!(
@@ -2324,6 +2519,239 @@ impl RemoteStoreManifest {
         }
         Ok(())
     }
+
+    /// Validate compaction lineage records, split replacement states, and DAG acyclicity (`FS-039`).
+    pub fn validate_compaction_lineage(&self) -> Result<()> {
+        let splits_by_id: HashMap<&str, &RemoteSplitManifest> = self
+            .splits
+            .iter()
+            .map(|s| (s.split_id.as_str(), s))
+            .collect();
+        let mut edges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut all_replaced_inputs: HashMap<String, String> = HashMap::new();
+        let mut all_compaction_outputs: HashSet<String> = HashSet::new();
+
+        for split in &self.splits {
+            let parents = split.parent_split_ids()?;
+            let mut seen_parents = HashSet::new();
+            for parent_id in &parents {
+                if parent_id == &split.split_id {
+                    anyhow::bail!(
+                        "split '{}' in manifest generation {} references itself in parent_split_ids",
+                        split.split_id,
+                        self.generation
+                    );
+                }
+                if !seen_parents.insert(parent_id.as_str()) {
+                    anyhow::bail!(
+                        "split '{}' in manifest generation {} has duplicate parent_split_id '{parent_id}'",
+                        split.split_id,
+                        self.generation
+                    );
+                }
+                let Some(parent_split) = splits_by_id.get(parent_id.as_str()) else {
+                    anyhow::bail!(
+                        "split '{}' in manifest generation {} references missing parent_split_id '{parent_id}'",
+                        split.split_id,
+                        self.generation
+                    );
+                };
+                if matches!(parent_split.state, RemoteSplitState::Published) {
+                    anyhow::bail!(
+                        "split '{}' in manifest generation {} references parent_split_id '{parent_id}' whose state is still Published",
+                        split.split_id,
+                        self.generation
+                    );
+                }
+                edges
+                    .entry(parent_id.clone())
+                    .or_default()
+                    .insert(split.split_id.clone());
+            }
+
+            let replaced_by = split.replaced_by_split_ids()?;
+            if matches!(split.state, RemoteSplitState::Compacted) {
+                if replaced_by.is_empty()
+                    || split.replaced_by_operation_id().is_none_or(str::is_empty)
+                    || split
+                        .replaced_at_generation()?
+                        .is_none_or(|g| g == 0 || g > self.generation)
+                {
+                    anyhow::bail!(
+                        "compacted split '{}' in manifest generation {} is missing replacement metadata",
+                        split.split_id,
+                        self.generation
+                    );
+                }
+                for out_id in &replaced_by {
+                    if out_id == &split.split_id {
+                        anyhow::bail!(
+                            "split '{}' in manifest generation {} references itself in replaced_by_split_ids",
+                            split.split_id,
+                            self.generation
+                        );
+                    }
+                    let Some(out_split) = splits_by_id.get(out_id.as_str()) else {
+                        anyhow::bail!(
+                            "compacted split '{}' in manifest generation {} references missing output split '{out_id}'",
+                            split.split_id,
+                            self.generation
+                        );
+                    };
+                    if !out_split.parent_split_ids()?.contains(&split.split_id) {
+                        anyhow::bail!(
+                            "compacted split '{}' lists output '{out_id}', but '{out_id}' does not list '{}' in parent_split_ids",
+                            split.split_id,
+                            split.split_id
+                        );
+                    }
+                    edges
+                        .entry(split.split_id.clone())
+                        .or_default()
+                        .insert(out_id.clone());
+                }
+            } else if !replaced_by.is_empty() {
+                anyhow::bail!(
+                    "non-compacted split '{}' (state {:?}) cannot declare replaced_by_split_ids",
+                    split.split_id,
+                    split.state
+                );
+            }
+        }
+
+        for record in &self.compaction_lineage {
+            validate_publication_operation_id(&record.operation_id).map_err(|err| {
+                anyhow::anyhow!(
+                    "compaction lineage record has invalid operation_id '{}': {err}",
+                    record.operation_id
+                )
+            })?;
+            if record.committed_at_generation == 0
+                || record.committed_at_generation > self.generation
+            {
+                anyhow::bail!(
+                    "compaction lineage record '{}' has invalid committed_at_generation {} (manifest generation {})",
+                    record.operation_id,
+                    record.committed_at_generation,
+                    self.generation
+                );
+            }
+            if record.input_split_ids.is_empty() || record.output_split_ids.is_empty() {
+                anyhow::bail!(
+                    "compaction lineage record '{}' must have non-empty input_split_ids and output_split_ids",
+                    record.operation_id
+                );
+            }
+            let mut local_inputs = HashSet::new();
+            for input_id in &record.input_split_ids {
+                if !local_inputs.insert(input_id.as_str()) {
+                    anyhow::bail!(
+                        "compaction lineage record '{}' has duplicate input_split_id '{input_id}'",
+                        record.operation_id
+                    );
+                }
+                if let Some(prev_op) =
+                    all_replaced_inputs.insert(input_id.clone(), record.operation_id.clone())
+                {
+                    anyhow::bail!(
+                        "overlapping compaction replacement: split '{input_id}' is replaced by both '{prev_op}' and '{}'",
+                        record.operation_id
+                    );
+                }
+                let Some(in_split) = splits_by_id.get(input_id.as_str()) else {
+                    anyhow::bail!(
+                        "compaction lineage record '{}' references missing input_split_id '{input_id}'",
+                        record.operation_id
+                    );
+                };
+                if !matches!(
+                    in_split.state,
+                    RemoteSplitState::Compacted | RemoteSplitState::MarkedForDeletion
+                ) {
+                    anyhow::bail!(
+                        "compaction lineage record '{}' input split '{input_id}' is in state {:?}, expected Compacted",
+                        record.operation_id,
+                        in_split.state
+                    );
+                }
+            }
+            let mut local_outputs = HashSet::new();
+            for output_id in &record.output_split_ids {
+                if !local_outputs.insert(output_id.as_str()) {
+                    anyhow::bail!(
+                        "compaction lineage record '{}' has duplicate output_split_id '{output_id}'",
+                        record.operation_id
+                    );
+                }
+                if local_inputs.contains(output_id.as_str()) {
+                    anyhow::bail!(
+                        "compaction lineage record '{}' lists split '{output_id}' as both input and output",
+                        record.operation_id
+                    );
+                }
+                if !all_compaction_outputs.insert(output_id.clone()) {
+                    anyhow::bail!(
+                        "compaction lineage output split '{output_id}' is produced by multiple compaction records"
+                    );
+                }
+                if !splits_by_id.contains_key(output_id.as_str()) {
+                    anyhow::bail!(
+                        "compaction lineage record '{}' references missing output_split_id '{output_id}'",
+                        record.operation_id
+                    );
+                }
+                for input_id in &record.input_split_ids {
+                    edges
+                        .entry(input_id.clone())
+                        .or_default()
+                        .insert(output_id.clone());
+                }
+            }
+            if let (Some(start), Some(end)) =
+                (record.coverage_start_seq_no, record.coverage_end_seq_no)
+                && end < start
+            {
+                anyhow::bail!(
+                    "compaction lineage record '{}' has invalid coverage range {start}..={end}",
+                    record.operation_id
+                );
+            }
+        }
+
+        // Verify the directed lineage graph is acyclic (no cycles).
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum VisitState {
+            Visiting,
+            Visited,
+        }
+        fn dfs(
+            node: &str,
+            edges: &BTreeMap<String, BTreeSet<String>>,
+            state: &mut HashMap<String, VisitState>,
+        ) -> Result<()> {
+            match state.get(node).copied() {
+                Some(VisitState::Visiting) => {
+                    anyhow::bail!("compaction lineage contains a cycle involving split '{node}'")
+                }
+                Some(VisitState::Visited) => return Ok(()),
+                None => {}
+            }
+            state.insert(node.to_string(), VisitState::Visiting);
+            if let Some(children) = edges.get(node) {
+                for child in children {
+                    dfs(child, edges, state)?;
+                }
+            }
+            state.insert(node.to_string(), VisitState::Visited);
+            Ok(())
+        }
+
+        let mut visit_state = HashMap::new();
+        for node in edges.keys() {
+            dfs(node, &edges, &mut visit_state)?;
+        }
+        Ok(())
+    }
 }
 
 /// State of a split within a remote manifest.
@@ -2332,6 +2760,7 @@ impl RemoteStoreManifest {
 pub enum RemoteSplitState {
     Staged,
     Published,
+    Compacted,
     MarkedForDeletion,
 }
 
@@ -2461,6 +2890,129 @@ impl RemoteSplitManifest {
             tombstones,
         }))
     }
+
+    pub fn set_doc_versions_and_tombstones(
+        &mut self,
+        doc_versions: &[SplitDocVersionRecord],
+        tombstones: &[SplitTombstoneRecord],
+    ) {
+        if !doc_versions.is_empty() {
+            let versions_json =
+                serde_json::to_string(doc_versions).expect("doc_versions must serialize");
+            self.tags
+                .insert("seal_doc_versions_json".into(), versions_json);
+        } else {
+            self.tags.remove("seal_doc_versions_json");
+        }
+        if !tombstones.is_empty() {
+            let tombstones_json =
+                serde_json::to_string(tombstones).expect("tombstones must serialize");
+            self.tags
+                .insert("seal_tombstones_json".into(), tombstones_json);
+        } else {
+            self.tags.remove("seal_tombstones_json");
+        }
+    }
+
+    pub fn doc_versions(&self) -> Result<Vec<SplitDocVersionRecord>> {
+        match self.tags.get("seal_doc_versions_json") {
+            Some(raw) if !raw.is_empty() => serde_json::from_str::<Vec<SplitDocVersionRecord>>(raw)
+                .with_context(|| {
+                    format!(
+                        "split '{}' has invalid seal_doc_versions_json",
+                        self.split_id
+                    )
+                }),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    pub fn tombstones(&self) -> Result<Vec<SplitTombstoneRecord>> {
+        match self.tags.get("seal_tombstones_json") {
+            Some(raw) if !raw.is_empty() => serde_json::from_str::<Vec<SplitTombstoneRecord>>(raw)
+                .with_context(|| {
+                    format!("split '{}' has invalid seal_tombstones_json", self.split_id)
+                }),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    pub fn set_parent_split_ids(&mut self, parent_split_ids: &[String]) {
+        if !parent_split_ids.is_empty() {
+            let json =
+                serde_json::to_string(parent_split_ids).expect("parent_split_ids must serialize");
+            self.tags.insert("parent_split_ids_json".into(), json);
+        } else {
+            self.tags.remove("parent_split_ids_json");
+        }
+    }
+
+    pub fn parent_split_ids(&self) -> Result<Vec<String>> {
+        match self.tags.get("parent_split_ids_json") {
+            Some(raw) if !raw.is_empty() => {
+                serde_json::from_str::<Vec<String>>(raw).with_context(|| {
+                    format!(
+                        "split '{}' has invalid parent_split_ids_json",
+                        self.split_id
+                    )
+                })
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    pub fn set_replacement_metadata(
+        &mut self,
+        replaced_by_split_ids: &[String],
+        operation_id: &str,
+        generation: u64,
+    ) {
+        self.state = RemoteSplitState::Compacted;
+        let json = serde_json::to_string(replaced_by_split_ids)
+            .expect("replaced_by_split_ids must serialize");
+        self.tags.insert("replaced_by_split_ids_json".into(), json);
+        self.tags
+            .insert("replaced_by_operation_id".into(), operation_id.to_string());
+        self.tags
+            .insert("replaced_at_generation".into(), generation.to_string());
+        // Strip per-document version and tombstone arrays from compacted split entries
+        // in newer manifest generations so manifests stay compact while older generations
+        // retain their immutable split metadata.
+        self.tags.remove("seal_doc_versions_json");
+        self.tags.remove("seal_tombstones_json");
+    }
+
+    pub fn replaced_by_split_ids(&self) -> Result<Vec<String>> {
+        match self.tags.get("replaced_by_split_ids_json") {
+            Some(raw) if !raw.is_empty() => {
+                serde_json::from_str::<Vec<String>>(raw).with_context(|| {
+                    format!(
+                        "split '{}' has invalid replaced_by_split_ids_json",
+                        self.split_id
+                    )
+                })
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    pub fn replaced_by_operation_id(&self) -> Option<&str> {
+        self.tags
+            .get("replaced_by_operation_id")
+            .map(String::as_str)
+    }
+
+    pub fn replaced_at_generation(&self) -> Result<Option<u64>> {
+        match self.tags.get("replaced_at_generation") {
+            Some(raw) if !raw.is_empty() => raw.parse::<u64>().map(Some).with_context(|| {
+                format!(
+                    "split '{}' has invalid replaced_at_generation",
+                    self.split_id
+                )
+            }),
+            _ => Ok(None),
+        }
+    }
 }
 
 /// Optional timestamp range summary used for split pruning.
@@ -2539,6 +3091,7 @@ mod tests {
                 hot_delta: None,
             }),
             published_watermarks: BTreeMap::new(),
+            compaction_lineage: Vec::new(),
             splits: vec![
                 RemoteSplitManifest {
                     split_id: "split-a".into(),
@@ -2720,6 +3273,7 @@ mod tests {
             published_at: "2026-04-16T00:00:00Z".into(),
             settings: None,
             published_watermarks: BTreeMap::new(),
+            compaction_lineage: Vec::new(),
             splits: vec![RemoteSplitManifest {
                 split_id: "split-a".into(),
                 state: RemoteSplitState::Published,

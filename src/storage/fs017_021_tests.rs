@@ -238,6 +238,7 @@ async fn fs017_manifest_and_pointer_version_window_and_broken_lineage_rejection(
         published_at: "2026-10-16T00:00:00Z".into(),
         settings: None,
         published_watermarks: std::collections::BTreeMap::new(),
+        compaction_lineage: Vec::new(),
         splits: vec![make_split(idx_broken, "split-2", "op-2", 'b')],
     };
     manager.publish_manifest(&broken_gen2).await.unwrap();
@@ -1068,5 +1069,497 @@ async fn fs020_021_inventory_and_janitor_enforce_retention_pins_sweep_grace_rate
             )
             .await
             .is_err()
+    );
+}
+
+async fn stage_operation_with_split(
+    manager: &StorageManager,
+    index_uuid: &str,
+    op_id: &str,
+    mut split: RemoteSplitManifest,
+) -> PublicationPreparedRecord {
+    let uploaded =
+        upload_mini_bundle(manager, index_uuid, &split.split_id, op_id, &split.split_id).await;
+    split.bundle_path = uploaded.bundle_path;
+    split.checksum = uploaded.checksum;
+    split.size_bytes = uploaded.size_bytes;
+    split.uncompressed_bytes = uploaded.uncompressed_bytes;
+    let fp = compute_publication_request_fingerprint(
+        index_uuid,
+        1,
+        "sha256:v1",
+        &[(op_id.to_string(), serde_json::json!({"op": op_id}))],
+    )
+    .unwrap();
+    let intent = PublicationIntentRecord {
+        format_version: PUBLICATION_RECORD_FORMAT_VERSION,
+        index_uuid: index_uuid.to_string(),
+        index_name: "events".to_string(),
+        operation_id: op_id.to_string(),
+        request_fingerprint: fp.clone(),
+        schema_generation: 1,
+        schema_hash: "sha256:v1".to_string(),
+        split_id: split.split_id.clone(),
+        planned_bundle_path: split.bundle_path.clone(),
+        doc_count: split.doc_count.max(1),
+        producer_node_id: "node-1".to_string(),
+        created_at: "2026-10-16T00:00:00Z".to_string(),
+        created_at_epoch_ms: 1_000,
+    };
+    manager.stage_publication_intent(&intent).await.unwrap();
+    let prepared = PublicationPreparedRecord {
+        format_version: PUBLICATION_RECORD_FORMAT_VERSION,
+        index_uuid: index_uuid.to_string(),
+        index_name: "events".to_string(),
+        operation_id: op_id.to_string(),
+        request_fingerprint: fp,
+        schema_generation: 1,
+        schema_hash: "sha256:v1".to_string(),
+        producer_node_id: "node-1".to_string(),
+        prepared_at: "2026-10-16T00:00:00Z".to_string(),
+        prepared_at_epoch_ms: 1_000,
+        split,
+    };
+    manager.write_publication_prepared(&prepared).await.unwrap()
+}
+
+#[tokio::test]
+async fn fs039_and_fs041_compaction_lineage_validation_and_snapshot_safe_gc() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("store");
+    let work = dir.path().join("work");
+    let manager = StorageManager::new(root.to_string_lossy().into_owned(), work).unwrap();
+    let index_uuid = "idx-fs039-041";
+
+    // 1. Validate compaction lineage rules (FS-039): reject self-reference, cycles,
+    // missing inputs, overlapping replacement commits, and Published parent state.
+    let mut split_a = make_split(index_uuid, "split-a", "op-1", 'a');
+    split_a.set_seal_range(&super::SplitSealRangeMetadata {
+        shard_id: 0,
+        start_seq_no: 0,
+        end_seq_no: 1,
+        primary_term: 1,
+        doc_versions: vec![
+            super::SplitDocVersionRecord {
+                doc_id: "d1".into(),
+                seq_no: 0,
+                primary_term: 1,
+                version: 1,
+            },
+            super::SplitDocVersionRecord {
+                doc_id: "d2".into(),
+                seq_no: 1,
+                primary_term: 1,
+                version: 1,
+            },
+        ],
+        tombstones: Vec::new(),
+    });
+
+    let mut split_b = make_split(index_uuid, "split-b", "op-2", 'b');
+    split_b.set_seal_range(&super::SplitSealRangeMetadata {
+        shard_id: 0,
+        start_seq_no: 2,
+        end_seq_no: 3,
+        primary_term: 1,
+        doc_versions: vec![super::SplitDocVersionRecord {
+            doc_id: "d1".into(),
+            seq_no: 2,
+            primary_term: 1,
+            version: 2,
+        }],
+        tombstones: vec![super::SplitTombstoneRecord {
+            doc_id: "d2".into(),
+            seq_no: 3,
+            primary_term: 1,
+            version: 2,
+        }],
+    });
+
+    // Self-reference in parent_split_ids must fail validation.
+    let mut self_ref_split = split_a.clone();
+    self_ref_split.set_parent_split_ids(&["split-a".to_string()]);
+    let self_ref_manifest = RemoteStoreManifest {
+        version: REMOTE_MANIFEST_FORMAT_VERSION,
+        engine: crate::cluster::state::IndexEngine::RemoteStore,
+        index_uuid: index_uuid.into(),
+        index_name: "events".into(),
+        schema_generation: 1,
+        schema_hash: "sha256:v1".into(),
+        generation: 1,
+        parent_generation: 0,
+        parent_manifest_path: None,
+        writer_epoch: 1,
+        operation_id: "op-1".into(),
+        request_fingerprint: format!("sha256:{}", "1".repeat(64)),
+        published_at: "2026-10-16T00:00:00Z".into(),
+        settings: None,
+        published_watermarks: std::collections::BTreeMap::new(),
+        compaction_lineage: Vec::new(),
+        splits: vec![self_ref_split],
+    };
+    let err = self_ref_manifest
+        .validate_for_read(index_uuid, 1, Some("sha256:v1"))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("references itself"),
+        "expected self-reference rejection, got: {err:#}"
+    );
+
+    // Cycle A -> B -> A must fail validation.
+    let mut cyc_a = split_a.clone();
+    cyc_a.set_parent_split_ids(&["split-b".to_string()]);
+    cyc_a.set_replacement_metadata(&["split-b".to_string()], "op-c1", 1);
+    let mut cyc_b = split_b.clone();
+    cyc_b.set_parent_split_ids(&["split-a".to_string()]);
+    cyc_b.set_replacement_metadata(&["split-a".to_string()], "op-c2", 1);
+    let mut cyc_manifest = self_ref_manifest.clone();
+    cyc_manifest.splits = vec![cyc_a, cyc_b];
+    let err = cyc_manifest
+        .validate_for_read(index_uuid, 1, Some("sha256:v1"))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("cycle"),
+        "expected cycle rejection, got: {err:#}"
+    );
+
+    // Overlapping compaction records replacing the same input split must fail validation.
+    let mut comp_a = split_a.clone();
+    comp_a.set_replacement_metadata(&["split-c".to_string()], "op-c1", 1);
+    let mut comp_c = make_split(index_uuid, "split-c", "op-c1", 'c');
+    comp_c.set_parent_split_ids(&["split-a".to_string()]);
+    let mut comp_d = make_split(index_uuid, "split-d", "op-c2", 'd');
+    comp_d.set_parent_split_ids(&["split-a".to_string()]);
+    let mut overlap_manifest = self_ref_manifest.clone();
+    overlap_manifest.splits = vec![comp_a, comp_c, comp_d];
+    overlap_manifest.compaction_lineage = vec![
+        super::CompactionLineageRecord {
+            operation_id: "op-c1".into(),
+            committed_at_generation: 1,
+            input_split_ids: vec!["split-a".into()],
+            output_split_ids: vec!["split-c".into()],
+            shard_id: Some(0),
+            coverage_start_seq_no: Some(0),
+            coverage_end_seq_no: Some(1),
+            retained_live_docs: 1,
+            retained_tombstones: 0,
+            dropped_superseded_versions: 0,
+        },
+        super::CompactionLineageRecord {
+            operation_id: "op-c2".into(),
+            committed_at_generation: 1,
+            input_split_ids: vec!["split-a".into()],
+            output_split_ids: vec!["split-d".into()],
+            shard_id: Some(0),
+            coverage_start_seq_no: Some(0),
+            coverage_end_seq_no: Some(1),
+            retained_live_docs: 1,
+            retained_tombstones: 0,
+            dropped_superseded_versions: 0,
+        },
+    ];
+    let err = overlap_manifest
+        .validate_for_read(index_uuid, 1, Some("sha256:v1"))
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("overlapping compaction replacement"),
+        "expected overlapping compaction rejection, got: {err:#}"
+    );
+
+    // 2. Commit generation 1 (split-a) and generation 2 (split-b), then compact into generation 3 (split-c).
+    let (fenced_ptr, _) = manager.fence_manifest_pointer(index_uuid, 1).await.unwrap();
+    let prep_1 = stage_operation_with_split(&manager, index_uuid, "op-1", split_a.clone()).await;
+    let out_1 = manager
+        .commit_prepared_publication(&SequencerCommitRequest {
+            index_uuid: index_uuid.into(),
+            index_name: "events".into(),
+            operation_id: "op-1".into(),
+            request_fingerprint: prep_1.request_fingerprint.clone(),
+            schema_generation: 1,
+            schema_hash: "sha256:v1".into(),
+            writer_epoch: 1,
+            lease_id: 1,
+            sequencer_node_id: "node-1".into(),
+            fenced_pointer_revision: fenced_ptr.pointer_revision,
+            settings: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(out_1.generation, 1);
+
+    let prep_2 = stage_operation_with_split(&manager, index_uuid, "op-2", split_b.clone()).await;
+    let out_2 = manager
+        .commit_prepared_publication(&SequencerCommitRequest {
+            index_uuid: index_uuid.into(),
+            index_name: "events".into(),
+            operation_id: "op-2".into(),
+            request_fingerprint: prep_2.request_fingerprint.clone(),
+            schema_generation: 1,
+            schema_hash: "sha256:v1".into(),
+            writer_epoch: 1,
+            lease_id: 1,
+            sequencer_node_id: "node-1".into(),
+            fenced_pointer_revision: out_1.pointer_revision,
+            settings: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(out_2.generation, 2);
+
+    // Unsafe compaction coverage check: missing live winner d1@seq=2 must be rejected.
+    let mut bad_comp_split = make_split(index_uuid, "split-bad", "op-bad-compact", 'x');
+    bad_comp_split.set_parent_split_ids(&["split-a".to_string(), "split-b".to_string()]);
+    bad_comp_split.set_seal_range(&super::SplitSealRangeMetadata {
+        shard_id: 0,
+        start_seq_no: 0,
+        end_seq_no: 3,
+        primary_term: 1,
+        doc_versions: vec![super::SplitDocVersionRecord {
+            doc_id: "d1".into(),
+            seq_no: 0, // stale version instead of winner seq_no=2!
+            primary_term: 1,
+            version: 1,
+        }],
+        tombstones: vec![super::SplitTombstoneRecord {
+            doc_id: "d2".into(),
+            seq_no: 3,
+            primary_term: 1,
+            version: 2,
+        }],
+    });
+    let prep_bad =
+        stage_operation_with_split(&manager, index_uuid, "op-bad-compact", bad_comp_split).await;
+    let bad_err = manager
+        .commit_prepared_publication(&SequencerCommitRequest {
+            index_uuid: index_uuid.into(),
+            index_name: "events".into(),
+            operation_id: "op-bad-compact".into(),
+            request_fingerprint: prep_bad.request_fingerprint.clone(),
+            schema_generation: 1,
+            schema_hash: "sha256:v1".into(),
+            writer_epoch: 1,
+            lease_id: 1,
+            sequencer_node_id: "node-1".into(),
+            fenced_pointer_revision: out_2.pointer_revision,
+            settings: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        bad_err
+            .to_string()
+            .contains("altered version of live winner"),
+        "expected unsafe coverage rejection, got: {bad_err:#}"
+    );
+
+    // Valid compaction split-c replacing split-a + split-b.
+    let mut split_c = make_split(index_uuid, "split-c", "op-3-compact", 'c');
+    split_c.set_parent_split_ids(&["split-a".to_string(), "split-b".to_string()]);
+    split_c.set_seal_range(&super::SplitSealRangeMetadata {
+        shard_id: 0,
+        start_seq_no: 0,
+        end_seq_no: 3,
+        primary_term: 1,
+        doc_versions: vec![super::SplitDocVersionRecord {
+            doc_id: "d1".into(),
+            seq_no: 2,
+            primary_term: 1,
+            version: 2,
+        }],
+        tombstones: vec![super::SplitTombstoneRecord {
+            doc_id: "d2".into(),
+            seq_no: 3,
+            primary_term: 1,
+            version: 2,
+        }],
+    });
+    let prep_3 =
+        stage_operation_with_split(&manager, index_uuid, "op-3-compact", split_c.clone()).await;
+    let out_3 = manager
+        .commit_prepared_publication(&SequencerCommitRequest {
+            index_uuid: index_uuid.into(),
+            index_name: "events".into(),
+            operation_id: "op-3-compact".into(),
+            request_fingerprint: prep_3.request_fingerprint.clone(),
+            schema_generation: 1,
+            schema_hash: "sha256:v1".into(),
+            writer_epoch: 1,
+            lease_id: 1,
+            sequencer_node_id: "node-1".into(),
+            fenced_pointer_revision: out_2.pointer_revision,
+            settings: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(out_3.generation, 3);
+
+    // Concurrent second compaction attempting to replace already-compacted split-a must fail with OperationConflict!
+    let mut split_dup = make_split(index_uuid, "split-dup", "op-4-dup-compact", 'e');
+    split_dup.set_parent_split_ids(&["split-a".to_string()]);
+    split_dup.set_seal_range(&super::SplitSealRangeMetadata {
+        shard_id: 0,
+        start_seq_no: 0,
+        end_seq_no: 1,
+        primary_term: 1,
+        doc_versions: vec![
+            super::SplitDocVersionRecord {
+                doc_id: "d1".into(),
+                seq_no: 0,
+                primary_term: 1,
+                version: 1,
+            },
+            super::SplitDocVersionRecord {
+                doc_id: "d2".into(),
+                seq_no: 1,
+                primary_term: 1,
+                version: 1,
+            },
+        ],
+        tombstones: Vec::new(),
+    });
+    let prep_dup =
+        stage_operation_with_split(&manager, index_uuid, "op-4-dup-compact", split_dup).await;
+    let dup_err = manager
+        .commit_prepared_publication(&SequencerCommitRequest {
+            index_uuid: index_uuid.into(),
+            index_name: "events".into(),
+            operation_id: "op-4-dup-compact".into(),
+            request_fingerprint: prep_dup.request_fingerprint.clone(),
+            schema_generation: 1,
+            schema_hash: "sha256:v1".into(),
+            writer_epoch: 1,
+            lease_id: 1,
+            sequencer_node_id: "node-1".into(),
+            fenced_pointer_revision: out_3.pointer_revision,
+            settings: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            dup_err.downcast_ref::<PublicationError>(),
+            Some(PublicationError::OperationConflict { .. })
+        ),
+        "expected OperationConflict for already-compacted input split, got: {dup_err:#}"
+    );
+
+    // 3. Snapshot-safe GC (FS-041):
+    // Acquire an active SnapshotRetentionLease on generation 1 and advance clock beyond retention_horizon_ms.
+    let base_now_ms = super::now_epoch_ms();
+    let lease_guard = manager.acquire_snapshot_retention_lease(super::SnapshotRetentionLease {
+        snapshot_id: "snap-pinned-g1".into(),
+        index_uuid: index_uuid.into(),
+        manifest_generation: 1,
+        pinned_split_ids: std::collections::HashSet::from(["split-a".to_string()]),
+        acquired_at_epoch_ms: base_now_ms,
+        expires_at_epoch_ms: base_now_ms + 10_000_000,
+    });
+
+    let mut inv_opts = ReachabilityInventoryOptions::for_index(index_uuid, Some("events".into()));
+    inv_opts.retention_generations = 0;
+    inv_opts.retention_horizon_ms = 60_000;
+    inv_opts.active_grace_ms = 10_000;
+    inv_opts.now_epoch_ms = base_now_ms + 600_000;
+
+    let report_while_leased = manager
+        .build_reachability_inventory(&inv_opts)
+        .await
+        .unwrap();
+    let entry_split_a = report_while_leased
+        .objects
+        .iter()
+        .find(|o| o.path == split_a.bundle_path)
+        .unwrap();
+    assert_eq!(
+        entry_split_a.classification,
+        ObjectReachabilityClass::Pinned
+    );
+    assert!(entry_split_a.pinned);
+    assert!(!entry_split_a.reclaimable);
+
+    // split-b (from unpinned expired generation 2) IS Superseded and reclaimable, while split-c is Committed!
+    let entry_split_b = report_while_leased
+        .objects
+        .iter()
+        .find(|o| o.path == split_b.bundle_path)
+        .unwrap();
+    assert_eq!(
+        entry_split_b.classification,
+        ObjectReachabilityClass::Superseded
+    );
+    assert!(entry_split_b.reclaimable);
+
+    let entry_split_c = report_while_leased
+        .objects
+        .iter()
+        .find(|o| o.path == split_c.bundle_path)
+        .unwrap();
+    assert_eq!(
+        entry_split_c.classification,
+        ObjectReachabilityClass::Committed
+    );
+    assert!(!entry_split_c.reclaimable);
+
+    // Run destructive janitor while lease on generation 1 is active: split-b is swept, split-a and split-c survive!
+    let janitor_res_1 = manager
+        .run_janitor(&JanitorOptions {
+            dry_run: false,
+            inventory_options: inv_opts.clone(),
+            max_deletes_per_run: 64,
+            max_delete_bytes_per_run: 10 * 1024 * 1024,
+            sweep_grace_ms: 0,
+        })
+        .await
+        .unwrap();
+    assert!(!janitor_res_1.blocked);
+    assert!(
+        manager
+            .get_bytes(&manager.object_path(&split_a.bundle_path).unwrap())
+            .await
+            .is_ok(),
+        "pinned split-a must survive GC while SnapshotRetentionLease is active"
+    );
+    assert!(
+        manager
+            .get_bytes(&manager.object_path(&split_b.bundle_path).unwrap())
+            .await
+            .is_err(),
+        "unpinned expired compacted split-b must be swept by GC"
+    );
+    assert!(
+        manager
+            .get_bytes(&manager.object_path(&split_c.bundle_path).unwrap())
+            .await
+            .is_ok(),
+        "committed replacement split-c must survive GC"
+    );
+
+    // Drop the SnapshotRetentionLease on generation 1 and run GC again: now split-a is also swept!
+    drop(lease_guard);
+    let janitor_res_2 = manager
+        .run_janitor(&JanitorOptions {
+            dry_run: false,
+            inventory_options: inv_opts,
+            max_deletes_per_run: 64,
+            max_delete_bytes_per_run: 10 * 1024 * 1024,
+            sweep_grace_ms: 0,
+        })
+        .await
+        .unwrap();
+    assert!(!janitor_res_2.blocked);
+    assert!(
+        manager
+            .get_bytes(&manager.object_path(&split_a.bundle_path).unwrap())
+            .await
+            .is_err(),
+        "compacted split-a must be swept after its SnapshotRetentionLease is released"
+    );
+    assert!(
+        manager
+            .get_bytes(&manager.object_path(&split_c.bundle_path).unwrap())
+            .await
+            .is_ok(),
+        "committed replacement split-c must still survive repeated GC"
     );
 }

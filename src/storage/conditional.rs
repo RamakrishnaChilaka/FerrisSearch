@@ -2544,6 +2544,7 @@ tmpfs /mnt/nfs_share/local_tmp tmpfs rw 0 0\n";
                 published_at: "2026-10-16T00:00:00Z".into(),
                 settings: None,
                 published_watermarks: BTreeMap::new(),
+                compaction_lineage: Vec::new(),
                 splits: vec![RemoteSplitManifest {
                     split_id: "split-1".into(),
                     state: RemoteSplitState::Published,

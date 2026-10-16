@@ -139,6 +139,34 @@ pub enum QueryClause {
     Prefix(HashMap<String, serde_json::Value>),
     /// Fuzzy query: `{ "fuzzy": { "field": { "value": "rsut", "fuzziness": 1 } } }`
     Fuzzy(HashMap<String, FuzzyParams>),
+    /// Internal/pinned snapshot visibility and supersession filter (`FS-037`, `FS-038`).
+    SnapshotFilter(SnapshotFilterParams),
+}
+
+/// Snapshot visibility and supersession filter parameters (`FS-037`, `FS-038`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotFilterParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_doc_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub split_excluded_doc_ids: std::collections::BTreeMap<String, Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_exclusive_seq_no: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inclusive_seq_no: Option<u64>,
+}
+
+impl SnapshotFilterParams {
+    pub fn has_execution_filter(&self) -> bool {
+        !self.excluded_doc_ids.is_empty()
+            || !self.split_excluded_doc_ids.is_empty()
+            || self.min_exclusive_seq_no.is_some()
+            || self.max_inclusive_seq_no.is_some()
+    }
 }
 
 impl QueryClause {
@@ -150,6 +178,201 @@ impl QueryClause {
     /// Returns true if this query matches no documents.
     pub fn is_match_none(&self) -> bool {
         matches!(self, QueryClause::MatchNone(_))
+    }
+
+    /// Extract a pinned `snapshot_generation` if present in this query tree (`FS-037`, `FS-038`).
+    pub fn snapshot_generation(&self) -> Option<u64> {
+        match self {
+            QueryClause::SnapshotFilter(params) => params.snapshot_generation,
+            QueryClause::Bool(bq) => bq
+                .filter
+                .iter()
+                .chain(bq.must.iter())
+                .find_map(QueryClause::snapshot_generation),
+            _ => None,
+        }
+    }
+
+    pub fn snapshot_filter_params(&self) -> Option<&SnapshotFilterParams> {
+        match self {
+            QueryClause::SnapshotFilter(params) => Some(params),
+            QueryClause::Bool(bq) => bq
+                .filter
+                .iter()
+                .chain(bq.must.iter())
+                .find_map(QueryClause::snapshot_filter_params),
+            _ => None,
+        }
+    }
+
+    /// Strip any `SnapshotFilter` clauses from this query tree so callers can
+    /// re-attach a target-specific `SnapshotFilter`.
+    pub fn without_snapshot_filters(&self) -> QueryClause {
+        match self {
+            QueryClause::SnapshotFilter(_) => default_query(),
+            QueryClause::Bool(bq) => {
+                let must: Vec<QueryClause> = bq
+                    .must
+                    .iter()
+                    .filter(|c| !matches!(c, QueryClause::SnapshotFilter(_)))
+                    .map(QueryClause::without_snapshot_filters)
+                    .collect();
+                let should: Vec<QueryClause> = bq
+                    .should
+                    .iter()
+                    .map(QueryClause::without_snapshot_filters)
+                    .collect();
+                let must_not: Vec<QueryClause> = bq
+                    .must_not
+                    .iter()
+                    .map(QueryClause::without_snapshot_filters)
+                    .collect();
+                let filter: Vec<QueryClause> = bq
+                    .filter
+                    .iter()
+                    .filter(|c| !matches!(c, QueryClause::SnapshotFilter(_)))
+                    .map(QueryClause::without_snapshot_filters)
+                    .collect();
+                if must.len() == 1 && should.is_empty() && must_not.is_empty() && filter.is_empty()
+                {
+                    must.into_iter().next().unwrap()
+                } else if must.is_empty()
+                    && should.is_empty()
+                    && must_not.is_empty()
+                    && filter.is_empty()
+                {
+                    default_query()
+                } else {
+                    QueryClause::Bool(BoolQuery {
+                        must,
+                        should,
+                        must_not,
+                        filter,
+                    })
+                }
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Strip any `SnapshotFilter` clauses that carry only metadata (`!has_execution_filter()`).
+    pub fn without_noop_snapshot_filter(&self) -> QueryClause {
+        match self {
+            QueryClause::SnapshotFilter(params) if !params.has_execution_filter() => {
+                default_query()
+            }
+            QueryClause::Bool(bq) => {
+                let must: Vec<QueryClause> = bq
+                    .must
+                    .iter()
+                    .filter(|c| {
+                        !matches!(c, QueryClause::SnapshotFilter(p) if !p.has_execution_filter())
+                    })
+                    .map(QueryClause::without_noop_snapshot_filter)
+                    .collect();
+                let should: Vec<QueryClause> = bq
+                    .should
+                    .iter()
+                    .map(QueryClause::without_noop_snapshot_filter)
+                    .collect();
+                let must_not: Vec<QueryClause> = bq
+                    .must_not
+                    .iter()
+                    .map(QueryClause::without_noop_snapshot_filter)
+                    .collect();
+                let filter: Vec<QueryClause> = bq
+                    .filter
+                    .iter()
+                    .filter(|c| {
+                        !matches!(c, QueryClause::SnapshotFilter(p) if !p.has_execution_filter())
+                    })
+                    .map(QueryClause::without_noop_snapshot_filter)
+                    .collect();
+                if must.len() == 1 && should.is_empty() && must_not.is_empty() && filter.is_empty()
+                {
+                    must.into_iter().next().unwrap()
+                } else if must.is_empty()
+                    && should.is_empty()
+                    && must_not.is_empty()
+                    && filter.is_empty()
+                {
+                    default_query()
+                } else {
+                    QueryClause::Bool(BoolQuery {
+                        must,
+                        should,
+                        must_not,
+                        filter,
+                    })
+                }
+            }
+            other => other.clone(),
+        }
+    }
+}
+
+impl SearchRequest {
+    pub fn snapshot_generation(&self) -> Option<u64> {
+        self.query.snapshot_generation()
+    }
+
+    pub fn with_snapshot_generation(mut self, generation: u64) -> Self {
+        let base = self.query.without_snapshot_filters();
+        self.query = QueryClause::Bool(BoolQuery {
+            must: vec![base],
+            should: Vec::new(),
+            must_not: Vec::new(),
+            filter: vec![QueryClause::SnapshotFilter(SnapshotFilterParams {
+                snapshot_generation: Some(generation),
+                ..Default::default()
+            })],
+        });
+        self
+    }
+
+    pub fn without_snapshot_filters(&self) -> Self {
+        let mut cloned = self.clone();
+        cloned.query = self.query.without_snapshot_filters();
+        cloned
+    }
+
+    pub fn without_noop_snapshot_filter(&self) -> Self {
+        let mut cloned = self.clone();
+        cloned.query = self.query.without_noop_snapshot_filter();
+        cloned
+    }
+
+    pub fn with_snapshot_filter(&self, params: SnapshotFilterParams) -> Self {
+        let mut cloned = self.without_snapshot_filters();
+        if !params.has_execution_filter() {
+            return cloned;
+        }
+        let base = cloned.query;
+        cloned.query = QueryClause::Bool(BoolQuery {
+            must: vec![base],
+            should: Vec::new(),
+            must_not: Vec::new(),
+            filter: vec![QueryClause::SnapshotFilter(params)],
+        });
+        cloned
+    }
+
+    pub fn for_remote_split(&self, split_id: &str) -> Self {
+        let Some(params) = self.query.snapshot_filter_params().cloned() else {
+            return self.clone();
+        };
+        let mut excluded = params.excluded_doc_ids;
+        if let Some(split_excl) = params.split_excluded_doc_ids.get(split_id) {
+            excluded.extend(split_excl.iter().cloned());
+        }
+        self.with_snapshot_filter(SnapshotFilterParams {
+            snapshot_id: params.snapshot_id,
+            snapshot_generation: params.snapshot_generation,
+            excluded_doc_ids: excluded,
+            split_excluded_doc_ids: std::collections::BTreeMap::new(),
+            min_exclusive_seq_no: None,
+            max_inclusive_seq_no: None,
+        })
     }
 }
 

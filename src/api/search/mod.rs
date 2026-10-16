@@ -36,9 +36,9 @@ pub async fn count_documents(
 ) -> (StatusCode, Json<Value>) {
     // IndexName is validated at extraction time
 
-    let query = match &body {
+    let (query, requested_snapshot_gen) = match &body {
         Some(Json(req)) => match serde_json::from_value::<CountRequest>(req.clone()) {
-            Ok(cr) => cr.query,
+            Ok(cr) => (cr.query, cr.snapshot_generation),
             Err(e) => {
                 return crate::api::error_response(
                     StatusCode::BAD_REQUEST,
@@ -47,16 +47,19 @@ pub async fn count_documents(
                 );
             }
         },
-        None => crate::search::QueryClause::MatchAll(serde_json::json!({})),
+        None => (
+            crate::search::QueryClause::MatchAll(serde_json::json!({})),
+            None,
+        ),
     };
 
     // Fast path: match_all counts use doc_count() metadata — no search needed
-    if query.is_match_all() {
+    if query.is_match_all() && requested_snapshot_gen.is_none() {
         return count_match_all_fast(&state, &index_name).await;
     }
 
     // Slow path: run distributed search with size=0 to count matching docs
-    let search_req = crate::search::SearchRequest {
+    let mut search_req = crate::search::SearchRequest {
         query,
         size: 0,
         from: 0,
@@ -65,6 +68,9 @@ pub async fn count_documents(
         search_after: None,
         aggs: std::collections::HashMap::new(),
     };
+    if let Some(generation) = requested_snapshot_gen {
+        search_req = search_req.with_snapshot_generation(generation);
+    }
 
     match crate::api::index::execute_distributed_dsl_search(&state, &index_name, &search_req).await
     {
@@ -182,11 +188,43 @@ async fn count_remote_store_docs_from_manifest(
         }
     };
 
-    let (count, successful) = manifest
-        .published_splits()
-        .fold((0u64, 0u32), |(doc_count, split_count), split| {
-            (doc_count + split.doc_count, split_count + 1)
-        });
+    let mut doc_winners: HashMap<String, (u64, u64, u64, usize, bool)> = HashMap::new();
+    let mut unversioned_doc_count = 0u64;
+    let mut successful = 0u32;
+
+    for (split_idx, split) in manifest.published_splits().enumerate() {
+        successful += 1;
+        let dvs = split.doc_versions().unwrap_or_default();
+        let tss = split.tombstones().unwrap_or_default();
+        if dvs.is_empty() && tss.is_empty() {
+            unversioned_doc_count += split.doc_count;
+            continue;
+        }
+        for dv in dvs {
+            let cand = (dv.seq_no, dv.primary_term, dv.version, split_idx, false);
+            let update = doc_winners.get(&dv.doc_id).is_none_or(|(s, t, v, idx, _)| {
+                (cand.0, cand.1, cand.2, cand.3) >= (*s, *t, *v, *idx)
+            });
+            if update {
+                doc_winners.insert(dv.doc_id, cand);
+            }
+        }
+        for ts in tss {
+            let cand = (ts.seq_no, ts.primary_term, ts.version, split_idx, true);
+            let update = doc_winners.get(&ts.doc_id).is_none_or(|(s, t, v, idx, _)| {
+                (cand.0, cand.1, cand.2, cand.3) >= (*s, *t, *v, *idx)
+            });
+            if update {
+                doc_winners.insert(ts.doc_id, cand);
+            }
+        }
+    }
+
+    let versioned_live_count = doc_winners
+        .values()
+        .filter(|(_, _, _, _, is_tombstone)| !*is_tombstone)
+        .count() as u64;
+    let count = unversioned_doc_count + versioned_live_count;
 
     Ok((count, successful, 0))
 }
@@ -195,6 +233,8 @@ async fn count_remote_store_docs_from_manifest(
 struct CountRequest {
     #[serde(default = "default_match_all_query")]
     query: crate::search::QueryClause,
+    #[serde(default)]
+    snapshot_generation: Option<u64>,
 }
 
 fn default_match_all_query() -> crate::search::QueryClause {
@@ -213,6 +253,33 @@ async fn count_docs_from_metadata(
     index_name: &str,
     metadata: &crate::cluster::state::IndexMetadata,
 ) -> Result<MetadataDocCount, (StatusCode, Json<Value>)> {
+    if !metadata.uses_local_shards() {
+        let (count, successful, _) =
+            count_remote_store_docs_from_manifest(state, index_name, metadata).await?;
+        return Ok(MetadataDocCount {
+            count,
+            successful,
+            failures: Vec::new(),
+        });
+    }
+    if metadata.is_tiered() {
+        let req = crate::search::SearchRequest {
+            query: crate::search::QueryClause::MatchAll(serde_json::json!({})),
+            size: 0,
+            from: 0,
+            knn: None,
+            sort: Vec::new(),
+            aggs: HashMap::new(),
+            search_after: None,
+        };
+        let res =
+            crate::api::index::execute_distributed_dsl_search(state, index_name, &req).await?;
+        return Ok(MetadataDocCount {
+            count: res.total_hits as u64,
+            successful: res.successful_shards,
+            failures: res.shard_failures,
+        });
+    }
     let cluster_state = state.cluster_manager.get_state();
     let local_shards = crate::api::index::ensure_local_index_shards_open(
         state,
@@ -1337,14 +1404,15 @@ async fn execute_sql_query_with_plan(
     .await;
     let local_shard_ids: std::collections::HashSet<u32> =
         local_shards.iter().map(|(id, _)| *id).collect();
-    let is_remote_store = matches!(
+    let uses_immutable_splits = matches!(
         metadata.settings.engine,
         crate::cluster::state::IndexEngine::RemoteStore
-    );
+    ) || metadata.is_tiered()
+        || search_req.snapshot_generation().is_some();
 
     // Fast-field path: collect direct SQL partitions from local + remote shards
     let search_start = Instant::now();
-    let direct_sql = if !plan.selects_all_columns && !is_remote_store {
+    let direct_sql = if !plan.selects_all_columns && !uses_immutable_splits {
         match collect_direct_sql_partitions(
             state,
             &plan.index_name,
@@ -1766,12 +1834,12 @@ async fn execute_sql_stream_query(
         }
     };
     let plan = canonicalize_sql_plan_fields(plan, &metadata.mappings)?;
-    let is_remote_store = matches!(
+    let uses_immutable_splits = matches!(
         metadata.settings.engine,
         crate::cluster::state::IndexEngine::RemoteStore
-    );
+    ) || metadata.is_tiered();
 
-    if is_remote_store {
+    if uses_immutable_splits {
         let result = execute_sql_query(state, index_name, query).await?;
         return Ok(stream_json_response(sql_stream_response_body(&result)));
     }

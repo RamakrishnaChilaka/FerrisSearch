@@ -343,12 +343,14 @@ impl PublicationPreparedRecord {
                 self.split.checksum
             );
         }
+        let has_tombstones = !self.split.tombstones()?.is_empty()
+            || self
+                .split
+                .seal_range()?
+                .is_some_and(|r| !r.tombstones.is_empty());
+        let is_compaction = !self.split.parent_split_ids()?.is_empty();
         if self.split.size_bytes == 0
-            || (self.split.doc_count == 0
-                && !self
-                    .split
-                    .seal_range()?
-                    .is_some_and(|r| !r.tombstones.is_empty()))
+            || (self.split.doc_count == 0 && !has_tombstones && !is_compaction)
         {
             anyhow::bail!(
                 "publication prepared record split '{}' has zero size_bytes or doc_count",
@@ -356,6 +358,79 @@ impl PublicationPreparedRecord {
             );
         }
         Ok(())
+    }
+}
+
+/// Durable compaction replacement lineage entry recorded inside a manifest generation (`FS-039`, `FS-040`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CompactionLineageRecord {
+    pub operation_id: String,
+    pub committed_at_generation: u64,
+    pub input_split_ids: Vec<String>,
+    pub output_split_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_start_seq_no: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_end_seq_no: Option<u64>,
+    pub retained_live_docs: u64,
+    pub retained_tombstones: u64,
+    pub dropped_superseded_versions: u64,
+}
+
+/// Pinned cross-layer read snapshot descriptor (`FS-037`, `FS-038`, ADR 0003 section 3.1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadSnapshot {
+    pub snapshot_id: String,
+    pub index_uuid: String,
+    pub index_name: String,
+    pub schema_hash: String,
+    pub resolved_at_epoch_ms: u64,
+    pub expires_at_epoch_ms: u64,
+    pub pinned_historical_generation: bool,
+    pub manifest_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_checksum: Option<String>,
+    pub writer_epoch: u64,
+    pub pointer_revision: u64,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub published_watermarks: std::collections::BTreeMap<u32, ShardPublishedWatermark>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub shard_max_visible_seq_no: std::collections::BTreeMap<u32, Option<u64>>,
+}
+
+/// Active retention lease protecting a manifest generation and its split bundles
+/// from mark-and-sweep garbage collection (`FS-037`, `FS-041`, ADR 0003 section 3.9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotRetentionLease {
+    pub snapshot_id: String,
+    pub index_uuid: String,
+    pub manifest_generation: u64,
+    #[serde(default)]
+    pub pinned_split_ids: std::collections::HashSet<String>,
+    pub acquired_at_epoch_ms: u64,
+    pub expires_at_epoch_ms: u64,
+}
+
+/// RAII guard that releases an in-flight `SnapshotRetentionLease` on drop.
+pub struct SnapshotLeaseGuard {
+    pub(crate) snapshot_id: Option<String>,
+    pub(crate) leases:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, SnapshotRetentionLease>>>,
+}
+
+impl Drop for SnapshotLeaseGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.snapshot_id.take() {
+            self.leases
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
+        }
     }
 }
 
@@ -467,6 +542,273 @@ pub(crate) fn advance_shard_watermark(
         },
     );
     Ok(())
+}
+
+pub(crate) fn apply_compaction_replacement(
+    splits: &mut [RemoteSplitManifest],
+    watermarks: &mut std::collections::BTreeMap<u32, ShardPublishedWatermark>,
+    compaction_lineage: &mut Vec<CompactionLineageRecord>,
+    parent_split_ids: &[String],
+    output_split: &RemoteSplitManifest,
+    operation_id: &str,
+    candidate_generation: u64,
+) -> Result<usize> {
+    if parent_split_ids.is_empty() {
+        return Ok(splits.len());
+    }
+    let mut seen_inputs = std::collections::HashSet::new();
+    let mut indexed_inputs: Vec<(usize, RemoteSplitManifest)> =
+        Vec::with_capacity(parent_split_ids.len());
+
+    for input_id in parent_split_ids {
+        if !seen_inputs.insert(input_id.as_str()) {
+            return Err(PublicationError::OperationConflict {
+                operation_id: operation_id.to_string(),
+                reason: format!("compaction lists duplicate input split '{input_id}'"),
+            }
+            .into());
+        }
+        let Some((idx, existing)) = splits
+            .iter()
+            .enumerate()
+            .find(|(_, s)| &s.split_id == input_id)
+        else {
+            return Err(PublicationError::OperationConflict {
+                operation_id: operation_id.to_string(),
+                reason: format!(
+                    "compaction input split '{input_id}' does not exist in parent manifest"
+                ),
+            }
+            .into());
+        };
+        if !matches!(existing.state, super::RemoteSplitState::Published) {
+            return Err(PublicationError::OperationConflict {
+                operation_id: operation_id.to_string(),
+                reason: format!(
+                    "compaction input split '{input_id}' was already replaced (state: {:?})",
+                    existing.state
+                ),
+            }
+            .into());
+        }
+        indexed_inputs.push((idx, existing.clone()));
+    }
+    indexed_inputs.sort_by_key(|(idx, _)| *idx);
+
+    // Ensure no uncompacted Published split from the same shard/group sits between
+    // the first and last compacted input splits (preventing version order inversion).
+    let first_input_idx = indexed_inputs.first().map(|(i, _)| *i).unwrap_or(0);
+    let last_input_idx = indexed_inputs.last().map(|(i, _)| *i).unwrap_or(0);
+    let input_shard_id = indexed_inputs
+        .first()
+        .and_then(|(_, s)| s.seal_range().ok().flatten().map(|r| r.shard_id));
+    for (mid_idx, mid_split) in splits
+        .iter()
+        .enumerate()
+        .take(last_input_idx)
+        .skip(first_input_idx + 1)
+    {
+        if matches!(mid_split.state, super::RemoteSplitState::Published)
+            && !seen_inputs.contains(mid_split.split_id.as_str())
+        {
+            let mid_shard = mid_split.seal_range().ok().flatten().map(|r| r.shard_id);
+            if mid_shard == input_shard_id {
+                anyhow::bail!(
+                    "compaction operation '{operation_id}' has non-contiguous Published input splits: skips split '{}' at index {mid_idx}",
+                    mid_split.split_id
+                );
+            }
+        }
+    }
+
+    // Compute input version/tombstone winners across the input splits.
+    // Winner tuple: (seq_no, primary_term, version, manifest_idx, is_tombstone)
+    let mut input_winners: std::collections::HashMap<String, (u64, u64, u64, usize, bool)> =
+        std::collections::HashMap::new();
+    let mut total_input_records = 0u64;
+    let mut input_ranges = Vec::new();
+
+    for (idx, in_split) in &indexed_inputs {
+        if let Some(range) = in_split.seal_range()? {
+            input_ranges.push(range);
+        }
+        for dv in in_split.doc_versions()? {
+            total_input_records += 1;
+            let cand = (dv.seq_no, dv.primary_term, dv.version, *idx, false);
+            let update = input_winners
+                .get(&dv.doc_id)
+                .is_none_or(|(s, t, v, i, _)| (cand.0, cand.1, cand.2, cand.3) >= (*s, *t, *v, *i));
+            if update {
+                input_winners.insert(dv.doc_id, cand);
+            }
+        }
+        for ts in in_split.tombstones()? {
+            total_input_records += 1;
+            let cand = (ts.seq_no, ts.primary_term, ts.version, *idx, true);
+            let update = input_winners
+                .get(&ts.doc_id)
+                .is_none_or(|(s, t, v, i, _)| (cand.0, cand.1, cand.2, cand.3) >= (*s, *t, *v, *i));
+            if update {
+                input_winners.insert(ts.doc_id, cand);
+            }
+        }
+    }
+
+    let mut shard_id_opt = None;
+    let mut coverage_start_seq_no = None;
+    let mut coverage_end_seq_no = None;
+
+    if !input_ranges.is_empty() {
+        if input_ranges.len() != indexed_inputs.len() {
+            anyhow::bail!(
+                "compaction operation '{operation_id}' mixes splits with and without seal_range metadata"
+            );
+        }
+        input_ranges.sort_by_key(|r| r.start_seq_no);
+        let shard_id = input_ranges[0].shard_id;
+        let min_start = input_ranges[0].start_seq_no;
+        let mut prev_end = input_ranges[0].end_seq_no;
+        let mut max_term = input_ranges[0].primary_term;
+        for r in input_ranges.iter().skip(1) {
+            if r.shard_id != shard_id {
+                anyhow::bail!(
+                    "compaction operation '{operation_id}' mixes splits from shard {} and shard {}",
+                    shard_id,
+                    r.shard_id
+                );
+            }
+            if r.start_seq_no != prev_end.saturating_add(1) {
+                anyhow::bail!(
+                    "compaction operation '{operation_id}' has non-contiguous input seal ranges: {}..={} followed by {}..={}",
+                    min_start,
+                    prev_end,
+                    r.start_seq_no,
+                    r.end_seq_no
+                );
+            }
+            prev_end = r.end_seq_no;
+            max_term = max_term.max(r.primary_term);
+        }
+        let Some(out_range) = output_split.seal_range()? else {
+            anyhow::bail!(
+                "compaction output split '{}' for operation '{operation_id}' is missing required seal_range metadata",
+                output_split.split_id
+            );
+        };
+        if out_range.shard_id != shard_id
+            || out_range.start_seq_no != min_start
+            || out_range.end_seq_no != prev_end
+            || out_range.primary_term != max_term
+        {
+            anyhow::bail!(
+                "compaction output split '{}' has unsafe seal_range ({}, {}..={}, term {}) vs inputs ({}, {}..={}, term {})",
+                output_split.split_id,
+                out_range.shard_id,
+                out_range.start_seq_no,
+                out_range.end_seq_no,
+                out_range.primary_term,
+                shard_id,
+                min_start,
+                prev_end,
+                max_term
+            );
+        }
+        shard_id_opt = Some(shard_id);
+        coverage_start_seq_no = Some(min_start);
+        coverage_end_seq_no = Some(prev_end);
+        if let Some(wm) = watermarks.get_mut(&shard_id)
+            && seen_inputs.contains(wm.last_split_id.as_str())
+        {
+            wm.last_split_id = output_split.split_id.clone();
+        }
+    }
+
+    let out_live_by_id: std::collections::HashMap<String, SplitDocVersionRecord> = output_split
+        .doc_versions()?
+        .into_iter()
+        .map(|dv| (dv.doc_id.clone(), dv))
+        .collect();
+    let out_ts_by_id: std::collections::HashMap<String, SplitTombstoneRecord> = output_split
+        .tombstones()?
+        .into_iter()
+        .map(|ts| (ts.doc_id.clone(), ts))
+        .collect();
+    let drop_tombstones = output_split
+        .tags
+        .get("compaction_drop_tombstones")
+        .map(String::as_str)
+        == Some("true");
+
+    // Check if any other uncompacted split in the same shard/group (outside parent_split_ids) exists.
+    let has_other_published_splits = splits.iter().any(|s| {
+        matches!(s.state, super::RemoteSplitState::Published)
+            && !seen_inputs.contains(s.split_id.as_str())
+            && s.seal_range().ok().flatten().map(|r| r.shard_id) == input_shard_id
+    });
+
+    for (doc_id, (seq_no, term, ver, _, is_tombstone)) in &input_winners {
+        if !*is_tombstone {
+            let Some(out_dv) = out_live_by_id.get(doc_id) else {
+                anyhow::bail!(
+                    "compaction output split '{}' is missing live winner for doc_id '{doc_id}'",
+                    output_split.split_id
+                );
+            };
+            if (out_dv.seq_no, out_dv.primary_term, out_dv.version) != (*seq_no, *term, *ver) {
+                anyhow::bail!(
+                    "compaction output split '{}' altered version of live winner '{doc_id}': expected ({seq_no}, {term}, {ver}), got ({}, {}, {})",
+                    output_split.split_id,
+                    out_dv.seq_no,
+                    out_dv.primary_term,
+                    out_dv.version
+                );
+            }
+        } else if let Some(out_ts) = out_ts_by_id.get(doc_id) {
+            if (out_ts.seq_no, out_ts.primary_term, out_ts.version) != (*seq_no, *term, *ver) {
+                anyhow::bail!(
+                    "compaction output split '{}' altered version of tombstone '{doc_id}': expected ({seq_no}, {term}, {ver}), got ({}, {}, {})",
+                    output_split.split_id,
+                    out_ts.seq_no,
+                    out_ts.primary_term,
+                    out_ts.version
+                );
+            }
+        } else if !drop_tombstones || has_other_published_splits {
+            anyhow::bail!(
+                "compaction output split '{}' unsafe coverage: dropped tombstone for '{doc_id}' while other published splits or tombstone retention require it",
+                output_split.split_id
+            );
+        }
+    }
+
+    for split in splits.iter_mut() {
+        if seen_inputs.contains(split.split_id.as_str()) {
+            split.set_replacement_metadata(
+                std::slice::from_ref(&output_split.split_id),
+                operation_id,
+                candidate_generation,
+            );
+        }
+    }
+
+    let retained_live_docs = output_split.doc_count;
+    let retained_tombstones = out_ts_by_id.len() as u64;
+    let dropped_superseded_versions =
+        total_input_records.saturating_sub(retained_live_docs + retained_tombstones);
+
+    compaction_lineage.push(CompactionLineageRecord {
+        operation_id: operation_id.to_string(),
+        committed_at_generation: candidate_generation,
+        input_split_ids: parent_split_ids.to_vec(),
+        output_split_ids: vec![output_split.split_id.clone()],
+        shard_id: shard_id_opt,
+        coverage_start_seq_no,
+        coverage_end_seq_no,
+        retained_live_docs,
+        retained_tombstones,
+        dropped_superseded_versions,
+    });
+    Ok(last_input_idx + 1)
 }
 
 /// Immutable committed record written at `<index_uuid>/publications/<operation_id>/committed.json`.
@@ -1496,6 +1838,7 @@ impl StorageManager {
                     mut splits,
                     existing_settings,
                     mut published_watermarks,
+                    mut compaction_lineage,
                 ) = if pointer.current_generation == 0 {
                     (
                         0u64,
@@ -1503,6 +1846,7 @@ impl StorageManager {
                         Vec::new(),
                         None,
                         std::collections::BTreeMap::new(),
+                        Vec::new(),
                     )
                 } else {
                     let parent = self
@@ -1518,6 +1862,7 @@ impl StorageManager {
                         parent.splits,
                         parent.settings,
                         parent.published_watermarks,
+                        parent.compaction_lineage,
                     )
                 };
 
@@ -1545,16 +1890,30 @@ impl StorageManager {
                     "schema_generation".into(),
                     req.schema_generation.to_string(),
                 );
-                if let Some(range) = split_entry.seal_range()? {
-                    advance_shard_watermark(
+                let parent_split_ids = split_entry.parent_split_ids()?;
+                if !parent_split_ids.is_empty() {
+                    let insert_idx = apply_compaction_replacement(
+                        &mut splits,
                         &mut published_watermarks,
-                        &range,
-                        &split_entry.split_id,
+                        &mut compaction_lineage,
+                        &parent_split_ids,
+                        &split_entry,
                         &req.operation_id,
                         candidate_generation,
                     )?;
+                    splits.insert(insert_idx.min(splits.len()), split_entry.clone());
+                } else {
+                    if let Some(range) = split_entry.seal_range()? {
+                        advance_shard_watermark(
+                            &mut published_watermarks,
+                            &range,
+                            &split_entry.split_id,
+                            &req.operation_id,
+                            candidate_generation,
+                        )?;
+                    }
+                    splits.push(split_entry.clone());
                 }
-                splits.push(split_entry.clone());
 
                 // Step 7: Create candidate immutable manifest at manifests/<gen>/<operation_id>.json
                 // (or disambiguate with --epoch-<epoch> if a crashed earlier epoch left a candidate at the same generation).
@@ -1579,6 +1938,7 @@ impl StorageManager {
                     published_at: prepared.prepared_at.clone(),
                     settings: req.settings.clone().or(existing_settings),
                     published_watermarks: published_watermarks.clone(),
+                    compaction_lineage,
                     splits,
                 };
                 candidate_manifest.validate_for_read(

@@ -8760,3 +8760,466 @@ async fn fs034_fs035_fs036_tiered_hot_delta_bounded_sealing_and_visibility_water
 
     Ok(())
 }
+
+#[tokio::test]
+async fn fs037_through_fs041_cross_layer_snapshot_tombstones_compaction_and_gc() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+
+    // 1. Create a Tiered index with keyword + integer fields for exact sort, paging, aggs, and SQL.
+    let (create_status, create_body) = harness
+        .put_json(
+            "/tiered-orders",
+            json!({
+                "settings": {
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0,
+                    "remote_store": {
+                        "hot_delta": {
+                            "enabled": true,
+                            "min_seal_docs": 2,
+                            "max_seal_docs": 100
+                        }
+                    }
+                },
+                "mappings": {
+                    "properties": {
+                        "category": { "type": "keyword" },
+                        "amount": { "type": "integer" },
+                        "note": { "type": "text" }
+                    }
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(create_status, StatusCode::OK, "{create_body}");
+
+    // 2. Index 4 initial documents into the hot delta.
+    for (id, cat, amount, note) in [
+        ("ord-1", "books", 10, "rust programming"),
+        ("ord-2", "books", 20, "systems design"),
+        ("ord-3", "games", 30, "arcade classic"),
+        ("ord-4", "games", 40, "strategy board"),
+    ] {
+        let (st, b) = harness
+            .put_json(
+                &format!("/tiered-orders/_doc/{id}?refresh=true"),
+                json!({ "category": cat, "amount": amount, "note": note }),
+            )
+            .await?;
+        assert_eq!(st, StatusCode::CREATED, "{b}");
+    }
+
+    // 3. Seal the first batch into split 1 with retire_after_commit=false first to prove
+    //    FS-037 suppresses physical overlap across hot delta and immutable split 1 in
+    //    Search DSL, aggregations, _count, and SQL!
+    let (seal1_status, seal1_body) = harness
+        .post_json(
+            "/tiered-orders/_remote_store/seal",
+            json!({ "force": true, "retire_after_commit": false }),
+        )
+        .await?;
+    assert_eq!(seal1_status, StatusCode::OK, "{seal1_body}");
+    assert_eq!(seal1_body["splits_sealed"], json!(1));
+    let split_1_id = seal1_body["shards"][0]["split_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(seal1_body["shards"][0]["generation"], json!(1));
+
+    // Verify grouped SQL and count during physical overlap (retire_after_commit=false):
+    // No document is double-counted in hits, aggregations, or grouped SQL!
+    let (sql_overlap_status, sql_overlap_body) = harness
+        .post_json(
+            "/tiered-orders/_sql",
+            json!({
+                "query": "SELECT category, COUNT(*) AS cnt, SUM(amount) AS total_amt FROM \"tiered-orders\" GROUP BY category ORDER BY category"
+            }),
+        )
+        .await?;
+    assert_eq!(sql_overlap_status, StatusCode::OK, "{sql_overlap_body}");
+    assert_eq!(
+        sql_overlap_body["execution_mode"],
+        json!("tantivy_grouped_partials")
+    );
+    assert_eq!(sql_overlap_body["matched_hits"], json!(4));
+    assert_eq!(
+        sql_overlap_body["rows"],
+        json!([
+            { "category": "books", "cnt": 2, "total_amt": 30.0 },
+            { "category": "games", "cnt": 2, "total_amt": 70.0 }
+        ])
+    );
+
+    // 4. Perform hot-delta mutations (FS-037 + FS-038):
+    //    - Update ord-1 (books: 10 -> books: 100)
+    //    - Delete ord-2 (tombstone!)
+    //    - Insert ord-5 (music: 50)
+    let (u1_st, u1_b) = harness
+        .put_json(
+            "/tiered-orders/_doc/ord-1?refresh=true",
+            json!({ "category": "books", "amount": 100, "note": "rust second edition" }),
+        )
+        .await?;
+    assert_eq!(u1_st, StatusCode::OK, "{u1_b}");
+
+    let (d2_st, d2_b) = harness
+        .delete_json("/tiered-orders/_doc/ord-2?refresh=true")
+        .await?;
+    assert_eq!(d2_st, StatusCode::OK, "{d2_b}");
+
+    let (i5_st, i5_b) = harness
+        .put_json(
+            "/tiered-orders/_doc/ord-5?refresh=true",
+            json!({ "category": "music", "amount": 50, "note": "vinyl synth" }),
+        )
+        .await?;
+    assert_eq!(i5_st, StatusCode::CREATED, "{i5_b}");
+
+    // Expected oracle state now:
+    // ord-3 (games, 30) [in split 1]
+    // ord-4 (games, 40) [in split 1]
+    // ord-5 (music, 50) [in hot delta]
+    // ord-1 (books, 100) [in hot delta, supersedes ord-1=10 in split 1]
+    // ord-2 is tombstoned in hot delta (suppresses ord-2=20 in split 1)
+
+    // Verify _count matches oracle (4 live docs).
+    let (cnt_st, cnt_b) = harness.get_json("/tiered-orders/_count").await?;
+    assert_eq!(cnt_st, StatusCode::OK, "{cnt_b}");
+    assert_eq!(cnt_b["count"], json!(4));
+
+    // Verify SQL count(*) fast path matches oracle (4 live docs).
+    let (sql_cnt_st, sql_cnt_b) = harness
+        .post_json(
+            "/tiered-orders/_sql",
+            json!({ "query": "SELECT COUNT(*) AS c FROM \"tiered-orders\"" }),
+        )
+        .await?;
+    assert_eq!(sql_cnt_st, StatusCode::OK, "{sql_cnt_b}");
+    assert_eq!(sql_cnt_b["rows"][0]["c"], json!(4));
+
+    // Verify Search DSL with exact sort, aggregations, and search_after pagination across hot + split layers!
+    let (page1_st, page1_b) = harness
+        .post_json(
+            "/tiered-orders/_search",
+            json!({
+                "query": { "match_all": {} },
+                "size": 2,
+                "sort": [{ "amount": "asc" }],
+                "aggs": {
+                    "by_cat": { "terms": { "field": "category" } },
+                    "amt_stats": { "stats": { "field": "amount" } }
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(page1_st, StatusCode::OK, "{page1_b}");
+    assert_eq!(page1_b["hits"]["total"]["value"], json!(4));
+    assert_eq!(page1_b["hits"]["hits"][0]["_id"], json!("ord-3"));
+    assert_eq!(page1_b["hits"]["hits"][1]["_id"], json!("ord-4"));
+    assert_eq!(page1_b["aggregations"]["amt_stats"]["count"], json!(4));
+    assert_eq!(page1_b["aggregations"]["amt_stats"]["sum"], json!(220.0));
+
+    let cursor = page1_b["hits"]["hits"][1]["sort"].clone();
+    let (page2_st, page2_b) = harness
+        .post_json(
+            "/tiered-orders/_search",
+            json!({
+                "query": { "match_all": {} },
+                "size": 2,
+                "sort": [{ "amount": "asc" }],
+                "search_after": cursor,
+                "aggs": {
+                    "amt_stats": { "stats": { "field": "amount" } }
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(page2_st, StatusCode::OK, "{page2_b}");
+    assert_eq!(page2_b["hits"]["total"]["value"], json!(4));
+    assert_eq!(page2_b["hits"]["hits"][0]["_id"], json!("ord-5"));
+    assert_eq!(page2_b["hits"]["hits"][1]["_id"], json!("ord-1"));
+    assert_eq!(page2_b["aggregations"]["amt_stats"]["sum"], json!(220.0));
+
+    // Verify tabular SQL across hot + immutable layers.
+    let (sql_tab_st, sql_tab_b) = harness
+        .post_json(
+            "/tiered-orders/_sql",
+            json!({
+                "query": "SELECT category, amount FROM \"tiered-orders\" WHERE amount >= 35 ORDER BY amount ASC"
+            }),
+        )
+        .await?;
+    assert_eq!(sql_tab_st, StatusCode::OK, "{sql_tab_b}");
+    assert_eq!(
+        sql_tab_b["rows"],
+        json!([
+            { "category": "games", "amount": 40 },
+            { "category": "music", "amount": 50 },
+            { "category": "books", "amount": 100 }
+        ])
+    );
+
+    // 5. Verify pinned historical snapshot_generation = 1 (FS-038):
+    //    Still sees the exact generation-1 state (ord-1=10, ord-2=20, ord-3=30, ord-4=40, sum=100)!
+    let (snap1_st, snap1_b) = harness
+        .post_json(
+            "/tiered-orders/_search",
+            json!({
+                "snapshot_generation": 1,
+                "query": { "match_all": {} },
+                "sort": [{ "amount": "asc" }],
+                "aggs": {
+                    "amt_stats": { "stats": { "field": "amount" } }
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(snap1_st, StatusCode::OK, "{snap1_b}");
+    assert_eq!(snap1_b["hits"]["total"]["value"], json!(4));
+    assert_eq!(snap1_b["hits"]["hits"][0]["_id"], json!("ord-1"));
+    assert_eq!(snap1_b["hits"]["hits"][0]["_source"]["amount"], json!(10));
+    assert_eq!(snap1_b["hits"]["hits"][1]["_id"], json!("ord-2"));
+    assert_eq!(snap1_b["aggregations"]["amt_stats"]["sum"], json!(100.0));
+
+    // 6. Seal the second batch (ord-1 update, ord-2 tombstone, ord-5 insert) into split 2 (generation 2).
+    let (seal2_status, seal2_body) = harness
+        .post_json(
+            "/tiered-orders/_remote_store/seal",
+            json!({ "force": true, "retire_after_commit": true }),
+        )
+        .await?;
+    assert_eq!(seal2_status, StatusCode::OK, "{seal2_body}");
+    assert_eq!(seal2_body["splits_sealed"], json!(1));
+    assert_eq!(seal2_body["shards"][0]["generation"], json!(2));
+    let split_2_id = seal2_body["shards"][0]["split_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Now all data is in split 1 + split 2 (with duplicate ID ord-1 and tombstone ord-2 across splits!).
+    // Verify grouped SQL at generation 2 matches the oracle across the two overlapping splits!
+    let (sql_gen2_st, sql_gen2_b) = harness
+        .post_json(
+            "/tiered-orders/_sql",
+            json!({
+                "query": "SELECT category, COUNT(*) AS cnt, SUM(amount) AS total_amt FROM \"tiered-orders\" GROUP BY category ORDER BY category"
+            }),
+        )
+        .await?;
+    assert_eq!(sql_gen2_st, StatusCode::OK, "{sql_gen2_b}");
+    assert_eq!(
+        sql_gen2_b["rows"],
+        json!([
+            { "category": "books", "cnt": 1, "total_amt": 100.0 },
+            { "category": "games", "cnt": 2, "total_amt": 70.0 },
+            { "category": "music", "cnt": 1, "total_amt": 50.0 }
+        ])
+    );
+
+    // 7. Fenced, idempotent split compactor (FS-039 + FS-040):
+    //    Inject a crash after bundle upload before prepared record to prove crash/retry idempotency!
+    harness
+        .app_state
+        .storage_manager
+        .set_publication_crash_stage_for_test(Some(
+            ferrissearch::storage::PublicationCrashStage::AfterBundleUploadBeforePreparedRecord,
+        ));
+    let (comp_crash_st, _comp_crash_b) = harness
+        .post_json(
+            "/tiered-orders/_remote_store/compact",
+            json!({
+                "split_ids": [split_1_id, split_2_id],
+                "operation_id": "compact-gen1-gen2"
+            }),
+        )
+        .await?;
+    assert_eq!(comp_crash_st, StatusCode::INTERNAL_SERVER_ERROR);
+
+    // Retry the compaction with the same operation_id: succeeds and commits generation 3!
+    let (comp_ok_st, comp_ok_b) = harness
+        .post_json(
+            "/tiered-orders/_remote_store/compact",
+            json!({
+                "split_ids": [split_1_id, split_2_id],
+                "operation_id": "compact-gen1-gen2"
+            }),
+        )
+        .await?;
+    assert_eq!(comp_ok_st, StatusCode::OK, "{comp_ok_b}");
+    assert_eq!(comp_ok_b["status"], json!("committed"));
+    assert_eq!(comp_ok_b["generation"], json!(3));
+    assert_eq!(comp_ok_b["splits_compacted"], json!(2));
+    assert_eq!(comp_ok_b["retained_live_docs"], json!(4));
+    assert_eq!(comp_ok_b["retained_tombstones"], json!(1));
+    assert_eq!(comp_ok_b["dropped_superseded_versions"], json!(2));
+    let compacted_split_id = comp_ok_b["output_split_id"].as_str().unwrap().to_string();
+
+    // Retrying the exact same compaction again replays idempotently!
+    let (comp_replay_st, comp_replay_b) = harness
+        .post_json(
+            "/tiered-orders/_remote_store/compact",
+            json!({
+                "split_ids": [split_1_id, split_2_id],
+                "operation_id": "compact-gen1-gen2"
+            }),
+        )
+        .await?;
+    assert_eq!(comp_replay_st, StatusCode::OK, "{comp_replay_b}");
+    assert_eq!(comp_replay_b["status"], json!("replayed"));
+    assert_eq!(comp_replay_b["replayed"], json!(true));
+    assert_eq!(comp_replay_b["output_split_id"], json!(compacted_split_id));
+
+    // Concurrent/conflicting compactor trying to compact already-replaced split_1_id with a new operation_id
+    // is rejected with 409 Conflict!
+    let (comp_conflict_st, comp_conflict_b) = harness
+        .post_json(
+            "/tiered-orders/_remote_store/compact",
+            json!({
+                "split_ids": [split_1_id],
+                "operation_id": "compact-conflicting-attempt"
+            }),
+        )
+        .await?;
+    assert_eq!(comp_conflict_st, StatusCode::CONFLICT, "{comp_conflict_b}");
+    assert_eq!(
+        comp_conflict_b["error"]["type"],
+        json!("operation_id_conflict")
+    );
+
+    // Verify generation 3 queries only the 1 compacted split and returns identical results!
+    let (gen3_search_st, gen3_search_b) = harness
+        .post_json(
+            "/tiered-orders/_search",
+            json!({
+                "query": { "match_all": {} },
+                "sort": [{ "amount": "asc" }]
+            }),
+        )
+        .await?;
+    assert_eq!(gen3_search_st, StatusCode::OK, "{gen3_search_b}");
+    assert_eq!(
+        gen3_search_b["remote_store"]["pruning"]["published_splits"],
+        json!(1)
+    );
+    assert_eq!(gen3_search_b["hits"]["total"]["value"], json!(4));
+    assert_eq!(gen3_search_b["hits"]["hits"][0]["_id"], json!("ord-3"));
+    assert_eq!(gen3_search_b["hits"]["hits"][3]["_id"], json!("ord-1"));
+    assert_eq!(
+        gen3_search_b["hits"]["hits"][3]["_source"]["amount"],
+        json!(100)
+    );
+
+    // And historical snapshot_generation = 1 and snapshot_generation = 2 remain readable after compaction!
+    let (snap1_after_st, snap1_after_b) = harness
+        .post_json(
+            "/tiered-orders/_count",
+            json!({
+                "snapshot_generation": 1,
+                "query": { "term": { "category": "books" } }
+            }),
+        )
+        .await?;
+    assert_eq!(snap1_after_st, StatusCode::OK, "{snap1_after_b}");
+    assert_eq!(snap1_after_b["count"], json!(2)); // ord-1 and ord-2 were both books in generation 1!
+
+    let (snap2_after_st, snap2_after_b) = harness
+        .post_json(
+            "/tiered-orders/_count",
+            json!({
+                "snapshot_generation": 2,
+                "query": { "term": { "category": "books" } }
+            }),
+        )
+        .await?;
+    assert_eq!(snap2_after_st, StatusCode::OK, "{snap2_after_b}");
+    assert_eq!(snap2_after_b["count"], json!(1)); // ord-2 was deleted in generation 2!
+
+    // 8. Forward-only rollback (FS-041) to generation 2 creates generation 4, then compact again to generation 5:
+    let (rb_st, rb_b) = harness
+        .post_json(
+            "/tiered-orders/_remote_store/rollback",
+            json!({ "target_generation": 2 }),
+        )
+        .await?;
+    assert_eq!(rb_st, StatusCode::OK, "{rb_b}");
+    assert_eq!(rb_b["generation"], json!(4));
+    assert_eq!(rb_b["published_splits"], json!(2));
+
+    let (recomp_st, recomp_b) = harness
+        .post_json(
+            "/tiered-orders/_remote_store/compact",
+            json!({
+                "split_ids": [split_1_id, split_2_id],
+                "operation_id": "compact-gen4-to-gen5"
+            }),
+        )
+        .await?;
+    assert_eq!(recomp_st, StatusCode::OK, "{recomp_b}");
+    assert_eq!(recomp_b["generation"], json!(5));
+
+    // 9. Snapshot-safe GC via POST /tiered-orders/_remote_store/janitor (FS-041):
+    //    When pinned_generations=[1, 2], neither split_1_id nor split_2_id is deleted.
+    let future_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 1_000_000;
+    let (jan_pinned_st, jan_pinned_b) = harness
+        .post_json(
+            "/tiered-orders/_remote_store/janitor",
+            json!({
+                "dry_run": false,
+                "retention_generations": 0,
+                "retention_horizon_ms": 1_000,
+                "active_grace_ms": 1_000,
+                "now_epoch_ms": future_now_ms,
+                "pinned_generations": [1, 2]
+            }),
+        )
+        .await?;
+    assert_eq!(jan_pinned_st, StatusCode::OK, "{jan_pinned_b}");
+    assert_eq!(jan_pinned_b["blocked"], json!(false));
+
+    // Generation 1 is still readable because pinned_generations protected it!
+    let (snap1_still_st, snap1_still_b) = harness
+        .post_json(
+            "/tiered-orders/_count",
+            json!({
+                "snapshot_generation": 1,
+                "query": { "term": { "category": "books" } }
+            }),
+        )
+        .await?;
+    assert_eq!(snap1_still_st, StatusCode::OK, "{snap1_still_b}");
+    assert_eq!(snap1_still_b["count"], json!(2));
+
+    // Now run janitor without pinned_generations: compacted bundles are swept while generation 5 remains healthy!
+    let (jan_sweep_st, jan_sweep_b) = harness
+        .post_json(
+            "/tiered-orders/_remote_store/janitor",
+            json!({
+                "dry_run": false,
+                "retention_generations": 0,
+                "retention_horizon_ms": 1_000,
+                "active_grace_ms": 1_000,
+                "now_epoch_ms": future_now_ms
+            }),
+        )
+        .await?;
+    assert_eq!(jan_sweep_st, StatusCode::OK, "{jan_sweep_b}");
+    assert_eq!(jan_sweep_b["blocked"], json!(false));
+    assert!(
+        jan_sweep_b["deleted_objects"].as_u64().unwrap_or(0) >= 2,
+        "expected compacted split bundles to be swept, got: {jan_sweep_b}"
+    );
+
+    // Current generation 5 remains 100% queryable and checksum-verified after GC!
+    let (verify_st, verify_b) = harness
+        .post_json("/tiered-orders/_remote_store/verify", json!({}))
+        .await?;
+    assert_eq!(verify_st, StatusCode::OK, "{verify_b}");
+    assert_eq!(verify_b["ok_count"], json!(1));
+    assert_eq!(verify_b["missing_count"], json!(0));
+
+    Ok(())
+}
