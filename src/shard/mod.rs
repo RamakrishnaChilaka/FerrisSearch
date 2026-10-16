@@ -3084,21 +3084,13 @@ impl ShardManager {
             flush_threshold_rx,
         );
 
-        // Only scan stored documents when the index has vector fields.
+        // Recover vectors from snapshot or unbounded streaming segment scan.
+        // Vector recovery errors keep the shard unavailable rather than being swallowed.
         let has_vectors = mappings
             .values()
             .any(|m| matches!(m.field_type, crate::cluster::state::FieldType::KnnVector));
-        if has_vectors {
-            if assignment.is_some() {
-                engine.rebuild_vectors()?;
-            } else if let Err(e) = engine.rebuild_vectors() {
-                tracing::warn!(
-                    "Failed to rebuild vectors for {}/shard_{}: {}",
-                    index,
-                    shard_id,
-                    e
-                );
-            }
+        if has_vectors || engine.has_persisted_or_stale_vector_state()? {
+            engine.recover_vectors()?;
         }
 
         tracing::info!(
@@ -4323,8 +4315,11 @@ impl ShardManager {
                         crate::cluster::state::FieldType::KnnVector
                     )
                 });
-                if has_vectors || snapshot_vectors_installed {
-                    verification_engine.rebuild_vectors()?;
+                if has_vectors
+                    || snapshot_vectors_installed
+                    || verification_engine.has_persisted_or_stale_vector_state()?
+                {
+                    verification_engine.recover_vectors()?;
                 }
 
                 verification_engine.reconcile_term_sequence_state(
@@ -4380,8 +4375,11 @@ impl ShardManager {
                     crate::cluster::state::FieldType::KnnVector
                 )
             });
-            if has_vectors || snapshot_vectors_installed {
-                engine.rebuild_vectors()?;
+            if has_vectors
+                || snapshot_vectors_installed
+                || engine.has_persisted_or_stale_vector_state()?
+            {
+                engine.recover_vectors()?;
             }
             engine
                 .reconcile_term_sequence_state(identity.replica_fence, identity.fence_max_seq_no)?;
@@ -4813,8 +4811,9 @@ impl ShardManager {
                         mapping.field_type,
                         crate::cluster::state::FieldType::KnnVector
                     )
-                }) {
-                    engine.rebuild_vectors()?;
+                }) || engine.has_persisted_or_stale_vector_state()?
+                {
+                    engine.recover_vectors()?;
                 }
                 CompositeEngine::start_refresh_loop_reactive(
                     engine.clone(),

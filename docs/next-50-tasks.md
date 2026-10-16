@@ -6,12 +6,10 @@
 >
 > **Current-behavior authority:** source and tests.
 >
-> **Last source audit:** 2026-10-16 for FS-014 through FS-021; 2026-10-15 for FS-013;
+> **Last source audit:** 2026-10-16 for FS-014 through FS-031; 2026-10-15 for FS-013;
 > 2026-10-14 for FS-010 and FS-012; 2026-10-13 for FS-003,
 > FS-004, and FS-011; 2026-10-09 for
-> FS-002; 2026-10-08 for FS-001 and FS-007; 2026-09-27
-> for FS-019 and FS-022 through FS-026, after
-> PRs #142-#144. Other tasks were last audited on 2026-07-10.
+> FS-002; 2026-10-08 for FS-001 and FS-007. Other tasks were last audited on 2026-07-10.
 
 This is a dependency-aware sequence, not a feature wish list. Rank expresses
 current strategic importance; a task still waits for every listed dependency.
@@ -931,6 +929,17 @@ acknowledge a write below the documented durability contract.
 
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-022
 
+**Status (2026-10-16):** Complete (`src/engine/vector.rs`, `src/engine/composite.rs`,
+`src/engine/tantivy.rs`, `src/shard/mod.rs`). Persisted vector sidecars
+(`vectors.docids.bin` v2) record dimensions, vector count, `vectors.usearch`
+SHA-256, per-document `(seq_no, primary_term)` versions, and sequence coverage.
+`CompositeEngine::recover_vectors()` restores directly from verified persisted
+or snapshot state (`VectorRecoveryMode::SnapshotRestored`) when coverage matches
+and vectors are not stale, and otherwise rebuilds via an unbounded streaming
+segment-by-segment scan (`VectorRecoveryMode::SegmentScanRebuilt`) with explicit
+`VectorRecoveryProgress` reporting. Vector recovery errors fail closed and keep
+the shard unavailable.
+
 **Evidence:** vector rebuild scans a fixed maximum and recovery errors can be
 hidden or deferred.
 
@@ -945,6 +954,15 @@ restart/failover tests compare vector results to an oracle.
 ### FS-028 — Add Request-Scoped Cancellation
 
 **Class:** Scale blocker | **Gate:** 1 | **Depends on:** none
+
+**Status (2026-10-16):** Complete (`src/worker.rs`, `src/api/mod.rs`,
+`src/transport/state_wait.rs`, `src/transport/server/mod.rs`,
+`src/engine/tantivy.rs`, `src/engine/remote_store.rs`, `src/storage/mod.rs`).
+`RequestCancellationContext` and `CancellationDropGuard` are created at HTTP and
+gRPC ingress, propagated to child fan-out tasks and worker threads, and observed
+across local search, SQL batch/stream execution, split hydration, force merge,
+and maintenance, releasing temporary files, pins, load counters, and byte
+reservations on cancellation.
 
 **Evidence:** HTTP/gRPC futures may time out or disconnect while collectors,
 rayon work, hydration, and residual execution continue consuming resources.
@@ -961,6 +979,14 @@ time.
 
 **Class:** Scale blocker | **Gate:** 1 | **Depends on:** FS-028
 
+**Status (2026-10-16):** Complete (`src/worker.rs`, `src/transport/state_wait.rs`,
+`src/transport/refresh_deadline.rs`, `src/api/mod.rs`). Coordinators derive
+`RequestDeadline` budgets, clamp child fan-out budgets so nested RPCs cannot
+outlive the parent budget, forward `x-ferris-remaining-budget-ms`,
+`x-ferris-deadline-epoch-ms`, and `grpc-timeout`, charge admission queue wait
+against remaining budget, reject expired work before execution, and record
+`ferrissearch_deadline_exhausted_total{stage}` by stage.
+
 **Evidence:** connection/request timeouts exist, but child RPCs do not share one
 end-to-end budget.
 
@@ -975,6 +1001,14 @@ the stage that exhausted the budget.
 ### FS-030 — Add Bounded Admission Queues
 
 **Class:** Scale blocker | **Gate:** 1 | **Depends on:** FS-028, FS-029
+
+**Status (2026-10-16):** Complete (`src/worker.rs`, `src/transport/server/mod.rs`,
+`src/api/search/failures.rs`, `src/metrics/mod.rs`). `AdmissionController`
+enforces bounded concurrency and FIFO queue depth per `WorkClass` (`Search`,
+`Sql`, `Write`, `Hydration`, `Recovery`, `Maintenance`), returning stable
+`ResourceExhausted` / HTTP `429 Too Many Requests` overload rejections before
+spawning tasks or allocating buffers, with cancellation removal, deadline-aware
+dequeue, and separate queue/execution Prometheus metrics.
 
 **Evidence:** dedicated search/write threads isolate CPU pools but do not bound
 all queued distributed, hydration, recovery, or maintenance work.
@@ -991,6 +1025,14 @@ separate queue/execution metrics.
 ### FS-031 — Reserve Memory, Disk, And In-Flight Bytes
 
 **Class:** Scale blocker | **Gate:** 1 | **Depends on:** FS-030
+
+**Status (2026-10-16):** Complete (`src/worker.rs`, `src/storage/mod.rs`,
+`src/engine/remote_store.rs`, `src/transport/server/mod.rs`,
+`src/metrics/mod.rs`). `ResourceGovernor` and RAII `ResourceReservation` guards
+govern `Memory`, `TempDisk`, `PersistentCache`, and `ObjectStoreInflight` byte
+pools, reserving estimated bytes before allocation or download, reconciling
+actual usage, rejecting oversized requests/splits early, and releasing bytes on
+every completion, error, or cancellation path.
 
 **Evidence:** column arrays, result buffers, bundle downloads, extracted files,
 open readers, and background jobs have separate or incomplete accounting.

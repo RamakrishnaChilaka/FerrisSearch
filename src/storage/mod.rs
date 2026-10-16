@@ -123,6 +123,7 @@ struct CachedSplitEntry {
     split_id: String,
     size_bytes: u64,
     last_access_epoch_ms: u64,
+    reservation: Option<Arc<StdMutex<crate::worker::ResourceReservation>>>,
 }
 
 fn cache_entry_key(index_uuid: &str, split_id: &str) -> String {
@@ -216,8 +217,22 @@ pub struct StorageManager {
         Arc<StdMutex<HashMap<String, crate::cluster::state::ManifestWriterAuthority>>>,
     publication_crash_stage: Arc<StdMutex<Option<PublicationCrashStage>>>,
     janitor_fail_delete_paths: Arc<StdMutex<HashSet<String>>>,
+    resource_governor: Arc<crate::worker::ResourceGovernor>,
+    admission: Arc<crate::worker::AdmissionController>,
     #[cfg(test)]
     local_cas_crash_stage: Arc<StdMutex<Option<LocalCasCrashStage>>>,
+}
+
+impl std::fmt::Debug for crate::worker::ResourceGovernor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResourceGovernor").finish()
+    }
+}
+
+impl std::fmt::Debug for crate::worker::AdmissionController {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdmissionController").finish()
+    }
 }
 
 impl StorageManager {
@@ -293,9 +308,29 @@ impl StorageManager {
             cached_writer_authorities: Arc::new(StdMutex::new(HashMap::new())),
             publication_crash_stage: Arc::new(StdMutex::new(None)),
             janitor_fail_delete_paths: Arc::new(StdMutex::new(HashSet::new())),
+            resource_governor: Arc::new(crate::worker::ResourceGovernor::default()),
+            admission: Arc::new(crate::worker::AdmissionController::new(4, 4)),
             #[cfg(test)]
             local_cas_crash_stage: Arc::new(StdMutex::new(None)),
         })
+    }
+
+    pub fn with_governance(
+        mut self,
+        resource_governor: Arc<crate::worker::ResourceGovernor>,
+        admission: Arc<crate::worker::AdmissionController>,
+    ) -> Self {
+        self.resource_governor = resource_governor;
+        self.admission = admission;
+        self
+    }
+
+    pub fn resource_governor(&self) -> &Arc<crate::worker::ResourceGovernor> {
+        &self.resource_governor
+    }
+
+    pub fn admission(&self) -> &Arc<crate::worker::AdmissionController> {
+        &self.admission
     }
 
     /// Construct a `StorageManager` wrapping a caller-supplied `ObjectStore`
@@ -332,6 +367,8 @@ impl StorageManager {
             cached_writer_authorities: Arc::new(StdMutex::new(HashMap::new())),
             publication_crash_stage: Arc::new(StdMutex::new(None)),
             janitor_fail_delete_paths: Arc::new(StdMutex::new(HashSet::new())),
+            resource_governor: Arc::new(crate::worker::ResourceGovernor::default()),
+            admission: Arc::new(crate::worker::AdmissionController::new(4, 4)),
             #[cfg(test)]
             local_cas_crash_stage: Arc::new(StdMutex::new(None)),
         })
@@ -416,8 +453,37 @@ impl StorageManager {
     }
 
     pub fn record_cached_split_access(&self, index_uuid: &str, split_id: &str, size_bytes: u64) {
+        self.record_cached_split_access_with_reservation(index_uuid, split_id, size_bytes, None);
+    }
+
+    fn record_cached_split_access_with_reservation(
+        &self,
+        index_uuid: &str,
+        split_id: &str,
+        size_bytes: u64,
+        reservation: Option<crate::worker::ResourceReservation>,
+    ) {
         let key = cache_entry_key(index_uuid, split_id);
         let mut cache_entries = self.cache_entries.lock().unwrap_or_else(|e| e.into_inner());
+        let existing_reservation = cache_entries
+            .get(&key)
+            .and_then(|entry| entry.reservation.clone());
+        let reservation = reservation
+            .map(|res| Arc::new(StdMutex::new(res)))
+            .or(existing_reservation)
+            .or_else(|| {
+                (size_bytes > 0)
+                    .then(|| {
+                        self.resource_governor
+                            .try_reserve(
+                                crate::worker::ResourcePoolKind::PersistentCache,
+                                size_bytes,
+                            )
+                            .ok()
+                            .map(|res| Arc::new(StdMutex::new(res)))
+                    })
+                    .flatten()
+            });
         cache_entries.insert(
             key,
             CachedSplitEntry {
@@ -425,6 +491,7 @@ impl StorageManager {
                 split_id: split_id.to_string(),
                 size_bytes,
                 last_access_epoch_ms: now_epoch_ms(),
+                reservation,
             },
         );
     }
@@ -522,6 +589,7 @@ impl StorageManager {
                         split_id,
                         size_bytes: dir_size_bytes(&entry.path()),
                         last_access_epoch_ms: 0,
+                        reservation: None,
                     },
                 ));
             }
@@ -622,6 +690,8 @@ impl StorageManager {
             );
         }
 
+        crate::worker::check_current_request_active(crate::worker::ExecutionStage::Hydration)?;
+
         let cache_dir = self.cache_dir(index_uuid, &split.split_id);
         let done_marker = cache_dir.join(".done");
         if let Ok(bytes) = std::fs::read(&done_marker)
@@ -634,14 +704,33 @@ impl StorageManager {
             );
             return Ok(cache_dir);
         }
-        // A stale `.done` with a different checksum means the manifest was
-        // republished with a different payload for the same split_id — it
-        // shouldn't happen for an immutable split_id, but fall through and
-        // re-download defensively.
+
+        let current_ctx = crate::worker::current_request_context();
+        let _hydration_lease = self
+            .admission
+            .acquire(crate::worker::WorkClass::Hydration, current_ctx.as_ref())
+            .await?;
 
         let cache_key = format!("{}/{}", index_uuid, split.split_id);
         let guard_arc = self.split_lock(&cache_key).await;
-        let _guard = guard_arc.lock().await;
+        let _guard = match &current_ctx {
+            Some(ctx) => {
+                tokio::select! {
+                    biased;
+                    _ = ctx.wait_cancelled(crate::worker::ExecutionStage::Hydration) => {
+                        ctx.check_active(crate::worker::ExecutionStage::Hydration)?;
+                        return Err(crate::worker::RequestCancelledError {
+                            stage: crate::worker::ExecutionStage::Hydration,
+                            reason: crate::worker::CancellationReason::ClientDisconnected,
+                        }.into());
+                    }
+                    guard = guard_arc.lock() => guard,
+                }
+            }
+            None => guard_arc.lock().await,
+        };
+
+        crate::worker::check_current_request_active(crate::worker::ExecutionStage::Hydration)?;
 
         // Re-check inside the lock: a concurrent caller may have just finished.
         if let Ok(bytes) = std::fs::read(&done_marker)
@@ -654,6 +743,21 @@ impl StorageManager {
             );
             return Ok(cache_dir);
         }
+
+        let estimated_inflight = split.size_bytes.max(1);
+        let estimated_unpacked = split.uncompressed_bytes.max(split.size_bytes).max(1);
+        let mut inflight_reservation = self.resource_governor.try_reserve(
+            crate::worker::ResourcePoolKind::ObjectStoreInflight,
+            estimated_inflight,
+        )?;
+        let mut temp_disk_reservation = self.resource_governor.try_reserve(
+            crate::worker::ResourcePoolKind::TempDisk,
+            estimated_unpacked,
+        )?;
+        let mut cache_reservation = self.resource_governor.try_reserve(
+            crate::worker::ResourcePoolKind::PersistentCache,
+            estimated_unpacked,
+        )?;
 
         // Clean up any partial state from a previous failed extract.
         if cache_dir.exists() {
@@ -668,10 +772,45 @@ impl StorageManager {
         std::fs::create_dir_all(&tmp_dir)
             .with_context(|| format!("failed to create tmp cache dir {tmp_dir:?}"))?;
 
+        struct TempDirCleanupGuard {
+            path: Option<PathBuf>,
+        }
+        impl Drop for TempDirCleanupGuard {
+            fn drop(&mut self) {
+                if let Some(path) = self.path.take()
+                    && path.exists()
+                {
+                    let _ = std::fs::remove_dir_all(&path);
+                }
+            }
+        }
+        let mut tmp_cleanup = TempDirCleanupGuard {
+            path: Some(tmp_dir.clone()),
+        };
+
         let object_path = self.object_path(&split.bundle_path)?;
-        let (bundle_bytes, actual_checksum) = self.download_and_hash(&object_path).await?;
+        let (bundle_bytes, actual_checksum) = match &current_ctx {
+            Some(ctx) => {
+                tokio::select! {
+                    biased;
+                    _ = ctx.wait_cancelled(crate::worker::ExecutionStage::Hydration) => {
+                        ctx.check_active(crate::worker::ExecutionStage::Hydration)?;
+                        return Err(crate::worker::RequestCancelledError {
+                            stage: crate::worker::ExecutionStage::Hydration,
+                            reason: crate::worker::CancellationReason::ClientDisconnected,
+                        }.into());
+                    }
+                    res = self.download_and_hash_with_reservation(&object_path, &mut inflight_reservation) => res?,
+                }
+            }
+            None => {
+                self.download_and_hash_with_reservation(&object_path, &mut inflight_reservation)
+                    .await?
+            }
+        };
+        crate::worker::check_current_request_active(crate::worker::ExecutionStage::Hydration)?;
+
         if actual_checksum != split.checksum {
-            let _ = std::fs::remove_dir_all(&tmp_dir);
             anyhow::bail!(
                 "bundle checksum mismatch for split {}: expected {}, got {}",
                 split.split_id,
@@ -687,32 +826,41 @@ impl StorageManager {
             unpack_bundle_into(&bundle_bytes, &tmp_dir_for_unpack)
         })
         .await;
+        drop(inflight_reservation);
 
         match unpack_result {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                let _ = std::fs::remove_dir_all(&tmp_dir);
                 return Err(e);
             }
             Err(e) => {
-                let _ = std::fs::remove_dir_all(&tmp_dir);
                 return Err(anyhow::anyhow!("unpack task panicked: {e}"));
             }
         }
+
+        crate::worker::check_current_request_active(crate::worker::ExecutionStage::Hydration)?;
+        let unpacked_bytes = dir_size_bytes(&tmp_dir);
+        temp_disk_reservation.reconcile(unpacked_bytes)?;
 
         if let Some(parent) = cache_dir.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create cache parent {parent:?}"))?;
         }
+        tmp_cleanup.path = None;
         std::fs::rename(&tmp_dir, &cache_dir).with_context(|| {
             format!("failed to promote tmp cache dir {tmp_dir:?} to final {cache_dir:?}")
         })?;
+        drop(temp_disk_reservation);
+
         std::fs::write(&done_marker, split.checksum.as_bytes())
             .with_context(|| format!("failed to write done marker {done_marker:?}"))?;
-        self.record_cached_split_access(
+        let actual_cached_bytes = self.cached_split_size_bytes(index_uuid, &split.split_id);
+        cache_reservation.reconcile(actual_cached_bytes)?;
+        self.record_cached_split_access_with_reservation(
             index_uuid,
             &split.split_id,
-            self.cached_split_size_bytes(index_uuid, &split.split_id),
+            actual_cached_bytes,
+            Some(cache_reservation),
         );
 
         Ok(cache_dir)
@@ -802,6 +950,37 @@ impl StorageManager {
             hasher.update(&chunk);
             buf.extend_from_slice(&chunk);
         }
+        let checksum = format!("sha256:{:x}", hasher.finalize());
+        crate::metrics::record_object_store_request("get", "success");
+        crate::metrics::record_object_store_transfer("download", buf.len());
+        Ok((buf, checksum))
+    }
+
+    async fn download_and_hash_with_reservation(
+        &self,
+        key: &ObjectPath,
+        inflight_reservation: &mut crate::worker::ResourceReservation,
+    ) -> Result<(Vec<u8>, String)> {
+        let mut stream = self.get_object(key).await?.into_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut hasher = Sha256::new();
+        while let Some(chunk) = stream.next().await {
+            crate::worker::check_current_request_active(crate::worker::ExecutionStage::Hydration)?;
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    crate::metrics::record_object_store_request("get", "error");
+                    return Err(anyhow::Error::from(error));
+                }
+            };
+            let next_len = (buf.len() + chunk.len()) as u64;
+            if next_len > inflight_reservation.reserved_bytes() {
+                inflight_reservation.reconcile(next_len)?;
+            }
+            hasher.update(&chunk);
+            buf.extend_from_slice(&chunk);
+        }
+        inflight_reservation.reconcile(buf.len() as u64)?;
         let checksum = format!("sha256:{:x}", hasher.finalize());
         crate::metrics::record_object_store_request("get", "success");
         crate::metrics::record_object_store_transfer("download", buf.len());
@@ -3148,6 +3327,114 @@ mod tests {
             !manager
                 .cached_split_status("idx-1", "live-budget", "sha256:test")
                 .artifact_cached
+        );
+    }
+
+    #[tokio::test]
+    async fn fs028_fs031_split_hydration_governor_and_cancellation_cleanup() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = StorageManager::new_in_path(temp_dir.path()).unwrap();
+        let stage = manager.staging_dir("idx-uuid", "split-gov");
+        std::fs::create_dir_all(&stage).unwrap();
+        write_file(&stage, "index/meta.json", b"{\"meta\":12345}");
+
+        let (bundle_key, checksum, size) = manager
+            .upload_split_bundle("idx-uuid", "split-gov", &stage)
+            .await
+            .unwrap();
+
+        let split = RemoteSplitManifest {
+            split_id: "split-gov".into(),
+            state: RemoteSplitState::Published,
+            bundle_path: bundle_key,
+            bundle_etag: None,
+            hotcache_path: None,
+            checksum,
+            doc_count: 1,
+            size_bytes: size,
+            uncompressed_bytes: size * 2,
+            hotcache_bytes: None,
+            time_range: None,
+            tags: BTreeMap::new(),
+            field_ranges: BTreeMap::new(),
+            field_terms: BTreeMap::new(),
+        };
+
+        // 1. Oversized split rejected before download/staging
+        manager.resource_governor().set_capacity(
+            crate::worker::ResourcePoolKind::ObjectStoreInflight,
+            size - 1,
+        );
+        let err = manager
+            .fetch_split_into_cache("idx-uuid", &split)
+            .await
+            .unwrap_err();
+        assert!(err.is::<crate::worker::ResourceExhaustedError>());
+        assert!(!manager.cache_dir("idx-uuid", "split-gov").exists());
+        assert_eq!(
+            manager
+                .resource_governor()
+                .reserved_bytes(crate::worker::ResourcePoolKind::ObjectStoreInflight),
+            0
+        );
+        assert_eq!(
+            manager
+                .resource_governor()
+                .reserved_bytes(crate::worker::ResourcePoolKind::TempDisk),
+            0
+        );
+
+        // 2. Cancelled context rejects hydration before creating cache/tmp dirs
+        manager.resource_governor().set_capacity(
+            crate::worker::ResourcePoolKind::ObjectStoreInflight,
+            1024 * 1024,
+        );
+        let cancelled_ctx = crate::worker::RequestCancellationContext::new();
+        cancelled_ctx.cancel(crate::worker::CancellationReason::ClientDisconnected);
+        let cancel_err = crate::worker::with_task_request_context(
+            cancelled_ctx,
+            manager.fetch_split_into_cache("idx-uuid", &split),
+        )
+        .await
+        .unwrap_err();
+        assert!(cancel_err.is::<crate::worker::RequestCancelledError>());
+        assert!(!manager.cache_dir("idx-uuid", "split-gov").exists());
+
+        // 3. Normal hydration reserves and reconciles PersistentCache, and reaping releases it
+        let cache_dir = manager
+            .fetch_split_into_cache("idx-uuid", &split)
+            .await
+            .unwrap();
+        assert!(cache_dir.exists());
+        assert_eq!(
+            manager
+                .resource_governor()
+                .reserved_bytes(crate::worker::ResourcePoolKind::ObjectStoreInflight),
+            0
+        );
+        assert_eq!(
+            manager
+                .resource_governor()
+                .reserved_bytes(crate::worker::ResourcePoolKind::TempDisk),
+            0
+        );
+        let cached_bytes = manager.cached_split_size_bytes("idx-uuid", "split-gov");
+        assert_eq!(
+            manager
+                .resource_governor()
+                .reserved_bytes(crate::worker::ResourcePoolKind::PersistentCache),
+            cached_bytes
+        );
+
+        manager
+            .reap_split_cache("idx-uuid", &HashSet::new(), Some(0))
+            .unwrap();
+        assert_eq!(
+            manager
+                .resource_governor()
+                .reserved_bytes(crate::worker::ResourcePoolKind::PersistentCache),
+            0,
+            "evicting split from cache must release PersistentCache reservation"
         );
     }
 }

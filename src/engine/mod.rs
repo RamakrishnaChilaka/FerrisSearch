@@ -24,7 +24,7 @@ pub use self::client_operation::{
     ClientOperationConflictError, ClientOperationIntent, ClientOperationRecord,
     ClientOperationResult,
 };
-pub use self::composite::CompositeEngine;
+pub use self::composite::{CompositeEngine, VectorRecoveryMode, VectorRecoveryProgress};
 pub use self::sequence::{SEQUENCE_FORMAT_VERSION, SequenceStats};
 pub use self::snapshot::{
     PERSISTED_SHARD_SNAPSHOT_DIR, SHARD_SNAPSHOT_COMPLETE_FILE, SHARD_SNAPSHOT_FORMAT_CAPABILITY,
@@ -934,6 +934,14 @@ pub trait SearchEngine: Send + Sync {
 
     fn latest_persisted_shard_snapshot(&self) -> Result<Option<snapshot::ShardSnapshotManifest>> {
         Ok(None)
+    }
+
+    fn recover_vectors(&self) -> Result<VectorRecoveryProgress> {
+        Ok(VectorRecoveryProgress::not_applicable())
+    }
+
+    fn vector_recovery_progress(&self) -> Option<VectorRecoveryProgress> {
+        None
     }
 
     fn release_peer_recovery_pin(&self, _pin_id: u64) -> Result<()> {

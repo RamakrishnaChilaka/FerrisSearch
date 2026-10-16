@@ -677,6 +677,236 @@ pub static PEER_RECOVERY_CANCELLATIONS_TOTAL: LazyLock<IntCounter> = LazyLock::n
     counter
 });
 
+pub static REQUEST_CANCELLATIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "ferrissearch_request_cancellations_total",
+            "Request-scoped cancellations observed by execution stage and reason",
+        ),
+        &["stage", "reason"],
+    )
+    .expect("metric: request_cancellations_total");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: request_cancellations_total");
+    counter
+});
+
+pub static DEADLINE_EXHAUSTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "ferrissearch_deadline_exhausted_total",
+            "Requests and child RPCs that exhausted their deadline budget by stage",
+        ),
+        &["stage"],
+    )
+    .expect("metric: deadline_exhausted_total");
+    for stage in [
+        "queue",
+        "search",
+        "sql",
+        "write",
+        "hydration",
+        "replication",
+        "recovery",
+        "merge",
+        "maintenance",
+    ] {
+        let _ = counter.with_label_values(&[stage]);
+    }
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: deadline_exhausted_total");
+    counter
+});
+
+pub static ADMISSION_QUEUED_GAUGE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "ferrissearch_admission_queued",
+            "Currently queued requests waiting for admission by work class",
+        ),
+        &["work_class"],
+    )
+    .expect("metric: admission_queued");
+    for class in [
+        "search",
+        "sql",
+        "write",
+        "hydration",
+        "recovery",
+        "maintenance",
+    ] {
+        let _ = gauge.with_label_values(&[class]);
+    }
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register: admission_queued");
+    gauge
+});
+
+pub static ADMISSION_EXECUTING_GAUGE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "ferrissearch_admission_executing",
+            "Currently executing requests holding an admission lease by work class",
+        ),
+        &["work_class"],
+    )
+    .expect("metric: admission_executing");
+    for class in [
+        "search",
+        "sql",
+        "write",
+        "hydration",
+        "recovery",
+        "maintenance",
+    ] {
+        let _ = gauge.with_label_values(&[class]);
+    }
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register: admission_executing");
+    gauge
+});
+
+pub static ADMISSION_ACQUIRED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "ferrissearch_admission_acquired_total",
+            "Total admission leases acquired by work class",
+        ),
+        &["work_class"],
+    )
+    .expect("metric: admission_acquired_total");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: admission_acquired_total");
+    counter
+});
+
+pub static ADMISSION_REJECTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "ferrissearch_admission_rejected_total",
+            "Total admission requests rejected by work class and reason",
+        ),
+        &["work_class", "reason"],
+    )
+    .expect("metric: admission_rejected_total");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: admission_rejected_total");
+    counter
+});
+
+pub static ADMISSION_QUEUE_WAIT_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    let histogram = HistogramVec::new(
+        HistogramOpts::new(
+            "ferrissearch_admission_queue_wait_seconds",
+            "Time spent waiting in the bounded admission queue in seconds",
+        )
+        .buckets(vec![
+            0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0,
+        ]),
+        &["work_class"],
+    )
+    .expect("metric: admission_queue_wait_seconds");
+    REGISTRY
+        .register(Box::new(histogram.clone()))
+        .expect("register: admission_queue_wait_seconds");
+    histogram
+});
+
+pub static ADMISSION_EXECUTION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    let histogram = HistogramVec::new(
+        HistogramOpts::new(
+            "ferrissearch_admission_execution_seconds",
+            "Time spent executing while holding an admission lease in seconds",
+        )
+        .buckets(vec![
+            0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+        ]),
+        &["work_class"],
+    )
+    .expect("metric: admission_execution_seconds");
+    REGISTRY
+        .register(Box::new(histogram.clone()))
+        .expect("register: admission_execution_seconds");
+    histogram
+});
+
+pub static RESOURCE_POOL_CAPACITY_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "ferrissearch_resource_pool_capacity_bytes",
+            "Configured capacity in bytes for each governed resource pool",
+        ),
+        &["pool"],
+    )
+    .expect("metric: resource_pool_capacity_bytes");
+    for pool in [
+        "memory",
+        "temp_disk",
+        "persistent_cache",
+        "object_store_inflight",
+    ] {
+        let _ = gauge.with_label_values(&[pool]);
+    }
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register: resource_pool_capacity_bytes");
+    gauge
+});
+
+pub static RESOURCE_POOL_RESERVED_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "ferrissearch_resource_pool_reserved_bytes",
+            "Currently reserved bytes in each governed resource pool",
+        ),
+        &["pool"],
+    )
+    .expect("metric: resource_pool_reserved_bytes");
+    for pool in [
+        "memory",
+        "temp_disk",
+        "persistent_cache",
+        "object_store_inflight",
+    ] {
+        let _ = gauge.with_label_values(&[pool]);
+    }
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register: resource_pool_reserved_bytes");
+    gauge
+});
+
+pub static RESOURCE_RESERVATIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "ferrissearch_resource_reservations_total",
+            "Resource byte reservation operations by pool and outcome",
+        ),
+        &["pool", "outcome"],
+    )
+    .expect("metric: resource_reservations_total");
+    for pool in [
+        "memory",
+        "temp_disk",
+        "persistent_cache",
+        "object_store_inflight",
+    ] {
+        for outcome in ["granted", "rejected", "reconciled"] {
+            let _ = counter.with_label_values(&[pool, outcome]);
+        }
+    }
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: resource_reservations_total");
+    counter
+});
+
 fn set_column_cache_budget_gauges(
     effective_memory_gauge: &IntGauge,
     cache_budget_gauge: &IntGauge,
@@ -738,6 +968,17 @@ fn initialize_metrics() {
     let _ = &*PEER_RECOVERY_BYTES_TOTAL;
     let _ = &*PEER_RECOVERY_OPS_TOTAL;
     let _ = &*PEER_RECOVERY_CANCELLATIONS_TOTAL;
+    let _ = &*REQUEST_CANCELLATIONS_TOTAL;
+    let _ = &*DEADLINE_EXHAUSTED_TOTAL;
+    let _ = &*ADMISSION_QUEUED_GAUGE;
+    let _ = &*ADMISSION_EXECUTING_GAUGE;
+    let _ = &*ADMISSION_ACQUIRED_TOTAL;
+    let _ = &*ADMISSION_REJECTED_TOTAL;
+    let _ = &*ADMISSION_QUEUE_WAIT_SECONDS;
+    let _ = &*ADMISSION_EXECUTION_SECONDS;
+    let _ = &*RESOURCE_POOL_CAPACITY_BYTES;
+    let _ = &*RESOURCE_POOL_RESERVED_BYTES;
+    let _ = &*RESOURCE_RESERVATIONS_TOTAL;
 }
 
 pub fn record_replica_state_transition(from: &str, to: &str) {

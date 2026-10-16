@@ -1243,10 +1243,13 @@ pub(crate) async fn execute_distributed_dsl_search(
             let sid = *shard_id;
             let req_clone = search_req.clone();
             let node_id = node_info.id.clone();
+            let child_ctx = crate::worker::current_request_context().map(|ctx| ctx.child());
             let handle = tokio::spawn(async move {
-                client
-                    .forward_search_dsl_to_shard(&node_info, &index, sid, &req_clone)
-                    .await
+                let fut = client.forward_search_dsl_to_shard(&node_info, &index, sid, &req_clone);
+                match child_ctx {
+                    Some(ctx) => crate::worker::with_task_request_context(ctx, fut).await,
+                    None => fut.await,
+                }
             });
             remote_futures.push(async move { (sid, node_id, handle.await) });
         } else {

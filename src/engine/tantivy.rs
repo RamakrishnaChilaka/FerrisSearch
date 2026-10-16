@@ -4131,6 +4131,7 @@ impl HotEngine {
         needs_id: bool,
         needs_score: bool,
     ) -> Result<super::SqlBatchResult> {
+        crate::worker::check_current_request_active(crate::worker::ExecutionStage::Sql)?;
         crate::search::validate_sort_width(req.sort.len())?;
         let searcher = self.reader.searcher();
         let query = self.build_query(&req.query)?;
@@ -5360,7 +5361,7 @@ impl HotEngine {
         searcher: &tantivy::Searcher,
     ) -> Result<Vec<(String, serde_json::Value, u64, u64)>> {
         let mut documents = Vec::new();
-        self.for_each_vector_rebuild_batch(searcher, |batch| {
+        self.for_each_vector_rebuild_batch(searcher, |_, _, batch| {
             documents.extend(batch);
             Ok(())
         })?;
@@ -5473,10 +5474,21 @@ impl HotEngine {
         })
     }
 
+    pub(crate) fn persisted_vector_coverage(
+        &self,
+    ) -> Result<super::vector::PersistedVectorCoverage> {
+        let coverage = self.processed_coverage_for_vector_rebuild()?;
+        Ok(super::vector::PersistedVectorCoverage::from_ranges(
+            coverage.processed_checkpoint,
+            coverage.max_seq_no,
+            &coverage.missing_intervals,
+        ))
+    }
+
     pub(crate) fn for_each_committed_vector_rebuild_batch(
         &self,
-        consume: impl FnMut(Vec<(String, serde_json::Value, u64, u64)>) -> Result<()>,
-    ) -> Result<()> {
+        consume: impl FnMut(usize, usize, Vec<(String, serde_json::Value, u64, u64)>) -> Result<()>,
+    ) -> Result<(super::vector::PersistedVectorCoverage, usize)> {
         let _maintenance = self.maintenance_guard("vector rebuild")?;
         let (reader, covered) = self.with_translog("vector rebuild", |_| {
             let mut writer_state = self
@@ -5493,20 +5505,29 @@ impl HotEngine {
         })?;
         // The private reader pins its files and callers retain vector_recovery.
         // Realtime GET must not wait on the translog during enumeration.
-        self.for_each_vector_rebuild_batch(&reader.searcher(), consume)?;
+        let searcher = reader.searcher();
+        let segments_total = searcher.segment_readers().len();
+        self.for_each_vector_rebuild_batch(&searcher, consume)?;
         let applied = self.processed_coverage_for_vector_rebuild()?;
         if applied != covered {
             anyhow::bail!(
                 "vector rebuild commit no longer covers applied history: committed {covered:?}; applied {applied:?}"
             );
         }
-        Ok(())
+        Ok((
+            super::vector::PersistedVectorCoverage::from_ranges(
+                covered.processed_checkpoint,
+                covered.max_seq_no,
+                &covered.missing_intervals,
+            ),
+            segments_total,
+        ))
     }
 
     fn for_each_vector_rebuild_batch(
         &self,
         searcher: &tantivy::Searcher,
-        mut consume: impl FnMut(Vec<(String, serde_json::Value, u64, u64)>) -> Result<()>,
+        mut consume: impl FnMut(usize, usize, Vec<(String, serde_json::Value, u64, u64)>) -> Result<()>,
     ) -> Result<()> {
         #[cfg(test)]
         {
@@ -5528,6 +5549,7 @@ impl HotEngine {
             .unwrap_or_else(|error| error.into_inner());
         let batch_size = vector_rebuild_batch_size();
         let mut batch = Vec::with_capacity(batch_size);
+        let segments_total = searcher.segment_readers().len();
         for (segment_ord, segment) in searcher.segment_readers().iter().enumerate() {
             let seq_column = segment.fast_fields().u64(SEQ_NO_FIELD_NAME).ok();
             let term_column = segment.fast_fields().u64(PRIMARY_TERM_FIELD_NAME).ok();
@@ -5568,15 +5590,16 @@ impl HotEngine {
                 })?;
                 batch.push((document_id, source, seq_no, primary_term));
                 if batch.len() == batch_size {
-                    consume(std::mem::replace(
-                        &mut batch,
-                        Vec::with_capacity(batch_size),
-                    ))?;
+                    consume(
+                        segments_total,
+                        segment_ord,
+                        std::mem::replace(&mut batch, Vec::with_capacity(batch_size)),
+                    )?;
                 }
             }
         }
         if !batch.is_empty() {
-            consume(batch)?;
+            consume(segments_total, segments_total, batch)?;
         }
         Ok(())
     }
@@ -9425,6 +9448,7 @@ impl super::SearchEngine for HotEngine {
             self.reload_reader()?;
 
             loop {
+                crate::worker::check_current_request_active(crate::worker::ExecutionStage::Merge)?;
                 let segment_ids = self.index.searchable_segment_ids()?;
                 if segment_ids.len() <= max_num_segments {
                     break;
@@ -9482,6 +9506,7 @@ impl super::SearchEngine for HotEngine {
     }
 
     fn search(&self, query_str: &str) -> Result<Vec<serde_json::Value>> {
+        crate::worker::check_current_request_active(crate::worker::ExecutionStage::Search)?;
         let searcher = self.reader.searcher();
         let query = crate::search::query_string::parse_query_string(&self.index, query_str, None)?;
         self.execute_search(searcher, &*query, 100)
@@ -9495,6 +9520,7 @@ impl super::SearchEngine for HotEngine {
         usize,
         std::collections::HashMap<String, crate::search::PartialAggResult>,
     )> {
+        crate::worker::check_current_request_active(crate::worker::ExecutionStage::Search)?;
         crate::search::validate_sort_width(req.sort.len())?;
         let searcher = self.reader.searcher();
         // A shard cannot contribute more hits than its live document count.
@@ -10507,6 +10533,8 @@ impl HotEngine {
         _needs_score: bool,
         batch_size: usize,
     ) -> Result<super::SqlStreamingBatchHandle> {
+        crate::worker::check_current_request_active(crate::worker::ExecutionStage::Sql)?;
+        let captured_ctx = crate::worker::current_request_context();
         crate::search::validate_sort_width(req.sort.len())?;
         let searcher = self.reader.searcher();
         let query = self.build_query(&req.query)?;
@@ -10568,7 +10596,13 @@ impl HotEngine {
         Ok(super::SqlStreamingBatchHandle::new(
             total_hits,
             total_hits,
-            move || state.next_batch(),
+            move || {
+                if let Some(ref ctx) = captured_ctx {
+                    ctx.check_active(crate::worker::ExecutionStage::Sql)?;
+                }
+                crate::worker::check_current_request_active(crate::worker::ExecutionStage::Sql)?;
+                state.next_batch()
+            },
         ))
     }
 

@@ -2427,6 +2427,10 @@ impl InternalTransport for TransportService {
         &self,
         request: Request<ShardSearchRequest>,
     ) -> Result<Response<ShardSearchResponse>, Status> {
+        let (ctx, mut _drop_guard) = crate::transport::state_wait::extract_grpc_request_context(
+            &request,
+            crate::worker::ExecutionStage::Search,
+        )?;
         self.wait_for_forwarded_state(
             &request,
             Some(&request.get_ref().index_name),
@@ -2439,14 +2443,27 @@ impl InternalTransport for TransportService {
             .get_or_open_search_shard(&req.index_name, req.shard_id)
             .await?;
 
-        let search_result = {
+        let search_result = crate::worker::with_task_request_context(ctx.clone(), async {
+            let _mem_res = self
+                .worker_pools
+                .resource_governor()
+                .try_reserve(crate::worker::ResourcePoolKind::Memory, 100 * 256)?;
             let engine = engine.clone();
             let query = req.query.clone();
             self.worker_pools
-                .spawn_search(move || engine.search(&query))
+                .spawn_search_in_class(crate::worker::WorkClass::Search, move || {
+                    engine.search(&query)
+                })
                 .await
-                .map_err(|e| Status::internal(e.to_string()))?
-        };
+        })
+        .await
+        .map_err(|e| {
+            crate::transport::state_wait::status_from_worker_error(
+                &e,
+                crate::worker::ExecutionStage::Search,
+            )
+        })?;
+        _drop_guard.disarm();
 
         match search_result {
             Ok(hits) => {
@@ -2476,6 +2493,10 @@ impl InternalTransport for TransportService {
         &self,
         request: Request<ShardSearchDslRequest>,
     ) -> Result<Response<ShardSearchResponse>, Status> {
+        let (ctx, mut _drop_guard) = crate::transport::state_wait::extract_grpc_request_context(
+            &request,
+            crate::worker::ExecutionStage::Search,
+        )?;
         self.wait_for_forwarded_state(
             &request,
             Some(&request.get_ref().index_name),
@@ -2496,12 +2517,19 @@ impl InternalTransport for TransportService {
         let mut all_hits = Vec::new();
         let mut total_hits: usize = 0;
 
+        let estimated_bytes =
+            ((search_req.size.saturating_add(search_req.from)).max(1) as u64).saturating_mul(256);
+
         // Run all blocking engine work on the search pool
-        let search_result = {
+        let search_result = crate::worker::with_task_request_context(ctx.clone(), async {
+            let mut mem_reservation = self
+                .worker_pools
+                .resource_governor()
+                .try_reserve(crate::worker::ResourcePoolKind::Memory, estimated_bytes)?;
             let engine = engine.clone();
             let search_req = search_req.clone();
-            self.worker_pools
-                .spawn_search(move || -> crate::common::Result<(Vec<serde_json::Value>, usize, std::collections::HashMap<String, crate::search::PartialAggResult>, Vec<serde_json::Value>)> {
+            let res = self.worker_pools
+                .spawn_search_in_class(crate::worker::WorkClass::Search, move || -> crate::common::Result<(Vec<serde_json::Value>, usize, std::collections::HashMap<String, crate::search::PartialAggResult>, Vec<serde_json::Value>)> {
                     let (hits, total, partial_aggs) = engine.search_query(&search_req)?;
                     let mut knn_hits = Vec::new();
                     if let Some(ref knn) = search_req.knn
@@ -2516,9 +2544,21 @@ impl InternalTransport for TransportService {
                     }
                     Ok((hits, total, partial_aggs, knn_hits))
                 })
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
-        };
+                .await?;
+            if let Ok((ref hits, _, _, ref knn_hits)) = res {
+                let actual_bytes = ((hits.len() + knn_hits.len()) as u64).saturating_mul(256);
+                let _ = mem_reservation.reconcile(actual_bytes);
+            }
+            Ok(res)
+        })
+        .await
+        .map_err(|e| {
+            crate::transport::state_wait::status_from_worker_error(
+                &e,
+                crate::worker::ExecutionStage::Search,
+            )
+        })?;
+        _drop_guard.disarm();
 
         match search_result {
             Ok((hits, total, partial_aggs, knn_hits)) => {
@@ -2608,6 +2648,10 @@ impl InternalTransport for TransportService {
         &self,
         request: Request<RemoteStoreSearchRequest>,
     ) -> Result<Response<RemoteStoreSearchResponse>, Status> {
+        let (ctx, mut _drop_guard) = crate::transport::state_wait::extract_grpc_request_context(
+            &request,
+            crate::worker::ExecutionStage::Search,
+        )?;
         self.wait_for_forwarded_state(
             &request,
             Some(&request.get_ref().index_name),
@@ -2660,15 +2704,19 @@ impl InternalTransport for TransportService {
             reader_cache: self.remote_store_reader_cache.clone(),
         };
 
-        let outcomes = crate::engine::remote_store::execute_leaf_search_batch(
-            &context,
-            &metadata,
-            &search_req,
-            &split_plans,
-            &live_split_ids,
+        let outcomes = crate::worker::with_task_request_context(
+            ctx,
+            crate::engine::remote_store::execute_leaf_search_batch(
+                &context,
+                &metadata,
+                &search_req,
+                &split_plans,
+                &live_split_ids,
+            ),
         )
         .await
         .map_err(crate::search::query_string::search_error_status)?;
+        _drop_guard.disarm();
 
         let mut results = Vec::with_capacity(outcomes.len());
         for outcome in outcomes {
@@ -2745,6 +2793,10 @@ impl InternalTransport for TransportService {
         &self,
         request: Request<SqlRecordBatchRequest>,
     ) -> Result<Response<SqlRecordBatchResponse>, Status> {
+        let (ctx, mut _drop_guard) = crate::transport::state_wait::extract_grpc_request_context(
+            &request,
+            crate::worker::ExecutionStage::Sql,
+        )?;
         self.wait_for_forwarded_state(
             &request,
             Some(&request.get_ref().index_name),
@@ -2776,20 +2828,40 @@ impl InternalTransport for TransportService {
             })?;
 
         let columns: Vec<String> = req.columns;
+        let estimated_bytes = ((search_req.size.max(1) as u64)
+            .saturating_mul((columns.len().max(1) as u64) * 32))
+        .max(256);
 
-        let batch_result = {
+        let batch_result = crate::worker::with_task_request_context(ctx.clone(), async {
+            let mut mem_reservation = self
+                .worker_pools
+                .resource_governor()
+                .try_reserve(crate::worker::ResourcePoolKind::Memory, estimated_bytes)?;
             let engine = engine.clone();
             let search_req = search_req.clone();
             let columns = columns.clone();
             let needs_id = req.needs_id;
             let needs_score = req.needs_score;
-            self.worker_pools
-                .spawn_search(move || {
+            let res = self
+                .worker_pools
+                .spawn_search_in_class(crate::worker::WorkClass::Sql, move || {
                     engine.sql_record_batch(&search_req, &columns, needs_id, needs_score)
                 })
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
-        };
+                .await?;
+            if let Ok(Some(ref batch_res)) = res {
+                let actual = batch_res.batch.get_array_memory_size() as u64;
+                let _ = mem_reservation.reconcile(actual);
+            }
+            Ok(res)
+        })
+        .await
+        .map_err(|e| {
+            crate::transport::state_wait::status_from_worker_error(
+                &e,
+                crate::worker::ExecutionStage::Sql,
+            )
+        })?;
+        _drop_guard.disarm();
 
         match batch_result {
             Ok(Some(batch_result)) => {
@@ -2815,6 +2887,10 @@ impl InternalTransport for TransportService {
         &self,
         request: Request<SqlRecordBatchRequest>,
     ) -> Result<Response<Self::SqlRecordBatchStreamStream>, Status> {
+        let (ctx, stream_drop_guard) = crate::transport::state_wait::extract_grpc_request_context(
+            &request,
+            crate::worker::ExecutionStage::Sql,
+        )?;
         self.wait_for_forwarded_state(
             &request,
             Some(&request.get_ref().index_name),
@@ -2853,14 +2929,21 @@ impl InternalTransport for TransportService {
 
         let columns = req.columns;
         let batch_size = req.batch_size as usize;
-        let stream_result = {
+        let estimated_batch_bytes = ((batch_size.clamp(1, 8192) as u64)
+            .saturating_mul((columns.len().max(1) as u64) * 32))
+        .max(256);
+        let stream_result = crate::worker::with_task_request_context(ctx.clone(), async {
+            let _mem_res = self.worker_pools.resource_governor().try_reserve(
+                crate::worker::ResourcePoolKind::Memory,
+                estimated_batch_bytes,
+            )?;
             let engine = engine.clone();
             let search_req = search_req.clone();
             let columns = columns.clone();
             let needs_id = req.needs_id;
             let needs_score = req.needs_score;
             self.worker_pools
-                .spawn_search(move || {
+                .spawn_search_in_class(crate::worker::WorkClass::Sql, move || {
                     match engine.sql_streaming_batch_handle(
                         &search_req,
                         &columns,
@@ -2885,8 +2968,14 @@ impl InternalTransport for TransportService {
                     }
                 })
                 .await
-                .map_err(|e| Status::internal(e.to_string()))?
-        };
+        })
+        .await
+        .map_err(|e| {
+            crate::transport::state_wait::status_from_worker_error(
+                &e,
+                crate::worker::ExecutionStage::Sql,
+            )
+        })?;
 
         // Lazily encode each batch to IPC as it is consumed by the gRPC
         // transport. The streaming-handle path also keeps raw RecordBatches
@@ -2897,19 +2986,57 @@ impl InternalTransport for TransportService {
                 let collected_rows = handle.collected_rows;
                 let worker_pools = self.worker_pools.clone();
                 let handle = Arc::new(std::sync::Mutex::new(handle));
+                let stream_drop_guard = Arc::new(std::sync::Mutex::new(stream_drop_guard));
                 Box::pin(stream::try_unfold(
-                    (handle, worker_pools, total_hits, collected_rows),
-                    |(handle, worker_pools, total_hits, collected_rows)| async move {
+                    (
+                        handle,
+                        worker_pools,
+                        total_hits,
+                        collected_rows,
+                        ctx,
+                        stream_drop_guard,
+                        estimated_batch_bytes,
+                    ),
+                    |(
+                        handle,
+                        worker_pools,
+                        total_hits,
+                        collected_rows,
+                        ctx,
+                        stream_drop_guard,
+                        estimated_batch_bytes,
+                    )| async move {
                         let handle_for_batch = handle.clone();
-                        let next_batch = worker_pools
-                            .clone()
-                            .spawn_search(move || {
-                                let mut handle =
-                                    handle_for_batch.lock().unwrap_or_else(|e| e.into_inner());
-                                handle.next_batch()
+                        let next_batch =
+                            crate::worker::with_task_request_context(ctx.clone(), async {
+                                let mut mem_res = worker_pools.resource_governor().try_reserve(
+                                    crate::worker::ResourcePoolKind::Memory,
+                                    estimated_batch_bytes,
+                                )?;
+                                let res = worker_pools
+                                    .clone()
+                                    .spawn_search_in_class(
+                                        crate::worker::WorkClass::Sql,
+                                        move || {
+                                            let mut handle = handle_for_batch
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner());
+                                            handle.next_batch()
+                                        },
+                                    )
+                                    .await?;
+                                if let Ok(Some(ref batch)) = res {
+                                    let _ = mem_res.reconcile(batch.get_array_memory_size() as u64);
+                                }
+                                Ok(res)
                             })
                             .await
-                            .map_err(|e| Status::internal(e.to_string()))?;
+                            .map_err(|e| {
+                                crate::transport::state_wait::status_from_worker_error(
+                                    &e,
+                                    crate::worker::ExecutionStage::Sql,
+                                )
+                            })?;
 
                         match next_batch {
                             Ok(Some(batch)) => {
@@ -2922,10 +3049,24 @@ impl InternalTransport for TransportService {
                                 .map_err(|error| Status::internal(error.to_string()))?;
                                 Ok(Some((
                                     item,
-                                    (handle, worker_pools, total_hits, collected_rows),
+                                    (
+                                        handle,
+                                        worker_pools,
+                                        total_hits,
+                                        collected_rows,
+                                        ctx,
+                                        stream_drop_guard,
+                                        estimated_batch_bytes,
+                                    ),
                                 )))
                             }
-                            Ok(None) => Ok(None),
+                            Ok(None) => {
+                                stream_drop_guard
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .disarm();
+                                Ok(None)
+                            }
                             Err(error) => {
                                 Err(crate::search::query_string::search_error_status(error))
                             }

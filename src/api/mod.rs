@@ -228,6 +228,95 @@ async fn pretty_json_middleware(req: Request<Body>, next: Next) -> Response {
     Response::from_parts(parts, Body::from(bytes))
 }
 
+fn parse_http_timeout_param(raw: &str) -> Option<std::time::Duration> {
+    let raw = raw.trim();
+    if let Some(ms) = raw.strip_suffix("ms") {
+        return ms
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .map(std::time::Duration::from_millis);
+    }
+    if let Some(secs) = raw.strip_suffix('s') {
+        return secs
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .map(std::time::Duration::from_secs);
+    }
+    if let Some(mins) = raw.strip_suffix('m') {
+        return mins
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .map(|m| std::time::Duration::from_secs(m.saturating_mul(60)));
+    }
+    raw.parse::<u64>()
+        .ok()
+        .map(std::time::Duration::from_millis)
+}
+
+fn infer_http_stage(path: &str) -> crate::worker::ExecutionStage {
+    if path.contains("/_sql") {
+        crate::worker::ExecutionStage::Sql
+    } else if path.contains("/_forcemerge") {
+        crate::worker::ExecutionStage::Merge
+    } else if path.contains("/_refresh") || path.contains("/_flush") {
+        crate::worker::ExecutionStage::Maintenance
+    } else if path.contains("/_doc") || path.contains("/_bulk") || path.contains("/_update") {
+        crate::worker::ExecutionStage::Write
+    } else {
+        crate::worker::ExecutionStage::Search
+    }
+}
+
+async fn request_context_middleware(req: Request<Body>, next: Next) -> Response {
+    let stage = infer_http_stage(req.uri().path());
+    let header_budget = req
+        .headers()
+        .get(crate::transport::state_wait::REMAINING_BUDGET_MS_HEADER)
+        .or_else(|| req.headers().get("x-ferris-timeout-ms"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_http_timeout_param);
+    let query_budget = req.uri().query().and_then(|q| {
+        q.split('&').find_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            (k == "timeout")
+                .then(|| parse_http_timeout_param(v))
+                .flatten()
+        })
+    });
+    let effective_budget = match (header_budget, query_budget) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+
+    if let Some(budget) = effective_budget
+        && budget.is_zero()
+    {
+        crate::metrics::DEADLINE_EXHAUSTED_TOTAL
+            .with_label_values(&[stage.as_str()])
+            .inc();
+        return error_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            "deadline_exceeded_exception",
+            format!("request deadline budget (0 ms) exhausted during stage [{stage}]"),
+        )
+        .into_response();
+    }
+
+    let ctx = match effective_budget {
+        Some(budget) => crate::worker::RequestCancellationContext::with_budget(budget),
+        None => crate::worker::RequestCancellationContext::new(),
+    };
+    let mut drop_guard = ctx.drop_guard(crate::worker::CancellationReason::ClientDisconnected);
+    let response = crate::worker::with_task_request_context(ctx, next.run(req)).await;
+    drop_guard.disarm();
+    response
+}
+
 /// Middleware that records HTTP request count and latency as Prometheus metrics.
 async fn metrics_middleware(req: Request<Body>, next: Next) -> Response {
     let method = req.method().to_string();
@@ -391,6 +480,7 @@ pub fn create_router(mut state: AppState) -> Router {
             security_manager,
             crate::security::auth_middleware,
         ))
+        .layer(middleware::from_fn(request_context_middleware))
         .layer(middleware::from_fn(pretty_json_middleware))
         .layer(middleware::from_fn(metrics_middleware))
         .with_state(state)

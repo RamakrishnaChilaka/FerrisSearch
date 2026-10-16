@@ -218,6 +218,15 @@ pub(crate) fn query_error_reason(error: &anyhow::Error) -> Option<QueryErrorReas
 }
 
 pub(crate) fn search_error_status(error: anyhow::Error) -> tonic::Status {
+    if crate::worker::is_cancellation_or_deadline_error(&error)
+        || error.is::<crate::worker::AdmissionError>()
+        || error.is::<crate::worker::ResourceExhaustedError>()
+    {
+        return crate::transport::state_wait::status_from_worker_error(
+            &error,
+            crate::worker::ExecutionStage::Search,
+        );
+    }
     let message = format!("{error:#}");
     match query_error_reason(&error) {
         Some(reason) => match serde_json::to_vec(&reason) {

@@ -121,6 +121,22 @@ impl ShardFailure {
                 "shard_not_available_exception",
             )
         } else if matches!(
+            error.downcast_ref::<crate::worker::AdmissionError>(),
+            Some(crate::worker::AdmissionError::QueueFull { .. })
+        ) || error.is::<crate::worker::ResourceExhaustedError>()
+        {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rejected_execution_exception",
+            )
+        } else if error.is::<crate::worker::RequestDeadlineExceeded>()
+            || matches!(
+                error.downcast_ref::<crate::worker::AdmissionError>(),
+                Some(crate::worker::AdmissionError::DeadlineExceeded(_))
+            )
+        {
+            (StatusCode::GATEWAY_TIMEOUT, "deadline_exceeded_exception")
+        } else if matches!(
             error.downcast_ref::<tantivy::TantivyError>(),
             Some(tantivy::TantivyError::InvalidArgument(_))
         ) {
@@ -151,6 +167,29 @@ pub(crate) fn shard_stats(successful: u32, failed: u32, failures: &[ShardFailure
 }
 
 pub(crate) fn query_error_response(error: anyhow::Error) -> (StatusCode, Json<Value>) {
+    if matches!(
+        error.downcast_ref::<crate::worker::AdmissionError>(),
+        Some(crate::worker::AdmissionError::QueueFull { .. })
+    ) || error.is::<crate::worker::ResourceExhaustedError>()
+    {
+        return crate::api::error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rejected_execution_exception",
+            format!("{error:#}"),
+        );
+    }
+    if error.is::<crate::worker::RequestDeadlineExceeded>()
+        || matches!(
+            error.downcast_ref::<crate::worker::AdmissionError>(),
+            Some(crate::worker::AdmissionError::DeadlineExceeded(_))
+        )
+    {
+        return crate::api::error_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            "deadline_exceeded_exception",
+            format!("{error:#}"),
+        );
+    }
     match query_error_reason(&error) {
         Some(reason) => {
             let status = query_status(&error);
@@ -176,6 +215,7 @@ pub(crate) fn all_shards_failed_response(
     }
     let status = [
         StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::GATEWAY_TIMEOUT,
         StatusCode::SERVICE_UNAVAILABLE,
         StatusCode::TOO_MANY_REQUESTS,
         StatusCode::FORBIDDEN,

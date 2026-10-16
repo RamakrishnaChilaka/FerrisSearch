@@ -20,11 +20,48 @@ pub struct VectorIndex {
     versions: RwLock<HashMap<u64, VectorVersionValue>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct VectorVersionValue {
     pub seq_no: u64,
     pub primary_term: u64,
     pub deleted: bool,
+}
+
+pub const VECTOR_SIDECAR_FORMAT_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedVectorCoverage {
+    pub processed_checkpoint: Option<u64>,
+    pub max_seq_no: Option<u64>,
+    pub missing_intervals: Vec<(u64, u64)>,
+}
+
+impl PersistedVectorCoverage {
+    pub fn from_ranges(
+        processed_checkpoint: Option<u64>,
+        max_seq_no: Option<u64>,
+        missing_intervals: &[std::ops::RangeInclusive<u64>],
+    ) -> Self {
+        Self {
+            processed_checkpoint,
+            max_seq_no,
+            missing_intervals: missing_intervals
+                .iter()
+                .map(|range| (*range.start(), *range.end()))
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PersistedVectorSidecar {
+    format_version: u32,
+    dimensions: usize,
+    vector_count: usize,
+    usearch_sha256: String,
+    coverage: Option<PersistedVectorCoverage>,
+    key_to_doc_id: HashMap<u64, String>,
+    versions: HashMap<u64, VectorVersionValue>,
 }
 
 impl VectorIndex {
@@ -197,10 +234,10 @@ impl VectorIndex {
             .versions
             .write()
             .unwrap_or_else(|error| error.into_inner());
-        if versions
-            .get(&key)
-            .is_some_and(|current| current.seq_no >= seq_no)
-        {
+        if versions.get(&key).is_some_and(|current| {
+            current.seq_no > seq_no
+                || (current.seq_no == seq_no && current.primary_term >= primary_term)
+        }) {
             return Ok(false);
         }
         let existing_vector = versions.get(&key).is_some_and(|current| !current.deleted)
@@ -239,14 +276,24 @@ impl VectorIndex {
             .versions
             .write()
             .unwrap_or_else(|error| error.into_inner());
-        if versions
-            .get(&key)
-            .is_some_and(|current| current.seq_no >= seq_no)
-        {
+        if versions.get(&key).is_some_and(|current| {
+            current.seq_no > seq_no
+                || (current.seq_no == seq_no && current.primary_term >= primary_term)
+        }) {
             return Ok(false);
         }
-        if versions.get(&key).is_some_and(|current| !current.deleted) {
+        let had_entry = versions.get(&key).is_some_and(|current| !current.deleted)
+            || self
+                .key_to_doc_id
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains_key(&key);
+        if had_entry {
             let _ = self.index.remove(key);
+            self.key_to_doc_id
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&key);
         }
         versions.insert(
             key,
@@ -308,53 +355,208 @@ impl VectorIndex {
 
     /// Save the index and doc_id mapping to disk.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
+        self.save_with_coverage(path, None)
+    }
+
+    /// Save the index, doc_id mapping, version state, and sequence coverage to disk.
+    pub fn save_with_coverage(
+        &self,
+        path: impl AsRef<Path>,
+        coverage: Option<PersistedVectorCoverage>,
+    ) -> Result<()> {
         let path = path.as_ref();
-        self.index
-            .save(path.to_str().unwrap_or(""))
-            .map_err(|e| anyhow::anyhow!("Failed to save vector index: {e}"))?;
-        // Persist key→doc_id mapping as a binary sidecar (bincode)
+        let tmp_index_path = path.with_extension("usearch.tmp");
         let map_path = path.with_extension("docids.bin");
+        let tmp_map_path = path.with_extension("docids.bin.tmp");
+
+        self.index
+            .save(tmp_index_path.to_str().unwrap_or(""))
+            .map_err(|e| anyhow::anyhow!("Failed to save vector index: {e}"))?;
+        let (_, usearch_sha256) = crate::engine::snapshot::hash_file_sha256(&tmp_index_path)?;
         let map = self.key_to_doc_id.read().unwrap_or_else(|e| e.into_inner());
-        let encoded = bincode_next::serde::encode_to_vec(&*map, BINCODE_CONFIG)?;
-        std::fs::write(&map_path, encoded)?;
+        let versions = self.versions.read().unwrap_or_else(|e| e.into_inner());
+        let sidecar = PersistedVectorSidecar {
+            format_version: VECTOR_SIDECAR_FORMAT_VERSION,
+            dimensions: self.dimensions,
+            vector_count: self.len(),
+            usearch_sha256,
+            coverage,
+            key_to_doc_id: map.clone(),
+            versions: versions.clone(),
+        };
+        let encoded = bincode_next::serde::encode_to_vec(&sidecar, BINCODE_CONFIG)?;
+        std::fs::write(&tmp_map_path, encoded)?;
+        std::fs::File::open(&tmp_index_path)?.sync_all()?;
+        std::fs::File::open(&tmp_map_path)?.sync_all()?;
+        std::fs::rename(&tmp_index_path, path)?;
+        std::fs::rename(&tmp_map_path, &map_path)?;
         Ok(())
+    }
+
+    fn decode_sidecar(usearch_path: &Path) -> Result<Option<PersistedVectorSidecar>> {
+        let bin_path = usearch_path.with_extension("docids.bin");
+        match std::fs::read(&bin_path) {
+            Ok(data) => {
+                let (sidecar, consumed) = bincode_next::serde::decode_from_slice::<
+                    PersistedVectorSidecar,
+                    _,
+                >(&data, BINCODE_CONFIG)
+                .map_err(|error| {
+                    crate::common::unsupported_index_format(
+                        "vector doc-id map",
+                        format!("cannot decode current binary sidecar {bin_path:?}: {error}"),
+                    )
+                })?;
+                if consumed != data.len() {
+                    return Err(crate::common::unsupported_index_format(
+                        "vector doc-id map",
+                        format!("binary sidecar {bin_path:?} has trailing bytes"),
+                    ));
+                }
+                if sidecar.format_version != VECTOR_SIDECAR_FORMAT_VERSION {
+                    return Err(crate::common::unsupported_index_format(
+                        "vector doc-id map",
+                        format!(
+                            "binary sidecar {bin_path:?} uses unsupported format_version {} (expected {})",
+                            sidecar.format_version, VECTOR_SIDECAR_FORMAT_VERSION
+                        ),
+                    ));
+                }
+                Ok(Some(sidecar))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let json_path = usearch_path.with_extension("docids.json");
+                if json_path.try_exists()? {
+                    return Err(crate::common::unsupported_index_format(
+                        "vector doc-id map",
+                        format!("JSON sidecar {json_path:?} is not supported"),
+                    ));
+                }
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Load the current binary doc_id mapping sidecar if present.
     pub fn load_doc_id_map(&self, usearch_path: impl AsRef<Path>) -> Result<()> {
-        let bin_path = usearch_path.as_ref().with_extension("docids.bin");
-        if let Ok(data) = std::fs::read(&bin_path) {
-            let (loaded, consumed) = bincode_next::serde::decode_from_slice::<
-                HashMap<u64, String>,
-                _,
-            >(&data, BINCODE_CONFIG)
-            .map_err(|error| {
-                crate::common::unsupported_index_format(
-                    "vector doc-id map",
-                    format!("cannot decode current binary sidecar {bin_path:?}: {error}"),
-                )
-            })?;
-            if consumed != data.len() {
-                return Err(crate::common::unsupported_index_format(
-                    "vector doc-id map",
-                    format!("binary sidecar {bin_path:?} has trailing bytes"),
-                ));
-            }
-            let mut map = self
-                .key_to_doc_id
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
-            *map = loaded;
+        let usearch_path = usearch_path.as_ref();
+        let Some(sidecar) = Self::decode_sidecar(usearch_path)? else {
             return Ok(());
+        };
+        if sidecar.dimensions != self.dimensions {
+            anyhow::bail!(
+                "vector sidecar dimensions {} do not match expected dimensions {}",
+                sidecar.dimensions,
+                self.dimensions
+            );
         }
-        let json_path = usearch_path.as_ref().with_extension("docids.json");
-        if json_path.try_exists()? {
-            return Err(crate::common::unsupported_index_format(
-                "vector doc-id map",
-                format!("JSON sidecar {json_path:?} is not supported"),
-            ));
+        if usearch_path.is_file() {
+            let (_, actual_sha256) = crate::engine::snapshot::hash_file_sha256(usearch_path)?;
+            if actual_sha256 != sidecar.usearch_sha256 {
+                anyhow::bail!(
+                    "persisted vector index {usearch_path:?} checksum mismatch: expected {}, got {}",
+                    sidecar.usearch_sha256,
+                    actual_sha256
+                );
+            }
+            if self.len() != sidecar.vector_count {
+                anyhow::bail!(
+                    "persisted vector index {usearch_path:?} count {} does not match sidecar vector_count {}",
+                    self.len(),
+                    sidecar.vector_count
+                );
+            }
         }
+        *self
+            .key_to_doc_id
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = sidecar.key_to_doc_id;
+        *self.versions.write().unwrap_or_else(|e| e.into_inner()) = sidecar.versions;
         Ok(())
+    }
+
+    /// Attempt to open a persisted vector index and verify that its checksum,
+    /// dimensions, vector count, and sequence coverage match `expected_coverage`.
+    /// Returns `Ok(None)` when the persisted vector files are absent or cover an
+    /// older sequence boundary (indicating that a streaming segment scan is needed).
+    pub(crate) fn open_verified_with_coverage(
+        path: impl AsRef<Path>,
+        expected_coverage: &PersistedVectorCoverage,
+        metric: MetricKind,
+    ) -> Result<Option<Self>> {
+        let path = path.as_ref();
+        let Some(sidecar) = Self::decode_sidecar(path)? else {
+            if path.try_exists()? {
+                anyhow::bail!(
+                    "persisted vector index {path:?} is missing its required sidecar {:?}",
+                    path.with_extension("docids.bin")
+                );
+            }
+            return Ok(None);
+        };
+        if !path.try_exists()? {
+            anyhow::bail!(
+                "persisted vector sidecar {:?} exists without vector index {path:?}",
+                path.with_extension("docids.bin")
+            );
+        }
+        if sidecar.dimensions == 0 {
+            anyhow::bail!("persisted vector sidecar has zero dimensions");
+        }
+        if sidecar.coverage.as_ref() != Some(expected_coverage) {
+            return Ok(None);
+        }
+        let (_, actual_sha256) = crate::engine::snapshot::hash_file_sha256(path)?;
+        if actual_sha256 != sidecar.usearch_sha256 {
+            anyhow::bail!(
+                "persisted vector index {path:?} checksum mismatch: expected {}, got {}",
+                sidecar.usearch_sha256,
+                actual_sha256
+            );
+        }
+        let live_versions = sidecar
+            .versions
+            .iter()
+            .filter(|(_, version)| !version.deleted)
+            .count();
+        if live_versions != sidecar.vector_count
+            || sidecar.key_to_doc_id.len() != sidecar.vector_count
+        {
+            anyhow::bail!(
+                "persisted vector sidecar for {path:?} has inconsistent counts: vector_count={}, live_versions={}, doc_ids={}",
+                sidecar.vector_count,
+                live_versions,
+                sidecar.key_to_doc_id.len()
+            );
+        }
+        for (key, version) in &sidecar.versions {
+            if !version.deleted && !sidecar.key_to_doc_id.contains_key(key) {
+                anyhow::bail!(
+                    "persisted vector sidecar for {path:?} is missing doc_id for live key {key}"
+                );
+            }
+        }
+        let vi = Self::new(sidecar.dimensions, metric)?;
+        vi.index
+            .load(path.to_str().unwrap_or(""))
+            .map_err(|e| anyhow::anyhow!("Failed to load vector index: {e}"))?;
+        if vi.index.size() != sidecar.vector_count {
+            anyhow::bail!(
+                "loaded vector index {path:?} size {} does not match sidecar vector_count {}",
+                vi.index.size(),
+                sidecar.vector_count
+            );
+        }
+        if vi.index.size() >= vi.index.capacity() {
+            let new_cap = (vi.index.capacity() * 2).max(10_000);
+            vi.index
+                .reserve(new_cap)
+                .map_err(|e| anyhow::anyhow!("Failed to reserve capacity: {e}"))?;
+        }
+        *vi.key_to_doc_id.write().unwrap_or_else(|e| e.into_inner()) = sidecar.key_to_doc_id;
+        *vi.versions.write().unwrap_or_else(|e| e.into_inner()) = sidecar.versions;
+        Ok(Some(vi))
     }
 }
 
