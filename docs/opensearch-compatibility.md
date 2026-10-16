@@ -1,8 +1,8 @@
 # OpenSearch Compatibility Matrix
 
 > - **Status:** Current implemented behavior
-> - **Matrix version:** 2026-10-13
-> - **Source baseline:** `f9457f1`
+> - **Matrix version:** 2026-10-15
+> - **Source baseline:** `d1aa226` plus FS-014
 > - **Product claim:** OpenSearch-style REST API subset
 > - **Canonical inventory:** [`opensearch-compatibility.json`](opensearch-compatibility.json)
 
@@ -94,7 +94,8 @@ and [ADR 0001 D8](adr/0001-write-consistency-and-retry-contract.md#d8-visibility
 ### Bulk parsing and failures
 
 - The NDJSON parser supports `index`, `create`, `update`, and `delete` actions.
-  It is materialized rather than streaming.
+  It validates streamed input in protected temporary storage before bounded
+  execution and emits ordered results without whole-response buffering.
 - Malformed action structure, missing required source lines, and unsupported
   safety metadata reject the whole request before mutation. Invalid document
   sources and mapper errors remain per-item failures, so valid neighboring
@@ -105,10 +106,16 @@ and [ADR 0001 D8](adr/0001-write-consistency-and-retry-contract.md#d8-visibility
   top-level `errors`; `errors` reflects item error objects.
 - Infrastructure, replication, and ambiguous outcomes preserve their
   underlying cause instead of becoming generic item failures.
+- FerrisSearch-specific admission, input/spool/line limits, and cancellation
+  are described in [bounded bulk ingestion](bulk-ingestion.md). Bulk is not
+  atomic across shard RPC units. Post-dispatch spool failures remain
+  indeterminate; failed response reads abort the body.
 
 Evidence:
-`src/api/index/bulk.rs` and
-`tests/rest_api_integration.rs#writes_regression_bulk_delete_and_update_preserve_action_boundaries`.
+`src/api/index/bulk.rs`,
+`src/api/index/bulk/pipeline.rs`,
+`tests/rest_api/bulk_streaming.rs`,
+and `src/api/index/fs014_tests.rs`.
 
 ### Search, count, and partial failures
 

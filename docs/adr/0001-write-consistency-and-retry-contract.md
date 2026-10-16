@@ -684,19 +684,24 @@ Remaining: external versioning remains unimplemented.
 
 ### D12. Bulk semantics
 
-**Status (2026-09-30):** Implemented: strict action/metadata parsing, source
+**Status (2026-10-15):** Implemented: strict action/metadata parsing, source
 line boundaries, all four actions, ordered per-shard execution, and per-item
 outcomes. `_index` overrides on index-scoped bulk requests are honored and
-authorized. Updates use D9; consecutive other actions use one shard RPC.
+authorized. Updates use D9; consecutive other actions use bounded shard RPCs.
 Unconditional index-only runs retain the existing engine batch path; mixed
 or conditional runs execute sequential single-write handlers. Explicit bulk
 refresh is deferred until all shard units finish, with one primary-owned
 round per touched shard (D8), rather than refreshing each item.
 
-Remaining: FS-014's bounded streaming parser, backpressure, cancellation,
-and resource accounting. Request parsing and shard grouping still materialize
-the body. Failure classification and known failure receipts follow implemented
-D4; D2's acknowledgement/exclusion refinements remain proposed.
+FS-014 stages and validates the complete streamed input in protected anonymous
+files, then executes bounded shard units and spools ordered outcomes. Intake,
+target fan-out, response emission, and admitted requests have explicit bounds.
+Handler cancellation stops later work while issued RPCs and blocking I/O retain
+ownership until settlement. Post-dispatch spool failures remain indeterminate;
+corrupt/truncated response storage aborts the body. See
+[bounded bulk ingestion](../bulk-ingestion.md) for limits and evidence.
+Failure classification and known receipts follow D4; FS013 implements D2's
+selected acknowledgement/exclusion policy without claiming general D10.
 
 - **Results:** items return in request order. `errors` is true only when an
   item has an `error` object; delete's `404 not_found` does not set it.

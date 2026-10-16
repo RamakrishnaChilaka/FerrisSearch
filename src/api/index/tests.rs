@@ -6,6 +6,54 @@ use crate::shard::ShardManager;
 use std::sync::Arc;
 use std::time::Duration;
 
+async fn bulk_index(
+    state: State<AppState>,
+    index: Path<crate::common::IndexName>,
+    principal: Option<axum::extract::Extension<crate::security::Principal>>,
+    query: Query<RefreshParam>,
+    body: axum::body::Bytes,
+) -> (StatusCode, Json<Value>) {
+    bulk_json(
+        super::bulk::bulk_index(
+            state,
+            index,
+            principal,
+            query,
+            axum::extract::RawQuery(None),
+            axum::body::Body::from(body),
+        )
+        .await,
+    )
+    .await
+}
+
+async fn bulk_index_global(
+    state: State<AppState>,
+    principal: Option<axum::extract::Extension<crate::security::Principal>>,
+    query: Query<RefreshParam>,
+    body: axum::body::Bytes,
+) -> (StatusCode, Json<Value>) {
+    bulk_json(
+        super::bulk::bulk_index_global(
+            state,
+            principal,
+            query,
+            axum::extract::RawQuery(None),
+            axum::body::Body::from(body),
+        )
+        .await,
+    )
+    .await
+}
+
+async fn bulk_json(response: axum::response::Response) -> (StatusCode, Json<Value>) {
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024 * 1024)
+        .await
+        .unwrap();
+    (status, Json(serde_json::from_slice(&bytes).unwrap()))
+}
+
 #[test]
 fn forwarding_metadata_timeout_is_retryable_but_ambiguous_rpc_timeouts_are_not() {
     for status in [
@@ -255,6 +303,7 @@ async fn make_test_app_state(cluster_state: ClusterState) -> (tempfile::TempDir,
         remote_store_reader_cache: Arc::new(
             crate::engine::remote_store::RemoteSplitReaderCache::default(),
         ),
+        bulk_runtime: Arc::new(crate::api::index::BulkRuntime::default()),
         sql_group_by_scan_limit: 1_000_000,
         sql_approximate_top_k: false,
     };
@@ -298,6 +347,140 @@ async fn empty_bulk_does_not_create_an_index() {
     assert_eq!(body["items"], serde_json::json!([]));
     assert_eq!(body["errors"], false);
     assert!(state.cluster_manager.get_state().indices.is_empty());
+}
+
+#[tokio::test]
+async fn streaming_bulk_late_structural_errors_never_create_indices_or_write() {
+    for tail in [
+        "{\"unknown\":{}}\n",
+        "{\"index\":{\"routing\":\"unsupported\"}}\n{}\n",
+        "{\"update\":{\"_id\":\"missing-source\"}}\n",
+    ] {
+        let (_temporary, state) = make_test_app_state(ClusterState::new("late-bulk".into())).await;
+        let mut input = String::new();
+        for id in 0..600 {
+            input.push_str(&format!(
+                "{{\"index\":{{\"_id\":\"{id}\"}}}}\n{{\"body\":\"valid\"}}\n"
+            ));
+        }
+        input.push_str(tail);
+        let frames = input
+            .as_bytes()
+            .chunks(31)
+            .map(|bytes| Ok::<_, std::io::Error>(axum::body::Bytes::copy_from_slice(bytes)))
+            .collect::<Vec<_>>();
+        let response = super::bulk::bulk_index(
+            State(state.clone()),
+            Path(crate::common::IndexName::new("must-not-exist").unwrap()),
+            None,
+            Query(RefreshParam::default()),
+            axum::extract::RawQuery(None),
+            axum::body::Body::from_stream(futures::stream::iter(frames)),
+        )
+        .await;
+        let (status, Json(body)) = bulk_json(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["type"], "illegal_argument_exception");
+        assert!(state.cluster_manager.get_state().indices.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn streaming_bulk_rejects_admission_before_polling_the_body_and_recovers_after_cancel() {
+    let (_temporary, mut state) =
+        make_test_app_state(ClusterState::new("bulk-admission".into())).await;
+    state.bulk_runtime = Arc::new(
+        crate::api::index::BulkRuntime::new(&crate::config::AppConfig {
+            bulk_max_concurrent_requests: 1,
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let observed = reached.clone();
+    let first_body = axum::body::Body::from_stream(
+        futures::stream::once(async move {
+            observed.notify_one();
+            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"{\"index\":{}}\n"))
+        })
+        .chain(futures::stream::pending()),
+    );
+    let first = tokio::spawn(super::bulk::bulk_index_global(
+        State(state.clone()),
+        None,
+        Query(RefreshParam::default()),
+        axum::extract::RawQuery(None),
+        first_body,
+    ));
+    reached.notified().await;
+    let polled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = polled.clone();
+    let response = super::bulk::bulk_index_global(
+        State(state.clone()),
+        None,
+        Query(RefreshParam::default()),
+        axum::extract::RawQuery(None),
+        axum::body::Body::from_stream(futures::stream::once(async move {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, std::io::Error>(axum::body::Bytes::new())
+        })),
+    )
+    .await;
+    let (status, Json(body)) = bulk_json(response).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["error"]["type"], "es_rejected_execution_exception");
+    assert_eq!(polled.load(std::sync::atomic::Ordering::SeqCst), 0);
+    first.abort();
+    assert!(matches!(first.await, Err(error) if error.is_cancelled()));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let (status, Json(body)) = bulk_index_global(
+                State(state.clone()),
+                None,
+                Query(RefreshParam::default()),
+                axum::body::Bytes::new(),
+            )
+            .await;
+            if status == StatusCode::OK {
+                assert_eq!(body["items"], serde_json::json!([]));
+                break;
+            }
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(state.cluster_manager.get_state().indices.is_empty());
+}
+
+#[tokio::test]
+async fn streaming_bulk_input_and_spool_limits_fail_before_autocreation() {
+    for (input_limit, spool_limit, expected) in [
+        (16, 1024, StatusCode::PAYLOAD_TOO_LARGE),
+        (1024, 16, StatusCode::INSUFFICIENT_STORAGE),
+    ] {
+        let (_temporary, mut state) =
+            make_test_app_state(ClusterState::new("bulk-limits".into())).await;
+        state.bulk_runtime = Arc::new(
+            crate::api::index::BulkRuntime::new(&crate::config::AppConfig {
+                bulk_max_request_bytes: input_limit,
+                bulk_max_spool_bytes: spool_limit,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let (status, Json(body)) = bulk_index(
+            State(state.clone()),
+            Path(crate::common::IndexName::new("must-not-exist").unwrap()),
+            None,
+            Query(RefreshParam::default()),
+            axum::body::Bytes::from_static(b"{\"index\":{\"_id\":\"x\"}}\n{\"body\":\"valid\"}\n"),
+        )
+        .await;
+        assert_eq!(status, expected, "{body}");
+        assert!(state.cluster_manager.get_state().indices.is_empty());
+    }
 }
 
 #[tokio::test]

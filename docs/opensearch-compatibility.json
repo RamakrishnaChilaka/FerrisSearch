@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "matrix_version": "2026-10-13",
-  "source_baseline": "f9457f1",
+  "matrix_version": "2026-10-15",
+  "source_baseline": "d1aa226 + FS-014",
   "product": "FerrisSearch pre-1.0",
   "claim": "OpenSearch-style REST API subset",
   "classifications": {
@@ -280,10 +280,12 @@
       "methods": ["POST"],
       "path": "/_bulk",
       "classification": "partial",
-      "summary": "Materialized NDJSON parser supports index, create, update, and delete with per-item results; unsupported action metadata rejects the whole request before writes.",
+      "summary": "Streamed NDJSON uses protected disk staging, bounded ordered execution, admission, cancellation, and streamed results; malformed or unsupported action metadata rejects the whole request before writes.",
       "evidence": [
         "src/api/index/bulk.rs#bulk_index_global",
-        "tests/rest_api_integration.rs#writes_regression_bulk_delete_and_update_preserve_action_boundaries"
+        "tests/rest_api_integration.rs#writes_regression_bulk_delete_and_update_preserve_action_boundaries",
+        "tests/rest_api/bulk_streaming.rs#fs014_pretty_bulk_response_larger_than_ten_mib_is_not_rebuffered",
+        "src/api/index/fs014_tests.rs#fs014_cancelled_request_retains_issued_rpc_admission_and_stops_later_units"
       ]
     },
     {
@@ -294,7 +296,9 @@
       "summary": "Same bulk subset as /_bulk with the path index as a default; action _index overrides remain authorized and honored.",
       "evidence": [
         "src/api/index/bulk.rs#bulk_index",
-        "tests/rest_api_integration.rs#writes_regression_bulk_order_conflicts_and_missing_delete"
+        "tests/rest_api_integration.rs#writes_regression_bulk_order_conflicts_and_missing_delete",
+        "tests/rest_api/bulk_streaming.rs#fs014_bulk_crosses_batch_boundaries_with_order_occ_retry_ids_and_one_final_visibility",
+        "docs/bulk-ingestion.md"
       ]
     },
     {

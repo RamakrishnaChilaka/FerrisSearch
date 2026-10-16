@@ -7,6 +7,8 @@ use std::sync::atomic::Ordering;
 
 const INDEX: &str = "refresh-copies";
 
+#[path = "fs014_tests.rs"]
+mod fs014;
 #[path = "idempotency_tests.rs"]
 mod idempotency;
 #[path = "refresh_review_tests.rs"]

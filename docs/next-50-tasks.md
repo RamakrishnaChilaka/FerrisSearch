@@ -6,10 +6,11 @@
 >
 > **Current-behavior authority:** source and tests.
 >
-> **Last source audit:** 2026-10-14 for FS-010 and FS-012; 2026-10-13 for FS-003,
+> **Last source audit:** 2026-10-15 for FS-013 and FS-014; 2026-10-14 for FS-010
+> and FS-012; 2026-10-13 for FS-003,
 > FS-004, and FS-011; 2026-10-09 for
-> FS-002; 2026-10-08 for FS-001 and FS-007; 2026-10-05 for FS-013; 2026-09-27
-> for FS-014, FS-019, and FS-022 through FS-026, after
+> FS-002; 2026-10-08 for FS-001 and FS-007; 2026-09-27
+> for FS-019 and FS-022 through FS-026, after
 > PRs #142-#144. Other tasks were last audited on 2026-07-10.
 
 This is a dependency-aware sequence, not a feature wish list. Rank expresses
@@ -461,16 +462,18 @@ restart.
 
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-001, FS-011, FS-012
 
-**Status (2026-10-06):** Acknowledgement-policy design/model slice only. The selected D2/D5/D14
-targets and copy-floor choice have bounded safety, rejection, and progress
-checks in `specs/tla/MC_D2_WriteAck.tla`. Production still fails any required
-replica error. [D4 mutation outcome classes and known failure receipts](adr/0001-write-consistency-and-retry-contract.md#d4-outcome-classes)
-are implemented, but do not close FS-013. No minimum-copy setting,
-success-after-exclusion, restart exclusion-debt reconstruction, or D14
-immediate fail-stop policy has shipped. Those require an approved runtime
-slice and result-level transport/restart tests before this task can close.
+**Status (2026-10-15):** Implemented and merged in PR #179. Request-durable
+writes certify the exact operation on every captured in-sync copy or observe
+a settled conditional Raft exclusion, and honor `minimum_durable_copies`
+before mutation and acknowledgement. Exclusion debt survives restart,
+WAL/post-WAL uncertainty immediately fail-stops the copy, and fresh primary
+incarnations acquire committed canonical authority. Responses distinguish
+data-copy certification from refresh visibility. Transport, real-Raft,
+process-restart, cancellation, and bounded D2/FS013 controls cover the
+supported failure matrix. This does not close general D10 rollback/resync or
+the entire FS-007 failure framework.
 
-**Status (2026-09-27):** Evidence changed.
+**Historical status (2026-09-27):** Evidence changed.
 - Writes now wait only for the Raft-owned in-sync replica set.
 - Any replica failure fails the request, even though the primary already
   mutated.
@@ -483,9 +486,9 @@ slice and result-level transport/restart tests before this task can close.
   timeout. The failure detector removes only nodes that stop pinging the Raft
   leader.
 
-**Evidence:** writes wait for the Raft-authoritative in-sync replicas, global checkpoint
-progress is tied to the slowest replica, and failure after local mutation is
-ambiguous.
+**Historical evidence:** writes waited for every Raft-authoritative in-sync
+replica, global checkpoint progress was tied to the slowest replica, and
+failure after local mutation was ambiguous.
 
 **Outcome:** A documented policy defines required acknowledgements, degraded
 availability, replica exclusion/rejoin, global checkpoint advancement, and
@@ -499,8 +502,26 @@ replicas without false success.
 
 **Class:** Scale blocker | **Gate:** 1 | **Depends on:** FS-001, FS-009
 
-**Status (2026-09-30):** The interim correctness work is implemented. Parsing
-rejects malformed action/metadata lines and missing sources before execution;
+**Status (2026-10-15):** Implemented locally, pending merge. The HTTP handlers
+stage and validate the complete request in protected anonymous files before
+executing bounded coordinator batches and shard RPC units. Ordered results
+are spooled and streamed, including `?pretty`. Per-node admission, body/spool
+limits, idle budgets, and bounded metrics cover intake through file cleanup.
+Cancellation stops later work; owned I/O and issued RPCs retain admission
+until settlement. One final primary-owned refresh covers each mutated shard
+without changing data-copy acknowledgement semantics.
+
+**Completion evidence:** parser/spool boundary tests, streamed REST ordering,
+OCC, operation-ID retry, large pretty responses, and post-write spool failure;
+real-Raft multi-copy, failed-replica range, and actual HTTP-disconnect controls;
+and a 2 GiB logical-input probe with 158.24 MiB added peak child RSS versus
+145.38 MiB for 256 MiB. See [bulk ingestion](bulk-ingestion.md) for the
+workload, hardware, build, reproduction commands, and retained raw evidence.
+These results do not establish a universal process-memory ceiling, general
+request cancellation/deadlines (FS-028/FS-029), or D10 rollback/resync.
+
+**Historical status (2026-09-30):** The interim correctness work is
+implemented. Parsing rejects malformed action/metadata lines and missing sources before execution;
 invalid JSON sources retain their item positions as 400 errors. Index, create,
 delete, and update execute in request order per shard, with real per-item
 results and conditions. Index-scoped `_index` overrides are honored and
@@ -508,8 +529,8 @@ authorized. Evidence: `writes_regression_*` REST tests and replicated mixed
 bulk coverage. Streaming, bounded memory, admission/backpressure, and
 cancellation remain open; this is not completion of FS-014.
 
-**Integration note (2026-09-30):** Shard action runs now move their document
-sources and serialize borrowed envelopes. Bulk update retains the same
+**Historical integration note (2026-09-30):** Shard action runs now move their
+document sources and serialize borrowed envelopes. Bulk update retains the same
 incarnation-pinned CAS logic as single update. Parsing/grouping remain
 materialized; these ownership changes do not implement bounded streaming.
 
@@ -530,8 +551,8 @@ An interim mitigation does not depend on FS-001 or FS-009:
   does.
 - Reject well-formed but unsupported actions per item.
 
-**Evidence:** bulk parsing/routing materializes request text, action pairs, and
-per-shard collections before execution.
+**Historical evidence (before FS-014):** bulk parsing/routing materializes
+request text, action pairs, and per-shard collections before execution.
 
 **Outcome:** A bounded NDJSON parser validates action/document pairs
 incrementally, applies auth/index checks, routes bounded shard batches, and

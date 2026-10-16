@@ -105,6 +105,78 @@ pub static BULK_REQUESTS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     counter
 });
 
+pub(crate) static BULK_ACTIVE_REQUESTS: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "ferrissearch_bulk_active_requests",
+        "Bulk request leases retained by intake, execution, response, or cleanup",
+    )
+    .expect("metric: bulk_active_requests");
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register: bulk_active_requests");
+    gauge
+});
+
+pub(crate) static BULK_SPOOL_RESERVED_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "ferrissearch_bulk_spool_reserved_bytes",
+        "Input/result spool bytes reserved until their anonymous files are closed",
+    )
+    .expect("metric: bulk_spool_reserved_bytes");
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register: bulk_spool_reserved_bytes");
+    gauge
+});
+
+pub(crate) static BULK_ADMISSION_REJECTIONS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "ferrissearch_bulk_admission_rejections_total",
+        "Bulk requests rejected before body polling because admission is exhausted",
+    )
+    .expect("metric: bulk_admission_rejections_total");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: bulk_admission_rejections_total");
+    counter
+});
+
+pub(crate) static BULK_STAGED_INPUT_BYTES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "ferrissearch_bulk_staged_input_bytes_total",
+        "HTTP bulk input bytes staged before execution",
+    )
+    .expect("metric: bulk_staged_input_bytes_total");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: bulk_staged_input_bytes_total");
+    counter
+});
+
+pub(crate) static BULK_EXECUTION_BATCHES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "ferrissearch_bulk_execution_batches_total",
+        "Bounded coordinator bulk batches submitted for item execution",
+    )
+    .expect("metric: bulk_execution_batches_total");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: bulk_execution_batches_total");
+    counter
+});
+
+pub(crate) static BULK_CANCELLED_REQUESTS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "ferrissearch_bulk_cancelled_requests_total",
+        "Bulk leases released without a completed response or explicit API failure",
+    )
+    .expect("metric: bulk_cancelled_requests_total");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: bulk_cancelled_requests_total");
+    counter
+});
+
 pub static BULK_DOCS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     let counter = IntCounter::new(
         "ferrissearch_bulk_docs_total",
@@ -463,6 +535,12 @@ fn initialize_metrics() {
     let _ = &*SEARCH_LATENCY_SECONDS;
     let _ = &*DOCS_INDEXED_TOTAL;
     let _ = &*BULK_REQUESTS_TOTAL;
+    let _ = &*BULK_ACTIVE_REQUESTS;
+    let _ = &*BULK_SPOOL_RESERVED_BYTES;
+    let _ = &*BULK_ADMISSION_REJECTIONS_TOTAL;
+    let _ = &*BULK_STAGED_INPUT_BYTES_TOTAL;
+    let _ = &*BULK_EXECUTION_BATCHES_TOTAL;
+    let _ = &*BULK_CANCELLED_REQUESTS_TOTAL;
     let _ = &*BULK_DOCS_TOTAL;
     let _ = &*INDEX_LATENCY_SECONDS;
     let _ = &*WRITE_CERTIFICATIONS_TOTAL;

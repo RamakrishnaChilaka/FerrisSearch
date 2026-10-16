@@ -3,6 +3,14 @@
 use super::*;
 use crate::engine::WriteCondition;
 use crate::transport::proto::{ShardBulkItemResponse, ShardBulkOpKind, ShardBulkOperation};
+use axum::body::Body;
+use axum::extract::RawQuery;
+use axum::response::{IntoResponse, Response};
+use pipeline::{BulkError, StoredResult};
+
+mod parser;
+mod pipeline;
+pub use pipeline::BulkRuntime;
 
 #[derive(Debug)]
 pub(super) struct BulkDoc {
@@ -167,123 +175,103 @@ fn wire_item_json(index: &str, shard: u32, item: ShardBulkItemResponse) -> Value
     result
 }
 
+fn parse_bulk_action(action_line: &str, line: u64, item: usize) -> Result<BulkDoc, String> {
+    let malformed = |reason: String| format!("Malformed action/metadata line [{line}]: {reason}");
+    let value: Value =
+        serde_json::from_str(action_line).map_err(|error| malformed(error.to_string()))?;
+    let object = value
+        .as_object()
+        .filter(|object| object.len() == 1)
+        .ok_or_else(|| {
+            malformed("expected exactly one action [index, create, update, delete]".into())
+        })?;
+    let (action, metadata) = object.iter().next().expect("one action");
+    if !matches!(action.as_str(), "index" | "create" | "update" | "delete") {
+        return Err(malformed(format!("unknown action [{action}]")));
+    }
+    let metadata = metadata
+        .as_object()
+        .ok_or_else(|| malformed(format!("action [{action}] must contain an object")))?;
+    for (name, value) in metadata {
+        if matches!(name.as_str(), "if_seq_no" | "if_primary_term")
+            || (name == "retry_on_conflict" && action == "update")
+            || name == "_operation_id"
+        {
+            continue;
+        }
+        let scalar = value
+            .as_str()
+            .or_else(|| (value.as_u64() == Some(1)).then_some("1"));
+        validate_write_parameter(name, scalar)
+            .map_err(|reason| malformed(format!("bulk item [{item}]: {reason}")))?;
+    }
+    let string = |key: &str| -> Result<Option<String>, String> {
+        metadata
+            .get(key)
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| malformed(format!("[{key}] must be a string")))
+            })
+            .transpose()
+    };
+    let number = |key: &str| -> Result<Option<u64>, String> {
+        metadata
+            .get(key)
+            .map(|value| {
+                value
+                    .as_u64()
+                    .ok_or_else(|| malformed(format!("[{key}] must be a non-negative integer")))
+            })
+            .transpose()
+    };
+    let condition =
+        WriteCondition::from_optional_values(number("if_seq_no")?, number("if_primary_term")?)
+            .map_err(|error| malformed(error.to_string()))?;
+    if action == "create" && condition != WriteCondition::Unconditional {
+        return Err(malformed(
+            "create operations cannot use if_seq_no or if_primary_term".into(),
+        ));
+    }
+    let retries = number("retry_on_conflict")?.unwrap_or(0);
+    let retry_on_conflict = u32::try_from(retries)
+        .map_err(|_| malformed("retry_on_conflict exceeds the supported range".into()))?;
+    let operation_id = string("_operation_id")?;
+    if let Some(operation_id) = operation_id.as_deref() {
+        crate::engine::ClientOperationIntent::validate_id(operation_id)
+            .map_err(|error| malformed(error.to_string()))?;
+    }
+    let doc_id = match string("_id")? {
+        Some(doc_id) => doc_id,
+        None if matches!(action.as_str(), "index" | "create") => match operation_id.as_deref() {
+            Some(operation_id) => {
+                crate::engine::ClientOperationIntent::stable_document_id(operation_id)
+                    .map_err(|error| malformed(error.to_string()))?
+            }
+            None => uuid::Uuid::new_v4().to_string(),
+        },
+        None => String::new(),
+    };
+    let index = string("_index")?;
+    Ok(BulkDoc {
+        action: action.clone(),
+        doc_id,
+        index,
+        payload: Value::Null,
+        condition,
+        retry_on_conflict,
+        operation_id,
+        source_error: None,
+    })
+}
+
+#[cfg(test)]
 pub(super) fn parse_bulk_ndjson(text: &str) -> Result<Vec<BulkDoc>, String> {
+    let mut decoder = parser::BulkDecoder::new(std::io::Cursor::new(text));
     let mut documents = Vec::new();
-    let mut lines = text
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty());
-    while let Some((line, action_line)) = lines.next() {
-        let line = line + 1;
-        let malformed =
-            |reason: String| format!("Malformed action/metadata line [{line}]: {reason}");
-        let value: Value =
-            serde_json::from_str(action_line).map_err(|error| malformed(error.to_string()))?;
-        let object = value
-            .as_object()
-            .filter(|object| object.len() == 1)
-            .ok_or_else(|| {
-                malformed("expected exactly one action [index, create, update, delete]".into())
-            })?;
-        let (action, metadata) = object.iter().next().expect("one action");
-        if !matches!(action.as_str(), "index" | "create" | "update" | "delete") {
-            return Err(malformed(format!("unknown action [{action}]")));
-        }
-        let metadata = metadata
-            .as_object()
-            .ok_or_else(|| malformed(format!("action [{action}] must contain an object")))?;
-        for (name, value) in metadata {
-            if matches!(name.as_str(), "if_seq_no" | "if_primary_term")
-                || (name == "retry_on_conflict" && action == "update")
-                || name == "_operation_id"
-            {
-                continue;
-            }
-            let scalar = value
-                .as_str()
-                .or_else(|| (value.as_u64() == Some(1)).then_some("1"));
-            validate_write_parameter(name, scalar).map_err(|reason| {
-                malformed(format!("bulk item [{}]: {reason}", documents.len() + 1))
-            })?;
-        }
-        let string = |key: &str| -> Result<Option<String>, String> {
-            metadata
-                .get(key)
-                .map(|value| {
-                    value
-                        .as_str()
-                        .map(str::to_string)
-                        .ok_or_else(|| malformed(format!("[{key}] must be a string")))
-                })
-                .transpose()
-        };
-        let number = |key: &str| -> Result<Option<u64>, String> {
-            metadata
-                .get(key)
-                .map(|value| {
-                    value
-                        .as_u64()
-                        .ok_or_else(|| malformed(format!("[{key}] must be a non-negative integer")))
-                })
-                .transpose()
-        };
-        let condition =
-            WriteCondition::from_optional_values(number("if_seq_no")?, number("if_primary_term")?)
-                .map_err(|error| malformed(error.to_string()))?;
-        if action == "create" && condition != WriteCondition::Unconditional {
-            return Err(malformed(
-                "create operations cannot use if_seq_no or if_primary_term".into(),
-            ));
-        }
-        let retries = number("retry_on_conflict")?.unwrap_or(0);
-        let retry_on_conflict = u32::try_from(retries)
-            .map_err(|_| malformed("retry_on_conflict exceeds the supported range".into()))?;
-        let operation_id = string("_operation_id")?;
-        if let Some(operation_id) = operation_id.as_deref() {
-            crate::engine::ClientOperationIntent::validate_id(operation_id)
-                .map_err(|error| malformed(error.to_string()))?;
-        }
-        let doc_id = match string("_id")? {
-            Some(doc_id) => doc_id,
-            None if matches!(action.as_str(), "index" | "create") => {
-                match operation_id.as_deref() {
-                    Some(operation_id) => {
-                        crate::engine::ClientOperationIntent::stable_document_id(operation_id)
-                            .map_err(|error| malformed(error.to_string()))?
-                    }
-                    None => uuid::Uuid::new_v4().to_string(),
-                }
-            }
-            None => String::new(),
-        };
-        let index = string("_index")?;
-        let (payload, source_error) = if action == "delete" {
-            (Value::Null, None)
-        } else {
-            let (source_line, source) = lines
-                .next()
-                .ok_or_else(|| malformed(format!("action [{action}] requires a source line")))?;
-            match serde_json::from_str(source) {
-                Ok(payload) => (payload, None),
-                Err(error) => (
-                    Value::Null,
-                    Some(format!(
-                        "Malformed source line [{}]: {error}",
-                        source_line + 1
-                    )),
-                ),
-            }
-        };
-        documents.push(BulkDoc {
-            action: action.clone(),
-            doc_id,
-            index,
-            payload,
-            condition,
-            retry_on_conflict,
-            operation_id,
-            source_error,
-        });
+    while let Some(document) = decoder.next_document().map_err(|error| error.to_string())? {
+        documents.push(document);
     }
     Ok(documents)
 }
@@ -355,9 +343,9 @@ async fn forward_bulk_batches(
     state: &AppState,
     cluster_state: &crate::cluster::state::ClusterState,
     routed_docs: &mut [RoutedBulkDoc],
-    refresh: bool,
+    lease: &pipeline::RequestLease,
 ) -> BulkTargetResults {
-    let mut batches: HashMap<BulkTargetKey, Vec<&mut RoutedBulkDoc>> = HashMap::new();
+    let mut batches: HashMap<BulkTargetKey, Vec<RoutedBulkDoc>> = HashMap::new();
     for document in routed_docs {
         batches
             .entry((
@@ -366,9 +354,20 @@ async fn forward_bulk_batches(
                 document.shard_id,
             ))
             .or_default()
-            .push(document);
+            .push(RoutedBulkDoc {
+                position: document.position,
+                index_name: document.index_name.clone(),
+                doc_id: document.doc_id.clone(),
+                payload: document.payload.take(),
+                shard_id: document.shard_id,
+                node_id: document.node_id.clone(),
+                action: document.action.clone(),
+                condition: document.condition,
+                retry_on_conflict: document.retry_on_conflict,
+                operation_id: document.operation_id.clone(),
+            });
     }
-    join_all(batches.into_iter().map(|(key, mut batch)| async move {
+    stream::iter(batches.into_iter().map(|(key, mut batch)| async move {
         let Some(node) = cluster_state.nodes.get(&key.1) else {
             return (
                 key,
@@ -383,10 +382,29 @@ async fn forward_bulk_batches(
         let mut results = Vec::with_capacity(batch.len());
         let mut cursor = 0;
         while cursor < batch.len() {
-            let document = &mut *batch[cursor];
+            if lease.is_cancelled() {
+                let failure = BulkTargetFailure::from_forward_error(
+                    crate::transport::write_failure::WriteFailure::not_executed(
+                        "Bulk request cancelled before this shard unit was dispatched",
+                    )
+                    .into(),
+                );
+                for document in &batch[cursor..] {
+                    let item = failure.item(
+                        &document.action,
+                        &document.index_name,
+                        &document.doc_id,
+                        0,
+                        1,
+                    );
+                    results.push(item[&document.action].clone());
+                }
+                break;
+            }
+            let document = &mut batch[cursor];
             if document.action == "update" {
                 let (if_seq_no, if_primary_term) = document.condition.expected_version();
-                let (status, Json(mut response)) = execute_update(
+                let (status, Json(mut response)) = execute_update_cancellable(
                     state,
                     &document.index_name,
                     &document.doc_id,
@@ -399,6 +417,7 @@ async fn forward_bulk_batches(
                         operation_id: document.operation_id.clone(),
                         ..UpdateParams::default()
                     },
+                    Some(lease.cancellation_flag()),
                 )
                 .await;
                 response["status"] = serde_json::json!(status.as_u16());
@@ -409,7 +428,10 @@ async fn forward_bulk_batches(
                 continue;
             }
             let start = cursor;
-            while cursor < batch.len() && batch[cursor].action != "update" {
+            while cursor < batch.len()
+                && batch[cursor].action != "update"
+                && cursor - start < pipeline::RPC_ITEMS
+            {
                 cursor += 1;
             }
             let run = &mut batch[start..cursor];
@@ -475,21 +497,11 @@ async fn forward_bulk_batches(
                 }
             }
         }
-        if refresh && results.iter().any(is_acknowledged_mutation) {
-            let report = refresh_bulk_target(state, cluster_state, &key, &results).await;
-            for item in &mut results {
-                if item.get("error").is_none() {
-                    crate::transport::write_refresh::add_write_refresh_to_response(
-                        item, &key.0, key.2, &report,
-                    );
-                }
-            }
-        }
         (key, Ok(results))
     }))
-    .await
-    .into_iter()
+    .buffer_unordered(8)
     .collect()
+    .await
 }
 
 fn is_acknowledged_mutation(item: &Value) -> bool {
@@ -503,7 +515,7 @@ async fn refresh_bulk_target(
     state: &AppState,
     cluster_state: &crate::cluster::state::ClusterState,
     key: &BulkTargetKey,
-    results: &[Value],
+    primary_term: u64,
 ) -> crate::transport::proto::ShardWriteRefreshResult {
     let allocation = cluster_state
         .shard_allocation_id(&key.0, key.2, &key.1)
@@ -517,12 +529,6 @@ async fn refresh_bulk_target(
             .nodes
             .get(&key.1)
             .ok_or_else(|| anyhow::anyhow!("bulk refresh primary node [{}] is missing", key.1))?;
-        let term = results
-            .iter()
-            .rev()
-            .find(|item| is_acknowledged_mutation(item))
-            .and_then(|item| item["_primary_term"].as_u64())
-            .ok_or_else(|| anyhow::anyhow!("bulk refresh has no acknowledged primary term"))?;
         let allocation = allocation
             .ok_or_else(|| anyhow::anyhow!("bulk refresh primary allocation is missing"))?;
         state
@@ -534,7 +540,7 @@ async fn refresh_bulk_target(
                     index_uuid: metadata.uuid.to_string(),
                     shard_id: key.2,
                     primary_node_id: key.1.clone(),
-                    primary_term: Some(term),
+                    primary_term: Some(primary_term),
                     target_allocation_id: Some(allocation),
                 },
             )
@@ -635,12 +641,11 @@ pub(super) fn finalize_bulk_items(
         .collect()
 }
 
-async fn bulk_metadata(
+fn authorize_bulk_index(
     state: &AppState,
-    cluster_state: &crate::cluster::state::ClusterState,
     principal: Option<&crate::security::Principal>,
     index: &str,
-) -> Result<IndexMetadata, BulkTargetFailure> {
+) -> Result<(), BulkTargetFailure> {
     if crate::security::is_protected_system_index(index) {
         return Err(BulkTargetFailure {
             status: StatusCode::FORBIDDEN,
@@ -671,7 +676,16 @@ async fn bulk_metadata(
             error_type: error.error_type.into(),
             reason: error.reason.to_string(),
             failure: None,
-        })?;
+        })
+}
+
+async fn bulk_metadata(
+    state: &AppState,
+    cluster_state: &crate::cluster::state::ClusterState,
+    principal: Option<&crate::security::Principal>,
+    index: &str,
+) -> Result<IndexMetadata, BulkTargetFailure> {
+    authorize_bulk_index(state, principal, index)?;
     let current;
     let cluster_state = if cluster_state.indices.contains_key(index) {
         cluster_state
@@ -693,82 +707,75 @@ async fn bulk_metadata(
     Ok(metadata)
 }
 
-async fn execute_bulk(
-    state: &AppState,
-    principal: Option<&crate::security::Principal>,
-    default_index: Option<&str>,
-    refresh: &RefreshParam,
-    body: &[u8],
-) -> (StatusCode, Json<Value>) {
-    if let Err(response) = refresh.validate() {
-        return response;
+struct BulkExecution {
+    state: AppState,
+    principal: Option<crate::security::Principal>,
+    default_index: Option<String>,
+    refresh: bool,
+    cluster_state: crate::cluster::state::ClusterState,
+    metadata: HashMap<String, Result<IndexMetadata, BulkTargetFailure>>,
+    targets: HashMap<BulkTargetKey, Option<u64>>,
+    dispatched: bool,
+    lease: Arc<pipeline::RequestLease>,
+}
+
+impl BulkExecution {
+    async fn owned_batch(
+        mut self,
+        documents: Vec<BulkDoc>,
+    ) -> Result<(Self, Vec<StoredResult>), BulkError> {
+        Ok(tokio::spawn(async move {
+            let results = self.batch(documents).await;
+            (self, results)
+        })
+        .await?)
     }
-    let text = match std::str::from_utf8(body) {
-        Ok(text) => text,
-        Err(error) => return illegal_argument(format!("Invalid UTF-8 bulk body: {error}")),
-    };
-    let documents = match parse_bulk_ndjson(text) {
-        Ok(documents) => documents,
-        Err(error) => return illegal_argument(error),
-    };
-    if documents.is_empty() {
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({"took": 0, "errors": false, "items": []})),
-        );
-    }
-    let mut cluster_state = state.cluster_manager.get_state();
-    if let Some(index) = default_index
-        && let Some(metadata) = cluster_state.indices.get(index)
-        && documents
-            .iter()
-            .all(|document| document.index.as_deref().unwrap_or(index) == index)
-        && let Some(response) = crate::api::reject_write_if_engine_read_only(metadata)
-    {
-        return response;
-    }
-    let mut items = vec![None; documents.len()];
-    let mut metadata: HashMap<String, Result<IndexMetadata, BulkTargetFailure>> = HashMap::new();
-    let mut routed = Vec::new();
-    for (position, document) in documents.into_iter().enumerate() {
-        let index = document
-            .index
-            .as_deref()
-            .map(str::to_owned)
-            .or_else(|| default_index.map(str::to_string));
-        if let Err(response) = validate_bulk_document(&document) {
-            let failure = BulkTargetFailure::from_api_response(response);
-            items[position] = Some(bulk_error_item(
-                &document.action,
-                index.as_deref(),
-                &document.doc_id,
-                failure.status,
-                &failure.error_type,
-                &failure.reason,
-            ));
-            continue;
-        }
-        let Some(index) = index else {
-            items[position] = Some(bulk_error_item(
-                &document.action,
-                None,
-                &document.doc_id,
-                StatusCode::BAD_REQUEST,
-                "action_request_validation_exception",
-                "bulk action metadata must include _index",
-            ));
-            continue;
-        };
-        if !metadata.contains_key(&index) {
-            metadata.insert(
-                index.clone(),
-                bulk_metadata(state, &cluster_state, principal, &index).await,
-            );
-            cluster_state = state.cluster_manager.get_state();
-        }
-        let index_metadata = match &metadata[&index] {
-            Ok(metadata) => metadata,
-            Err(failure) => {
+
+    async fn batch(&mut self, documents: Vec<BulkDoc>) -> Vec<StoredResult> {
+        let mut items = vec![None; documents.len()];
+        let mut routed = Vec::new();
+        for (position, document) in documents.into_iter().enumerate() {
+            if self.lease.is_cancelled() {
+                items[position] = Some(bulk_error_item(
+                    &document.action,
+                    document.index.as_deref().or(self.default_index.as_deref()),
+                    &document.doc_id,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "task_cancelled_exception",
+                    "Bulk request cancelled before metadata lookup or mutation",
+                ));
+                continue;
+            }
+            let index = document
+                .index
+                .as_deref()
+                .map(str::to_owned)
+                .or_else(|| self.default_index.clone());
+            if let Err(response) = validate_bulk_document(&document) {
+                let failure = BulkTargetFailure::from_api_response(response);
+                items[position] = Some(bulk_error_item(
+                    &document.action,
+                    index.as_deref(),
+                    &document.doc_id,
+                    failure.status,
+                    &failure.error_type,
+                    &failure.reason,
+                ));
+                continue;
+            }
+            let Some(index) = index else {
+                items[position] = Some(bulk_error_item(
+                    &document.action,
+                    None,
+                    &document.doc_id,
+                    StatusCode::BAD_REQUEST,
+                    "action_request_validation_exception",
+                    "bulk action metadata must include _index",
+                ));
+                continue;
+            };
+            if let Err(failure) = authorize_bulk_index(&self.state, self.principal.as_ref(), &index)
+            {
                 items[position] = Some(bulk_error_item(
                     &document.action,
                     Some(&index),
@@ -779,47 +786,278 @@ async fn execute_bulk(
                 ));
                 continue;
             }
-        };
-        match route_bulk_doc(
-            position,
-            index,
-            document.doc_id,
-            document.payload,
-            index_metadata,
-            &cluster_state,
-        ) {
-            Ok(mut target) => {
-                target.action = document.action;
-                target.condition = document.condition;
-                target.retry_on_conflict = document.retry_on_conflict;
-                target.operation_id = document.operation_id;
-                routed.push(target);
+            if !self.metadata.contains_key(&index) {
+                self.metadata.insert(
+                    index.clone(),
+                    bulk_metadata(
+                        &self.state,
+                        &self.cluster_state,
+                        self.principal.as_ref(),
+                        &index,
+                    )
+                    .await,
+                );
+                self.cluster_state = self.state.cluster_manager.get_state();
             }
-            Err(item) => {
-                let result = item["index"].clone();
-                items[position] = Some(serde_json::json!({(document.action): result}));
+            let index_metadata = match &self.metadata[&index] {
+                Ok(metadata) => metadata,
+                Err(failure) => {
+                    items[position] = Some(bulk_error_item(
+                        &document.action,
+                        Some(&index),
+                        &document.doc_id,
+                        failure.status,
+                        &failure.error_type,
+                        &failure.reason,
+                    ));
+                    continue;
+                }
+            };
+            match route_bulk_doc(
+                position,
+                index,
+                document.doc_id,
+                document.payload,
+                index_metadata,
+                &self.cluster_state,
+            ) {
+                Ok(mut target) => {
+                    if self.refresh {
+                        let key = (
+                            target.index_name.clone(),
+                            target.node_id.clone(),
+                            target.shard_id,
+                        );
+                        if !self.targets.contains_key(&key)
+                            && self.targets.len() == pipeline::MAX_TARGETS
+                        {
+                            items[position] = Some(bulk_error_item(
+                                &document.action,
+                                Some(&target.index_name),
+                                &target.doc_id,
+                                StatusCode::TOO_MANY_REQUESTS,
+                                "es_rejected_execution_exception",
+                                format!(
+                                    "Bulk refresh exceeds {} distinct shard targets",
+                                    pipeline::MAX_TARGETS
+                                ),
+                            ));
+                            continue;
+                        }
+                        self.targets.entry(key).or_insert(None);
+                    }
+                    target.action = document.action;
+                    target.condition = document.condition;
+                    target.retry_on_conflict = document.retry_on_conflict;
+                    target.operation_id = document.operation_id;
+                    routed.push(target);
+                }
+                Err(item) => {
+                    let result = item["index"].clone();
+                    items[position] = Some(serde_json::json!({(document.action): result}));
+                }
             }
         }
+        let positions = routed
+            .iter()
+            .map(|document| {
+                (
+                    document.position,
+                    (
+                        document.index_name.clone(),
+                        document.node_id.clone(),
+                        document.shard_id,
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        if !routed.is_empty() {
+            self.dispatched = true;
+        }
+        let outcomes =
+            forward_bulk_batches(&self.state, &self.cluster_state, &mut routed, &self.lease).await;
+        if self.refresh {
+            for (key, outcome) in &outcomes {
+                if let Ok(results) = outcome
+                    && let Some(term) = results
+                        .iter()
+                        .rev()
+                        .find(|item| is_acknowledged_mutation(item))
+                        .and_then(|item| item["_primary_term"].as_u64())
+                {
+                    *self.targets.get_mut(key).expect("tracked bulk target") = Some(term);
+                }
+            }
+        }
+        let mut results = finalize_bulk_items(items, routed, &outcomes)
+            .into_iter()
+            .map(|item| StoredResult { item, target: None })
+            .collect::<Vec<_>>();
+        for (position, key) in positions {
+            results[position].target = Some(key);
+        }
+        results
     }
-    let outcomes =
-        forward_bulk_batches(state, &cluster_state, &mut routed, refresh.should_refresh()).await;
-    let items = finalize_bulk_items(items, routed, &outcomes);
-    let errors = items.iter().any(|item| {
-        item.as_object()
-            .is_some_and(|object| object.values().any(|result| result.get("error").is_some()))
-    });
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"took": 0, "errors": errors, "items": items})),
-    )
+
+    async fn refresh_reports(
+        self,
+    ) -> Result<HashMap<BulkTargetKey, crate::transport::proto::ShardWriteRefreshResult>, BulkError>
+    {
+        Ok(tokio::spawn(async move {
+            let targets = self
+                .targets
+                .iter()
+                .filter_map(|(key, term)| term.map(|term| (key.clone(), term)))
+                .collect::<Vec<_>>();
+            let state = &self.state;
+            let cluster_state = &self.cluster_state;
+            let lease = &self.lease;
+            stream::iter(targets)
+                .map(|(key, term)| async move {
+                    let report = if lease.is_cancelled() {
+                        crate::transport::proto::ShardWriteRefreshResult {
+                            copies: vec![crate::transport::write_refresh::copy_refresh_failure(
+                                &key.1,
+                                cluster_state.shard_allocation_id(&key.0, key.2, &key.1),
+                                true,
+                                "Bulk request cancelled before final visibility dispatch"
+                                    .to_string(),
+                            )],
+                        }
+                    } else {
+                        refresh_bulk_target(state, cluster_state, &key, term).await
+                    };
+                    (key, report)
+                })
+                .buffer_unordered(8)
+                .collect()
+                .await
+        })
+        .await?)
+    }
+}
+
+async fn execute_bulk(
+    state: &AppState,
+    principal: Option<&crate::security::Principal>,
+    default_index: Option<&str>,
+    refresh: &RefreshParam,
+    pretty: bool,
+    body: Body,
+) -> Response {
+    if let Err(response) = refresh.validate() {
+        return response.into_response();
+    }
+    let refresh = refresh.should_refresh();
+    let lease = match state.bulk_runtime.acquire() {
+        Ok(lease) => lease,
+        Err(error) => return error.response(false, 0),
+    };
+    let mut scope = pipeline::RequestScope::new(lease.clone());
+    let mut dispatched = false;
+    let mut completed_items = 0;
+    let result: Result<Response, BulkError> = async {
+        let staged = pipeline::stage(
+            body,
+            state.shard_manager.data_dir().to_path_buf(),
+            default_index.map(str::to_string),
+            &state.bulk_runtime,
+            lease.clone(),
+        )
+        .await?;
+        if staged.item_count == 0 {
+            lease.complete();
+            return Ok((
+                StatusCode::OK,
+                Json(serde_json::json!({"took": 0, "errors": false, "items": []})),
+            )
+                .into_response());
+        }
+        let cluster_state = state.cluster_manager.get_state();
+        if let Some(index) = default_index
+            && staged.only_default_index
+            && let Some(metadata) = cluster_state.indices.get(index)
+            && let Some(response) = crate::api::reject_write_if_engine_read_only(metadata)
+        {
+            lease.fail();
+            return Ok(response.into_response());
+        }
+        let mut decoder = staged.decoder;
+        let mut spool =
+            pipeline::result_spool(state.shard_manager.data_dir().to_path_buf(), lease.clone())
+                .await?;
+        let mut execution = BulkExecution {
+            state: state.clone(),
+            principal: principal.cloned(),
+            default_index: default_index.map(str::to_string),
+            refresh,
+            cluster_state,
+            metadata: HashMap::new(),
+            targets: HashMap::new(),
+            dispatched: false,
+            lease: lease.clone(),
+        };
+        let mut errors = false;
+        loop {
+            let (next, documents) = pipeline::next_batch(decoder).await?;
+            decoder = next;
+            if documents.is_empty() {
+                break;
+            }
+            crate::metrics::BULK_EXECUTION_BATCHES_TOTAL.inc();
+            dispatched = true;
+            let (next_execution, results) = execution.owned_batch(documents).await?;
+            execution = next_execution;
+            dispatched = execution.dispatched;
+            errors |= results.iter().any(|result| {
+                result
+                    .item
+                    .as_object()
+                    .is_some_and(|object| object.values().any(|item| item.get("error").is_some()))
+            });
+            let count = results.len() as u64;
+            spool = pipeline::store_results(spool, results).await?;
+            completed_items += count;
+        }
+        drop(decoder);
+        if completed_items != staged.item_count {
+            return Err(BulkError::Io(std::io::Error::other(format!(
+                "Bulk spool item count changed: expected {}, completed {completed_items}",
+                staged.item_count
+            ))));
+        }
+        let reports = execution.refresh_reports().await?;
+        let spool = pipeline::finish_results(spool).await?;
+        Ok(pipeline::response(
+            spool,
+            reports,
+            errors,
+            pretty,
+            &state.bulk_runtime,
+            lease.clone(),
+        ))
+    }
+    .await;
+    match result {
+        Ok(response) => {
+            scope.handoff();
+            response
+        }
+        Err(error) => {
+            lease.fail();
+            tracing::error!(error = %error, dispatched, completed_items, "Bulk pipeline failed");
+            error.response(dispatched, completed_items)
+        }
+    }
 }
 
 pub async fn bulk_index_global(
     State(state): State<AppState>,
     principal: Option<axum::extract::Extension<crate::security::Principal>>,
     Query(refresh): Query<RefreshParam>,
-    body: axum::body::Bytes,
-) -> (StatusCode, Json<Value>) {
+    RawQuery(query): RawQuery,
+    body: Body,
+) -> Response {
     let _timer = crate::metrics::INDEX_LATENCY_SECONDS.start_timer();
     crate::metrics::BULK_REQUESTS_TOTAL.inc();
     execute_bulk(
@@ -827,7 +1065,8 @@ pub async fn bulk_index_global(
         principal.as_ref().map(|principal| &principal.0),
         None,
         &refresh,
-        &body,
+        crate::api::wants_pretty(query.as_deref()),
+        body,
     )
     .await
 }
@@ -837,8 +1076,9 @@ pub async fn bulk_index(
     Path(index): Path<crate::common::IndexName>,
     principal: Option<axum::extract::Extension<crate::security::Principal>>,
     Query(refresh): Query<RefreshParam>,
-    body: axum::body::Bytes,
-) -> (StatusCode, Json<Value>) {
+    RawQuery(query): RawQuery,
+    body: Body,
+) -> Response {
     let _timer = crate::metrics::INDEX_LATENCY_SECONDS.start_timer();
     crate::metrics::BULK_REQUESTS_TOTAL.inc();
     execute_bulk(
@@ -846,7 +1086,8 @@ pub async fn bulk_index(
         principal.as_ref().map(|principal| &principal.0),
         Some(&index),
         &refresh,
-        &body,
+        crate::api::wants_pretty(query.as_deref()),
+        body,
     )
     .await
 }

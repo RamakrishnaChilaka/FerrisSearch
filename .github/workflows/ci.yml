@@ -65,6 +65,10 @@ jobs:
         timeout-minutes: 5
         run: ./scripts/tla/test_d1_protocol_trace_ci.sh
 
+      - name: Validate bulk cancellation and multi-copy boundaries
+        timeout-minutes: 3
+        run: cargo test --features protocol-trace --lib fs014
+
   tla-model-check:
     runs-on: ubuntu-latest
     timeout-minutes: 15

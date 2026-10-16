@@ -4015,6 +4015,7 @@ async fn writes_regression_conditional_rest_updates_and_mixed_bulk_keep_replica_
         remote_store_reader_cache: Arc::new(
             ferrissearch::engine::remote_store::RemoteSplitReaderCache::default(),
         ),
+        bulk_runtime: Arc::new(ferrissearch::api::index::BulkRuntime::default()),
         sql_group_by_scan_limit: 1_000_000,
         sql_approximate_top_k: false,
     };

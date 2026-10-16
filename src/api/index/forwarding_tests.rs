@@ -66,6 +66,21 @@ impl ForwardingCluster {
     }
 
     async fn start_with_roles(roles: &[Vec<NodeRole>]) -> Self {
+        Self::start_with_roles_and_bulk_limit(
+            roles,
+            crate::config::AppConfig::default().bulk_max_concurrent_requests,
+        )
+        .await
+    }
+
+    async fn start_with_roles_and_bulk_limit(
+        roles: &[Vec<NodeRole>],
+        bulk_max_concurrent_requests: usize,
+    ) -> Self {
+        let config = crate::config::AppConfig {
+            bulk_max_concurrent_requests,
+            ..Default::default()
+        };
         let gate = Arc::new(TestApplyGate::default());
         let leader_gate = Arc::new(TestApplyGate::default());
         let mut nodes = Vec::new();
@@ -119,6 +134,7 @@ impl ForwardingCluster {
                 remote_store_reader_cache: Arc::new(
                     crate::engine::remote_store::RemoteSplitReaderCache::default(),
                 ),
+                bulk_runtime: Arc::new(crate::api::index::BulkRuntime::new(&config).unwrap()),
                 sql_group_by_scan_limit: 1_000_000,
                 sql_approximate_top_k: false,
             };

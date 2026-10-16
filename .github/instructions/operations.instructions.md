@@ -36,6 +36,14 @@ When adding config, cover default, YAML, environment, invalid, and
 feature-disabled behavior. Update `config/ferrissearch.yml` and README only for
 operator-facing fields.
 
+Bulk staging uses four positive node-local settings:
+`bulk_max_concurrent_requests` (default 2, range 1–64),
+`bulk_max_request_bytes` (8 GiB), `bulk_max_spool_bytes` (16 GiB per request),
+and `bulk_idle_timeout_ms` (30,000). Each has the corresponding uppercase
+`FERRISSEARCH_` override. Validate the concurrency/spool product within i64
+counter capacity at startup. These limits do not reserve physical disk space
+or provide global/tenant resource accounting.
+
 ## Runtime Scheduling
 
 - Tokio owns asynchronous control-plane work: Raft, HTTP/gRPC futures,
@@ -189,6 +197,11 @@ the conditional/mixed-bulk trace with pre-WAL rejections, and the fixed
 randomized seed set documented in `specs/tla/README.md`. Its TLC
 runs use one worker and at most 2 GiB each, with at most two trace validators in
 parallel.
+After that compilation, a separate three-minute step runs
+`cargo test --features protocol-trace --lib fs014` for protected staging,
+multi-batch copy/visibility boundaries, replica-floor fencing, and owned
+RPC cancellation. Keep it synchronized with `scripts/ci-local.sh`; do not
+consume the D1 validator's five-minute budget.
 Keep corruption,
 open/fence/marker/apply persistent-I/O escalation, promote-only primary
 reporting, the apply-I/O no-escalation temporal regression, and the

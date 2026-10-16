@@ -584,6 +584,7 @@ mod tests {
                 remote_store_reader_cache: Arc::new(
                     crate::engine::remote_store::RemoteSplitReaderCache::default(),
                 ),
+                bulk_runtime: Arc::new(crate::api::index::BulkRuntime::default()),
                 sql_group_by_scan_limit: 0,
                 sql_approximate_top_k: false,
             },

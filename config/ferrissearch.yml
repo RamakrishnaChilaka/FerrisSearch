@@ -6,6 +6,15 @@ cluster_name: "ferrissearch-local"
 http_port: 9200
 transport_port: 9300
 
+# Bulk ingestion
+# Limits apply per HTTP node. The input and ordered results use anonymous
+# temporary files on the node data volume; reserve disk headroom separately
+# from shard and WAL data. All limits must be positive.
+# bulk_max_concurrent_requests: 2
+# bulk_max_request_bytes: 8589934592
+# bulk_max_spool_bytes: 17179869184
+# bulk_idle_timeout_ms: 30000
+
 # SQL analytics
 # Shared column cache as a percentage of effective memory (host memory capped
 # by visible hard cgroup v2/v1 limits). Values above 90 are capped at 90; 0
