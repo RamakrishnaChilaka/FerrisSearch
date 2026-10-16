@@ -329,10 +329,31 @@ impl ClusterStateMachine {
                     updated_allocations.insert(*shard_id, next_ids);
                 }
 
+                let needs_manifest_authority = updated.uses_manifest_writer_authority();
+                let uses_remote = updated.uses_remote_store();
+                let updated_uuid = updated.uuid.to_string();
                 state.indices.insert(metadata.name.clone(), updated);
                 state
                     .shard_allocations
                     .insert(metadata.name.clone(), updated_allocations);
+                if needs_manifest_authority {
+                    let auth = state
+                        .manifest_writer_authorities
+                        .entry(metadata.name.clone())
+                        .or_insert_with(|| {
+                            crate::cluster::state::ManifestWriterAuthority::unassigned(
+                                metadata.name.clone(),
+                                updated_uuid,
+                            )
+                        });
+                    if !uses_remote {
+                        // When rolled back to MutableOnly, revoke active lease while preserving last_writer_epoch high-water mark.
+                        auth.phase = crate::cluster::state::ManifestWriterPhase::Unassigned;
+                        auth.lease_expires_at_millis = 0;
+                    }
+                } else {
+                    state.manifest_writer_authorities.remove(&metadata.name);
+                }
                 state.version += 1;
                 ClusterResponse::Ok
             }
@@ -947,7 +968,7 @@ impl ClusterStateMachine {
         raft_log_index: u64,
     ) -> ClusterResponse {
         use crate::cluster::state::{
-            IndexEngine, ManifestLeaseAcquireReason, ManifestWriterMutation, ManifestWriterPhase,
+            ManifestLeaseAcquireReason, ManifestWriterMutation, ManifestWriterPhase,
         };
 
         if let Err(reason) = mutation.validate() {
@@ -958,7 +979,7 @@ impl ClusterStateMachine {
                 reason: format!("index '{index_name}' does not exist"),
             };
         };
-        if !matches!(metadata.settings.engine, IndexEngine::RemoteStore) {
+        if !metadata.uses_manifest_writer_authority() {
             return ClusterResponse::ManifestWriterAuthorityRejected {
                 reason: format!(
                     "index '{index_name}' uses engine '{}', not remote_store",
@@ -966,20 +987,26 @@ impl ClusterStateMachine {
                 ),
             };
         }
-        if metadata.uuid.as_str() != mutation.index_uuid() {
+        let metadata_uuid = metadata.uuid.to_string();
+        if metadata_uuid != mutation.index_uuid() {
             return ClusterResponse::ManifestWriterAuthorityRejected {
                 reason: format!(
                     "index '{index_name}' UUID mismatch: expected {}, got {}",
-                    metadata.uuid,
+                    metadata_uuid,
                     mutation.index_uuid()
                 ),
             };
         }
-        let Some(current) = state.manifest_writer_authorities.get(index_name).cloned() else {
-            return ClusterResponse::ManifestWriterAuthorityRejected {
-                reason: format!("index '{index_name}' has no manifest writer authority metadata"),
-            };
-        };
+        let current = state
+            .manifest_writer_authorities
+            .get(index_name)
+            .cloned()
+            .unwrap_or_else(|| {
+                crate::cluster::state::ManifestWriterAuthority::unassigned(
+                    index_name.to_string(),
+                    metadata_uuid.clone(),
+                )
+            });
         if current.index_uuid != mutation.index_uuid() {
             return ClusterResponse::ManifestWriterAuthorityRejected {
                 reason: format!("manifest writer authority UUID mismatch for '{index_name}'"),

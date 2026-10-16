@@ -64,14 +64,22 @@ Do not collapse these responsibilities into API handlers.
   bundles whose source generations have expired) when listing and lineage are
   healthy. Node-local cache reaping remains separate from object-store
   reclamation.
-- Split hydration currently downloads the full bundle into memory before
-  writing/extracting it; do not describe this as streaming hydration.
-- Root scheduling performs per-query leaf status discovery. There is no
-  continuously maintained leaf inventory or admission controller.
+- Split hydration (`fetch_split_into_cache`, FS-044) streams bundle bytes to a
+  temporary file (`<cache_dir>.bundle.tmp`), incrementally verifies SHA-256 and
+  compressed/uncompressed byte limits (`HydrationLimits`), stream-unpacks with
+  bounded 64 KiB buffers, and atomically promotes `.done`.
+- `StorageManager` and `RemoteSplitReaderCache` maintain a unified cache
+  inventory (`NodeCacheInventorySnapshot`, FS-045) rebuilt once on startup
+  (`rebuild_cache_inventory_from_disk`) without per-query filesystem walks,
+  plus a TTL-bounded root-side leaf capability and load inventory
+  (`LeafCapabilityInventorySnapshot`, FS-046) with piggybacked batch warmth
+  updates and conservative fallback.
+- Cluster backup, verification, restore (`/_snapshot/{snapshot_id}*`, FS-042),
+  remote-store repair/quarantine (`/{index}/_remote_store/repair`, FS-042), and
+  explicit online lifecycle migration/rollback (`/{index}/_lifecycle/migrate`
+  and `/{index}/_lifecycle/rollback`, FS-043) are supported.
 - No hotcache sidecar is consumed yet, and remote split readers do not support
   the vector path.
-- Manifest generations do not yet define a cross-engine read snapshot with
-  mutable local shards.
 
 These are roadmap blockers, not implementation details to hide with retries or
 best-effort fallbacks.

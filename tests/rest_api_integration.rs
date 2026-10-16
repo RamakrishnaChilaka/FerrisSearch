@@ -9223,3 +9223,535 @@ async fn fs037_through_fs041_cross_layer_snapshot_tombstones_compaction_and_gc()
 
     Ok(())
 }
+
+#[tokio::test]
+async fn fs042_cluster_backup_verify_restore_and_remote_store_repair_workflows() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+
+    // 1. Create a local_shards (MutableOnly) index and a tiered index.
+    let (c1_st, c1_b) = harness
+        .put_json(
+            "/local-users",
+            json!({
+                "settings": { "number_of_shards": 1, "number_of_replicas": 0 },
+                "mappings": {
+                    "properties": {
+                        "username": { "type": "keyword" },
+                        "score": { "type": "integer" }
+                    }
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(c1_st, StatusCode::OK, "{c1_b}");
+
+    let (c2_st, c2_b) = harness
+        .put_json(
+            "/tiered-logs",
+            json!({
+                "engine": "remote_store",
+                "settings": {
+                    "lifecycle_mode": "tiered",
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0,
+                    "hot_delta": {
+                        "enabled": true,
+                        "min_seal_docs": 1,
+                        "max_seal_docs": 100
+                    }
+                },
+                "mappings": {
+                    "properties": {
+                        "service": { "type": "keyword" },
+                        "latency": { "type": "integer" }
+                    }
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(c2_st, StatusCode::OK, "{c2_b}");
+
+    // 2. Populate local-users with live docs and a deleted tombstone.
+    harness
+        .put_json(
+            "/local-users/_doc/u-1?refresh=true",
+            json!({ "username": "alice", "score": 42 }),
+        )
+        .await?;
+    harness
+        .put_json(
+            "/local-users/_doc/u-2?refresh=true",
+            json!({ "username": "bob", "score": 19 }),
+        )
+        .await?;
+    harness
+        .delete_json("/local-users/_doc/u-2?refresh=true")
+        .await?;
+
+    // 3. Populate tiered-logs with 2 sealed splits and 1 unsealed hot-delta doc.
+    harness
+        .put_json(
+            "/tiered-logs/_doc/log-1?refresh=true",
+            json!({ "service": "auth", "latency": 12 }),
+        )
+        .await?;
+    let (seal1_st, seal1_b) = harness
+        .post_json("/tiered-logs/_remote_store/seal", json!({ "force": true }))
+        .await?;
+    assert_eq!(seal1_st, StatusCode::OK, "{seal1_b}");
+    let split_1_id = seal1_b["shards"][0]["split_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    harness
+        .put_json(
+            "/tiered-logs/_doc/log-2?refresh=true",
+            json!({ "service": "payments", "latency": 35 }),
+        )
+        .await?;
+    let (seal2_st, seal2_b) = harness
+        .post_json("/tiered-logs/_remote_store/seal", json!({ "force": true }))
+        .await?;
+    assert_eq!(seal2_st, StatusCode::OK, "{seal2_b}");
+    let split_2_id = seal2_b["shards"][0]["split_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Unsealed hot-delta document:
+    harness
+        .put_json(
+            "/tiered-logs/_doc/log-3?refresh=true",
+            json!({ "service": "search", "latency": 8 }),
+        )
+        .await?;
+
+    // 4. Create cluster snapshot snap-clean.
+    let (snap_st, snap_b) = harness
+        .post_json("/_snapshot/snap-clean", json!({}))
+        .await?;
+    assert_eq!(snap_st, StatusCode::OK, "{snap_b}");
+    assert_eq!(snap_b["status"], json!("committed"));
+    assert_eq!(snap_b["total_indices"], json!(2));
+    assert_eq!(snap_b["total_splits"], json!(2));
+
+    // Verify GET /_snapshot/snap-clean and POST /_snapshot/snap-clean/_verify.
+    let (get_snap_st, get_snap_b) = harness.get_json("/_snapshot/snap-clean").await?;
+    assert_eq!(get_snap_st, StatusCode::OK, "{get_snap_b}");
+    assert_eq!(get_snap_b["snapshot_id"], json!("snap-clean"));
+
+    let (ver_snap_st, ver_snap_b) = harness
+        .post_json("/_snapshot/snap-clean/_verify", json!({}))
+        .await?;
+    assert_eq!(ver_snap_st, StatusCode::OK, "{ver_snap_b}");
+    assert_eq!(ver_snap_b["status"], json!("ok"));
+    assert_eq!(ver_snap_b["corrupt_count"], json!(0));
+    assert_eq!(ver_snap_b["missing_count"], json!(0));
+
+    // 5. Test repair workflows on tiered-logs:
+    //    5a. Compact split_1 and split_2 into generation 3, then corrupt the compacted split bundle in object storage
+    //        and verify POST /tiered-logs/_remote_store/repair reconstructs from the intact parent splits!
+    let (comp_st, comp_b) = harness
+        .post_json(
+            "/tiered-logs/_remote_store/compact",
+            json!({ "split_ids": [split_1_id, split_2_id] }),
+        )
+        .await?;
+    assert_eq!(comp_st, StatusCode::OK, "{comp_b}");
+    let compacted_split_id = comp_b["output_split_id"].as_str().unwrap().to_string();
+    let tiered_uuid = comp_b["index_uuid"].as_str().unwrap().to_string();
+
+    let corrupt_bundle_key =
+        ferrissearch::storage::StorageManager::split_bundle_key(&tiered_uuid, &compacted_split_id);
+    let corrupt_obj_path = harness
+        .app_state
+        .storage_manager
+        .object_path(&corrupt_bundle_key)?;
+    harness
+        .app_state
+        .storage_manager
+        .put(&corrupt_obj_path, b"corrupted-bundle-bytes".to_vec())
+        .await?;
+
+    let (rep_parent_st, rep_parent_b) = harness
+        .post_json("/tiered-logs/_remote_store/repair", json!({}))
+        .await?;
+    assert_eq!(rep_parent_st, StatusCode::OK, "{rep_parent_b}");
+    assert_eq!(rep_parent_b["status"], json!("repaired"));
+    assert!(
+        rep_parent_b["repaired_bundles"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(compacted_split_id))
+    );
+
+    //    5b. Corrupt manifest.current.json pointer and verify repair recovers from valid manifest generation history!
+    let ptr_obj_path = harness
+        .app_state
+        .storage_manager
+        .object_path(&format!("{tiered_uuid}/manifest.current.json"))?;
+    harness
+        .app_state
+        .storage_manager
+        .put(&ptr_obj_path, b"{not-valid-pointer".to_vec())
+        .await?;
+    let (rep_ptr_st, rep_ptr_b) = harness
+        .post_json("/tiered-logs/_remote_store/repair", json!({}))
+        .await?;
+    assert_eq!(rep_ptr_st, StatusCode::OK, "{rep_ptr_b}");
+    assert_eq!(rep_ptr_b["pointer_repaired"], json!(true));
+
+    //    5c. Corrupt split_2_id bundle (an uncompacted base split whose local shard range was already retired):
+    //        Verify default repair fails closed with 409 remote_store_irreparable_corruption_exception,
+    //        and quarantine_corrupt_splits=true quarantines it cleanly!
+    let s2_bundle_key =
+        ferrissearch::storage::StorageManager::split_bundle_key(&tiered_uuid, &split_2_id);
+    let s2_obj_path = harness
+        .app_state
+        .storage_manager
+        .object_path(&s2_bundle_key)?;
+    let original_s2_bytes = harness
+        .app_state
+        .storage_manager
+        .get_bytes(&s2_obj_path)
+        .await?;
+    harness
+        .app_state
+        .storage_manager
+        .put(&s2_obj_path, b"irreparable-corrupt-bytes".to_vec())
+        .await?;
+
+    let (irrep_st, irrep_b) = harness
+        .post_json(
+            "/tiered-logs/_remote_store/repair",
+            json!({ "quarantine_corrupt_splits": false }),
+        )
+        .await?;
+    assert_eq!(irrep_st, StatusCode::CONFLICT, "{irrep_b}");
+    assert_eq!(
+        irrep_b["error"]["type"],
+        json!("remote_store_irreparable_corruption_exception")
+    );
+
+    // Also verify that snap-clean/_verify detects the corrupted split_2_id bundle and blocks restore!
+    let (ver_corrupt_st, ver_corrupt_b) = harness
+        .post_json("/_snapshot/snap-clean/_verify", json!({}))
+        .await?;
+    assert_eq!(ver_corrupt_st, StatusCode::OK, "{ver_corrupt_b}");
+    assert_eq!(ver_corrupt_b["status"], json!("corrupt"));
+
+    let (rest_corrupt_st, rest_corrupt_b) = harness
+        .post_json("/_snapshot/snap-clean/_restore", json!({}))
+        .await?;
+    assert_eq!(rest_corrupt_st, StatusCode::CONFLICT, "{rest_corrupt_b}");
+    assert_eq!(
+        rest_corrupt_b["error"]["type"],
+        json!("snapshot_corruption_exception")
+    );
+
+    // Quarantine the corrupt split via quarantine_corrupt_splits=true:
+    let (quar_st, quar_b) = harness
+        .post_json(
+            "/tiered-logs/_remote_store/repair",
+            json!({ "quarantine_corrupt_splits": true }),
+        )
+        .await?;
+    assert_eq!(quar_st, StatusCode::OK, "{quar_b}");
+    assert_eq!(quar_b["status"], json!("quarantined"));
+    assert_eq!(quar_b["quarantined_splits"], json!([split_2_id]));
+
+    // Restore intact s2 bytes in object storage so snap-clean is healthy again, then delete both indices
+    // and restore the entire cluster from snap-clean!
+    harness
+        .app_state
+        .storage_manager
+        .put(&s2_obj_path, original_s2_bytes)
+        .await?;
+    harness.delete_json("/local-users").await?;
+    harness.delete_json("/tiered-logs").await?;
+
+    let (restore_ok_st, restore_ok_b) = harness
+        .post_json("/_snapshot/snap-clean/_restore", json!({}))
+        .await?;
+    assert_eq!(restore_ok_st, StatusCode::OK, "{restore_ok_b}");
+    assert_eq!(restore_ok_b["status"], json!("restored"));
+    assert_eq!(restore_ok_b["rpo_unsealed_ops"], json!(0));
+    assert!(restore_ok_b["rto_ms"].as_u64().is_some());
+
+    // 6. Validate restored queries against the pre-snapshot oracle!
+    let (u_count_st, u_count_b) = harness.post_json("/local-users/_count", json!({})).await?;
+    assert_eq!(u_count_st, StatusCode::OK, "{u_count_b}");
+    assert_eq!(u_count_b["count"], json!(1)); // u-1 is live, u-2 tombstone preserved!
+
+    let (l_search_st, l_search_b) = harness
+        .post_json(
+            "/tiered-logs/_search",
+            json!({
+                "query": { "match_all": {} },
+                "sort": [{ "latency": "asc" }]
+            }),
+        )
+        .await?;
+    assert_eq!(l_search_st, StatusCode::OK, "{l_search_b}");
+    assert_eq!(l_search_b["hits"]["total"]["value"], json!(3)); // log-1, log-2 (splits) + log-3 (hot delta)!
+    assert_eq!(l_search_b["hits"]["hits"][0]["_id"], json!("log-3"));
+    assert_eq!(l_search_b["hits"]["hits"][1]["_id"], json!("log-1"));
+    assert_eq!(l_search_b["hits"]["hits"][2]["_id"], json!("log-2"));
+
+    // Verify /_nodes/cache/inventory endpoint (FS-045 & FS-046):
+    let (inv_st, inv_b) = harness.get_json("/_nodes/cache/inventory").await?;
+    assert_eq!(inv_st, StatusCode::OK, "{inv_b}");
+    assert!(
+        inv_b["cache_inventory"]["artifact_entries"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1
+    );
+    assert!(inv_b["leaf_inventory"]["ttl_ms"].as_u64().unwrap_or(0) > 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn fs043_online_lifecycle_migration_equivalence_interruption_and_rollback() -> Result<()> {
+    let harness = RestTestHarness::start().await?;
+
+    // 1. Preflight checks:
+    //    - Reject ImmutableOnly source-only remote_store index migration
+    //    - Reject knn_vector index migration
+    //    - Reject direct lifecycle_mode change via PUT /{index}/_settings
+    harness
+        .put_json(
+            "/immutable-items",
+            json!({
+                "engine": "remote_store",
+                "mappings": { "properties": { "title": { "type": "text" } } }
+            }),
+        )
+        .await?;
+    let (imm_mig_st, imm_mig_b) = harness
+        .post_json("/immutable-items/_lifecycle/migrate", json!({}))
+        .await?;
+    assert_eq!(imm_mig_st, StatusCode::BAD_REQUEST, "{imm_mig_b}");
+
+    harness
+        .put_json(
+            "/vec-items",
+            json!({
+                "settings": { "number_of_shards": 1, "number_of_replicas": 0 },
+                "mappings": {
+                    "properties": {
+                        "emb": { "type": "knn_vector", "dimension": 4 }
+                    }
+                }
+            }),
+        )
+        .await?;
+    let (vec_mig_st, vec_mig_b) = harness
+        .post_json("/vec-items/_lifecycle/migrate", json!({}))
+        .await?;
+    assert_eq!(vec_mig_st, StatusCode::BAD_REQUEST, "{vec_mig_b}");
+    assert!(
+        vec_mig_b["error"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("knn_vector")
+    );
+
+    // 2. Create a MutableOnly local_shards index and populate with inserts, updates, and deletes.
+    let (create_st, create_b) = harness
+        .put_json(
+            "/mig-orders",
+            json!({
+                "settings": { "number_of_shards": 1, "number_of_replicas": 0 },
+                "mappings": {
+                    "properties": {
+                        "customer": { "type": "keyword" },
+                        "total": { "type": "integer" }
+                    }
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(create_st, StatusCode::OK, "{create_b}");
+
+    // Direct PUT /mig-orders/_settings with index.lifecycle_mode must be rejected!
+    let (bad_set_st, bad_set_b) = harness
+        .put_json(
+            "/mig-orders/_settings",
+            json!({ "index": { "lifecycle_mode": "tiered" } }),
+        )
+        .await?;
+    assert_eq!(bad_set_st, StatusCode::BAD_REQUEST, "{bad_set_b}");
+
+    harness
+        .put_json(
+            "/mig-orders/_doc/o-1?refresh=true",
+            json!({ "customer": "acme", "total": 100 }),
+        )
+        .await?;
+    harness
+        .put_json(
+            "/mig-orders/_doc/o-1?refresh=true",
+            json!({ "customer": "acme", "total": 150 }),
+        )
+        .await?;
+    harness
+        .put_json(
+            "/mig-orders/_doc/o-2?refresh=true",
+            json!({ "customer": "globex", "total": 200 }),
+        )
+        .await?;
+    harness
+        .put_json(
+            "/mig-orders/_doc/o-3?refresh=true",
+            json!({ "customer": "initech", "total": 300 }),
+        )
+        .await?;
+    harness
+        .delete_json("/mig-orders/_doc/o-2?refresh=true")
+        .await?;
+
+    // 3. Test interrupted migration after bootstrap before validate:
+    //    Index must remain in MutableOnly while recording TieringBootstrap!
+    let (int_st, int_b) = harness
+        .post_json(
+            "/mig-orders/_lifecycle/migrate",
+            json!({
+                "migration_id": "mig-run-1",
+                "fail_stage": "after_bootstrap_before_validate"
+            }),
+        )
+        .await?;
+    assert_eq!(int_st, StatusCode::INTERNAL_SERVER_ERROR, "{int_b}");
+
+    let (status1_st, status1_b) = harness.get_json("/mig-orders/_lifecycle/status").await?;
+    assert_eq!(status1_st, StatusCode::OK, "{status1_b}");
+    assert_eq!(status1_b["lifecycle_mode"], json!("mutable_only"));
+    assert_eq!(status1_b["migration"]["phase"], json!("tiering_bootstrap"));
+
+    // Conflicting migration_id while mig-run-1 is active must be rejected with 409 Conflict!
+    let (conf_st, conf_b) = harness
+        .post_json(
+            "/mig-orders/_lifecycle/migrate",
+            json!({ "migration_id": "mig-conflicting" }),
+        )
+        .await?;
+    assert_eq!(conf_st, StatusCode::CONFLICT, "{conf_b}");
+
+    // Pre-cutover rollback cancels mig-run-1 and keeps MutableOnly!
+    let (rb_cancel_st, rb_cancel_b) = harness
+        .post_json("/mig-orders/_lifecycle/rollback", json!({}))
+        .await?;
+    assert_eq!(rb_cancel_st, StatusCode::OK, "{rb_cancel_b}");
+    assert_eq!(
+        rb_cancel_b["rollback_kind"],
+        json!("cancelled_before_cutover")
+    );
+    assert_eq!(rb_cancel_b["lifecycle_mode"], json!("mutable_only"));
+
+    // 4. Complete online migration to Tiered (retaining local base for fast rollback):
+    let (mig_ok_st, mig_ok_b) = harness
+        .post_json(
+            "/mig-orders/_lifecycle/migrate",
+            json!({
+                "migration_id": "mig-run-2",
+                "retire_sealed_base": false
+            }),
+        )
+        .await?;
+    assert_eq!(mig_ok_st, StatusCode::OK, "{mig_ok_b}");
+    assert_eq!(mig_ok_b["status"], json!("committed"));
+    assert_eq!(mig_ok_b["lifecycle_mode"], json!("tiered"));
+    assert_eq!(mig_ok_b["equivalence_verified"], json!(true));
+    assert_eq!(mig_ok_b["fast_rollback_retained"], json!(true));
+    assert_eq!(mig_ok_b["verified_live_docs"], json!(2));
+
+    // Re-running with the same migration_id is idempotent!
+    let (mig_rep_st, mig_rep_b) = harness
+        .post_json(
+            "/mig-orders/_lifecycle/migrate",
+            json!({ "migration_id": "mig-run-2" }),
+        )
+        .await?;
+    assert_eq!(mig_rep_st, StatusCode::OK, "{mig_rep_b}");
+    assert_eq!(mig_rep_b["status"], json!("replayed"));
+
+    // 5. Fast rollback during the retention window (before local base retirement):
+    let (rb_fast_st, rb_fast_b) = harness
+        .post_json("/mig-orders/_lifecycle/rollback", json!({}))
+        .await?;
+    assert_eq!(rb_fast_st, StatusCode::OK, "{rb_fast_b}");
+    assert_eq!(rb_fast_b["rollback_kind"], json!("fast_retained_local"));
+    assert_eq!(rb_fast_b["lifecycle_mode"], json!("mutable_only"));
+
+    // 6. Migrate again with retire_sealed_base = true (retiring local base documents),
+    //    write a new hot-delta document o-4, then test post-retirement rollback!
+    let (mig3_st, mig3_b) = harness
+        .post_json(
+            "/mig-orders/_lifecycle/migrate",
+            json!({
+                "migration_id": "mig-run-3",
+                "retire_sealed_base": true
+            }),
+        )
+        .await?;
+    assert_eq!(mig3_st, StatusCode::OK, "{mig3_b}");
+    assert_eq!(mig3_b["lifecycle_mode"], json!("tiered"));
+    assert_eq!(mig3_b["fast_rollback_retained"], json!(false));
+
+    harness
+        .put_json(
+            "/mig-orders/_doc/o-4?refresh=true",
+            json!({ "customer": "umbrella", "total": 400 }),
+        )
+        .await?;
+
+    // Immediate metadata-only rollback without reconstruction must be rejected after local base retirement!
+    let (rb_forbid_st, rb_forbid_b) = harness
+        .post_json(
+            "/mig-orders/_lifecycle/rollback",
+            json!({ "allow_reconstruction": false }),
+        )
+        .await?;
+    assert_eq!(rb_forbid_st, StatusCode::CONFLICT, "{rb_forbid_b}");
+
+    // Post-retirement rollback with allow_reconstruction=true enters MutableRollbackPreparing,
+    // reconstructs retired base documents + hot suffix, verifies equivalence, and switches to MutableOnly!
+    let (rb_recon_st, rb_recon_b) = harness
+        .post_json(
+            "/mig-orders/_lifecycle/rollback",
+            json!({ "allow_reconstruction": true }),
+        )
+        .await?;
+    assert_eq!(rb_recon_st, StatusCode::OK, "{rb_recon_b}");
+    assert_eq!(
+        rb_recon_b["rollback_kind"],
+        json!("reconstructed_from_splits")
+    );
+    assert_eq!(rb_recon_b["lifecycle_mode"], json!("mutable_only"));
+    assert_eq!(rb_recon_b["verified_live_docs"], json!(3));
+
+    // Verify all 3 live documents (o-1=150, o-3=300, o-4=400) and tombstone suppression of o-2 in MutableOnly!
+    let (final_search_st, final_search_b) = harness
+        .post_json(
+            "/mig-orders/_search",
+            json!({
+                "query": { "match_all": {} },
+                "sort": [{ "total": "asc" }]
+            }),
+        )
+        .await?;
+    assert_eq!(final_search_st, StatusCode::OK, "{final_search_b}");
+    assert_eq!(final_search_b["hits"]["total"]["value"], json!(3));
+    assert_eq!(final_search_b["hits"]["hits"][0]["_id"], json!("o-1"));
+    assert_eq!(
+        final_search_b["hits"]["hits"][0]["_source"]["total"],
+        json!(150)
+    );
+    assert_eq!(final_search_b["hits"]["hits"][1]["_id"], json!("o-3"));
+    assert_eq!(final_search_b["hits"]["hits"][2]["_id"], json!("o-4"));
+
+    Ok(())
+}

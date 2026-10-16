@@ -120,10 +120,97 @@ pub struct RemoteStoreLoadSnapshot {
     pub queue_depth: usize,
 }
 
+pub const DEFAULT_MAX_HYDRATION_BUNDLE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub const DEFAULT_MAX_HYDRATION_UNCOMPRESSED_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const STREAM_HYDRATION_COPY_BUF_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HydrationLimits {
+    pub max_bundle_bytes: u64,
+    pub max_uncompressed_bytes: u64,
+}
+
+impl Default for HydrationLimits {
+    fn default() -> Self {
+        Self {
+            max_bundle_bytes: DEFAULT_MAX_HYDRATION_BUNDLE_BYTES,
+            max_uncompressed_bytes: DEFAULT_MAX_HYDRATION_UNCOMPRESSED_BYTES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeCacheInventorySnapshot {
+    pub artifact_entries: usize,
+    pub artifact_logical_bytes: u64,
+    pub artifact_physical_bytes: u64,
+    pub pinned_entries: usize,
+    pub pinned_bytes: u64,
+    pub reader_entries: usize,
+    pub reader_bytes: u64,
+    pub column_entries: u64,
+    pub column_bytes: u64,
+    pub staging_bytes: u64,
+    pub artifact_budget_bytes: Option<u64>,
+    pub max_single_artifact_bytes: Option<u64>,
+    pub hits_by_tier: BTreeMap<String, u64>,
+    pub misses_by_tier: BTreeMap<String, u64>,
+    pub evictions_by_reason: BTreeMap<String, u64>,
+    pub admission_rejections_by_reason: BTreeMap<String, u64>,
+    pub filesystem_scans_total: u64,
+}
+
+#[derive(Debug, Default)]
+struct NodeCacheGovernorStats {
+    artifact_budget_bytes: Option<u64>,
+    max_single_artifact_bytes: Option<u64>,
+    inflight_admission_bytes: u64,
+    reader_entries: usize,
+    reader_bytes: u64,
+    column_entries: u64,
+    column_bytes: u64,
+    staging_bytes: u64,
+    hits_by_tier: BTreeMap<String, u64>,
+    misses_by_tier: BTreeMap<String, u64>,
+    evictions_by_reason: BTreeMap<String, u64>,
+    admission_rejections_by_reason: BTreeMap<String, u64>,
+    filesystem_scans_total: u64,
+}
+
+struct ArtifactAdmissionGuard {
+    reserved_bytes: u64,
+    stats: Arc<StdMutex<NodeCacheGovernorStats>>,
+}
+
+impl ArtifactAdmissionGuard {
+    fn reconcile(&mut self, new_bytes: u64) {
+        let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+        stats.inflight_admission_bytes = stats
+            .inflight_admission_bytes
+            .saturating_sub(self.reserved_bytes)
+            .saturating_add(new_bytes);
+        self.reserved_bytes = new_bytes;
+    }
+}
+
+impl Drop for ArtifactAdmissionGuard {
+    fn drop(&mut self) {
+        if self.reserved_bytes > 0 {
+            let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+            stats.inflight_admission_bytes = stats
+                .inflight_admission_bytes
+                .saturating_sub(self.reserved_bytes);
+            self.reserved_bytes = 0;
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CachedSplitEntry {
     index_uuid: String,
     split_id: String,
+    checksum: String,
+    logical_bytes: u64,
     size_bytes: u64,
     last_access_epoch_ms: u64,
     reservation: Option<Arc<StdMutex<crate::worker::ResourceReservation>>>,
@@ -163,18 +250,35 @@ fn dir_size_bytes(path: &Path) -> u64 {
 pub struct SplitCachePin {
     key: String,
     pin_counts: Arc<StdMutex<HashMap<String, usize>>>,
+    cache_entries: Arc<StdMutex<HashMap<String, CachedSplitEntry>>>,
 }
 
 impl Drop for SplitCachePin {
     fn drop(&mut self) {
-        let mut pin_counts = self.pin_counts.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(count) = pin_counts.get_mut(&self.key) {
-            if *count <= 1 {
-                pin_counts.remove(&self.key);
-            } else {
-                *count -= 1;
+        {
+            let mut pin_counts = self.pin_counts.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(count) = pin_counts.get_mut(&self.key) {
+                if *count <= 1 {
+                    pin_counts.remove(&self.key);
+                } else {
+                    *count -= 1;
+                }
             }
         }
+        // Always acquire `cache_entries` before `pin_counts` to preserve the global lock order.
+        let pinned_bytes: u64 = if let Ok(entries) = self.cache_entries.lock() {
+            let pin_counts = self.pin_counts.lock().unwrap_or_else(|e| e.into_inner());
+            pin_counts
+                .iter()
+                .filter(|(_, count)| **count > 0)
+                .filter_map(|(k, _)| entries.get(k).map(|e| e.size_bytes))
+                .sum()
+        } else {
+            0
+        };
+        crate::metrics::CACHE_TIER_BYTES
+            .with_label_values(&["artifact", "pinned"])
+            .set(i64::try_from(pinned_bytes).unwrap_or(i64::MAX));
     }
 }
 
@@ -212,6 +316,8 @@ pub struct StorageManager {
     sequencer_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     cache_entries: Arc<StdMutex<HashMap<String, CachedSplitEntry>>>,
     pin_counts: Arc<StdMutex<HashMap<String, usize>>>,
+    cache_governor_stats: Arc<StdMutex<NodeCacheGovernorStats>>,
+    hydration_limits: Arc<StdMutex<HydrationLimits>>,
     remote_store_inflight_bytes: Arc<AtomicU64>,
     remote_store_queue_depth: Arc<AtomicUsize>,
     capability_state: Arc<StdMutex<CapabilityProbeState>>,
@@ -297,7 +403,7 @@ impl StorageManager {
             format!("failed to canonicalize remote_store local workdir {local_workdir:?}")
         })?;
 
-        Ok(Self {
+        let manager = Self {
             backend,
             local_workdir,
             publish_lock: Arc::new(Mutex::new(())),
@@ -305,6 +411,8 @@ impl StorageManager {
             sequencer_locks: Arc::new(Mutex::new(HashMap::new())),
             cache_entries: Arc::new(StdMutex::new(HashMap::new())),
             pin_counts: Arc::new(StdMutex::new(HashMap::new())),
+            cache_governor_stats: Arc::new(StdMutex::new(NodeCacheGovernorStats::default())),
+            hydration_limits: Arc::new(StdMutex::new(HydrationLimits::default())),
             remote_store_inflight_bytes: Arc::new(AtomicU64::new(0)),
             remote_store_queue_depth: Arc::new(AtomicUsize::new(0)),
             capability_state: Arc::new(StdMutex::new(initial_capability)),
@@ -317,7 +425,9 @@ impl StorageManager {
             admission: Arc::new(crate::worker::AdmissionController::new(4, 4)),
             #[cfg(test)]
             local_cas_crash_stage: Arc::new(StdMutex::new(None)),
-        })
+        };
+        let _ = manager.rebuild_cache_inventory_from_disk();
+        Ok(manager)
     }
 
     pub fn with_governance(
@@ -357,7 +467,7 @@ impl StorageManager {
             Some(reason) => CapabilityProbeState::Unsupported(reason),
             None => CapabilityProbeState::Unprobed,
         };
-        Ok(Self {
+        let manager = Self {
             backend: Backend::Remote { store, uri },
             local_workdir,
             publish_lock: Arc::new(Mutex::new(())),
@@ -365,6 +475,8 @@ impl StorageManager {
             sequencer_locks: Arc::new(Mutex::new(HashMap::new())),
             cache_entries: Arc::new(StdMutex::new(HashMap::new())),
             pin_counts: Arc::new(StdMutex::new(HashMap::new())),
+            cache_governor_stats: Arc::new(StdMutex::new(NodeCacheGovernorStats::default())),
+            hydration_limits: Arc::new(StdMutex::new(HydrationLimits::default())),
             remote_store_inflight_bytes: Arc::new(AtomicU64::new(0)),
             remote_store_queue_depth: Arc::new(AtomicUsize::new(0)),
             capability_state: Arc::new(StdMutex::new(initial_capability)),
@@ -377,7 +489,347 @@ impl StorageManager {
             admission: Arc::new(crate::worker::AdmissionController::new(4, 4)),
             #[cfg(test)]
             local_cas_crash_stage: Arc::new(StdMutex::new(None)),
-        })
+        };
+        let _ = manager.rebuild_cache_inventory_from_disk();
+        Ok(manager)
+    }
+
+    pub fn set_hydration_limits(&self, limits: HydrationLimits) {
+        *self
+            .hydration_limits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = limits;
+    }
+
+    pub fn hydration_limits(&self) -> HydrationLimits {
+        *self
+            .hydration_limits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn set_cache_governor_budgets(
+        &self,
+        artifact_budget_bytes: Option<u64>,
+        max_single_artifact_bytes: Option<u64>,
+    ) {
+        let mut stats = self
+            .cache_governor_stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        stats.artifact_budget_bytes = artifact_budget_bytes.filter(|b| *b > 0);
+        stats.max_single_artifact_bytes = max_single_artifact_bytes.filter(|b| *b > 0);
+    }
+
+    pub fn record_cache_tier_hit(&self, tier: &str) {
+        let mut stats = self
+            .cache_governor_stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *stats.hits_by_tier.entry(tier.to_string()).or_insert(0) += 1;
+        crate::metrics::CACHE_TIER_REQUESTS_TOTAL
+            .with_label_values(&[tier, "hit"])
+            .inc();
+    }
+
+    pub fn record_cache_tier_miss(&self, tier: &str) {
+        let mut stats = self
+            .cache_governor_stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *stats.misses_by_tier.entry(tier.to_string()).or_insert(0) += 1;
+        crate::metrics::CACHE_TIER_REQUESTS_TOTAL
+            .with_label_values(&[tier, "miss"])
+            .inc();
+    }
+
+    pub fn record_cache_eviction(&self, tier: &str, reason: &str) {
+        let mut stats = self
+            .cache_governor_stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *stats
+            .evictions_by_reason
+            .entry(format!("{tier}:{reason}"))
+            .or_insert(0) += 1;
+        crate::metrics::CACHE_EVICTIONS_TOTAL
+            .with_label_values(&[tier, reason])
+            .inc();
+    }
+
+    pub fn record_cache_admission_rejection(&self, tier: &str, reason: &str) {
+        let mut stats = self
+            .cache_governor_stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *stats
+            .admission_rejections_by_reason
+            .entry(format!("{tier}:{reason}"))
+            .or_insert(0) += 1;
+        crate::metrics::CACHE_ADMISSION_REJECTIONS_TOTAL
+            .with_label_values(&[tier, reason])
+            .inc();
+    }
+
+    pub fn update_reader_cache_accounting(&self, reader_entries: usize, reader_bytes: u64) {
+        {
+            let mut stats = self
+                .cache_governor_stats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            stats.reader_entries = reader_entries;
+            stats.reader_bytes = reader_bytes;
+        }
+        let val = i64::try_from(reader_bytes).unwrap_or(i64::MAX);
+        crate::metrics::CACHE_TIER_BYTES
+            .with_label_values(&["reader", "logical"])
+            .set(val);
+        crate::metrics::CACHE_TIER_BYTES
+            .with_label_values(&["reader", "physical"])
+            .set(val);
+    }
+
+    pub fn update_column_cache_accounting(&self, column_entries: u64, column_bytes: u64) {
+        {
+            let mut stats = self
+                .cache_governor_stats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            stats.column_entries = column_entries;
+            stats.column_bytes = column_bytes;
+        }
+        let val = i64::try_from(column_bytes).unwrap_or(i64::MAX);
+        crate::metrics::CACHE_TIER_BYTES
+            .with_label_values(&["column", "logical"])
+            .set(val);
+        crate::metrics::CACHE_TIER_BYTES
+            .with_label_values(&["column", "physical"])
+            .set(val);
+    }
+
+    fn add_staging_bytes(&self, delta: u64) {
+        let total = {
+            let mut stats = self
+                .cache_governor_stats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            stats.staging_bytes = stats.staging_bytes.saturating_add(delta);
+            stats.staging_bytes
+        };
+        let val = i64::try_from(total).unwrap_or(i64::MAX);
+        crate::metrics::CACHE_TIER_BYTES
+            .with_label_values(&["staging", "logical"])
+            .set(val);
+        crate::metrics::CACHE_TIER_BYTES
+            .with_label_values(&["staging", "physical"])
+            .set(val);
+    }
+
+    fn sub_staging_bytes(&self, delta: u64) {
+        let total = {
+            let mut stats = self
+                .cache_governor_stats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            stats.staging_bytes = stats.staging_bytes.saturating_sub(delta);
+            stats.staging_bytes
+        };
+        let val = i64::try_from(total).unwrap_or(i64::MAX);
+        crate::metrics::CACHE_TIER_BYTES
+            .with_label_values(&["staging", "logical"])
+            .set(val);
+        crate::metrics::CACHE_TIER_BYTES
+            .with_label_values(&["staging", "physical"])
+            .set(val);
+    }
+
+    fn sync_artifact_cache_gauges(&self) {
+        let (logical_bytes, physical_bytes, pinned_bytes) = {
+            let entries = self.cache_entries.lock().unwrap_or_else(|e| e.into_inner());
+            let pin_counts = self.pin_counts.lock().unwrap_or_else(|e| e.into_inner());
+            let mut logical = 0u64;
+            let mut physical = 0u64;
+            let mut pinned = 0u64;
+            for (k, entry) in entries.iter() {
+                logical = logical.saturating_add(entry.logical_bytes);
+                physical = physical.saturating_add(entry.size_bytes);
+                if pin_counts.get(k).copied().unwrap_or(0) > 0 {
+                    pinned = pinned.saturating_add(entry.size_bytes);
+                }
+            }
+            (logical, physical, pinned)
+        };
+        crate::metrics::CACHE_TIER_BYTES
+            .with_label_values(&["artifact", "logical"])
+            .set(i64::try_from(logical_bytes).unwrap_or(i64::MAX));
+        crate::metrics::CACHE_TIER_BYTES
+            .with_label_values(&["artifact", "physical"])
+            .set(i64::try_from(physical_bytes).unwrap_or(i64::MAX));
+        crate::metrics::CACHE_TIER_BYTES
+            .with_label_values(&["artifact", "pinned"])
+            .set(i64::try_from(pinned_bytes).unwrap_or(i64::MAX));
+    }
+
+    /// Rebuild the unified artifact cache inventory from disk once at quiescent
+    /// startup, removing any orphaned `.tmp` / `.bundle.tmp` hydration artifacts
+    /// so steady-state queries never need per-query filesystem walks (`FS-045`).
+    pub fn rebuild_cache_inventory_from_disk(&self) -> Result<usize> {
+        self.rebuild_cache_inventory_from_disk_inner(true)
+    }
+
+    /// Reconcile the artifact cache inventory from disk on a live node without
+    /// deleting in-flight `.tmp` or `.bundle.tmp` hydration paths (`FS-045`).
+    pub fn rebuild_cache_inventory_online(&self) -> Result<usize> {
+        self.rebuild_cache_inventory_from_disk_inner(false)
+    }
+
+    fn rebuild_cache_inventory_from_disk_inner(&self, remove_orphans: bool) -> Result<usize> {
+        {
+            let mut stats = self
+                .cache_governor_stats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            stats.filesystem_scans_total += 1;
+        }
+        let splits_root = self.local_workdir.join("splits");
+        if !splits_root.exists() {
+            self.sync_artifact_cache_gauges();
+            return Ok(0);
+        }
+
+        let mut discovered = HashMap::new();
+        for index_entry in std::fs::read_dir(&splits_root)
+            .with_context(|| format!("read splits cache root {splits_root:?}"))?
+        {
+            let index_entry = index_entry?;
+            if !index_entry.file_type()?.is_dir() {
+                continue;
+            }
+            let index_uuid = index_entry.file_name().to_string_lossy().to_string();
+            let index_path = index_entry.path();
+            for split_entry in std::fs::read_dir(&index_path)
+                .with_context(|| format!("read index cache dir {index_path:?}"))?
+            {
+                let split_entry = split_entry?;
+                let path = split_entry.path();
+                let file_name = split_entry.file_name().to_string_lossy().to_string();
+                if file_name.ends_with(".tmp") || file_name.ends_with(".bundle.tmp") {
+                    if remove_orphans {
+                        if path.is_dir() {
+                            let _ = std::fs::remove_dir_all(&path);
+                        } else {
+                            let _ = std::fs::remove_file(&path);
+                        }
+                    }
+                    continue;
+                }
+                if !split_entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let done_marker = path.join(".done");
+                let Ok(done_bytes) = std::fs::read(&done_marker) else {
+                    if remove_orphans {
+                        let _ = std::fs::remove_dir_all(&path);
+                    }
+                    continue;
+                };
+                let checksum = String::from_utf8_lossy(&done_bytes).trim().to_string();
+                if checksum.is_empty() {
+                    if remove_orphans {
+                        let _ = std::fs::remove_dir_all(&path);
+                    }
+                    continue;
+                }
+                let physical_bytes = dir_size_bytes(&path);
+                let last_access_epoch_ms = std::fs::metadata(&done_marker)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or_else(now_epoch_ms);
+                let key = cache_entry_key(&index_uuid, &file_name);
+                let reservation = (physical_bytes > 0)
+                    .then(|| {
+                        self.resource_governor
+                            .try_reserve(
+                                crate::worker::ResourcePoolKind::PersistentCache,
+                                physical_bytes,
+                            )
+                            .ok()
+                            .map(|res| Arc::new(StdMutex::new(res)))
+                    })
+                    .flatten();
+                discovered.insert(
+                    key,
+                    CachedSplitEntry {
+                        index_uuid: index_uuid.clone(),
+                        split_id: file_name,
+                        checksum,
+                        logical_bytes: physical_bytes,
+                        size_bytes: physical_bytes,
+                        last_access_epoch_ms,
+                        reservation,
+                    },
+                );
+            }
+        }
+
+        let count = discovered.len();
+        {
+            let mut entries = self.cache_entries.lock().unwrap_or_else(|e| e.into_inner());
+            *entries = discovered;
+        }
+        self.sync_artifact_cache_gauges();
+        Ok(count)
+    }
+
+    pub fn cache_inventory_snapshot(&self) -> NodeCacheInventorySnapshot {
+        let (
+            artifact_entries,
+            artifact_logical_bytes,
+            artifact_physical_bytes,
+            pinned_entries,
+            pinned_bytes,
+        ) = {
+            let entries = self.cache_entries.lock().unwrap_or_else(|e| e.into_inner());
+            let pin_counts = self.pin_counts.lock().unwrap_or_else(|e| e.into_inner());
+            let mut logical = 0u64;
+            let mut physical = 0u64;
+            let mut pinned_cnt = 0usize;
+            let mut pinned_sz = 0u64;
+            for (k, entry) in entries.iter() {
+                logical = logical.saturating_add(entry.logical_bytes);
+                physical = physical.saturating_add(entry.size_bytes);
+                if pin_counts.get(k).copied().unwrap_or(0) > 0 {
+                    pinned_cnt += 1;
+                    pinned_sz = pinned_sz.saturating_add(entry.size_bytes);
+                }
+            }
+            (entries.len(), logical, physical, pinned_cnt, pinned_sz)
+        };
+        let stats = self
+            .cache_governor_stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        NodeCacheInventorySnapshot {
+            artifact_entries,
+            artifact_logical_bytes,
+            artifact_physical_bytes,
+            pinned_entries,
+            pinned_bytes,
+            reader_entries: stats.reader_entries,
+            reader_bytes: stats.reader_bytes,
+            column_entries: stats.column_entries,
+            column_bytes: stats.column_bytes,
+            staging_bytes: stats.staging_bytes,
+            artifact_budget_bytes: stats.artifact_budget_bytes,
+            max_single_artifact_bytes: stats.max_single_artifact_bytes,
+            hits_by_tier: stats.hits_by_tier.clone(),
+            misses_by_tier: stats.misses_by_tier.clone(),
+            evictions_by_reason: stats.evictions_by_reason.clone(),
+            admission_rejections_by_reason: stats.admission_rejections_by_reason.clone(),
+            filesystem_scans_total: stats.filesystem_scans_total,
+        }
     }
 
     #[cfg(test)]
@@ -455,51 +907,93 @@ impl StorageManager {
     }
 
     pub fn cached_split_size_bytes(&self, index_uuid: &str, split_id: &str) -> u64 {
+        let key = cache_entry_key(index_uuid, split_id);
+        if let Some(size_bytes) = self
+            .cache_entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .map(|entry| entry.size_bytes)
+        {
+            return size_bytes;
+        }
+        {
+            let mut stats = self
+                .cache_governor_stats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            stats.filesystem_scans_total += 1;
+        }
         dir_size_bytes(&self.cache_dir(index_uuid, split_id))
     }
 
     pub fn record_cached_split_access(&self, index_uuid: &str, split_id: &str, size_bytes: u64) {
-        self.record_cached_split_access_with_reservation(index_uuid, split_id, size_bytes, None);
+        self.record_cached_split_access_with_metadata(
+            index_uuid, split_id, None, size_bytes, size_bytes, None,
+        );
     }
 
-    fn record_cached_split_access_with_reservation(
+    fn record_cached_split_access_with_metadata(
         &self,
         index_uuid: &str,
         split_id: &str,
+        checksum: Option<&str>,
+        logical_bytes: u64,
         size_bytes: u64,
         reservation: Option<crate::worker::ResourceReservation>,
     ) {
         let key = cache_entry_key(index_uuid, split_id);
-        let mut cache_entries = self.cache_entries.lock().unwrap_or_else(|e| e.into_inner());
-        let existing_reservation = cache_entries
-            .get(&key)
-            .and_then(|entry| entry.reservation.clone());
-        let reservation = reservation
-            .map(|res| Arc::new(StdMutex::new(res)))
-            .or(existing_reservation)
-            .or_else(|| {
-                (size_bytes > 0)
-                    .then(|| {
-                        self.resource_governor
-                            .try_reserve(
-                                crate::worker::ResourcePoolKind::PersistentCache,
-                                size_bytes,
-                            )
-                            .ok()
-                            .map(|res| Arc::new(StdMutex::new(res)))
-                    })
-                    .flatten()
-            });
-        cache_entries.insert(
-            key,
-            CachedSplitEntry {
-                index_uuid: index_uuid.to_string(),
-                split_id: split_id.to_string(),
-                size_bytes,
-                last_access_epoch_ms: now_epoch_ms(),
-                reservation,
-            },
-        );
+        {
+            let mut cache_entries = self.cache_entries.lock().unwrap_or_else(|e| e.into_inner());
+            let existing = cache_entries.get(&key).cloned();
+            let resolved_checksum = checksum
+                .map(ToString::to_string)
+                .or_else(|| existing.as_ref().map(|e| e.checksum.clone()))
+                .or_else(|| {
+                    std::fs::read(self.cache_dir(index_uuid, split_id).join(".done"))
+                        .ok()
+                        .map(|b| String::from_utf8_lossy(&b).trim().to_string())
+                })
+                .unwrap_or_default();
+            let resolved_logical = if logical_bytes > 0 {
+                logical_bytes
+            } else {
+                existing
+                    .as_ref()
+                    .map(|e| e.logical_bytes)
+                    .unwrap_or(size_bytes)
+            };
+            let existing_reservation = existing.and_then(|entry| entry.reservation);
+            let reservation = reservation
+                .map(|res| Arc::new(StdMutex::new(res)))
+                .or(existing_reservation)
+                .or_else(|| {
+                    (size_bytes > 0)
+                        .then(|| {
+                            self.resource_governor
+                                .try_reserve(
+                                    crate::worker::ResourcePoolKind::PersistentCache,
+                                    size_bytes,
+                                )
+                                .ok()
+                                .map(|res| Arc::new(StdMutex::new(res)))
+                        })
+                        .flatten()
+                });
+            cache_entries.insert(
+                key,
+                CachedSplitEntry {
+                    index_uuid: index_uuid.to_string(),
+                    split_id: split_id.to_string(),
+                    checksum: resolved_checksum,
+                    logical_bytes: resolved_logical,
+                    size_bytes,
+                    last_access_epoch_ms: now_epoch_ms(),
+                    reservation,
+                },
+            );
+        }
+        self.sync_artifact_cache_gauges();
     }
 
     pub fn cached_split_status(
@@ -508,22 +1002,47 @@ impl StorageManager {
         split_id: &str,
         checksum: &str,
     ) -> CachedSplitStatus {
+        let key = cache_entry_key(index_uuid, split_id);
         let cache_dir = self.cache_dir(index_uuid, split_id);
         let done_marker = cache_dir.join(".done");
+        let in_inventory = {
+            let entries = self.cache_entries.lock().unwrap_or_else(|e| e.into_inner());
+            entries
+                .get(&key)
+                .map(|entry| entry.checksum == checksum || entry.checksum.is_empty())
+        };
+        if let Some(true) = in_inventory
+            && done_marker.exists()
+        {
+            return CachedSplitStatus {
+                artifact_cached: true,
+            };
+        }
         let artifact_cached = cache_dir.exists()
             && std::fs::read(&done_marker)
                 .map(|bytes| bytes == checksum.as_bytes())
                 .unwrap_or(false);
+        if !artifact_cached && in_inventory.is_some() {
+            self.cache_entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            self.sync_artifact_cache_gauges();
+        }
         CachedSplitStatus { artifact_cached }
     }
 
     pub fn pin_cached_split(&self, index_uuid: &str, split_id: &str) -> SplitCachePin {
         let key = cache_entry_key(index_uuid, split_id);
-        let mut pin_counts = self.pin_counts.lock().unwrap_or_else(|e| e.into_inner());
-        *pin_counts.entry(key.clone()).or_insert(0) += 1;
+        {
+            let mut pin_counts = self.pin_counts.lock().unwrap_or_else(|e| e.into_inner());
+            *pin_counts.entry(key.clone()).or_insert(0) += 1;
+        }
+        self.sync_artifact_cache_gauges();
         SplitCachePin {
             key,
             pin_counts: Arc::clone(&self.pin_counts),
+            cache_entries: Arc::clone(&self.cache_entries),
         }
     }
 
@@ -557,13 +1076,59 @@ impl StorageManager {
         }
     }
 
+    pub fn evict_split_from_cache(
+        &self,
+        index_uuid: &str,
+        split_id: &str,
+        reason: &str,
+    ) -> Result<bool> {
+        let key = cache_entry_key(index_uuid, split_id);
+        let is_pinned = self
+            .pin_counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+            > 0;
+        if is_pinned {
+            return Ok(false);
+        }
+        let cache_dir = self.cache_dir(index_uuid, split_id);
+        let removed_dir = if cache_dir.exists() {
+            std::fs::remove_dir_all(&cache_dir)
+                .with_context(|| format!("remove cache dir {cache_dir:?}"))?;
+            true
+        } else {
+            false
+        };
+        let removed_entry = self
+            .cache_entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key)
+            .is_some();
+        if removed_dir || removed_entry {
+            self.record_cache_eviction("artifact", reason);
+            self.sync_artifact_cache_gauges();
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     pub fn reap_split_cache(
         &self,
         index_uuid: &str,
         live_split_ids: &HashSet<String>,
         budget_bytes: Option<u64>,
     ) -> Result<()> {
-        let cache_root = self.local_workdir.join("splits").join(index_uuid);
+        let effective_budget = budget_bytes.filter(|b| *b > 0).or_else(|| {
+            self.cache_governor_stats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .artifact_budget_bytes
+        });
 
         let mut entries: Vec<(String, CachedSplitEntry)> = {
             let cache_entries = self.cache_entries.lock().unwrap_or_else(|e| e.into_inner());
@@ -573,33 +1138,6 @@ impl StorageManager {
                 .map(|(key, entry)| (key.clone(), entry.clone()))
                 .collect()
         };
-
-        if cache_root.exists() {
-            for entry in std::fs::read_dir(&cache_root)
-                .with_context(|| format!("read cache root {cache_root:?}"))?
-            {
-                let entry = entry?;
-                if !entry.file_type()?.is_dir() {
-                    continue;
-                }
-                let split_id = entry.file_name().to_string_lossy().to_string();
-                let key = cache_entry_key(index_uuid, &split_id);
-                if entries.iter().any(|(existing_key, _)| existing_key == &key) {
-                    continue;
-                }
-
-                entries.push((
-                    key,
-                    CachedSplitEntry {
-                        index_uuid: index_uuid.to_string(),
-                        split_id,
-                        size_bytes: dir_size_bytes(&entry.path()),
-                        last_access_epoch_ms: 0,
-                        reservation: None,
-                    },
-                ));
-            }
-        }
 
         let mut total_bytes: u64 = entries.iter().map(|(_, entry)| entry.size_bytes).sum();
         entries.sort_by_key(|(_, entry)| {
@@ -611,7 +1149,7 @@ impl StorageManager {
 
         for (key, entry) in entries {
             let is_stale = !live_split_ids.contains(&entry.split_id);
-            let over_budget = budget_bytes.is_some_and(|budget| total_bytes > budget);
+            let over_budget = effective_budget.is_some_and(|budget| total_bytes > budget);
             if !is_stale && !over_budget {
                 continue;
             }
@@ -637,10 +1175,143 @@ impl StorageManager {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&key);
+            let reason = if is_stale {
+                "stale_split"
+            } else {
+                "budget_pressure"
+            };
+            self.record_cache_eviction("artifact", reason);
             total_bytes = total_bytes.saturating_sub(entry.size_bytes);
         }
+        self.sync_artifact_cache_gauges();
 
         Ok(())
+    }
+
+    fn enforce_artifact_admission_budget(
+        &self,
+        needed_bytes: u64,
+    ) -> Result<ArtifactAdmissionGuard> {
+        let (artifact_budget, max_single, inflight_admission) = {
+            let stats = self
+                .cache_governor_stats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            (
+                stats.artifact_budget_bytes,
+                stats.max_single_artifact_bytes,
+                stats.inflight_admission_bytes,
+            )
+        };
+        if let Some(max_single_bytes) = max_single
+            && needed_bytes > max_single_bytes
+        {
+            self.record_cache_admission_rejection("artifact", "oversized_entry");
+            return Err(crate::worker::ResourceExhaustedError {
+                pool: crate::worker::ResourcePoolKind::PersistentCache,
+                requested_bytes: needed_bytes,
+                available_bytes: max_single_bytes,
+                capacity_bytes: max_single_bytes,
+            }
+            .into());
+        }
+        let Some(budget) = artifact_budget else {
+            let mut stats = self
+                .cache_governor_stats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            stats.inflight_admission_bytes =
+                stats.inflight_admission_bytes.saturating_add(needed_bytes);
+            return Ok(ArtifactAdmissionGuard {
+                reserved_bytes: needed_bytes,
+                stats: Arc::clone(&self.cache_governor_stats),
+            });
+        };
+        if needed_bytes > budget {
+            self.record_cache_admission_rejection("artifact", "oversized_entry");
+            return Err(crate::worker::ResourceExhaustedError {
+                pool: crate::worker::ResourcePoolKind::PersistentCache,
+                requested_bytes: needed_bytes,
+                available_bytes: budget,
+                capacity_bytes: budget,
+            }
+            .into());
+        }
+
+        let mut candidates: Vec<(String, CachedSplitEntry)> = {
+            let entries = self.cache_entries.lock().unwrap_or_else(|e| e.into_inner());
+            entries
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+        let mut total_bytes: u64 = candidates
+            .iter()
+            .map(|(_, e)| e.size_bytes)
+            .sum::<u64>()
+            .saturating_add(inflight_admission);
+        if total_bytes.saturating_add(needed_bytes) > budget {
+            candidates.sort_by_key(|(_, e)| e.last_access_epoch_ms);
+            for (key, entry) in candidates {
+                if total_bytes.saturating_add(needed_bytes) <= budget {
+                    break;
+                }
+                let is_pinned = self
+                    .pin_counts
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(0)
+                    > 0;
+                if is_pinned {
+                    continue;
+                }
+                let cache_dir = self.cache_dir(&entry.index_uuid, &entry.split_id);
+                if cache_dir.exists() {
+                    let _ = std::fs::remove_dir_all(&cache_dir);
+                }
+                self.cache_entries
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&key);
+                self.record_cache_eviction("artifact", "budget_pressure");
+                total_bytes = total_bytes.saturating_sub(entry.size_bytes);
+            }
+            self.sync_artifact_cache_gauges();
+        }
+
+        let current_cached_bytes: u64 = self
+            .cache_entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(|e| e.size_bytes)
+            .sum();
+        {
+            let mut stats = self
+                .cache_governor_stats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let used = current_cached_bytes.saturating_add(stats.inflight_admission_bytes);
+            if used.saturating_add(needed_bytes) > budget {
+                drop(stats);
+                self.record_cache_admission_rejection("artifact", "pinned_budget_exhausted");
+                return Err(crate::worker::ResourceExhaustedError {
+                    pool: crate::worker::ResourcePoolKind::PersistentCache,
+                    requested_bytes: needed_bytes,
+                    available_bytes: budget.saturating_sub(used),
+                    capacity_bytes: budget,
+                }
+                .into());
+            }
+            stats.inflight_admission_bytes =
+                stats.inflight_admission_bytes.saturating_add(needed_bytes);
+        }
+        Ok(ArtifactAdmissionGuard {
+            reserved_bytes: needed_bytes,
+            stats: Arc::clone(&self.cache_governor_stats),
+        })
     }
 
     /// Staging directory for building a split in-progress. Used by the
@@ -668,14 +1339,9 @@ impl StorageManager {
             .clone()
     }
 
-    /// Download a split's bundle from the object store, verify its checksum,
-    /// and unpack it into the node-local cache. Reuses the cached copy on
-    /// subsequent calls when the `.done` marker matches `expected_checksum`.
-    ///
-    /// `split` is trusted only for its `split_id`, `bundle_path`, and
-    /// `checksum` fields; `bundle_path` is validated against the expected
-    /// canonical key shape so a malicious manifest cannot escape the key
-    /// namespace or reference another index's splits.
+    /// Stream-download a split's bundle from the object store to a temporary file,
+    /// incrementally verify its SHA-256 checksum and compressed/uncompressed bounds,
+    /// unpack it into the node-local cache, and atomically write the `.done` marker (`FS-044`, `FS-045`).
     pub async fn fetch_split_into_cache(
         &self,
         index_uuid: &str,
@@ -700,13 +1366,19 @@ impl StorageManager {
 
         let cache_dir = self.cache_dir(index_uuid, &split.split_id);
         let done_marker = cache_dir.join(".done");
-        if let Ok(bytes) = std::fs::read(&done_marker)
-            && bytes == split.checksum.as_bytes()
+        if self
+            .cached_split_status(index_uuid, &split.split_id, &split.checksum)
+            .artifact_cached
         {
-            self.record_cached_split_access(
+            self.record_cache_tier_hit("artifact");
+            let cached_bytes = self.cached_split_size_bytes(index_uuid, &split.split_id);
+            self.record_cached_split_access_with_metadata(
                 index_uuid,
                 &split.split_id,
-                self.cached_split_size_bytes(index_uuid, &split.split_id),
+                Some(&split.checksum),
+                split.size_bytes.max(cached_bytes),
+                cached_bytes,
+                None,
             );
             return Ok(cache_dir);
         }
@@ -714,6 +1386,7 @@ impl StorageManager {
         let current_ctx = crate::worker::current_request_context();
         let _hydration_timer =
             crate::worker::start_current_stage_timer(crate::worker::TraceStage::Hydration);
+        let hydration_started = std::time::Instant::now();
         let _hydration_lease = self
             .admission
             .acquire(crate::worker::WorkClass::Hydration, current_ctx.as_ref())
@@ -726,6 +1399,9 @@ impl StorageManager {
                 tokio::select! {
                     biased;
                     _ = ctx.wait_cancelled(crate::worker::ExecutionStage::Hydration) => {
+                        crate::metrics::HYDRATION_FAILURES_TOTAL
+                            .with_label_values(&["cancelled"])
+                            .inc();
                         ctx.check_active(crate::worker::ExecutionStage::Hydration)?;
                         return Err(crate::worker::RequestCancelledError {
                             stage: crate::worker::ExecutionStage::Hydration,
@@ -740,34 +1416,88 @@ impl StorageManager {
 
         crate::worker::check_current_request_active(crate::worker::ExecutionStage::Hydration)?;
 
-        // Re-check inside the lock: a concurrent caller may have just finished.
-        if let Ok(bytes) = std::fs::read(&done_marker)
-            && bytes == split.checksum.as_bytes()
+        // Re-check inside the single-flight lock: a concurrent caller may have just finished.
+        if self
+            .cached_split_status(index_uuid, &split.split_id, &split.checksum)
+            .artifact_cached
         {
-            self.record_cached_split_access(
+            crate::metrics::HYDRATION_COALESCED_TOTAL.inc();
+            self.record_cache_tier_hit("artifact");
+            let cached_bytes = self.cached_split_size_bytes(index_uuid, &split.split_id);
+            self.record_cached_split_access_with_metadata(
                 index_uuid,
                 &split.split_id,
-                self.cached_split_size_bytes(index_uuid, &split.split_id),
+                Some(&split.checksum),
+                split.size_bytes.max(cached_bytes),
+                cached_bytes,
+                None,
             );
             return Ok(cache_dir);
+        }
+        self.record_cache_tier_miss("artifact");
+
+        let limits = self.hydration_limits();
+        if split.size_bytes > limits.max_bundle_bytes {
+            crate::metrics::HYDRATION_FAILURES_TOTAL
+                .with_label_values(&["decompression_bomb"])
+                .inc();
+            self.record_cache_admission_rejection("artifact", "decompression_bomb");
+            anyhow::bail!(
+                "decompression bomb rejected for split {}: declared bundle size {} exceeds max_bundle_bytes {}",
+                split.split_id,
+                split.size_bytes,
+                limits.max_bundle_bytes
+            );
+        }
+        if split.uncompressed_bytes > limits.max_uncompressed_bytes {
+            crate::metrics::HYDRATION_FAILURES_TOTAL
+                .with_label_values(&["decompression_bomb"])
+                .inc();
+            self.record_cache_admission_rejection("artifact", "decompression_bomb");
+            anyhow::bail!(
+                "decompression bomb rejected for split {}: declared uncompressed_bytes {} exceeds max_uncompressed_bytes {}",
+                split.split_id,
+                split.uncompressed_bytes,
+                limits.max_uncompressed_bytes
+            );
         }
 
         let estimated_inflight = split.size_bytes.max(1);
         let estimated_unpacked = split.uncompressed_bytes.max(split.size_bytes).max(1);
-        let mut inflight_reservation = self.resource_governor.try_reserve(
-            crate::worker::ResourcePoolKind::ObjectStoreInflight,
-            estimated_inflight,
-        )?;
-        let mut temp_disk_reservation = self.resource_governor.try_reserve(
-            crate::worker::ResourcePoolKind::TempDisk,
-            estimated_unpacked,
-        )?;
-        let mut cache_reservation = self.resource_governor.try_reserve(
-            crate::worker::ResourcePoolKind::PersistentCache,
-            estimated_unpacked,
-        )?;
+        let mut admission_guard = self.enforce_artifact_admission_budget(estimated_unpacked)?;
 
-        // Clean up any partial state from a previous failed extract.
+        let mut inflight_reservation = self
+            .resource_governor
+            .try_reserve(
+                crate::worker::ResourcePoolKind::ObjectStoreInflight,
+                estimated_inflight,
+            )
+            .inspect_err(|_| {
+                self.record_cache_admission_rejection("artifact", "resource_pool_exhausted");
+            })?;
+        let mut temp_disk_reservation = self
+            .resource_governor
+            .try_reserve(
+                crate::worker::ResourcePoolKind::TempDisk,
+                estimated_unpacked.saturating_add(estimated_inflight),
+            )
+            .inspect_err(|_| {
+                self.record_cache_admission_rejection("artifact", "resource_pool_exhausted");
+            })?;
+        let mut cache_reservation = self
+            .resource_governor
+            .try_reserve(
+                crate::worker::ResourcePoolKind::PersistentCache,
+                estimated_unpacked,
+            )
+            .inspect_err(|_| {
+                self.record_cache_admission_rejection("artifact", "resource_pool_exhausted");
+            })?;
+
+        if let Some(parent) = cache_dir.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create cache parent {parent:?}"))?;
+        }
         if cache_dir.exists() {
             std::fs::remove_dir_all(&cache_dir)
                 .with_context(|| format!("failed to clear stale cache dir {cache_dir:?}"))?;
@@ -777,48 +1507,103 @@ impl StorageManager {
             std::fs::remove_dir_all(&tmp_dir)
                 .with_context(|| format!("failed to clear stale tmp dir {tmp_dir:?}"))?;
         }
+        let bundle_tmp_file = cache_dir.with_extension("bundle.tmp");
+        if bundle_tmp_file.exists() {
+            let _ = std::fs::remove_file(&bundle_tmp_file);
+        }
         std::fs::create_dir_all(&tmp_dir)
             .with_context(|| format!("failed to create tmp cache dir {tmp_dir:?}"))?;
 
-        struct TempDirCleanupGuard {
-            path: Option<PathBuf>,
+        struct TempHydrationCleanupGuard {
+            dir_path: Option<PathBuf>,
+            bundle_file_path: Option<PathBuf>,
+            staged_bytes: u64,
+            manager: StorageManager,
         }
-        impl Drop for TempDirCleanupGuard {
+        impl Drop for TempHydrationCleanupGuard {
             fn drop(&mut self) {
-                if let Some(path) = self.path.take()
-                    && path.exists()
+                if self.staged_bytes > 0 {
+                    self.manager.sub_staging_bytes(self.staged_bytes);
+                    self.staged_bytes = 0;
+                }
+                if let Some(file_path) = self.bundle_file_path.take()
+                    && file_path.exists()
                 {
-                    let _ = std::fs::remove_dir_all(&path);
+                    let _ = std::fs::remove_file(&file_path);
+                }
+                if let Some(dir_path) = self.dir_path.take()
+                    && dir_path.exists()
+                {
+                    let _ = std::fs::remove_dir_all(&dir_path);
                 }
             }
         }
-        let mut tmp_cleanup = TempDirCleanupGuard {
-            path: Some(tmp_dir.clone()),
+        let mut tmp_cleanup = TempHydrationCleanupGuard {
+            dir_path: Some(tmp_dir.clone()),
+            bundle_file_path: Some(bundle_tmp_file.clone()),
+            staged_bytes: 0,
+            manager: self.clone(),
+        };
+
+        let max_allowed_bundle_bytes = if split.size_bytes > 0 {
+            split.size_bytes.min(limits.max_bundle_bytes)
+        } else {
+            limits.max_bundle_bytes
+        };
+        let max_allowed_unpacked_bytes = if split.uncompressed_bytes > 0 {
+            split
+                .uncompressed_bytes
+                .max(split.size_bytes)
+                .min(limits.max_uncompressed_bytes)
+        } else {
+            limits.max_uncompressed_bytes
         };
 
         let object_path = self.object_path(&split.bundle_path)?;
-        let (bundle_bytes, actual_checksum) = match &current_ctx {
+        let (streamed_bundle_bytes, actual_checksum) = match &current_ctx {
             Some(ctx) => {
                 tokio::select! {
                     biased;
                     _ = ctx.wait_cancelled(crate::worker::ExecutionStage::Hydration) => {
+                        crate::metrics::HYDRATION_FAILURES_TOTAL
+                            .with_label_values(&["cancelled"])
+                            .inc();
                         ctx.check_active(crate::worker::ExecutionStage::Hydration)?;
                         return Err(crate::worker::RequestCancelledError {
                             stage: crate::worker::ExecutionStage::Hydration,
                             reason: crate::worker::CancellationReason::ClientDisconnected,
                         }.into());
                     }
-                    res = self.download_and_hash_with_reservation(&object_path, &mut inflight_reservation) => res?,
+                    res = self.stream_bundle_to_temp_file_with_reservation(
+                        &object_path,
+                        &bundle_tmp_file,
+                        split.size_bytes,
+                        max_allowed_bundle_bytes,
+                        &mut inflight_reservation,
+                        &mut temp_disk_reservation,
+                        &mut tmp_cleanup.staged_bytes,
+                    ) => res?,
                 }
             }
             None => {
-                self.download_and_hash_with_reservation(&object_path, &mut inflight_reservation)
-                    .await?
+                self.stream_bundle_to_temp_file_with_reservation(
+                    &object_path,
+                    &bundle_tmp_file,
+                    split.size_bytes,
+                    max_allowed_bundle_bytes,
+                    &mut inflight_reservation,
+                    &mut temp_disk_reservation,
+                    &mut tmp_cleanup.staged_bytes,
+                )
+                .await?
             }
         };
         crate::worker::check_current_request_active(crate::worker::ExecutionStage::Hydration)?;
 
         if actual_checksum != split.checksum {
+            crate::metrics::HYDRATION_FAILURES_TOTAL
+                .with_label_values(&["checksum_mismatch"])
+                .inc();
             anyhow::bail!(
                 "bundle checksum mismatch for split {}: expected {}, got {}",
                 split.split_id,
@@ -827,49 +1612,89 @@ impl StorageManager {
             );
         }
 
-        // Unpack in a blocking task so we don't stall the reactor on large
-        // bundles.
+        // Stream-unpack from the verified temporary bundle file in a blocking task
+        // using a fixed 64 KiB buffer so peak memory never scales with bundle size.
         let tmp_dir_for_unpack = tmp_dir.clone();
+        let bundle_file_for_unpack = bundle_tmp_file.clone();
         let unpack_result = tokio::task::spawn_blocking(move || {
-            unpack_bundle_into(&bundle_bytes, &tmp_dir_for_unpack)
+            unpack_bundle_file_into(
+                &bundle_file_for_unpack,
+                &tmp_dir_for_unpack,
+                max_allowed_unpacked_bytes,
+            )
         })
         .await;
         drop(inflight_reservation);
 
-        match unpack_result {
-            Ok(Ok(())) => {}
+        let unpacked_bytes = match unpack_result {
+            Ok(Ok(bytes)) => bytes,
             Ok(Err(e)) => {
+                let msg = format!("{e:#}");
+                if msg.contains("decompression bomb") || msg.contains("uncompressed byte limit") {
+                    crate::metrics::HYDRATION_FAILURES_TOTAL
+                        .with_label_values(&["decompression_bomb"])
+                        .inc();
+                    self.record_cache_admission_rejection("artifact", "decompression_bomb");
+                } else {
+                    crate::metrics::HYDRATION_FAILURES_TOTAL
+                        .with_label_values(&["io_error"])
+                        .inc();
+                }
                 return Err(e);
             }
             Err(e) => {
+                crate::metrics::HYDRATION_FAILURES_TOTAL
+                    .with_label_values(&["io_error"])
+                    .inc();
                 return Err(anyhow::anyhow!("unpack task panicked: {e}"));
             }
+        };
+
+        // Remove the temporary bundle file as soon as unpacking succeeds.
+        if let Some(bundle_file) = tmp_cleanup.bundle_file_path.take()
+            && bundle_file.exists()
+        {
+            let _ = std::fs::remove_file(&bundle_file);
+        }
+        if tmp_cleanup.staged_bytes > 0 {
+            self.sub_staging_bytes(tmp_cleanup.staged_bytes);
+            tmp_cleanup.staged_bytes = 0;
         }
 
         crate::worker::check_current_request_active(crate::worker::ExecutionStage::Hydration)?;
-        let unpacked_bytes = dir_size_bytes(&tmp_dir);
+        if unpacked_bytes > estimated_unpacked {
+            drop(admission_guard);
+            admission_guard = self.enforce_artifact_admission_budget(unpacked_bytes.max(1))?;
+        } else {
+            admission_guard.reconcile(unpacked_bytes.max(1));
+        }
         temp_disk_reservation.reconcile(unpacked_bytes)?;
 
-        if let Some(parent) = cache_dir.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create cache parent {parent:?}"))?;
-        }
-        tmp_cleanup.path = None;
+        tmp_cleanup.dir_path = None;
         std::fs::rename(&tmp_dir, &cache_dir).with_context(|| {
             format!("failed to promote tmp cache dir {tmp_dir:?} to final {cache_dir:?}")
         })?;
         drop(temp_disk_reservation);
 
-        std::fs::write(&done_marker, split.checksum.as_bytes())
-            .with_context(|| format!("failed to write done marker {done_marker:?}"))?;
-        let actual_cached_bytes = self.cached_split_size_bytes(index_uuid, &split.split_id);
+        let done_tmp = cache_dir.join(".done.tmp");
+        std::fs::write(&done_tmp, split.checksum.as_bytes())
+            .with_context(|| format!("failed to write temp done marker {done_tmp:?}"))?;
+        std::fs::rename(&done_tmp, &done_marker)
+            .with_context(|| format!("failed to atomically publish done marker {done_marker:?}"))?;
+        let done_len = split.checksum.len() as u64;
+        let actual_cached_bytes = unpacked_bytes.saturating_add(done_len);
         cache_reservation.reconcile(actual_cached_bytes)?;
-        self.record_cached_split_access_with_reservation(
+        self.record_cached_split_access_with_metadata(
             index_uuid,
             &split.split_id,
+            Some(&split.checksum),
+            streamed_bundle_bytes.max(split.size_bytes),
             actual_cached_bytes,
             Some(cache_reservation),
         );
+        drop(admission_guard);
+        crate::metrics::HYDRATION_DURATION_SECONDS
+            .observe(hydration_started.elapsed().as_secs_f64());
 
         Ok(cache_dir)
     }
@@ -941,6 +1766,7 @@ impl StorageManager {
 
     /// Inspect an already-uploaded split bundle when resuming a publication
     /// whose `intent.json` fingerprint was already verified (`FS-019`, `FS-040`).
+    /// Streams the bundle to verify magic header, size, and SHA-256 without buffering the full object in memory.
     pub async fn inspect_existing_split_bundle(
         &self,
         index_uuid: &str,
@@ -948,20 +1774,38 @@ impl StorageManager {
     ) -> Result<Option<(String, String, u64)>> {
         let bundle_key = Self::split_bundle_key(index_uuid, split_id);
         let object_path = self.object_path(&bundle_key)?;
-        match self.download_and_hash(&object_path).await {
-            Ok((bytes, checksum)) if bytes.starts_with(BUNDLE_MAGIC) => {
-                Ok(Some((bundle_key, checksum, bytes.len() as u64)))
+        let Ok(get_res) = self.get_object(&object_path).await else {
+            return Ok(None);
+        };
+        let mut stream = get_res.into_stream();
+        let mut hasher = Sha256::new();
+        let mut header_prefix = Vec::with_capacity(BUNDLE_MAGIC.len());
+        let mut total_bytes = 0u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(_) => {
+                    crate::metrics::record_object_store_request("get", "error");
+                    return Ok(None);
+                }
+            };
+            if header_prefix.len() < BUNDLE_MAGIC.len() {
+                let needed = BUNDLE_MAGIC.len() - header_prefix.len();
+                header_prefix.extend_from_slice(&chunk[..chunk.len().min(needed)]);
             }
-            Ok(_) => anyhow::bail!("existing split bundle at {bundle_key} has invalid header"),
-            Err(_) => Ok(None),
+            total_bytes = total_bytes.saturating_add(chunk.len() as u64);
+            hasher.update(&chunk);
         }
+        crate::metrics::record_object_store_request("get", "success");
+        crate::metrics::record_object_store_transfer("download", total_bytes as usize);
+        if header_prefix.as_slice() != BUNDLE_MAGIC {
+            anyhow::bail!("existing split bundle at {bundle_key} has invalid header");
+        }
+        let checksum = format!("sha256:{:x}", hasher.finalize());
+        Ok(Some((bundle_key, checksum, total_bytes)))
     }
 
-    /// Stream-download an object into a `Vec<u8>` and compute its sha256 in
-    /// the same pass. For MVP we buffer the whole bundle in memory; a
-    /// future PR can switch to a file-backed staging buffer for very large
-    /// bundles.
-    async fn download_and_hash(&self, key: &ObjectPath) -> Result<(Vec<u8>, String)> {
+    pub(crate) async fn download_and_hash(&self, key: &ObjectPath) -> Result<(Vec<u8>, String)> {
         let mut stream = self.get_object(key).await?.into_stream();
         let mut buf: Vec<u8> = Vec::new();
         let mut hasher = Sha256::new();
@@ -982,43 +1826,103 @@ impl StorageManager {
         Ok((buf, checksum))
     }
 
-    async fn download_and_hash_with_reservation(
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_bundle_to_temp_file_with_reservation(
         &self,
         key: &ObjectPath,
+        bundle_tmp_file: &Path,
+        expected_size_bytes: u64,
+        max_bundle_bytes: u64,
         inflight_reservation: &mut crate::worker::ResourceReservation,
-    ) -> Result<(Vec<u8>, String)> {
+        temp_disk_reservation: &mut crate::worker::ResourceReservation,
+        staged_bytes_tracker: &mut u64,
+    ) -> Result<(u64, String)> {
+        use tokio::io::AsyncWriteExt;
+
         let mut stream = self.get_object(key).await?.into_stream();
-        let mut buf: Vec<u8> = Vec::new();
+        let file = tokio::fs::File::create(bundle_tmp_file)
+            .await
+            .with_context(|| format!("failed to create temp bundle file {bundle_tmp_file:?}"))?;
+        let mut writer = tokio::io::BufWriter::with_capacity(STREAM_HYDRATION_COPY_BUF_BYTES, file);
         let mut hasher = Sha256::new();
+        let mut downloaded_bytes: u64 = 0;
+
         while let Some(chunk) = stream.next().await {
             crate::worker::check_current_request_active(crate::worker::ExecutionStage::Hydration)?;
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(error) => {
                     crate::metrics::record_object_store_request("get", "error");
+                    crate::metrics::HYDRATION_FAILURES_TOTAL
+                        .with_label_values(&["short_read"])
+                        .inc();
                     return Err(anyhow::Error::from(error));
                 }
             };
-            let next_len = (buf.len() + chunk.len()) as u64;
+            let chunk_len = chunk.len() as u64;
+            let next_len = downloaded_bytes.saturating_add(chunk_len);
+            if next_len > max_bundle_bytes {
+                crate::metrics::record_object_store_request("get", "error");
+                crate::metrics::HYDRATION_FAILURES_TOTAL
+                    .with_label_values(&["decompression_bomb"])
+                    .inc();
+                self.record_cache_admission_rejection("artifact", "decompression_bomb");
+                anyhow::bail!(
+                    "decompression bomb rejected: bundle stream for {key} exceeded compressed byte limit ({next_len} > {max_bundle_bytes})"
+                );
+            }
             if next_len > inflight_reservation.reserved_bytes() {
-                inflight_reservation.reconcile(next_len)?;
+                inflight_reservation.reconcile(next_len).inspect_err(|_| {
+                    self.record_cache_admission_rejection("artifact", "resource_pool_exhausted");
+                })?;
+            }
+            if next_len > temp_disk_reservation.reserved_bytes() {
+                temp_disk_reservation.reconcile(next_len).inspect_err(|_| {
+                    self.record_cache_admission_rejection("artifact", "resource_pool_exhausted");
+                })?;
             }
             let current_ctx = crate::worker::current_request_context();
             self.admission
                 .account_io_bytes(
                     crate::worker::WorkClass::Hydration,
-                    chunk.len() as u64,
+                    chunk_len,
                     current_ctx.as_ref(),
                 )
                 .await?;
             hasher.update(&chunk);
-            buf.extend_from_slice(&chunk);
+            writer
+                .write_all(&chunk)
+                .await
+                .with_context(|| format!("failed to write chunk to {bundle_tmp_file:?}"))?;
+            downloaded_bytes = next_len;
+            self.add_staging_bytes(chunk_len);
+            *staged_bytes_tracker = staged_bytes_tracker.saturating_add(chunk_len);
+            crate::metrics::HYDRATION_STREAMED_BYTES_TOTAL
+                .with_label_values(&["download"])
+                .inc_by(chunk_len);
         }
-        inflight_reservation.reconcile(buf.len() as u64)?;
+
+        writer
+            .flush()
+            .await
+            .with_context(|| format!("failed to flush temp bundle file {bundle_tmp_file:?}"))?;
+        drop(writer);
+
+        if expected_size_bytes > 0 && downloaded_bytes != expected_size_bytes {
+            crate::metrics::record_object_store_request("get", "error");
+            crate::metrics::HYDRATION_FAILURES_TOTAL
+                .with_label_values(&["short_read"])
+                .inc();
+            anyhow::bail!(
+                "short read on bundle stream for {key}: expected {expected_size_bytes} bytes, got {downloaded_bytes}"
+            );
+        }
+
+        inflight_reservation.reconcile(downloaded_bytes)?;
         let checksum = format!("sha256:{:x}", hasher.finalize());
         crate::metrics::record_object_store_request("get", "success");
-        crate::metrics::record_object_store_transfer("download", buf.len());
-        Ok((buf, checksum))
+        crate::metrics::record_object_store_transfer("download", downloaded_bytes as usize);
+        Ok((downloaded_bytes, checksum))
     }
 
     /// Upcast the concrete backend to the generic `ObjectStore` trait object.
@@ -1931,28 +2835,58 @@ pub(crate) fn pack_bundle_from_dir(dir: &Path) -> Result<(Vec<u8>, String)> {
     Ok((buf, checksum))
 }
 
+pub(crate) fn unpack_bundle_file_into(
+    bundle_file: &Path,
+    dir: &Path,
+    max_uncompressed_bytes: u64,
+) -> Result<u64> {
+    let file = std::fs::File::open(bundle_file)
+        .with_context(|| format!("failed to open temp bundle file {bundle_file:?}"))?;
+    let total_bundle_len = file
+        .metadata()
+        .with_context(|| format!("failed to stat temp bundle file {bundle_file:?}"))?
+        .len();
+    let mut reader = std::io::BufReader::with_capacity(STREAM_HYDRATION_COPY_BUF_BYTES, file);
+    unpack_bundle_reader_into(&mut reader, total_bundle_len, dir, max_uncompressed_bytes)
+}
+
 /// Inverse of `pack_bundle_from_dir`: parse `bytes` as a bundle and write
 /// each embedded file under `dir`. Rejects malformed frames and any
 /// relative path that would escape the target directory.
+#[cfg(test)]
 pub(crate) fn unpack_bundle_into(bytes: &[u8], dir: &Path) -> Result<()> {
+    let mut cursor = std::io::Cursor::new(bytes);
+    unpack_bundle_reader_into(
+        &mut cursor,
+        bytes.len() as u64,
+        dir,
+        DEFAULT_MAX_HYDRATION_UNCOMPRESSED_BYTES,
+    )
+    .map(|_| ())
+}
+
+fn unpack_bundle_reader_into<R: std::io::Read>(
+    reader: &mut R,
+    total_bundle_len: u64,
+    dir: &Path,
+    max_uncompressed_bytes: u64,
+) -> Result<u64> {
+    use std::io::Write;
     use std::path::Component;
 
-    if bytes.len() < BUNDLE_MAGIC.len() + 8 {
-        anyhow::bail!("bundle too short to contain header ({} bytes)", bytes.len());
+    let min_header = (BUNDLE_MAGIC.len() + 8) as u64;
+    if total_bundle_len < min_header {
+        anyhow::bail!("bundle too short to contain header ({total_bundle_len} bytes)");
     }
-    if &bytes[..BUNDLE_MAGIC.len()] != BUNDLE_MAGIC {
-        anyhow::bail!(
-            "bundle magic mismatch: expected {:?}, got {:?}",
-            BUNDLE_MAGIC,
-            &bytes[..BUNDLE_MAGIC.len()]
-        );
+    let mut magic_buf = [0u8; BUNDLE_MAGIC.len()];
+    reader
+        .read_exact(&mut magic_buf)
+        .context("bundle too short to contain magic")?;
+    if &magic_buf != BUNDLE_MAGIC {
+        anyhow::bail!("bundle magic mismatch: expected {BUNDLE_MAGIC:?}, got {magic_buf:?}");
     }
-    let mut off = BUNDLE_MAGIC.len();
-
-    let file_count = read_u64_le(bytes, &mut off)?;
-    // Defensive upper bound: splits realistically have thousands of files
-    // at most. Reject values that would let a malformed bundle trigger huge
-    // allocations.
+    let mut off = BUNDLE_MAGIC.len() as u64;
+    let file_count = read_u64_le_stream(reader, total_bundle_len, &mut off)?;
     if file_count > 1_000_000 {
         anyhow::bail!("bundle declares implausibly large file_count {file_count}");
     }
@@ -1963,15 +2897,21 @@ pub(crate) fn unpack_bundle_into(bytes: &[u8], dir: &Path) -> Result<()> {
         .canonicalize()
         .with_context(|| format!("failed to canonicalize {dir:?}"))?;
 
+    let mut total_unpacked_bytes = 0u64;
+    let mut copy_buf = vec![0u8; STREAM_HYDRATION_COPY_BUF_BYTES];
+
     for _ in 0..file_count {
-        let rel_len = read_u64_le(bytes, &mut off)? as usize;
-        if off + rel_len > bytes.len() {
+        let rel_len = read_u64_le_stream(reader, total_bundle_len, &mut off)?;
+        if rel_len == 0 || rel_len > 4096 || off.saturating_add(rel_len) > total_bundle_len {
             anyhow::bail!("bundle truncated while reading relative path");
         }
-        let rel_bytes = &bytes[off..off + rel_len];
+        let mut rel_bytes = vec![0u8; rel_len as usize];
+        reader
+            .read_exact(&mut rel_bytes)
+            .context("bundle truncated while reading relative path")?;
         off += rel_len;
         let rel_str =
-            std::str::from_utf8(rel_bytes).context("bundle relative path is not valid utf-8")?;
+            std::str::from_utf8(&rel_bytes).context("bundle relative path is not valid utf-8")?;
 
         let rel_path = Path::new(rel_str);
         if rel_path.is_absolute() {
@@ -1984,15 +2924,25 @@ pub(crate) fn unpack_bundle_into(bytes: &[u8], dir: &Path) -> Result<()> {
             }
         }
 
-        let content_len = read_u64_le(bytes, &mut off)? as usize;
-        if off + content_len > bytes.len() {
+        let content_len = read_u64_le_stream(reader, total_bundle_len, &mut off)?;
+        if off
+            .checked_add(content_len)
+            .is_none_or(|end| end > total_bundle_len)
+        {
             anyhow::bail!("bundle truncated while reading file content for {rel_str:?}");
         }
-        let content = &bytes[off..off + content_len];
-        off += content_len;
+        total_unpacked_bytes = total_unpacked_bytes
+            .checked_add(content_len)
+            .ok_or_else(|| {
+                anyhow::anyhow!("decompression bomb rejected: unpacked byte count overflow")
+            })?;
+        if total_unpacked_bytes > max_uncompressed_bytes {
+            anyhow::bail!(
+                "decompression bomb rejected: unpacked bytes ({total_unpacked_bytes}) exceed uncompressed byte limit ({max_uncompressed_bytes})"
+            );
+        }
 
         let abs = dir_canon.join(rel_path);
-        // Belt-and-suspenders: ensure the joined path still lives under `dir_canon`.
         if !abs.starts_with(&dir_canon) {
             anyhow::bail!("bundle file path {abs:?} would escape extract dir {dir_canon:?}");
         }
@@ -2000,25 +2950,53 @@ pub(crate) fn unpack_bundle_into(bytes: &[u8], dir: &Path) -> Result<()> {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create parent dir {parent:?}"))?;
         }
-        std::fs::write(&abs, content)
-            .with_context(|| format!("failed to write bundle file {abs:?}"))?;
+        let out_file = std::fs::File::create(&abs)
+            .with_context(|| format!("failed to create bundle file {abs:?}"))?;
+        let mut writer =
+            std::io::BufWriter::with_capacity(STREAM_HYDRATION_COPY_BUF_BYTES, out_file);
+        let mut remaining = content_len;
+        while remaining > 0 {
+            let to_read = (remaining as usize).min(copy_buf.len());
+            reader
+                .read_exact(&mut copy_buf[..to_read])
+                .with_context(|| {
+                    format!("bundle truncated while reading file content for {rel_str:?}")
+                })?;
+            writer
+                .write_all(&copy_buf[..to_read])
+                .with_context(|| format!("failed to write bundle file {abs:?}"))?;
+            remaining -= to_read as u64;
+        }
+        writer
+            .flush()
+            .with_context(|| format!("failed to flush bundle file {abs:?}"))?;
+        off += content_len;
     }
 
-    if off != bytes.len() {
+    if off != total_bundle_len {
         anyhow::bail!(
             "bundle has {} trailing bytes after last file",
-            bytes.len() - off
+            total_bundle_len - off
         );
     }
-    Ok(())
+    crate::metrics::HYDRATION_STREAMED_BYTES_TOTAL
+        .with_label_values(&["unpack"])
+        .inc_by(total_unpacked_bytes);
+    Ok(total_unpacked_bytes)
 }
 
-fn read_u64_le(bytes: &[u8], off: &mut usize) -> Result<u64> {
-    if *off + 8 > bytes.len() {
+fn read_u64_le_stream<R: std::io::Read>(
+    reader: &mut R,
+    total_len: u64,
+    off: &mut u64,
+) -> Result<u64> {
+    if off.saturating_add(8) > total_len {
         anyhow::bail!("bundle truncated while reading u64");
     }
     let mut b = [0u8; 8];
-    b.copy_from_slice(&bytes[*off..*off + 8]);
+    reader
+        .read_exact(&mut b)
+        .context("bundle truncated while reading u64")?;
     *off += 8;
     Ok(u64::from_le_bytes(b))
 }
@@ -4150,6 +5128,246 @@ mod tests {
                 .reserved_bytes(crate::worker::ResourcePoolKind::PersistentCache),
             0,
             "evicting split from cache must release PersistentCache reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn fs044_streaming_bundle_hydration_verifies_checksum_rejects_bombs_and_cleans_up_short_reads()
+     {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = StorageManager::new_in_path(temp_dir.path()).unwrap();
+        let stage = manager.staging_dir("idx-fs044", "split-stream");
+        std::fs::create_dir_all(&stage).unwrap();
+        let payload = vec![b'A'; 4096];
+        write_file(&stage, "index/segment_1.dat", &payload);
+        write_file(&stage, "index/meta.json", b"{\"meta\":1}");
+
+        let (bundle_key, checksum, size) = manager
+            .upload_split_bundle("idx-fs044", "split-stream", &stage)
+            .await
+            .unwrap();
+
+        let base_split = RemoteSplitManifest {
+            split_id: "split-stream".into(),
+            state: RemoteSplitState::Published,
+            bundle_path: bundle_key,
+            bundle_etag: None,
+            hotcache_path: None,
+            checksum,
+            doc_count: 1,
+            size_bytes: size,
+            uncompressed_bytes: size,
+            hotcache_bytes: None,
+            time_range: None,
+            tags: BTreeMap::new(),
+            field_ranges: BTreeMap::new(),
+            field_terms: BTreeMap::new(),
+        };
+
+        // 1. Compressed bundle limit exceeded (decompression bomb guard before/during stream).
+        manager.set_hydration_limits(HydrationLimits {
+            max_bundle_bytes: 64,
+            max_uncompressed_bytes: 1_000_000,
+        });
+        let bomb_err = manager
+            .fetch_split_into_cache("idx-fs044", &base_split)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{bomb_err:#}").contains("decompression bomb"),
+            "unexpected error: {bomb_err:#}"
+        );
+        assert!(!manager.cache_dir("idx-fs044", "split-stream").exists());
+        assert!(
+            !manager
+                .cache_dir("idx-fs044", "split-stream")
+                .with_extension("bundle.tmp")
+                .exists()
+        );
+
+        // 2. Uncompressed byte limit exceeded during streaming unpack.
+        manager.set_hydration_limits(HydrationLimits {
+            max_bundle_bytes: 1_000_000,
+            max_uncompressed_bytes: 100,
+        });
+        let mut sneak_split = base_split.clone();
+        sneak_split.uncompressed_bytes = 50; // Lie in manifest, caught during streaming unpack!
+        let unpack_bomb_err = manager
+            .fetch_split_into_cache("idx-fs044", &sneak_split)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{unpack_bomb_err:#}").contains("decompression bomb"),
+            "unexpected error: {unpack_bomb_err:#}"
+        );
+        assert!(!manager.cache_dir("idx-fs044", "split-stream").exists());
+        assert!(
+            !manager
+                .cache_dir("idx-fs044", "split-stream")
+                .with_extension("tmp")
+                .exists()
+        );
+        assert!(
+            !manager
+                .cache_dir("idx-fs044", "split-stream")
+                .with_extension("bundle.tmp")
+                .exists()
+        );
+
+        // 3. Short read / truncated stream detection when declared size_bytes > actual stream bytes.
+        manager.set_hydration_limits(HydrationLimits::default());
+        let mut short_split = base_split.clone();
+        short_split.size_bytes = size + 128;
+        let short_err = manager
+            .fetch_split_into_cache("idx-fs044", &short_split)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{short_err:#}").contains("short read"),
+            "unexpected error: {short_err:#}"
+        );
+        assert!(!manager.cache_dir("idx-fs044", "split-stream").exists());
+
+        // 4. Valid streaming hydration & single-flight coalescing.
+        let m1 = manager.clone();
+        let m2 = manager.clone();
+        let s1 = base_split.clone();
+        let s2 = base_split.clone();
+        let (r1, r2) = tokio::join!(
+            m1.fetch_split_into_cache("idx-fs044", &s1),
+            m2.fetch_split_into_cache("idx-fs044", &s2),
+        );
+        let dir1 = r1.unwrap();
+        let dir2 = r2.unwrap();
+        assert_eq!(dir1, dir2);
+        assert!(dir1.join(".done").exists());
+        assert_eq!(
+            std::fs::read(dir1.join("index/segment_1.dat")).unwrap(),
+            payload
+        );
+        assert_eq!(manager.cache_inventory_snapshot().staging_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn fs045_unified_cache_governor_enforces_budgets_protects_pins_and_rebuilds_inventory_on_restart()
+     {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = StorageManager::new_in_path(temp_dir.path()).unwrap();
+
+        let mut splits = Vec::new();
+        for name in ["split-1", "split-2", "split-3"] {
+            let stage = manager.staging_dir("idx-fs045", name);
+            std::fs::create_dir_all(&stage).unwrap();
+            write_file(&stage, "data.bin", &[b'x'; 200]);
+            let (bundle_key, checksum, size) = manager
+                .upload_split_bundle("idx-fs045", name, &stage)
+                .await
+                .unwrap();
+            splits.push(RemoteSplitManifest {
+                split_id: name.into(),
+                state: RemoteSplitState::Published,
+                bundle_path: bundle_key,
+                bundle_etag: None,
+                hotcache_path: None,
+                checksum,
+                doc_count: 1,
+                size_bytes: size,
+                uncompressed_bytes: size,
+                hotcache_bytes: None,
+                time_range: None,
+                tags: BTreeMap::new(),
+                field_ranges: BTreeMap::new(),
+                field_terms: BTreeMap::new(),
+            });
+        }
+
+        // Hydrate split-1 and split-2.
+        manager
+            .fetch_split_into_cache("idx-fs045", &splits[0])
+            .await
+            .unwrap();
+        manager
+            .fetch_split_into_cache("idx-fs045", &splits[1])
+            .await
+            .unwrap();
+
+        let snap_before = manager.cache_inventory_snapshot();
+        assert_eq!(snap_before.artifact_entries, 2);
+        assert!(snap_before.artifact_physical_bytes >= 400);
+        let initial_scans = snap_before.filesystem_scans_total;
+
+        // Steady-state cached_split_size_bytes and cached_split_status must not scan the filesystem!
+        let s1_bytes = manager.cached_split_size_bytes("idx-fs045", "split-1");
+        assert!(s1_bytes >= 200);
+        assert!(
+            manager
+                .cached_split_status("idx-fs045", "split-1", &splits[0].checksum)
+                .artifact_cached
+        );
+        assert_eq!(
+            manager.cache_inventory_snapshot().filesystem_scans_total,
+            initial_scans,
+            "steady-state cache queries must not trigger filesystem directory walks"
+        );
+
+        // Pin split-1 and set artifact budget so admitting split-3 must evict unpinned split-2 while protecting pinned split-1.
+        let pin1 = manager.pin_cached_split("idx-fs045", "split-1");
+        manager.set_cache_governor_budgets(Some(s1_bytes * 2 + 30), None);
+        manager
+            .fetch_split_into_cache("idx-fs045", &splits[2])
+            .await
+            .unwrap();
+
+        assert!(
+            manager
+                .cached_split_status("idx-fs045", "split-1", &splits[0].checksum)
+                .artifact_cached,
+            "pinned split-1 must be protected from eviction"
+        );
+        assert!(
+            !manager
+                .cached_split_status("idx-fs045", "split-2", &splits[1].checksum)
+                .artifact_cached,
+            "unpinned LRU split-2 must be evicted under budget pressure"
+        );
+        assert!(
+            manager
+                .cached_split_status("idx-fs045", "split-3", &splits[2].checksum)
+                .artifact_cached
+        );
+
+        // Pin split-3 as well; now both slots in the budget are pinned, so admitting split-2 must fail with pinned_budget_exhausted!
+        let _pin3 = manager.pin_cached_split("idx-fs045", "split-3");
+        let pin_err = manager
+            .fetch_split_into_cache("idx-fs045", &splits[1])
+            .await
+            .unwrap_err();
+        assert!(pin_err.is::<crate::worker::ResourceExhaustedError>());
+        let snap_after_reject = manager.cache_inventory_snapshot();
+        assert_eq!(
+            snap_after_reject
+                .admission_rejections_by_reason
+                .get("artifact:pinned_budget_exhausted")
+                .copied()
+                .unwrap_or(0),
+            1
+        );
+        drop(pin1);
+
+        // Simulate a crashed hydration leftover (.tmp and .bundle.tmp) and restart StorageManager on the same workdir.
+        let orphan_tmp = manager.cache_dir("idx-fs045", "orphan.tmp");
+        std::fs::create_dir_all(&orphan_tmp).unwrap();
+        let restarted = StorageManager::new_in_path(temp_dir.path()).unwrap();
+        assert!(
+            !orphan_tmp.exists(),
+            "startup inventory rebuild must remove orphaned .tmp directories"
+        );
+        let rebuilt_snap = restarted.cache_inventory_snapshot();
+        assert_eq!(rebuilt_snap.artifact_entries, 2);
+        assert!(
+            restarted
+                .cached_split_status("idx-fs045", "split-1", &splits[0].checksum)
+                .artifact_cached
         );
     }
 }

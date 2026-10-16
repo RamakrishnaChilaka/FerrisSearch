@@ -409,8 +409,12 @@ pub fn classify_request(method: &Method, path: &str) -> ClassifiedRequest {
             action: SecurityAction::ClusterStateRead,
             index: None,
         },
-        ["_cluster", ..] | ["_cat", ..] | ["_tasks", ..] => ClassifiedRequest {
+        ["_cluster", ..] | ["_cat", ..] | ["_tasks", ..] | ["_nodes", ..] => ClassifiedRequest {
             action: SecurityAction::ClusterMonitor,
+            index: None,
+        },
+        ["_snapshot", ..] => ClassifiedRequest {
+            action: SecurityAction::ClusterAdmin,
             index: None,
         },
         ["_bulk"] => ClassifiedRequest {
@@ -451,6 +455,10 @@ fn classify_index_action(method: &Method, action: &str) -> SecurityAction {
         },
         "_refresh" | "_flush" | "_forcemerge" => SecurityAction::IndexAdmin,
         "_remote_store" => SecurityAction::IndexAdmin,
+        "_lifecycle" => match *method {
+            Method::GET => SecurityAction::IndexRead,
+            _ => SecurityAction::IndexAdmin,
+        },
         _ => SecurityAction::IndexAdmin,
     }
 }
