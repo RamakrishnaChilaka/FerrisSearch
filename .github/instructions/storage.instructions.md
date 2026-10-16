@@ -32,10 +32,17 @@ Do not collapse these responsibilities into API handlers.
 
 ## Current Limits That Must Stay Explicit
 
-- Publication is serialized only by a process-local `publish_lock`. There is no
-  object-store compare-and-set, writer epoch, or cross-process fencing.
-- `append_split_and_publish()` is a read-modify-write sequence. Concurrent
-  publishers in different processes can lose manifest entries.
+- `StorageManager` now provides conditional object-store primitives
+  (`create_immutable`, `read_with_token`, `compare_and_swap`,
+  `compare_and_swap_optional`) and capability probing (FS-015), and manifest
+  publication uses `create_immutable` plus pointer CAS. However, there is not
+  yet a Raft-managed writer lease/epoch (FS-016), parent/epoch/operation-ID
+  manifest lineage (FS-017), or fenced single-sequencer commit path (FS-018).
+  Do not claim full multi-writer publication safety yet.
+- `append_split_and_publish()` detects concurrent pointer/generation conflicts
+  via CAS and fails closed rather than silently overwriting a concurrent
+  generation, but retry deduplication and sequencer coordination remain
+  FS-016..FS-018 work.
 - Standard `_doc`, `_bulk`, `_update`, and `_delete` APIs do not mutate a
   remote-store index. The dedicated publish endpoint is not near-real-time
   ingest.
@@ -87,6 +94,21 @@ best-effort fallbacks.
 - Any future multi-writer protocol needs conditional pointer publication,
   monotonic writer fencing, idempotent operation identity, and crash evidence.
   A process mutex or "last generation + 1" is not sufficient.
+- Conditional storage (`src/storage/conditional.rs`) must preserve atomic
+  create-if-absent (`create_immutable`), verified readback with integrity-checked
+  `CompareToken`s (`read_with_token`), and atomic pointer replacement
+  (`compare_and_swap`). Malformed, tampered, or cross-backend compare tokens
+  must fail closed with `ConditionalStorageError::InvalidToken`, and ambiguous
+  transport errors must remain `ConditionalStorageError::Indeterminate` rather
+  than masquerading as definite conflicts.
+- Local filesystem conditional writes must keep companion `.ferris.lock#0`,
+  `.ferris.state#0`, and `.ferris.*.tmp#0` files in the target's parent
+  directory with `#0` suffixes so `LocalFileSystem::list` ignores them, and
+  must never unlink or rename over the `flock` lock file itself.
+- Uncertified backends (including shared/network filesystems and S3 stores
+  without working `If-Match`/`If-None-Match` and `ETag` support) must fail
+  closed before staging or uploading publication artifacts while leaving
+  read-only search/verify and `/_cluster/health` diagnostics operational.
 - Any future GC must prove an object is unreachable from every retained
   snapshot and active reader before deletion.
 

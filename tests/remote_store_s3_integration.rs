@@ -350,3 +350,50 @@ async fn s3_backend_upload_fetch_verify_split_roundtrip() {
     );
     assert!(cache_dir.join(".done").exists());
 }
+
+#[tokio::test]
+async fn s3_backend_passes_shared_conditional_race_and_contract_suite() {
+    let Some((_, bucket)) = s3_env() else {
+        eprintln!("skip: {ENDPOINT_ENV} not set");
+        return;
+    };
+    let prefix = random_prefix();
+    let uri = format!("s3://{bucket}/{prefix}");
+    ferrissearch::storage::run_shared_conditional_race_and_contract_suite(move || {
+        StorageManager::new(
+            uri.clone(),
+            std::env::temp_dir().join(format!("ferris-rs-test-{}", Uuid::new_v4())),
+        )
+        .expect("s3 manager should build")
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn s3_backend_fails_closed_when_conditional_put_is_disabled() {
+    let Some((_, bucket)) = s3_env() else {
+        eprintln!("skip: {ENDPOINT_ENV} not set");
+        return;
+    };
+    let prefix = random_prefix();
+    let uri = format!("s3://{bucket}/{prefix}");
+    unsafe {
+        std::env::set_var("AWS_CONDITIONAL_PUT", "disabled");
+    }
+    let manager = StorageManager::new(
+        uri,
+        std::env::temp_dir().join(format!("ferris-rs-test-{}", Uuid::new_v4())),
+    )
+    .expect("s3 manager should build");
+    unsafe {
+        std::env::remove_var("AWS_CONDITIONAL_PUT");
+    }
+
+    let status = manager.publication_capability_status();
+    assert!(!status.supported);
+    let err = manager
+        .publish_manifest(&sample_manifest(&Uuid::new_v4().to_string(), 1))
+        .await
+        .expect_err("disabled conditional_put must fail closed");
+    assert!(err.to_string().contains("conditional_put_and_cas"));
+}

@@ -33,6 +33,17 @@ use std::sync::{
 use tokio::sync::Mutex;
 use url::Url;
 
+mod conditional;
+
+#[cfg(test)]
+use conditional::LocalCasCrashStage;
+use conditional::{CapabilityProbeState, detect_local_mount_fstype, is_uncertified_network_fstype};
+pub use conditional::{
+    CompareAndSwapOutcome, CompareToken, ConditionalRead, ConditionalStorageError,
+    CreateImmutableOutcome, ImmutableObjectIdentity, PublicationCapabilityStatus,
+    run_shared_conditional_race_and_contract_suite,
+};
+
 /// Directory name used under `<data_dir>/` for the node-local remote_store root.
 /// Exported so orphan cleanup (which otherwise treats unknown top-level data_dir
 /// entries as UUID directories) can exclude it.
@@ -167,6 +178,10 @@ pub struct StorageManager {
     pin_counts: Arc<StdMutex<HashMap<String, usize>>>,
     remote_store_inflight_bytes: Arc<AtomicU64>,
     remote_store_queue_depth: Arc<AtomicUsize>,
+    capability_state: Arc<StdMutex<CapabilityProbeState>>,
+    capability_probe_lock: Arc<Mutex<()>>,
+    #[cfg(test)]
+    local_cas_crash_stage: Arc<StdMutex<Option<LocalCasCrashStage>>>,
 }
 
 impl StorageManager {
@@ -177,7 +192,7 @@ impl StorageManager {
     /// the storage URI. `local_workdir` must be a writable local filesystem
     /// path; it's created if missing.
     pub fn new(path: String, local_workdir: PathBuf) -> Result<Self> {
-        let backend = match storage_scheme(&path) {
+        let (backend, initial_capability) = match storage_scheme(&path) {
             StorageScheme::Local => {
                 let root = normalize_local_root(&path)?;
                 std::fs::create_dir_all(&root)
@@ -185,18 +200,33 @@ impl StorageManager {
                 let root = root
                     .canonicalize()
                     .with_context(|| format!("failed to canonicalize storage root {root:?}"))?;
+                let capability = match detect_local_mount_fstype(&root) {
+                    Some(fstype) if is_uncertified_network_fstype(&fstype) => {
+                        CapabilityProbeState::Unsupported(format!(
+                            "shared or network filesystem '{fstype}' is not certified for conditional manifest publication (requires atomic local lock, rename, and fsync semantics)"
+                        ))
+                    }
+                    _ => CapabilityProbeState::Unprobed,
+                };
                 let local =
                     Arc::new(LocalFileSystem::new_with_prefix(&root).with_context(|| {
                         format!("failed to create object_store backend for {root:?}")
                     })?);
-                Backend::Local { root, local }
+                (Backend::Local { root, local }, capability)
             }
             StorageScheme::S3 => {
-                let store = build_s3_backend(&path)?;
-                Backend::Remote {
-                    store,
-                    uri: path.clone(),
-                }
+                let (store, unsupported_reason) = build_s3_backend(&path)?;
+                let capability = match unsupported_reason {
+                    Some(reason) => CapabilityProbeState::Unsupported(reason),
+                    None => CapabilityProbeState::Unprobed,
+                };
+                (
+                    Backend::Remote {
+                        store,
+                        uri: path.clone(),
+                    },
+                    capability,
+                )
             }
             StorageScheme::Unsupported(scheme) => {
                 anyhow::bail!(
@@ -221,7 +251,70 @@ impl StorageManager {
             pin_counts: Arc::new(StdMutex::new(HashMap::new())),
             remote_store_inflight_bytes: Arc::new(AtomicU64::new(0)),
             remote_store_queue_depth: Arc::new(AtomicUsize::new(0)),
+            capability_state: Arc::new(StdMutex::new(initial_capability)),
+            capability_probe_lock: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            local_cas_crash_stage: Arc::new(StdMutex::new(None)),
         })
+    }
+
+    /// Construct a `StorageManager` wrapping a caller-supplied `ObjectStore`
+    /// implementation (used by integration and fault-injection tests to exercise
+    /// remote conditional-put and capability-probe paths deterministically).
+    pub fn new_with_object_store(
+        uri: String,
+        store: Arc<dyn ObjectStore>,
+        local_workdir: PathBuf,
+        unsupported_reason: Option<String>,
+    ) -> Result<Self> {
+        std::fs::create_dir_all(&local_workdir).with_context(|| {
+            format!("failed to create remote_store local workdir {local_workdir:?}")
+        })?;
+        let local_workdir = local_workdir.canonicalize().with_context(|| {
+            format!("failed to canonicalize remote_store local workdir {local_workdir:?}")
+        })?;
+        let initial_capability = match unsupported_reason {
+            Some(reason) => CapabilityProbeState::Unsupported(reason),
+            None => CapabilityProbeState::Unprobed,
+        };
+        Ok(Self {
+            backend: Backend::Remote { store, uri },
+            local_workdir,
+            publish_lock: Arc::new(Mutex::new(())),
+            split_locks: Arc::new(Mutex::new(HashMap::new())),
+            cache_entries: Arc::new(StdMutex::new(HashMap::new())),
+            pin_counts: Arc::new(StdMutex::new(HashMap::new())),
+            remote_store_inflight_bytes: Arc::new(AtomicU64::new(0)),
+            remote_store_queue_depth: Arc::new(AtomicUsize::new(0)),
+            capability_state: Arc::new(StdMutex::new(initial_capability)),
+            capability_probe_lock: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            local_cas_crash_stage: Arc::new(StdMutex::new(None)),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_local_cas_crash_stage_for_test(&self, stage: Option<LocalCasCrashStage>) {
+        *self
+            .local_cas_crash_stage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = stage;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_local_cas_crash_stage_for_test(&self) -> Option<LocalCasCrashStage> {
+        self.local_cas_crash_stage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_unsupported_capability_for_test(&self, reason: impl Into<String>) {
+        *self
+            .capability_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = CapabilityProbeState::Unsupported(reason.into());
     }
 
     /// Returns the on-disk root when the backend is local, `None` for remote.
@@ -621,6 +714,7 @@ impl StorageManager {
         split_id: &str,
         staging_dir: &Path,
     ) -> Result<(String, String, u64)> {
+        self.ensure_publication_supported().await?;
         let staging_dir = staging_dir.to_path_buf();
         let (bundle_bytes, checksum) =
             tokio::task::spawn_blocking(move || pack_bundle_from_dir(&staging_dir))
@@ -630,7 +724,8 @@ impl StorageManager {
 
         let bundle_key = Self::split_bundle_key(index_uuid, split_id);
         let object_path = self.object_path(&bundle_key)?;
-        self.put(&object_path, bundle_bytes).await?;
+        let outcome = self.create_immutable(&object_path, bundle_bytes).await?;
+        outcome.ensure_matching_content(&object_path)?;
         Ok((bundle_key, checksum, size_bytes))
     }
 
@@ -863,28 +958,34 @@ impl StorageManager {
         Ok(Some(manifest))
     }
 
-    /// Publish a manifest atomically: write the immutable generation first,
-    /// then overwrite the mutable pointer. Returns the new pointer.
+    /// Publish a manifest atomically: write the immutable generation first
+    /// via `create_immutable`, then conditionally update `manifest.current.json`
+    /// via `compare_and_swap_optional`. Returns the new pointer.
     ///
-    /// If the pointer write fails, the immutable generation object is left in
-    /// place (it's immutable by design) and callers can retry.
-    ///
-    /// Serialized on `publish_lock` so that concurrent in-process publishers
-    /// observe a consistent pointer when reading-then-writing.
+    /// If the pointer CAS fails or conflicts, the immutable generation object
+    /// is left in place and the conflict is surfaced to the caller.
     pub async fn publish_manifest(
         &self,
         manifest: &RemoteStoreManifest,
     ) -> Result<RemoteManifestPointer> {
         let _guard = self.publish_lock.lock().await;
-        self.publish_manifest_inner(manifest).await
+        self.ensure_publication_supported().await?;
+        let current = self
+            .load_manifest_pointer_with_token(&manifest.index_uuid)
+            .await?;
+        self.publish_manifest_conditional(manifest, current.as_ref().map(|(_, token)| token))
+            .await
     }
 
     /// Append a single new split to the currently-published manifest and
     /// publish a new generation. Load-modify-publish runs under the per-
-    /// storage `publish_lock` so concurrent in-process publishers serialize.
+    /// storage `publish_lock` and commits `manifest.current.json` via
+    /// conditional compare-and-swap against the observed pointer token so
+    /// cross-process or independent writers cannot silently overwrite each
+    /// other's generations.
     ///
     /// - If no manifest exists yet, generation 1 is published with the new
-    ///   split as the only entry.
+    ///   split as the only entry (`expected_token = None`).
     /// - If a manifest exists, its `schema_hash` must match `schema_hash`
     ///   (we fail closed on mismatch to avoid publishing splits against a
     ///   stale schema assumption).
@@ -899,14 +1000,17 @@ impl StorageManager {
         new_split: RemoteSplitManifest,
     ) -> Result<RemoteStoreManifest> {
         let _guard = self.publish_lock.lock().await;
+        self.ensure_publication_supported().await?;
 
-        // Load current manifest (if any) WITHOUT schema validation — we want
-        // to surface a mismatch as a clear, targeted error rather than a
-        // generic load failure.
-        let current = self.load_current_manifest_unchecked(index_uuid).await?;
+        // Load current manifest + pointer token (if any) WITHOUT schema
+        // validation — we want to surface a mismatch as a clear, targeted
+        // error rather than a generic load failure.
+        let current = self
+            .load_current_manifest_unchecked_with_token(index_uuid)
+            .await?;
 
-        let (generation, mut splits, existing_settings) = match current {
-            Some(existing) => {
+        let (generation, mut splits, existing_settings, expected_token) = match current {
+            Some((existing, token)) => {
                 if existing.schema_hash != schema_hash {
                     anyhow::bail!(
                         "schema_hash mismatch while appending split: manifest={} local={}",
@@ -914,9 +1018,14 @@ impl StorageManager {
                         schema_hash
                     );
                 }
-                (existing.generation + 1, existing.splits, existing.settings)
+                (
+                    existing.generation + 1,
+                    existing.splits,
+                    existing.settings,
+                    Some(token),
+                )
             }
-            None => (1, Vec::new(), None),
+            None => (1, Vec::new(), None, None),
         };
 
         // Reject duplicate split_id within the same manifest — `published_splits`
@@ -942,34 +1051,62 @@ impl StorageManager {
             splits,
         };
 
-        // Reuse `publish_manifest` for the actual I/O — it takes the lock
-        // again, but tokio::sync::Mutex is NOT reentrant, so we release
-        // ours first by calling the inner non-locking write path directly.
-        self.publish_manifest_inner(&manifest).await?;
+        self.publish_manifest_conditional(&manifest, expected_token.as_ref())
+            .await?;
         Ok(manifest)
     }
 
-    /// Load the current manifest without schema validation. Used by
-    /// `append_split_and_publish` so we can produce a better error on
-    /// schema mismatch than `load_current_manifest` would.
-    async fn load_current_manifest_unchecked(
+    async fn load_manifest_pointer_with_token(
         &self,
         index_uuid: &str,
-    ) -> Result<Option<RemoteStoreManifest>> {
-        let Some(pointer) = self.load_manifest_pointer(index_uuid).await? else {
+    ) -> Result<Option<(RemoteManifestPointer, CompareToken)>> {
+        let location = self.object_path(&manifest_pointer_key(index_uuid))?;
+        let Some(read) = self.read_with_token(&location).await? else {
+            return Ok(None);
+        };
+        let pointer: RemoteManifestPointer =
+            serde_json::from_slice(&read.bytes).map_err(|error| {
+                crate::common::unsupported_index_format(
+                    "remote manifest pointer",
+                    format!("cannot decode current format at {location}: {error}"),
+                )
+            })?;
+        if pointer.version != REMOTE_MANIFEST_POINTER_FORMAT_VERSION {
+            return Err(crate::common::unsupported_index_format(
+                "remote manifest pointer",
+                format!(
+                    "version {} is not supported; expected {}",
+                    pointer.version, REMOTE_MANIFEST_POINTER_FORMAT_VERSION
+                ),
+            ));
+        }
+        Ok(Some((pointer, read.token)))
+    }
+
+    /// Load the current manifest and its pointer compare token without schema
+    /// validation. Used by `append_split_and_publish` so we can produce a
+    /// targeted error on schema mismatch and conditionally CAS the pointer.
+    async fn load_current_manifest_unchecked_with_token(
+        &self,
+        index_uuid: &str,
+    ) -> Result<Option<(RemoteStoreManifest, CompareToken)>> {
+        let Some((pointer, token)) = self.load_manifest_pointer_with_token(index_uuid).await?
+        else {
             return Ok(None);
         };
         let manifest = self
             .load_manifest(index_uuid, pointer.current_generation, None)
             .await?;
-        Ok(Some(manifest))
+        Ok(Some((manifest, token)))
     }
 
-    /// Internal publish that does not take the publish_lock (called from
-    /// `append_split_and_publish` which already holds it).
-    async fn publish_manifest_inner(
+    /// Internal conditional publish that writes the immutable generation via
+    /// `create_immutable` and updates `manifest.current.json` via
+    /// `compare_and_swap_optional`.
+    async fn publish_manifest_conditional(
         &self,
         manifest: &RemoteStoreManifest,
+        expected_pointer_token: Option<&CompareToken>,
     ) -> Result<RemoteManifestPointer> {
         if manifest.version != REMOTE_MANIFEST_FORMAT_VERSION {
             return Err(crate::common::unsupported_index_format(
@@ -984,7 +1121,10 @@ impl StorageManager {
         let generation_path = self.object_path(&generation_key)?;
         let manifest_bytes = serde_json::to_vec_pretty(manifest)
             .context("failed to serialize manifest before publish")?;
-        self.put(&generation_path, manifest_bytes).await?;
+        let create_outcome = self
+            .create_immutable(&generation_path, manifest_bytes)
+            .await?;
+        create_outcome.ensure_matching_content(&generation_path)?;
 
         let pointer = RemoteManifestPointer {
             version: REMOTE_MANIFEST_POINTER_FORMAT_VERSION,
@@ -995,8 +1135,21 @@ impl StorageManager {
         let pointer_path = self.object_path(&manifest_pointer_key(&manifest.index_uuid))?;
         let pointer_bytes = serde_json::to_vec_pretty(&pointer)
             .context("failed to serialize manifest pointer before publish")?;
-        self.put(&pointer_path, pointer_bytes).await?;
-        Ok(pointer)
+        match self
+            .compare_and_swap_optional(&pointer_path, expected_pointer_token, pointer_bytes)
+            .await?
+        {
+            CompareAndSwapOutcome::Swapped { .. } => Ok(pointer),
+            CompareAndSwapOutcome::Conflict => {
+                Err(anyhow::Error::from(ConditionalStorageError::Conflict {
+                    path: pointer_path.to_string(),
+                    reason: format!(
+                        "manifest pointer for index {} changed concurrently before generation {} could commit",
+                        manifest.index_uuid, manifest.generation
+                    ),
+                }))
+            }
+        }
     }
 }
 
@@ -1260,7 +1413,7 @@ fn storage_scheme(path: &str) -> StorageScheme {
 /// When a prefix is present in the URI (e.g. `s3://bucket/indexes`), all
 /// manifest keys are scoped under that prefix automatically by the
 /// object_store crate's `new_with_prefix` construction.
-fn build_s3_backend(uri: &str) -> Result<Arc<dyn ObjectStore>> {
+fn build_s3_backend(uri: &str) -> Result<(Arc<dyn ObjectStore>, Option<String>)> {
     let url = Url::parse(uri).with_context(|| format!("invalid s3:// storage URL '{uri}'"))?;
     let bucket = url
         .host_str()
@@ -1268,6 +1421,12 @@ fn build_s3_backend(uri: &str) -> Result<Arc<dyn ObjectStore>> {
     let prefix = url.path().trim_start_matches('/').to_string();
 
     let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+    let unsupported_reason = builder
+        .get_config_value(&object_store::aws::AmazonS3ConfigKey::ConditionalPut)
+        .filter(|value| value.trim().eq_ignore_ascii_case("disabled"))
+        .map(|_| {
+            "S3 conditional put (If-Match / If-None-Match) is disabled in configuration".to_string()
+        });
 
     // `from_env` reads AWS_ENDPOINT_URL, but only if set. For MinIO/RustFS
     // deployments using path-style addressing over plain HTTP, we must also
@@ -1291,15 +1450,16 @@ fn build_s3_backend(uri: &str) -> Result<Arc<dyn ObjectStore>> {
         .build()
         .with_context(|| format!("failed to build S3 backend for '{uri}'"))?;
 
-    if prefix.is_empty() {
-        Ok(Arc::new(s3))
+    let store: Arc<dyn ObjectStore> = if prefix.is_empty() {
+        Arc::new(s3)
     } else {
         // `object_store`'s PrefixStore wraps any ObjectStore with a fixed prefix.
         let prefix_path = ObjectPath::parse(&prefix)
             .with_context(|| format!("invalid s3 prefix '{prefix}' in URL '{uri}'"))?;
         let prefixed = object_store::prefix::PrefixStore::new(s3, prefix_path);
-        Ok(Arc::new(prefixed))
-    }
+        Arc::new(prefixed)
+    };
+    Ok((store, unsupported_reason))
 }
 
 /// Mutable pointer to the currently published immutable manifest generation.

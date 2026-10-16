@@ -6,8 +6,8 @@
 >
 > **Current-behavior authority:** source and tests.
 >
-> **Last source audit:** 2026-10-15 for FS-013 and FS-014; 2026-10-14 for FS-010
-> and FS-012; 2026-10-13 for FS-003,
+> **Last source audit:** 2026-10-16 for FS-014 and FS-015; 2026-10-15 for FS-013;
+> 2026-10-14 for FS-010 and FS-012; 2026-10-13 for FS-003,
 > FS-004, and FS-011; 2026-10-09 for
 > FS-002; 2026-10-08 for FS-001 and FS-007; 2026-09-27
 > for FS-019 and FS-022 through FS-026, after
@@ -502,7 +502,7 @@ replicas without false success.
 
 **Class:** Scale blocker | **Gate:** 1 | **Depends on:** FS-001, FS-009
 
-**Status (2026-10-15):** Implemented locally, pending merge. The HTTP handlers
+**Status (2026-10-16):** Implemented and merged in PR #180. The HTTP handlers
 stage and validate the complete request in protected anonymous files before
 executing bounded coordinator batches and shard RPC units. Ordered results
 are spooled and streamed, including `?pretty`. Per-node admission, body/spool
@@ -566,8 +566,28 @@ refresh, and per-item metadata match the write contract.
 
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-002
 
-**Evidence:** `StorageManager::put()` has no logical compare-and-set capability
-for `manifest.current.json`.
+**Status (2026-10-16):** Implemented locally, pending merge. `StorageManager`
+now exposes `create_immutable`, `read_with_token`, `compare_and_swap`, and
+`compare_and_swap_optional`, backed by MAC-authenticated `CompareToken`s.
+Local filesystems use an OS `flock` lock file, checksummed two-slot
+(`committed`/`pending`) revision state, same-directory staging + `fsync`,
+atomic rename, and parent-directory `fsync`; S3 backends use conditional
+`PutMode::Create` (`If-None-Match: *`) and `PutMode::Update` (`If-Match`).
+Backends must pass an isolated 5-step capability probe, and uncertified
+shared/network filesystem mounts or disabled S3 conditional PUTs fail closed
+before staging or publishing artifacts while read-only operations and
+`/_cluster/health` diagnostics remain available.
+
+**Completion evidence:** shared multi-writer race and ABA suite across local
+and remote object stores, 4-process OS `flock` subprocess race, all four local
+crash boundaries, corrupt state/token rejection, broken-backend capability
+probes, and REST publish fail-closed + health diagnostics coverage. Full
+multi-writer publication safety still requires FS-016 (Raft writer lease and
+epoch), FS-017 (manifest lineage and operation IDs), and FS-018 (fenced
+single-sequencer commit).
+
+**Historical evidence (before FS-015):** `StorageManager::put()` has no logical
+compare-and-set capability for `manifest.current.json`.
 
 **Outcome:** The storage abstraction exposes create-if-absent and
 match-version/ETag conditional writes with a clear unsupported-capability
