@@ -314,6 +314,18 @@ impl CompositeEngine {
                 "Deferred vector index save during auto-flush because the vector index is busy"
             );
         }
+        let stats = self.text.sequence_stats();
+        let copy = self.text.copy_write_state();
+        if stats.processed_checkpoint == stats.max_seq_no
+            && (!copy.enforces_primary_authority() || copy.canonical_history()?.is_some())
+            && let Err(error) = self.persist_latest_shard_snapshot_locked()
+        {
+            tracing::warn!(
+                path = ?self.data_dir,
+                error = %error,
+                "Failed to refresh latest persisted shard snapshot during auto-flush"
+            );
+        }
         Ok(true)
     }
 
@@ -776,6 +788,166 @@ impl CompositeEngine {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         self.rebuild_vectors_locked()
+    }
+
+    pub fn persist_latest_shard_snapshot(&self) -> Result<super::snapshot::ShardSnapshotManifest> {
+        let _vector_recovery = self
+            .vector_recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.persist_latest_shard_snapshot_locked()
+    }
+
+    fn persist_latest_shard_snapshot_locked(
+        &self,
+    ) -> Result<super::snapshot::ShardSnapshotManifest> {
+        let latest_dir = self.data_dir.join(super::PERSISTED_SHARD_SNAPSHOT_DIR);
+        let backup_dir = self
+            .data_dir
+            .join(format!("{}.backup", super::PERSISTED_SHARD_SNAPSHOT_DIR));
+        if !latest_dir.try_exists()? && backup_dir.try_exists()? {
+            let _ = std::fs::rename(&backup_dir, &latest_dir);
+        }
+        let previous_digests: std::collections::HashMap<(String, u64), String> = latest_dir
+            .join(super::SHARD_SNAPSHOT_MANIFEST_FILE)
+            .is_file()
+            .then(|| {
+                std::fs::read(latest_dir.join(super::SHARD_SNAPSHOT_MANIFEST_FILE))
+                    .ok()
+                    .and_then(|bytes| {
+                        serde_json::from_slice::<super::snapshot::ShardSnapshotManifest>(&bytes)
+                            .ok()
+                    })
+                    .map(|manifest| {
+                        manifest
+                            .files
+                            .into_iter()
+                            .filter(|f| {
+                                f.name != "meta.json"
+                                    && f.name != ".managed.json"
+                                    && f.name != VECTOR_INDEX_FILE
+                                    && f.name != VECTOR_DOC_IDS_FILE
+                            })
+                            .map(|f| ((f.name, f.length), f.sha256))
+                            .collect()
+                    })
+            })
+            .flatten()
+            .unwrap_or_default();
+
+        let staging_dir = self.data_dir.join(format!(
+            "{}.staging.{}",
+            super::PERSISTED_SHARD_SNAPSHOT_DIR,
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&staging_dir)?;
+        let snapshot_result = (|| -> Result<super::snapshot::ShardSnapshotManifest> {
+            let (committed_boundary, snapshot_cursor, schema_hash, mut file_names) = self
+                .text
+                .snapshot_committed_files_to_staging(&staging_dir)?;
+            let mut vector_state = super::snapshot::ShardSnapshotVectorMetadata::default();
+            {
+                let guard = self
+                    .vector
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner());
+                if let Some(ref vi) = *guard
+                    && !vi.is_empty()
+                {
+                    let vector_path = staging_dir.join(VECTOR_INDEX_FILE);
+                    let doc_ids_path = staging_dir.join(VECTOR_DOC_IDS_FILE);
+                    if self.vector_index_path().try_exists()?
+                        && self.vector_doc_ids_path().try_exists()?
+                    {
+                        std::fs::copy(self.vector_index_path(), &vector_path)?;
+                        std::fs::copy(self.vector_doc_ids_path(), &doc_ids_path)?;
+                        File::open(&vector_path)?.sync_all()?;
+                        File::open(&doc_ids_path)?.sync_all()?;
+                    } else {
+                        vi.save(&vector_path)?;
+                        File::open(&vector_path)?.sync_all()?;
+                        File::open(&doc_ids_path)?.sync_all()?;
+                    }
+                    file_names.push(VECTOR_INDEX_FILE.to_string());
+                    file_names.push(VECTOR_DOC_IDS_FILE.to_string());
+                    vector_state = super::snapshot::ShardSnapshotVectorMetadata {
+                        present: true,
+                        dimensions: Some(vi.dimensions()),
+                        vector_count: vi.len(),
+                        index_file: Some(VECTOR_INDEX_FILE.to_string()),
+                        doc_ids_file: Some(VECTOR_DOC_IDS_FILE.to_string()),
+                    };
+                }
+            }
+            let mut files = Vec::with_capacity(file_names.len());
+            for name in file_names {
+                let file_path = staging_dir.join(&name);
+                let length = std::fs::metadata(&file_path)?.len();
+                let sha256 = if let Some(cached) = previous_digests.get(&(name.clone(), length)) {
+                    cached.clone()
+                } else {
+                    super::snapshot::hash_file_sha256(&file_path)?.1
+                };
+                files.push(super::PeerRecoveryFileMetadata {
+                    name,
+                    length,
+                    sha256,
+                });
+            }
+            let binding = self.text.copy_write_state().binding().cloned();
+            let manifest = super::snapshot::ShardSnapshotManifest::new(
+                super::PERSISTED_SHARD_SNAPSHOT_DIR,
+                binding.as_ref().map(|b| b.index_uuid.clone()),
+                binding.as_ref().map(|b| b.shard_id),
+                binding.as_ref().map(|b| b.allocation_id),
+                schema_hash,
+                committed_boundary,
+                snapshot_cursor,
+                vector_state,
+                files,
+            )?;
+            manifest.persist_atomically(&staging_dir)?;
+            if backup_dir.try_exists()? {
+                let _ = std::fs::remove_dir_all(&backup_dir);
+            }
+            if latest_dir.try_exists()? {
+                std::fs::rename(&latest_dir, &backup_dir)?;
+            }
+            if let Err(error) = std::fs::rename(&staging_dir, &latest_dir) {
+                if backup_dir.exists() && !latest_dir.exists() {
+                    let _ = std::fs::rename(&backup_dir, &latest_dir);
+                }
+                return Err(error.into());
+            }
+            File::open(&self.data_dir)?.sync_all()?;
+            if backup_dir.try_exists()? {
+                let _ = std::fs::remove_dir_all(&backup_dir);
+            }
+            Ok(manifest)
+        })();
+        if snapshot_result.is_err() && staging_dir.exists() {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+        }
+        snapshot_result
+    }
+
+    fn refresh_latest_persisted_snapshot_after_flush(&self) -> Result<()> {
+        let stats = self.text.sequence_stats();
+        if stats.processed_checkpoint != stats.max_seq_no {
+            return Ok(());
+        }
+        let copy = self.text.copy_write_state();
+        if copy.enforces_primary_authority() && copy.canonical_history()?.is_none() {
+            return Ok(());
+        }
+        if let Err(error) = self.persist_latest_shard_snapshot() {
+            tracing::warn!(
+                path = ?self.data_dir,
+                error = %error,
+                "Failed to refresh latest persisted shard snapshot after flush"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1267,43 +1439,50 @@ impl SearchEngine for CompositeEngine {
         if self.text.copy_write_state().enforces_primary_authority() {
             return self.flush_with_global_checkpoint();
         }
-        let _vector_recovery = self
-            .vector_recovery
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let rebuild_vectors = self.prepare_vector_rebuild(false)?;
-        if let Err(error) = self.text.flush() {
-            return Err(self.record_vector_staleness_after_text_failure("flush", error));
+        {
+            let _vector_recovery = self
+                .vector_recovery
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let rebuild_vectors = self.prepare_vector_rebuild(false)?;
+            if let Err(error) = self.text.flush() {
+                return Err(self.record_vector_staleness_after_text_failure("flush", error));
+            }
+            if rebuild_vectors {
+                self.rebuild_vectors_locked()?;
+            } else {
+                self.save_vectors()?;
+            }
         }
-        if rebuild_vectors {
-            self.rebuild_vectors_locked()
-        } else {
-            self.save_vectors()
-        }
+        let _ = self.refresh_latest_persisted_snapshot_after_flush();
+        Ok(())
     }
 
     fn flush_with_global_checkpoint(&self) -> Result<()> {
-        let _vector_recovery = self
-            .vector_recovery
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let rebuild_vectors = self.prepare_vector_rebuild(false)?;
-        let result = if let Some(truncation_checkpoint) = self.safe_truncation_checkpoint()? {
-            self.text
-                .flush_with_global_checkpoint(truncation_checkpoint)
-        } else {
-            self.text.flush_without_truncation()
-        };
-        if let Err(error) = result {
-            return Err(
-                self.record_vector_staleness_after_text_failure("checkpoint-aware flush", error)
-            );
+        {
+            let _vector_recovery = self
+                .vector_recovery
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let rebuild_vectors = self.prepare_vector_rebuild(false)?;
+            let result = if let Some(truncation_checkpoint) = self.safe_truncation_checkpoint()? {
+                self.text
+                    .flush_with_global_checkpoint(truncation_checkpoint)
+            } else {
+                self.text.flush_without_truncation()
+            };
+            if let Err(error) = result {
+                return Err(self
+                    .record_vector_staleness_after_text_failure("checkpoint-aware flush", error));
+            }
+            if rebuild_vectors {
+                self.rebuild_vectors_locked()?;
+            } else {
+                self.save_vectors()?;
+            }
         }
-        if rebuild_vectors {
-            self.rebuild_vectors_locked()
-        } else {
-            self.save_vectors()
-        }
+        let _ = self.refresh_latest_persisted_snapshot_after_flush();
+        Ok(())
     }
 
     fn force_merge(&self, max_num_segments: usize) -> Result<()> {
@@ -1492,33 +1671,30 @@ impl SearchEngine for CompositeEngine {
         &self,
         snapshot_dir: &std::path::Path,
     ) -> Result<super::PeerRecoverySnapshot> {
-        let _vector_recovery = self
-            .vector_recovery
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let rebuild_vectors = self.prepare_vector_rebuild(false)?;
-        let snapshot = match self.text.create_peer_recovery_snapshot(snapshot_dir) {
-            Ok(snapshot) => snapshot,
+        let preparation = self.prepare_peer_recovery_snapshot(snapshot_dir)?;
+        #[cfg(test)]
+        self.text
+            .notify_peer_recovery_snapshot_ready_for_test(&preparation);
+        let prepared = match preparation.hash_files(snapshot_dir) {
+            Ok(prepared) => prepared,
             Err(error) => {
-                return Err(self.record_vector_staleness_after_text_failure(
-                    "peer recovery snapshot creation",
-                    error,
-                ));
+                let _ = std::fs::remove_dir_all(snapshot_dir);
+                return Err(error);
             }
         };
-        if rebuild_vectors && let Err(error) = self.rebuild_vectors_locked() {
-            let release_result = self
-                .text
-                .release_peer_recovery_pin(snapshot.retention_pin_id);
-            let _ = std::fs::remove_dir_all(snapshot_dir);
-            if let Err(release_error) = release_result {
-                return Err(release_error.context(format!(
-                    "failed to release peer recovery pin after vector rebuild failed: {error:#}"
-                )));
-            }
-            return Err(error);
-        }
-        Ok(snapshot)
+        Ok(super::PeerRecoverySnapshot {
+            snapshot_cursor: prepared.snapshot_cursor,
+            #[cfg(test)]
+            snapshot_next_seq_no: prepared.snapshot_next_seq_no,
+            #[cfg(feature = "protocol-trace")]
+            trace_processed_seqs: prepared.trace_processed_seqs,
+            #[cfg(feature = "protocol-trace")]
+            trace_documents: prepared.trace_documents,
+            committed_boundary: prepared.committed_boundary,
+            retention_pin_id: prepared.retention_pin.into_pin_id(),
+            files: prepared.files,
+            manifest: prepared.manifest,
+        })
     }
 
     fn prepare_peer_recovery_snapshot(
@@ -1530,7 +1706,7 @@ impl SearchEngine for CompositeEngine {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let rebuild_vectors = self.prepare_vector_rebuild(false)?;
-        let preparation = match self.text.prepare_peer_recovery_snapshot(snapshot_dir) {
+        let mut preparation = match self.text.prepare_peer_recovery_snapshot(snapshot_dir) {
             Ok(preparation) => preparation,
             Err(error) => {
                 return Err(self.record_vector_staleness_after_text_failure(
@@ -1544,7 +1720,57 @@ impl SearchEngine for CompositeEngine {
             let _ = std::fs::remove_dir_all(snapshot_dir);
             return Err(error);
         }
+        let capture_vectors = (|| -> Result<()> {
+            let guard = self
+                .vector
+                .read()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(ref vi) = *guard
+                && !vi.is_empty()
+            {
+                let vector_path = snapshot_dir.join(VECTOR_INDEX_FILE);
+                let doc_ids_path = snapshot_dir.join(VECTOR_DOC_IDS_FILE);
+                vi.save(&vector_path)?;
+                File::open(&vector_path)?.sync_all()?;
+                File::open(&doc_ids_path)?.sync_all()?;
+                File::open(snapshot_dir)?.sync_all()?;
+                preparation.file_names.push(VECTOR_INDEX_FILE.to_string());
+                preparation.file_names.push(VECTOR_DOC_IDS_FILE.to_string());
+                preparation.vector_state = super::snapshot::ShardSnapshotVectorMetadata {
+                    present: true,
+                    dimensions: Some(vi.dimensions()),
+                    vector_count: vi.len(),
+                    index_file: Some(VECTOR_INDEX_FILE.to_string()),
+                    doc_ids_file: Some(VECTOR_DOC_IDS_FILE.to_string()),
+                };
+            }
+            Ok(())
+        })();
+        if let Err(error) = capture_vectors {
+            drop(preparation);
+            let _ = std::fs::remove_dir_all(snapshot_dir);
+            return Err(error);
+        }
         Ok(preparation)
+    }
+
+    fn latest_persisted_shard_snapshot(
+        &self,
+    ) -> Result<Option<super::snapshot::ShardSnapshotManifest>> {
+        let latest_dir = self.data_dir.join(super::PERSISTED_SHARD_SNAPSHOT_DIR);
+        let backup_dir = self
+            .data_dir
+            .join(format!("{}.backup", super::PERSISTED_SHARD_SNAPSHOT_DIR));
+        if !latest_dir.try_exists()? && backup_dir.try_exists()? {
+            std::fs::rename(&backup_dir, &latest_dir)?;
+            File::open(&self.data_dir)?.sync_all()?;
+        }
+        if !latest_dir.try_exists()? {
+            return Ok(None);
+        }
+        Ok(Some(
+            super::snapshot::ShardSnapshotManifest::load_and_verify(&latest_dir)?,
+        ))
     }
 
     fn release_peer_recovery_pin(&self, pin_id: u64) -> Result<()> {

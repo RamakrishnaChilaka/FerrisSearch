@@ -38,7 +38,7 @@
 //! 4. In the consumer (engine, WAL, etc.), subscribe via `watch_*()` and
 //!    use `tokio::select!` to react when the value changes
 
-use crate::cluster::state::IndexSettings;
+use crate::cluster::state::{EffectiveReplicaPolicy, IndexSettings};
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -63,6 +63,8 @@ pub struct SettingsManager {
     /// Flush threshold watch channel — consumed by the background refresh loop
     /// to auto-flush when translog exceeds this size.
     flush_threshold_tx: watch::Sender<u64>,
+    /// Replica lag, recovery timeout, retry backoff, and ack policy watch channel.
+    replica_policy_tx: watch::Sender<EffectiveReplicaPolicy>,
 }
 
 impl SettingsManager {
@@ -78,10 +80,14 @@ impl SettingsManager {
             .unwrap_or(DEFAULT_FLUSH_THRESHOLD_BYTES);
         let (flush_tx, _flush_rx) = watch::channel(flush_threshold);
 
+        let replica_policy = initial.effective_replica_policy();
+        let (policy_tx, _policy_rx) = watch::channel(replica_policy);
+
         Self {
             values: std::sync::RwLock::new(initial.clone()),
             refresh_interval_tx: tx,
             flush_threshold_tx: flush_tx,
+            replica_policy_tx: policy_tx,
         }
     }
 
@@ -97,6 +103,11 @@ impl SettingsManager {
         self.flush_threshold_tx.subscribe()
     }
 
+    /// Subscribe to replica policy changes.
+    pub fn watch_replica_policy(&self) -> watch::Receiver<EffectiveReplicaPolicy> {
+        self.replica_policy_tx.subscribe()
+    }
+
     /// Get the current effective refresh interval.
     pub fn refresh_interval(&self) -> Duration {
         *self.refresh_interval_tx.borrow()
@@ -105,6 +116,11 @@ impl SettingsManager {
     /// Get the current effective flush threshold in bytes.
     pub fn flush_threshold(&self) -> u64 {
         *self.flush_threshold_tx.borrow()
+    }
+
+    /// Get the current effective replica policy.
+    pub fn replica_policy(&self) -> EffectiveReplicaPolicy {
+        *self.replica_policy_tx.borrow()
     }
 
     /// Update settings from new values (e.g. after Raft apply).
@@ -117,7 +133,9 @@ impl SettingsManager {
             let ms = new_values
                 .refresh_interval_ms
                 .unwrap_or(DEFAULT_REFRESH_INTERVAL_MS);
-            let _ = self.refresh_interval_tx.send(Duration::from_millis(ms));
+            let _ = self
+                .refresh_interval_tx
+                .send_replace(Duration::from_millis(ms));
             tracing::info!(
                 "Setting refresh_interval_ms updated: {:?} → {}ms",
                 values.refresh_interval_ms,
@@ -130,7 +148,7 @@ impl SettingsManager {
             let bytes = new_values
                 .flush_threshold_bytes
                 .unwrap_or(DEFAULT_FLUSH_THRESHOLD_BYTES);
-            let _ = self.flush_threshold_tx.send(bytes);
+            let _ = self.flush_threshold_tx.send_replace(bytes);
             tracing::info!(
                 "Setting flush_threshold_bytes updated: {:?} → {} bytes",
                 values.flush_threshold_bytes,
@@ -138,11 +156,17 @@ impl SettingsManager {
             );
         }
 
-        // ── Future settings go here ─────────────────────────────────
-        // When you add a new reactive setting:
-        // 1. Add a watch::Sender<T> field to SettingsManager
-        // 2. Add a watch_*() accessor method
-        // 3. Detect the change here and send the new value
+        // ── Replica policy ──────────────────────────────────────────
+        let new_policy = new_values.effective_replica_policy();
+        let old_policy = values.effective_replica_policy();
+        if new_policy != old_policy {
+            let _ = self.replica_policy_tx.send_replace(new_policy);
+            tracing::info!(
+                "Setting replica_policy updated: {:?} → {:?}",
+                old_policy,
+                new_policy
+            );
+        }
 
         *values = new_values.clone();
     }

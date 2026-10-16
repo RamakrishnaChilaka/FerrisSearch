@@ -77,6 +77,10 @@ impl CopyWriteState {
         self.failure.clone()
     }
 
+    pub(crate) fn binding(&self) -> Option<&CopyWriteBinding> {
+        self.binding.as_ref()
+    }
+
     pub(crate) fn require_primary_authority(&self) {
         self.enforce_primary_authority
             .store(true, Ordering::Release);

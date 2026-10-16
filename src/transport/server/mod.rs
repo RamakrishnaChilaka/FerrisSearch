@@ -3907,6 +3907,16 @@ impl InternalTransport for TransportService {
         ))
     }
 
+    async fn cancel_peer_recovery(
+        &self,
+        request: Request<CancelPeerRecoveryRequest>,
+    ) -> Result<Response<CancelPeerRecoveryResponse>, Status> {
+        Ok(Response::new(
+            self.cancel_peer_recovery_inner(request.into_inner())
+                .await?,
+        ))
+    }
+
     // ─── Dynamic Settings ─────────────────────────────────────────────────────
 
     async fn update_settings(
@@ -6666,6 +6676,24 @@ impl TransportService {
                     Self::computed_global_checkpoint(primary_persisted_checkpoint, &authoritative)
                 },
             );
+        let shard_key = crate::shard::ShardKey::new(index_name, shard_id);
+        for report in &current_reports {
+            let (lag_ops, exceeds) = self.shard_manager.isr_tracker.replica_lag_ops(
+                index_name,
+                shard_id,
+                &report.node_id,
+                primary_sequence.processed_checkpoint,
+            );
+            self.shard_manager.replica_states.update_lag_observation(
+                &shard_key,
+                &activated_primary.index_uuid,
+                &report.node_id,
+                report.allocation_id,
+                activated_primary.primary_term,
+                lag_ops,
+                exceeds,
+            );
+        }
         if let Some(checkpoint) = checkpoint
             && engine
                 .global_checkpoint()

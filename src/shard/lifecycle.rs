@@ -442,6 +442,7 @@ impl ShardManager {
                 }
                 let state = authority.cluster_manager.get_state();
                 let version = state.version;
+                manager.reconcile_applied_settings(&state);
                 let pins = manager.reconcile_frozen_histories_blocking().await;
                 let incarnations = manager.reconcile_index_incarnations_blocking(state).await;
                 match (pins, incarnations) {

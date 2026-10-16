@@ -1485,6 +1485,24 @@ impl TransportClient {
         Ok(response)
     }
 
+    pub async fn cancel_peer_recovery(
+        &self,
+        primary_node: &NodeInfo,
+        request: CancelPeerRecoveryRequest,
+    ) -> Result<CancelPeerRecoveryResponse, anyhow::Error> {
+        let mut client = self
+            .connect(&primary_node.host, primary_node.transport_port)
+            .await?;
+        let response = client
+            .cancel_peer_recovery(tonic::Request::new(request))
+            .await?
+            .into_inner();
+        if !response.error.is_empty() {
+            return Err(anyhow::anyhow!("{}", response.error));
+        }
+        Ok(response)
+    }
+
     /// Forward a settings update to the master node via gRPC.
     /// The master applies the changes via Raft.
     pub async fn forward_update_settings(

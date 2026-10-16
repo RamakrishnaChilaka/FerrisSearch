@@ -5295,6 +5295,36 @@ impl HotEngine {
     /// only up to the given global checkpoint. Entries above the checkpoint
     /// are retained for replica recovery via translog replay.
     /// Returns the highest seq_no written to the WAL.
+    pub(crate) fn snapshot_committed_files_to_staging(
+        &self,
+        staging_dir: &Path,
+    ) -> Result<(
+        CommittedBoundaryRecord,
+        crate::wal::WalCursor,
+        String,
+        Vec<String>,
+    )> {
+        let _maintenance = self.maintenance_guard("persisted shard snapshot")?;
+        let (committed_boundary, snapshot_cursor, file_names) =
+            self.with_translog("persisted shard snapshot", |translog| {
+                let committed_boundary = self.load_committed_boundary()?;
+                let snapshot_cursor = translog.recovery_read_snapshot()?.end_cursor();
+                let file_names = self.peer_recovery_file_names()?;
+                let index_dir = self
+                    .committed_boundary_path
+                    .parent()
+                    .expect("committed boundary path has a parent")
+                    .join("index");
+                for name in &file_names {
+                    std::fs::hard_link(index_dir.join(name), staging_dir.join(name))?;
+                }
+                Ok((committed_boundary, snapshot_cursor, file_names))
+            })?;
+        let schema_bytes = serde_json::to_vec(&self.index.schema())?;
+        let schema_hash = super::snapshot::hex_sha256(&schema_bytes);
+        Ok((committed_boundary, snapshot_cursor, schema_hash, file_names))
+    }
+
     pub fn sequence_stats(&self) -> SequenceStats {
         self.apply_state
             .lock()
@@ -9644,13 +9674,11 @@ impl super::SearchEngine for HotEngine {
         )?))
     }
 
-    fn create_peer_recovery_snapshot(
+    #[cfg(test)]
+    fn notify_peer_recovery_snapshot_ready_for_test(
         &self,
-        snapshot_dir: &Path,
-    ) -> Result<super::PeerRecoverySnapshot> {
-        let prepared = self.prepare_peer_recovery_snapshot(snapshot_dir)?;
-
-        #[cfg(test)]
+        prepared: &super::PeerRecoverySnapshotPreparation,
+    ) {
         if let Some(sender) = self
             .peer_recovery_snapshot_ready_sender
             .lock()
@@ -9664,7 +9692,6 @@ impl super::SearchEngine for HotEngine {
                 .unwrap_or(0);
             let _ = sender.send(snapshot_next_seq_no);
         }
-        #[cfg(test)]
         if let Some(receiver) = self
             .peer_recovery_snapshot_release_receiver
             .lock()
@@ -9673,6 +9700,16 @@ impl super::SearchEngine for HotEngine {
         {
             let _ = receiver.recv();
         }
+    }
+
+    fn create_peer_recovery_snapshot(
+        &self,
+        snapshot_dir: &Path,
+    ) -> Result<super::PeerRecoverySnapshot> {
+        let prepared = self.prepare_peer_recovery_snapshot(snapshot_dir)?;
+
+        #[cfg(test)]
+        self.notify_peer_recovery_snapshot_ready_for_test(&prepared);
 
         let prepared = match prepared.hash_files(snapshot_dir) {
             Ok(prepared) => prepared,
@@ -9692,6 +9729,7 @@ impl super::SearchEngine for HotEngine {
             committed_boundary: prepared.committed_boundary,
             retention_pin_id: prepared.retention_pin.into_pin_id(),
             files: prepared.files,
+            manifest: prepared.manifest,
         })
     }
 
@@ -9879,6 +9917,9 @@ impl super::SearchEngine for HotEngine {
             }
         };
         drop(_maintenance);
+        let schema_bytes = serde_json::to_vec(&self.index.schema())?;
+        let schema_hash = super::snapshot::hex_sha256(&schema_bytes);
+        let binding = self.write_state.binding();
         Ok(super::PeerRecoverySnapshotPreparation {
             snapshot_cursor,
             #[cfg(test)]
@@ -9896,6 +9937,11 @@ impl super::SearchEngine for HotEngine {
                 retention_pin_id,
             ),
             file_names,
+            schema_hash,
+            vector_state: super::snapshot::ShardSnapshotVectorMetadata::default(),
+            index_uuid: binding.map(|b| b.index_uuid.clone()),
+            shard_id: binding.map(|b| b.shard_id),
+            allocation_id: binding.map(|b| b.allocation_id),
         })
     }
 

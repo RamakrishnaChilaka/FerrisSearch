@@ -477,6 +477,9 @@ impl Node {
         ));
         shard_manager
             .bind_applied_shard_authority(cluster_manager.clone(), config.node_name.clone());
+        if tokio::runtime::Handle::try_current().is_ok() {
+            shard_manager.start_applied_index_reconciler();
+        }
         shard_manager.configure_copy_retry_policy(
             config.shard_io_failure_escalation_attempts,
             Duration::from_millis(config.shard_io_failure_escalation_window_ms),

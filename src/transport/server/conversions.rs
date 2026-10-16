@@ -90,6 +90,11 @@ pub(super) fn index_settings_to_proto(
         refresh_interval_ms: settings.refresh_interval_ms,
         flush_threshold_bytes: settings.flush_threshold_bytes,
         minimum_durable_copies: Some(settings.minimum_durable_copies),
+        replica_policy_json: settings
+            .replica_policy
+            .as_ref()
+            .filter(|policy| !policy.is_empty())
+            .map(|policy| serde_json::to_string(policy).expect("replica policy must serialize")),
         remote_store: settings.remote_store.as_ref().map(|remote_store| {
             crate::transport::proto::RemoteStoreSettings {
                 object_store_uri: remote_store.object_store_uri.clone(),
@@ -145,6 +150,19 @@ pub(super) fn proto_to_index_settings(
         ))
     })?;
 
+    let replica_policy = match settings.replica_policy_json.as_deref() {
+        Some(raw) if !raw.is_empty() => {
+            let parsed: crate::cluster::state::ReplicaPolicySettings = serde_json::from_str(raw)
+                .map_err(|error| {
+                    Status::invalid_argument(format!(
+                        "unsupported cluster-state wire format: invalid replica_policy_json: {error}"
+                    ))
+                })?;
+            (!parsed.is_empty()).then_some(parsed)
+        }
+        _ => None,
+    };
+
     Ok(crate::cluster::state::IndexSettings {
         engine,
         refresh_interval_ms: settings.refresh_interval_ms,
@@ -154,6 +172,7 @@ pub(super) fn proto_to_index_settings(
                 "unsupported cluster-state wire format: minimum_durable_copies is missing or zero; recreate the index",
             )
         })?,
+        replica_policy,
         remote_store: proto_to_remote_store_settings(settings.remote_store.as_ref()),
     })
 }

@@ -22,8 +22,10 @@ use std::time::{Duration, Instant};
 mod copy_authority;
 mod lifecycle;
 pub(crate) mod promotion;
+pub mod replica_state;
 
 pub(crate) use lifecycle::IndexIncarnationRetirementErrors;
+pub use replica_state::{ReplicaCopyLifecycleSnapshot, ReplicaCopyState, ReplicaStateRegistry};
 
 pub const SHARD_DATA_REMOVE_REASON_API_DELETE_INDEX: &str = "api_delete_index";
 pub const SHARD_DATA_REMOVE_REASON_TRANSPORT_DELETE_INDEX: &str = "transport_delete_index_rpc";
@@ -375,6 +377,7 @@ impl ShardCopyIdentity {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .and_then(|name| name.strip_prefix("shard_"))
+                .map(|name| name.strip_suffix(".staging").unwrap_or(name))
                 .and_then(|id| id.parse::<u32>().ok())
                 .ok_or_else(|| {
                     definitive_shard_copy_failure(
@@ -430,6 +433,8 @@ struct PeerRecoveryInstallMarker {
     version: u32,
     index_uuid: String,
     allocation_id: AllocationId,
+    #[serde(default)]
+    staged_with_previous_valid_shard: bool,
 }
 
 impl PeerRecoveryInstallMarker {
@@ -548,7 +553,9 @@ pub struct IsrTracker {
     /// Key: ShardKey, Value: HashMap<replica_node_id, ReplicaCheckpoint>
     replicas: RwLock<HashMap<ShardKey, HashMap<String, ReplicaCheckpoint>>>,
     gap_observations: RwLock<HashMap<ShardKey, HashMap<String, ReplicaGapObservation>>>,
-    /// Maximum allowed seq_no lag for the diagnostic lag-eligible view.
+    /// Per-index reactive replica policy overrides (`FS-026`).
+    index_policies: RwLock<HashMap<String, crate::cluster::state::EffectiveReplicaPolicy>>,
+    /// Default maximum allowed seq_no lag for the diagnostic lag-eligible view.
     max_lag: u64,
 }
 
@@ -557,8 +564,71 @@ impl IsrTracker {
         Self {
             replicas: RwLock::new(HashMap::new()),
             gap_observations: RwLock::new(HashMap::new()),
+            index_policies: RwLock::new(HashMap::new()),
             max_lag,
         }
+    }
+
+    pub fn set_index_policy(
+        &self,
+        index: &str,
+        policy: crate::cluster::state::EffectiveReplicaPolicy,
+    ) {
+        self.index_policies
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(index.to_string(), policy);
+    }
+
+    pub fn index_policy(
+        &self,
+        index: &str,
+    ) -> Option<crate::cluster::state::EffectiveReplicaPolicy> {
+        self.index_policies
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index)
+            .copied()
+    }
+
+    pub fn effective_max_lag_ops(&self, index: &str) -> u64 {
+        self.index_policy(index)
+            .map(|policy| policy.max_lag_ops)
+            .unwrap_or(self.max_lag)
+    }
+
+    pub fn effective_lag_timeout(&self, index: &str, fallback: Duration) -> Duration {
+        self.index_policy(index)
+            .map(|policy| Duration::from_millis(policy.lag_timeout_ms))
+            .unwrap_or(fallback)
+    }
+
+    pub fn replica_lag_ops(
+        &self,
+        index: &str,
+        shard_id: u32,
+        node_id: &str,
+        primary_checkpoint: Option<u64>,
+    ) -> (Option<u64>, bool) {
+        let key = ShardKey::new(index, shard_id);
+        let max_lag = self.effective_max_lag_ops(index);
+        let replicas = self.replicas.read().unwrap_or_else(|e| e.into_inner());
+        let Some(rc) = replicas.get(&key).and_then(|map| map.get(node_id)) else {
+            let has_gap = self
+                .gap_observations
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+                .is_some_and(|gaps| gaps.contains_key(node_id));
+            return (None, has_gap);
+        };
+        let lag = match (primary_checkpoint, rc.processed_checkpoint) {
+            (Some(primary_cp), Some(replica_cp)) => Some(primary_cp.saturating_sub(replica_cp)),
+            (Some(primary_cp), None) => Some(primary_cp.saturating_add(1)),
+            (None, _) => Some(0),
+        };
+        let exceeds = lag.is_some_and(|l| l > max_lag);
+        (lag, exceeds)
     }
 
     fn max_checkpoint(current: Option<u64>, reported: Option<u64>) -> Option<u64> {
@@ -743,13 +813,14 @@ impl IsrTracker {
         primary_checkpoint: u64,
     ) -> Vec<String> {
         let key = ShardKey::new(index, shard_id);
+        let max_lag = self.effective_max_lag_ops(index);
         let replicas = self.replicas.read().unwrap_or_else(|e| e.into_inner());
         match replicas.get(&key) {
             Some(shard_replicas) => shard_replicas
                 .iter()
                 .filter(|(_, rc)| {
                     rc.processed_checkpoint.is_some_and(|checkpoint| {
-                        primary_checkpoint.saturating_sub(checkpoint) <= self.max_lag
+                        primary_checkpoint.saturating_sub(checkpoint) <= max_lag
                     })
                 })
                 .map(|(node_id, _)| node_id.clone())
@@ -791,9 +862,12 @@ impl IsrTracker {
             .unwrap_or_else(|e| e.into_inner())
             .iter()
             .flat_map(|(key, observations)| {
+                let effective_timeout = self.effective_lag_timeout(&key.index, timeout);
                 observations
                     .values()
-                    .filter(|observation| now.duration_since(observation.first_seen) >= timeout)
+                    .filter(move |observation| {
+                        now.duration_since(observation.first_seen) >= effective_timeout
+                    })
                     .map(|observation| (key.clone(), observation.clone()))
             })
             .collect()
@@ -917,6 +991,10 @@ impl IsrTracker {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|k, _| k.index != index);
+        self.index_policies
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(index);
     }
 }
 
@@ -970,10 +1048,14 @@ pub struct ShardManager {
     assigned_open_attempts: AtomicUsize,
     #[cfg(test)]
     collision_quarantine_persist_failure: Mutex<Option<(i32, usize)>>,
+    #[cfg(test)]
+    recovery_install_io_failure: Mutex<Option<(i32, usize)>>,
     peer_recovery_targets: RwLock<HashMap<ShardKey, PeerRecoveryTargetState>>,
     source_recovery_cleanup: RwLock<Option<Arc<dyn SourceRecoverySessionCleanup>>>,
     /// ISR tracker for primary shards — tracks replica checkpoint lag.
     pub isr_tracker: IsrTracker,
+    /// Explicit per-copy replica recovery and ISR state machine (`FS-025`).
+    pub replica_states: ReplicaStateRegistry,
     /// Translog durability mode for new shards.
     durability: TranslogDurability,
     /// Shared column cache for SQL fast-field Arrow arrays and grouped-partials
@@ -1047,9 +1129,12 @@ impl ShardManager {
             assigned_open_attempts: AtomicUsize::new(0),
             #[cfg(test)]
             collision_quarantine_persist_failure: Mutex::new(None),
+            #[cfg(test)]
+            recovery_install_io_failure: Mutex::new(None),
             peer_recovery_targets: RwLock::new(HashMap::new()),
             source_recovery_cleanup: RwLock::new(None),
             isr_tracker: IsrTracker::new(1000),
+            replica_states: ReplicaStateRegistry::new(),
             durability,
             column_cache,
             #[cfg(feature = "protocol-trace")]
@@ -1441,6 +1526,116 @@ impl ShardManager {
         })?;
         identity.validate_directory(shard_dir)?;
         Ok(identity)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_recovery_install_io_failures(&self, raw_os_error: i32, attempts: usize) {
+        *self
+            .recovery_install_io_failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some((raw_os_error, attempts));
+    }
+
+    #[cfg(test)]
+    fn maybe_inject_recovery_install_io_failure(&self) -> Result<()> {
+        let mut injection = self
+            .recovery_install_io_failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some((raw_os_error, remaining)) = injection.as_mut() else {
+            return Ok(());
+        };
+        if *remaining == 0 {
+            *injection = None;
+            return Ok(());
+        }
+        *remaining -= 1;
+        Err(std::io::Error::from_raw_os_error(*raw_os_error).into())
+    }
+
+    fn peer_recovery_staging_dir(shard_dir: &std::path::Path) -> PathBuf {
+        let name = shard_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("shard");
+        shard_dir.with_file_name(format!("{name}.staging"))
+    }
+
+    fn peer_recovery_backup_dir(shard_dir: &std::path::Path) -> PathBuf {
+        let name = shard_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("shard");
+        shard_dir.with_file_name(format!("{name}.backup"))
+    }
+
+    fn has_valid_installed_shard(shard_dir: &std::path::Path) -> bool {
+        if !shard_dir.is_dir() {
+            return false;
+        }
+        if let Ok(Some(marker)) = Self::load_peer_recovery_install_marker(shard_dir)
+            && !marker.staged_with_previous_valid_shard
+        {
+            return false;
+        }
+        Self::load_copy_identity(shard_dir).is_ok()
+            && shard_dir.join("index").join("meta.json").is_file()
+            && shard_dir.join("translog.manifest").is_file()
+    }
+
+    fn reconcile_interrupted_staged_swap(shard_dir: &std::path::Path) -> Result<()> {
+        let backup_dir = Self::peer_recovery_backup_dir(shard_dir);
+        if !shard_dir.try_exists()? && backup_dir.try_exists()? {
+            std::fs::rename(&backup_dir, shard_dir)?;
+            if let Some(parent) = shard_dir.parent() {
+                std::fs::File::open(parent)?.sync_all()?;
+            }
+        } else if shard_dir.try_exists()?
+            && backup_dir.try_exists()?
+            && Self::has_valid_installed_shard(shard_dir)
+        {
+            Self::remove_dir_all_with_retry(&backup_dir)?;
+        }
+        Ok(())
+    }
+
+    fn reconcile_interrupted_staged_recovery_on_open(shard_dir: &std::path::Path) -> Result<()> {
+        Self::reconcile_interrupted_staged_swap(shard_dir)?;
+        if let Some(marker) = Self::load_peer_recovery_install_marker(shard_dir)?
+            && marker.staged_with_previous_valid_shard
+            && Self::has_valid_installed_shard(shard_dir)
+        {
+            let staging_dir = Self::peer_recovery_staging_dir(shard_dir);
+            if staging_dir.try_exists()? {
+                Self::remove_dir_all_with_retry(&staging_dir)?;
+            }
+            match std::fs::remove_file(shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER)) {
+                Ok(()) => std::fs::File::open(shard_dir)?.sync_all()?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    fn write_install_marker_atomically(
+        dir: &std::path::Path,
+        marker: &PeerRecoveryInstallMarker,
+    ) -> Result<()> {
+        std::fs::create_dir_all(dir)?;
+        let marker_path = dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER);
+        let temporary_path = marker_path.with_extension("tmp");
+        let bytes = serde_json::to_vec(marker)?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary_path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary_path, &marker_path)?;
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
     }
 
     fn load_peer_recovery_install_marker(
@@ -2699,14 +2894,14 @@ impl ShardManager {
             .data_dir
             .join(index_uuid)
             .join(format!("shard_{shard_id}"));
-        Self::ensure_no_current_peer_recovery_install(
-            &shard_dir, index, shard_id, index_uuid, assignment,
-        )?;
 
         // Fast path: shard already open.
         {
             let shards = self.shards.read().unwrap_or_else(|e| e.into_inner());
             if let Some(engine) = shards.get(&key) {
+                Self::ensure_no_current_peer_recovery_install(
+                    &shard_dir, index, shard_id, index_uuid, assignment,
+                )?;
                 if let Some(assignment) = assignment {
                     self.validated_cached_copy_identity(
                         &key,
@@ -2775,6 +2970,12 @@ impl ShardManager {
         {
             let shards = self.shards.read().unwrap_or_else(|e| e.into_inner());
             if let Some(engine) = shards.get(&key) {
+                if !self.is_peer_recovery_target(index, shard_id) {
+                    Self::reconcile_interrupted_staged_recovery_on_open(&shard_dir)?;
+                }
+                Self::ensure_no_current_peer_recovery_install(
+                    &shard_dir, index, shard_id, index_uuid, assignment,
+                )?;
                 if let Some(assignment) = assignment {
                     self.validated_cached_copy_identity(
                         &key,
@@ -2789,6 +2990,9 @@ impl ShardManager {
             }
         }
 
+        if !self.is_peer_recovery_target(index, shard_id) {
+            Self::reconcile_interrupted_staged_recovery_on_open(&shard_dir)?;
+        }
         Self::ensure_no_current_peer_recovery_install(
             &shard_dir, index, shard_id, index_uuid, assignment,
         )?;
@@ -3425,6 +3629,9 @@ impl ShardManager {
             .data_dir
             .join(index_uuid)
             .join(format!("shard_{shard_id}"));
+        if let Err(error) = Self::reconcile_interrupted_staged_recovery_on_open(&shard_dir) {
+            return Err(self.record_copy_io_failure(retry_key, error));
+        }
         let marker = match Self::load_peer_recovery_install_marker(&shard_dir) {
             Ok(Some(marker)) => marker,
             Ok(None) => {
@@ -3674,6 +3881,7 @@ impl ShardManager {
                 .data_dir
                 .join(&index_uuid)
                 .join(format!("shard_{shard_id}"));
+            Self::reconcile_interrupted_staged_swap(&shard_dir)?;
             if Self::matching_peer_recovery_awaiting_membership(
                 &shard_dir,
                 &index_uuid,
@@ -3690,29 +3898,40 @@ impl ShardManager {
                 })?;
             drop(removed);
 
-            if shard_dir.try_exists()? {
-                Self::remove_dir_all_with_retry(&shard_dir)?;
+            let staged_with_previous_valid_shard = Self::has_valid_installed_shard(&shard_dir);
+            if !staged_with_previous_valid_shard {
+                if shard_dir.try_exists()? {
+                    Self::remove_dir_all_with_retry(&shard_dir)?;
+                }
+                std::fs::create_dir_all(shard_dir.join("index"))?;
             }
-            std::fs::create_dir_all(shard_dir.join("index"))?;
-            let marker_path = shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER);
-            let temporary_path = marker_path.with_extension("tmp");
             let marker = PeerRecoveryInstallMarker {
                 version: 1,
-                index_uuid,
+                index_uuid: index_uuid.clone(),
                 allocation_id,
+                staged_with_previous_valid_shard,
             };
-            let bytes = serde_json::to_vec(&marker)?;
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&temporary_path)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            std::fs::rename(&temporary_path, &marker_path)?;
-            std::fs::File::open(&shard_dir)?.sync_all()?;
+            Self::write_install_marker_atomically(&shard_dir, &marker)?;
+            let staging_dir = Self::peer_recovery_staging_dir(&shard_dir);
+            if staging_dir.try_exists()? {
+                Self::remove_dir_all_with_retry(&staging_dir)?;
+            }
+            std::fs::create_dir_all(staging_dir.join("index"))?;
+            Self::write_install_marker_atomically(&staging_dir, &marker)?;
+            if let Some(authority) = shard_manager.applied_authority.get() {
+                let _ = shard_manager.replica_states.transition(
+                    &key,
+                    &index_uuid,
+                    &authority.local_node_id,
+                    Some(allocation_id),
+                    0,
+                    ReplicaCopyState::Snapshotting,
+                    false,
+                    None,
+                );
+            }
             observer();
-            Ok(shard_dir)
+            Ok(staging_dir)
         })
         .await
         .map_err(|e| anyhow::anyhow!("blocking peer recovery target preparation failed: {e}"))?
@@ -4008,6 +4227,8 @@ impl ShardManager {
             }
             let canonical_file_name = crate::engine::PEER_RECOVERY_CANONICAL_HISTORY_FILE;
             let canonical_file_path = shard_dir.join("index").join(canonical_file_name);
+            #[cfg(test)]
+            shard_manager.maybe_inject_recovery_install_io_failure()?;
             let wal = HotTranslog::open_with_durability(&shard_dir, shard_manager.durability)?;
             wal.import_snapshot_history(&canonical_file_path, history_start, history_end, |entry| {
                 if let Some(retained) = retained_entries.get(&entry.seq_no)
@@ -4041,6 +4262,26 @@ impl ShardManager {
             expected_files.retain(|file| file != canonical_file_name);
             std::fs::remove_file(&version_snapshot_path)?;
             expected_files.retain(|file| file != version_snapshot_name);
+            for snapshot_meta_file in [
+                crate::engine::SHARD_SNAPSHOT_MANIFEST_FILE,
+                crate::engine::SHARD_SNAPSHOT_COMPLETE_FILE,
+            ] {
+                let meta_path = shard_dir.join("index").join(snapshot_meta_file);
+                if meta_path.try_exists()? {
+                    std::fs::remove_file(&meta_path)?;
+                }
+                expected_files.retain(|file| file != snapshot_meta_file);
+            }
+            let mut snapshot_vectors_installed = false;
+            let staged_vector_index = shard_dir.join("index").join("vectors.usearch");
+            let staged_vector_docids = shard_dir.join("index").join("vectors.docids.bin");
+            if staged_vector_index.try_exists()? && staged_vector_docids.try_exists()? {
+                std::fs::rename(&staged_vector_index, shard_dir.join("vectors.usearch"))?;
+                std::fs::rename(&staged_vector_docids, shard_dir.join("vectors.docids.bin"))?;
+                expected_files
+                    .retain(|file| file != "vectors.usearch" && file != "vectors.docids.bin");
+                snapshot_vectors_installed = true;
+            }
             let committed_path = shard_dir.join("translog.committed");
             committed_boundary.persist(&committed_path)?;
             std::fs::File::open(shard_dir.join("index"))?.sync_all()?;
@@ -4058,38 +4299,108 @@ impl ShardManager {
             let refresh_interval = settings_manager.refresh_interval();
             let refresh_rx = settings_manager.watch_refresh_interval();
             let flush_threshold_rx = settings_manager.watch_flush_threshold();
+            {
+                let verification_engine = shard_manager.open_composite_engine(
+                    &index,
+                    shard_id,
+                    &shard_dir,
+                    refresh_interval,
+                    &mappings,
+                    CompositeOpenMode::ExistingOnly,
+                )?;
+                let mut actual_files = verification_engine.peer_recovery_commit_files()?;
+                expected_files.sort();
+                actual_files.sort();
+                if actual_files != expected_files {
+                    anyhow::bail!(
+                        "installed peer recovery commit file set does not match the source snapshot"
+                    );
+                }
+
+                let has_vectors = mappings.values().any(|mapping| {
+                    matches!(
+                        mapping.field_type,
+                        crate::cluster::state::FieldType::KnnVector
+                    )
+                });
+                if has_vectors || snapshot_vectors_installed {
+                    verification_engine.rebuild_vectors()?;
+                }
+
+                verification_engine.reconcile_term_sequence_state(
+                    identity.replica_fence,
+                    identity.fence_max_seq_no,
+                )?;
+            }
+            std::fs::remove_file(&marker_path)?;
+            std::fs::File::open(&shard_dir)?.sync_all()?;
+
+            #[cfg(test)]
+            shard_manager.maybe_inject_recovery_install_io_failure()?;
+            let canonical_shard_dir = shard_manager
+                .data_dir
+                .join(&index_uuid)
+                .join(format!("shard_{shard_id}"));
+            let backup_dir = Self::peer_recovery_backup_dir(&canonical_shard_dir);
+            if shard_dir != canonical_shard_dir {
+                if backup_dir.try_exists()? {
+                    Self::remove_dir_all_with_retry(&backup_dir)?;
+                }
+                if canonical_shard_dir.try_exists()? {
+                    std::fs::rename(&canonical_shard_dir, &backup_dir)?;
+                }
+                if let Err(error) = std::fs::rename(&shard_dir, &canonical_shard_dir) {
+                    if backup_dir.exists() && !canonical_shard_dir.exists() {
+                        let _ = std::fs::rename(&backup_dir, &canonical_shard_dir);
+                    }
+                    return Err(error.into());
+                }
+                if let Some(parent) = canonical_shard_dir.parent() {
+                    std::fs::File::open(parent)?.sync_all()?;
+                }
+            }
+            match std::fs::remove_file(canonical_shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            std::fs::File::open(&canonical_shard_dir)?.sync_all()?;
+
             let engine = shard_manager.open_composite_engine(
                 &index,
                 shard_id,
-                &shard_dir,
+                &canonical_shard_dir,
                 refresh_interval,
                 &mappings,
                 CompositeOpenMode::ExistingOnly,
             )?;
-            let mut actual_files = engine.peer_recovery_commit_files()?;
-            expected_files.sort();
-            actual_files.sort();
-            if actual_files != expected_files {
-                anyhow::bail!(
-                    "installed peer recovery commit file set does not match the source snapshot"
-                );
-            }
-
             let has_vectors = mappings.values().any(|mapping| {
                 matches!(
                     mapping.field_type,
                     crate::cluster::state::FieldType::KnnVector
                 )
             });
-            if has_vectors {
+            if has_vectors || snapshot_vectors_installed {
                 engine.rebuild_vectors()?;
             }
-
             engine
                 .reconcile_term_sequence_state(identity.replica_fence, identity.fence_max_seq_no)?;
-            std::fs::remove_file(&marker_path)?;
-            std::fs::File::open(&shard_dir)?.sync_all()?;
+            if backup_dir.exists() {
+                let _ = Self::remove_dir_all_with_retry(&backup_dir);
+            }
             observer(engine.as_ref())?;
+            if let Some(authority) = shard_manager.applied_authority.get() {
+                let _ = shard_manager.replica_states.transition(
+                    &key,
+                    &index_uuid,
+                    &authority.local_node_id,
+                    Some(allocation_id),
+                    primary_term,
+                    ReplicaCopyState::CatchingUp,
+                    false,
+                    None,
+                );
+            }
 
             CompositeEngine::start_refresh_loop_reactive(
                 engine.clone(),
@@ -4154,29 +4465,35 @@ impl ShardManager {
                 .data_dir
                 .join(&index_uuid)
                 .join(format!("shard_{shard_id}"));
+            let staging_dir = Self::peer_recovery_staging_dir(&shard_dir);
+            if staging_dir.try_exists()? {
+                Self::remove_dir_all_with_retry(&staging_dir)?;
+            }
             std::fs::create_dir_all(&shard_dir)?;
             match std::fs::remove_file(shard_dir.join(PEER_RECOVERY_AWAITING_MEMBERSHIP_MARKER)) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
-            let marker_path = shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER);
-            let temporary_path = marker_path.with_extension("tmp");
             let marker = PeerRecoveryInstallMarker {
                 version: 1,
-                index_uuid,
+                index_uuid: index_uuid.clone(),
                 allocation_id,
+                staged_with_previous_valid_shard: false,
             };
-            let bytes = serde_json::to_vec(&marker)?;
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&temporary_path)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            std::fs::rename(&temporary_path, &marker_path)?;
-            std::fs::File::open(shard_dir)?.sync_all()?;
+            Self::write_install_marker_atomically(&shard_dir, &marker)?;
+            if let Some(authority) = shard_manager.applied_authority.get() {
+                let _ = shard_manager.replica_states.transition(
+                    &key,
+                    &index_uuid,
+                    &authority.local_node_id,
+                    Some(allocation_id),
+                    0,
+                    ReplicaCopyState::Failed,
+                    false,
+                    Some("peer recovery target was aborted".into()),
+                );
+            }
             Ok(())
         })
         .await
@@ -4286,13 +4603,19 @@ impl ShardManager {
                     None => return Ok(()),
                 }
             }
-            if let Some(marker) = Self::load_peer_recovery_install_marker(&shard_dir)?
+            let marker = Self::load_peer_recovery_install_marker(&shard_dir)?;
+            if let Some(ref marker) = marker
                 && (marker.index_uuid != index_uuid || marker.allocation_id != allocation_id)
             {
                 anyhow::bail!(
                     "refusing retry cleanup because the install marker belongs to another allocation"
                 );
             }
+            let staging_dir = Self::peer_recovery_staging_dir(&shard_dir);
+            if staging_dir.try_exists()? {
+                Self::remove_dir_all_with_retry(&staging_dir)?;
+            }
+            Self::reconcile_interrupted_staged_swap(&shard_dir)?;
             shard_manager
                 .shards
                 .write()
@@ -4304,7 +4627,13 @@ impl ShardManager {
                 .unwrap_or_else(|error| error.into_inner())
                 .remove(&key);
             shard_manager.isr_tracker.remove_shard(&index, shard_id);
-            if shard_dir.try_exists()? {
+            if Self::has_valid_installed_shard(&shard_dir) {
+                match std::fs::remove_file(shard_dir.join(PEER_RECOVERY_IN_PROGRESS_MARKER)) {
+                    Ok(()) => std::fs::File::open(&shard_dir)?.sync_all()?,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            } else if shard_dir.try_exists()? {
                 Self::remove_dir_all_with_retry(&shard_dir)?;
             }
             shard_manager
@@ -4755,10 +5084,36 @@ impl ShardManager {
     pub fn apply_settings(&self, index: &str, new_settings: &IndexSettings) {
         let settings_mgr = self.ensure_settings_manager(index, new_settings);
         settings_mgr.update(new_settings);
+        self.isr_tracker
+            .set_index_policy(index, new_settings.effective_replica_policy());
+    }
+
+    /// Reconcile committed cluster settings on this node (`FS-026`).
+    /// Pushes committed `IndexSettings` to all local `SettingsManager` watch
+    /// channels and `IsrTracker` policies without requiring request ingress or reopen.
+    pub fn reconcile_applied_settings(&self, state: &crate::cluster::state::ClusterState) {
+        for (index_name, metadata) in &state.indices {
+            if !metadata.settings.engine.uses_local_shards() {
+                continue;
+            }
+            self.apply_settings(index_name, &metadata.settings);
+        }
     }
 
     /// Get the settings manager for an index, if one exists.
     pub fn get_settings_manager(&self, index: &str) -> Option<Arc<SettingsManager>> {
+        self.with_applied_state(|state| {
+            if let Some(metadata) = state.and_then(|state| state.indices.get(index))
+                && metadata.settings.engine.uses_local_shards()
+                && self
+                    .settings_managers
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(index)
+            {
+                self.apply_settings(index, &metadata.settings);
+            }
+        });
         self.settings_managers
             .read()
             .unwrap_or_else(|e| e.into_inner())

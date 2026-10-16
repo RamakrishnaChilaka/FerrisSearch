@@ -2736,6 +2736,7 @@ mod tests {
                 refresh_interval_ms: None,
                 flush_threshold_bytes: None,
                 minimum_durable_copies: 1,
+                replica_policy: None,
                 remote_store: Some(RemoteStoreSettings {
                     split_cache_bytes,
                     ..Default::default()
@@ -3357,7 +3358,7 @@ mod tests {
                 ..IndexSettings::default()
             },
         };
-        cs.indices.insert("events".into(), metadata.clone());
+        cs.add_index(metadata.clone());
         cluster_manager.update_state(cs);
 
         let app_state = AppState {

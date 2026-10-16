@@ -5,6 +5,7 @@ pub mod composite;
 pub mod remote_store;
 pub mod routing;
 pub(crate) mod sequence;
+pub mod snapshot;
 pub mod tantivy;
 pub mod vector;
 pub(crate) mod version_map;
@@ -25,6 +26,11 @@ pub use self::client_operation::{
 };
 pub use self::composite::CompositeEngine;
 pub use self::sequence::{SEQUENCE_FORMAT_VERSION, SequenceStats};
+pub use self::snapshot::{
+    PERSISTED_SHARD_SNAPSHOT_DIR, SHARD_SNAPSHOT_COMPLETE_FILE, SHARD_SNAPSHOT_FORMAT_CAPABILITY,
+    SHARD_SNAPSHOT_FORMAT_VERSION, SHARD_SNAPSHOT_MANIFEST_FILE, ShardSnapshotCompletionMarker,
+    ShardSnapshotManifest, ShardSnapshotVectorMetadata, compute_shard_schema_hash,
+};
 pub use self::tantivy::HotEngine;
 
 pub(crate) const PEER_RECOVERY_VERSION_SNAPSHOT_FILE: &str = "retained-delete-versions.json";
@@ -271,7 +277,8 @@ pub struct ClientNoOpWriteReceipt {
     pub deduplicated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PeerRecoveryFileMetadata {
     pub name: String,
     pub length: u64,
@@ -290,6 +297,7 @@ pub struct PeerRecoverySnapshot {
     pub(crate) committed_boundary: sequence::CommittedBoundaryRecord,
     pub retention_pin_id: u64,
     pub files: Vec<PeerRecoveryFileMetadata>,
+    pub manifest: snapshot::ShardSnapshotManifest,
 }
 
 pub struct PeerRecoveryRetentionPin {
@@ -352,6 +360,11 @@ pub struct PeerRecoverySnapshotPreparation {
     pub(crate) committed_boundary: sequence::CommittedBoundaryRecord,
     pub retention_pin: PeerRecoveryRetentionPin,
     pub file_names: Vec<String>,
+    pub schema_hash: String,
+    pub vector_state: snapshot::ShardSnapshotVectorMetadata,
+    pub index_uuid: Option<String>,
+    pub shard_id: Option<u32>,
+    pub allocation_id: Option<u64>,
 }
 
 pub struct PreparedPeerRecoverySnapshot {
@@ -365,6 +378,7 @@ pub struct PreparedPeerRecoverySnapshot {
     pub(crate) committed_boundary: sequence::CommittedBoundaryRecord,
     pub retention_pin: PeerRecoveryRetentionPin,
     pub files: Vec<PeerRecoveryFileMetadata>,
+    pub manifest: snapshot::ShardSnapshotManifest,
 }
 
 impl PeerRecoverySnapshotPreparation {
@@ -380,6 +394,11 @@ impl PeerRecoverySnapshotPreparation {
             committed_boundary,
             retention_pin,
             file_names,
+            schema_hash,
+            vector_state,
+            index_uuid,
+            shard_id,
+            allocation_id,
         } = self;
         let mut files = Vec::with_capacity(file_names.len());
         for name in file_names {
@@ -406,6 +425,24 @@ impl PeerRecoverySnapshotPreparation {
                 sha256,
             });
         }
+        let snapshot_id = snapshot_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let manifest = snapshot::ShardSnapshotManifest::new(
+            snapshot_id,
+            index_uuid,
+            shard_id,
+            allocation_id,
+            schema_hash,
+            committed_boundary.clone(),
+            snapshot_cursor,
+            vector_state,
+            files.clone(),
+        )?;
+        manifest.persist_atomically(snapshot_dir)?;
         Ok(PreparedPeerRecoverySnapshot {
             snapshot_cursor,
             #[cfg(test)]
@@ -417,6 +454,7 @@ impl PeerRecoverySnapshotPreparation {
             committed_boundary,
             retention_pin,
             files,
+            manifest,
         })
     }
 }
@@ -874,6 +912,28 @@ pub trait SearchEngine: Send + Sync {
         _snapshot_dir: &std::path::Path,
     ) -> Result<PeerRecoverySnapshotPreparation> {
         anyhow::bail!("peer recovery snapshot preparation is not supported by this engine")
+    }
+
+    #[cfg(test)]
+    fn notify_peer_recovery_snapshot_ready_for_test(
+        &self,
+        _prepared: &PeerRecoverySnapshotPreparation,
+    ) {
+    }
+
+    fn create_persisted_shard_snapshot(
+        &self,
+        snapshot_dir: &std::path::Path,
+    ) -> Result<snapshot::ShardSnapshotManifest> {
+        let prepared = self
+            .prepare_peer_recovery_snapshot(snapshot_dir)?
+            .hash_files(snapshot_dir)?;
+        prepared.retention_pin.release()?;
+        Ok(prepared.manifest)
+    }
+
+    fn latest_persisted_shard_snapshot(&self) -> Result<Option<snapshot::ShardSnapshotManifest>> {
+        Ok(None)
     }
 
     fn release_peer_recovery_pin(&self, _pin_id: u64) -> Result<()> {

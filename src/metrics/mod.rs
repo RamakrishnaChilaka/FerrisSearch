@@ -600,6 +600,83 @@ pub static REMOTE_STORE_JANITOR_DELETED_BYTES_TOTAL: LazyLock<IntCounter> = Lazy
     counter
 });
 
+pub static REPLICA_COPY_STATE_COPIES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "ferrissearch_replica_copy_state_copies",
+            "Replica copies across the cluster by explicit FS-025 lifecycle state",
+        ),
+        &["state"],
+    )
+    .expect("metric: replica_copy_state_copies");
+    for state in [
+        "unassigned",
+        "initializing",
+        "snapshotting",
+        "catching_up",
+        "in_sync",
+        "stale",
+        "failed",
+    ] {
+        let _ = gauge.with_label_values(&[state]);
+    }
+    REGISTRY
+        .register(Box::new(gauge.clone()))
+        .expect("register: replica_copy_state_copies");
+    gauge
+});
+
+pub static REPLICA_STATE_TRANSITIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "ferrissearch_replica_state_transitions_total",
+            "Replica recovery and ISR state machine transitions by source and target state",
+        ),
+        &["from", "to"],
+    )
+    .expect("metric: replica_state_transitions_total");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: replica_state_transitions_total");
+    counter
+});
+
+pub static PEER_RECOVERY_BYTES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "ferrissearch_peer_recovery_bytes_total",
+        "Total snapshot bytes transferred during peer recovery",
+    )
+    .expect("metric: peer_recovery_bytes_total");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: peer_recovery_bytes_total");
+    counter
+});
+
+pub static PEER_RECOVERY_OPS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "ferrissearch_peer_recovery_ops_total",
+        "Total WAL suffix operations applied during peer recovery",
+    )
+    .expect("metric: peer_recovery_ops_total");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: peer_recovery_ops_total");
+    counter
+});
+
+pub static PEER_RECOVERY_CANCELLATIONS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "ferrissearch_peer_recovery_cancellations_total",
+        "Total peer recovery sessions cancelled on target or source",
+    )
+    .expect("metric: peer_recovery_cancellations_total");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("register: peer_recovery_cancellations_total");
+    counter
+});
+
 fn set_column_cache_budget_gauges(
     effective_memory_gauge: &IntGauge,
     cache_budget_gauge: &IntGauge,
@@ -656,6 +733,26 @@ fn initialize_metrics() {
     let _ = &*REMOTE_STORE_JANITOR_RUNS_TOTAL;
     let _ = &*REMOTE_STORE_JANITOR_CANDIDATES_TOTAL;
     let _ = &*REMOTE_STORE_JANITOR_DELETED_BYTES_TOTAL;
+    let _ = &*REPLICA_COPY_STATE_COPIES;
+    let _ = &*REPLICA_STATE_TRANSITIONS_TOTAL;
+    let _ = &*PEER_RECOVERY_BYTES_TOTAL;
+    let _ = &*PEER_RECOVERY_OPS_TOTAL;
+    let _ = &*PEER_RECOVERY_CANCELLATIONS_TOTAL;
+}
+
+pub fn record_replica_state_transition(from: &str, to: &str) {
+    REPLICA_STATE_TRANSITIONS_TOTAL
+        .with_label_values(&[from, to])
+        .inc();
+}
+
+pub fn record_peer_recovery_progress(bytes: u64, operations: u64) {
+    PEER_RECOVERY_BYTES_TOTAL.inc_by(bytes);
+    PEER_RECOVERY_OPS_TOTAL.inc_by(operations);
+}
+
+pub fn record_peer_recovery_cancellation() {
+    PEER_RECOVERY_CANCELLATIONS_TOTAL.inc();
 }
 
 pub fn record_object_store_request(operation: &str, outcome: &str) {
@@ -773,14 +870,45 @@ pub fn update_cluster_metrics(state: &crate::api::AppState) {
     let mut primary_count = 0i64;
     let mut replica_count = 0i64;
     let mut authority_counts = [0i64; 3];
+    let mut replica_state_counts = [0i64; 7];
     let mut fail_stopped_copies = 0i64;
     let mut pending_exclusions = 0i64;
     for metadata in cs.indices.values() {
         primary_count += metadata.shard_routing.len() as i64;
         for routing in metadata.shard_routing.values() {
             replica_count += routing.replicas.len() as i64;
+            replica_state_counts[0] += routing.unassigned_replicas as i64;
         }
         for (shard, routing) in &metadata.shard_routing {
+            for replica_node in &routing.replicas {
+                let copy_failed = replica_node == &state.local_node_id
+                    && cs
+                        .shard_allocation_id(&metadata.name, *shard, replica_node)
+                        .is_some_and(|alloc| {
+                            state.shard_manager.is_copy_write_fail_stopped(
+                                metadata.uuid.as_str(),
+                                *shard,
+                                alloc,
+                            )
+                        });
+                let copy_state = state.shard_manager.replica_states.evaluate_copy_state(
+                    &cs,
+                    &metadata.name,
+                    *shard,
+                    replica_node,
+                    copy_failed,
+                );
+                let idx = match copy_state {
+                    crate::shard::ReplicaCopyState::Unassigned => 0,
+                    crate::shard::ReplicaCopyState::Initializing => 1,
+                    crate::shard::ReplicaCopyState::Snapshotting => 2,
+                    crate::shard::ReplicaCopyState::CatchingUp => 3,
+                    crate::shard::ReplicaCopyState::InSync => 4,
+                    crate::shard::ReplicaCopyState::Stale => 5,
+                    crate::shard::ReplicaCopyState::Failed => 6,
+                };
+                replica_state_counts[idx] += 1;
+            }
             let Some(allocation) =
                 cs.shard_allocation_id(&metadata.name, *shard, &state.local_node_id)
             else {
@@ -841,6 +969,22 @@ pub fn update_cluster_metrics(state: &crate::api::AppState) {
     }
     LOCAL_WRITE_FAIL_STOPPED_COPIES.set(fail_stopped_copies);
     LOCAL_WRITE_EXCLUSION_JOURNAL_PENDING.set(pending_exclusions);
+    for (state_label, count) in [
+        "unassigned",
+        "initializing",
+        "snapshotting",
+        "catching_up",
+        "in_sync",
+        "stale",
+        "failed",
+    ]
+    .iter()
+    .zip(replica_state_counts)
+    {
+        REPLICA_COPY_STATE_COPIES
+            .with_label_values(&[state_label])
+            .set(count);
+    }
 
     // Master status
     let is_master = state.raft.is_leader();

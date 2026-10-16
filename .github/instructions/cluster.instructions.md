@@ -238,11 +238,12 @@ impl SettingsManager {
 6. `SettingsManager::update()` pushes to local `watch::Sender`s
 7. Local `watch::Receiver`s (engine refresh / auto-flush loops) react
 
-The Raft state machine does not own `ShardManager`, so a follower that neither
-received nor led the request does not currently notify already-open engines
-when the committed metadata changes. Do not claim cluster-wide reactive
-application. A fix must apply committed settings to every node's local engines
-and include a multi-node regression.
+The Raft-backed applied-state reconciler (`ShardManager::start_applied_index_reconciler`)
+calls `ShardManager::reconcile_applied_settings(&state)` whenever the applied
+`ClusterState.version` advances, pushing committed `IndexSettings` (including
+`refresh_interval_ms`, `flush_threshold_bytes`, and `replica_policy`) to every
+node's local `SettingsManager` watch channels and `IsrTracker` without requiring
+request ingress or shard reopen on follower nodes.
 
 ### Adding a New Reactive Setting
 1. Add field to `IndexSettings`

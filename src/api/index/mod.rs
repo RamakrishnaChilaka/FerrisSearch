@@ -2102,6 +2102,7 @@ pub async fn get_index_settings(
         }
     };
 
+    let effective_policy = metadata.settings.effective_replica_policy();
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -2115,6 +2116,15 @@ pub async fn get_index_settings(
                         "refresh_interval_ms": metadata.settings.refresh_interval_ms,
                         "flush_threshold_bytes": metadata.settings.flush_threshold_bytes,
                         "dynamic": metadata.dynamic.to_string(),
+                        "replica_policy": {
+                            "max_lag_ops": effective_policy.max_lag_ops,
+                            "lag_timeout_ms": effective_policy.lag_timeout_ms,
+                            "recovery_session_timeout_ms": effective_policy.recovery_session_timeout_ms,
+                            "recovery_finalize_timeout_ms": effective_policy.recovery_finalize_timeout_ms,
+                            "recovery_retry_initial_backoff_ms": effective_policy.recovery_retry_initial_backoff_ms,
+                            "recovery_retry_max_backoff_ms": effective_policy.recovery_retry_max_backoff_ms,
+                            "write_ack_mode": effective_policy.write_ack_mode.as_str(),
+                        }
                     }
                 }
             }
