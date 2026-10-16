@@ -36,6 +36,7 @@ type RaftInstance = openraft::Raft<TypeConfig, ClusterStateMachine>;
 - `DeleteApiKey { key_id: String }` — remove a dynamic API key
 - `PutRole { role: SecurityRoleDefinition }` — upsert a custom role into `ClusterState.roles`
 - `DeleteRole { name: String }` — remove a custom role
+- `MutateManifestWriterAuthority { index_name, mutation }` — conditionally acquire, activate, renew, transfer, or release a `remote_store` index's `ManifestWriterAuthority` lease and monotonic `writer_epoch`
 
 Every variant has a `Display` arm (used in logs — never print secrets) with a serde JSON
 roundtrip test in `types.rs`, and an `apply_command` arm in `state_machine.rs`.

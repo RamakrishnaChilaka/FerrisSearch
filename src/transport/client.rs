@@ -1616,6 +1616,92 @@ impl TransportClient {
         Self::decode_shard_authority_result(response, Some(&exclusion.transition_id))
     }
 
+    pub async fn forward_mutate_manifest_writer_authority(
+        &self,
+        master: &NodeInfo,
+        index_name: &str,
+        mutation: &crate::cluster::state::ManifestWriterMutation,
+    ) -> Result<crate::cluster::state::ManifestWriterAuthority, anyhow::Error> {
+        if index_name.is_empty() {
+            anyhow::bail!("manifest writer authority mutation requires a non-empty index_name");
+        }
+        mutation.validate().map_err(anyhow::Error::msg)?;
+        let mut client = self
+            .connect(&master.host, master.transport_port)
+            .await
+            .context("connect to leader for manifest writer authority mutation")?;
+        let mut request = tonic::Request::new(ShardAuthorityMutationRequest {
+            index_name: index_name.to_string(),
+            record_json: serde_json::to_vec(mutation)?,
+        });
+        request.set_timeout(Duration::from_secs(5));
+        let response = client
+            .mutate_manifest_writer_authority(request)
+            .await
+            .context("MutateManifestWriterAuthority RPC")?
+            .into_inner();
+        use crate::consensus::types::{ClusterResponse, ManifestWriterAuthorityRejectedError};
+        let result: ClusterResponse = serde_json::from_slice(&response.result_json)
+            .context("decode strict manifest writer authority result")?;
+        match result {
+            ClusterResponse::ManifestWriterAuthorityApplied { authority } => Ok(authority),
+            ClusterResponse::ManifestWriterAuthorityRejected { reason } => {
+                Err(ManifestWriterAuthorityRejectedError { reason }.into())
+            }
+            ClusterResponse::Error(reason) => Err(anyhow::Error::msg(reason)),
+            other => Err(anyhow::anyhow!(
+                "inconsistent manifest writer authority result: {other:?}"
+            )),
+        }
+    }
+
+    /// Coordinator helper: executes a [`ManifestWriterMutation`] on the local
+    /// Raft leader or forwards it to the current master node over gRPC.
+    pub async fn propose_manifest_writer_authority_mutation(
+        &self,
+        raft: &crate::consensus::types::RaftInstance,
+        cluster_manager: &crate::cluster::ClusterManager,
+        index_name: &str,
+        mutation: crate::cluster::state::ManifestWriterMutation,
+    ) -> Result<crate::cluster::state::ManifestWriterAuthority, anyhow::Error> {
+        if index_name.is_empty() {
+            anyhow::bail!("manifest writer authority mutation requires a non-empty index_name");
+        }
+        mutation.validate().map_err(anyhow::Error::msg)?;
+        if raft.is_leader() {
+            let response = raft
+                .client_write(
+                    crate::consensus::types::ClusterCommand::MutateManifestWriterAuthority {
+                        index_name: index_name.to_string(),
+                        mutation,
+                    },
+                )
+                .await
+                .context("Raft MutateManifestWriterAuthority failed")?;
+            use crate::consensus::types::{ClusterResponse, ManifestWriterAuthorityRejectedError};
+            match response.data {
+                ClusterResponse::ManifestWriterAuthorityApplied { authority } => Ok(authority),
+                ClusterResponse::ManifestWriterAuthorityRejected { reason } => {
+                    Err(ManifestWriterAuthorityRejectedError { reason }.into())
+                }
+                ClusterResponse::Error(reason) => Err(anyhow::Error::msg(reason)),
+                other => Err(anyhow::anyhow!(
+                    "inconsistent manifest writer authority result: {other:?}"
+                )),
+            }
+        } else {
+            let state = cluster_manager.get_state();
+            let master_id = state.master_node.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("no master node available to forward manifest writer mutation")
+            })?;
+            let master = state.nodes.get(master_id).ok_or_else(|| {
+                anyhow::anyhow!("master node [{master_id}] not found in cluster state")
+            })?;
+            self.forward_mutate_manifest_writer_authority(master, index_name, &mutation)
+                .await
+        }
+    }
+
     fn decode_shard_authority_result(
         response: ShardAuthorityMutationResponse,
         transition_id: Option<&str>,

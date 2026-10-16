@@ -181,6 +181,7 @@ impl ClusterStateMachine {
             ClusterCommand::DeleteIndex { index_name } => {
                 state.indices.remove(index_name);
                 state.shard_allocations.remove(index_name);
+                state.manifest_writer_authorities.remove(index_name);
                 state.version += 1;
                 ClusterResponse::Ok
             }
@@ -927,7 +928,332 @@ impl ClusterStateMachine {
                 state.version += 1;
                 ClusterResponse::Ok
             }
+            ClusterCommand::MutateManifestWriterAuthority {
+                index_name,
+                mutation,
+            } => Self::apply_manifest_writer_mutation(
+                &mut state,
+                index_name,
+                mutation,
+                raft_log_index,
+            ),
         }
+    }
+
+    fn apply_manifest_writer_mutation(
+        state: &mut ClusterState,
+        index_name: &str,
+        mutation: &crate::cluster::state::ManifestWriterMutation,
+        raft_log_index: u64,
+    ) -> ClusterResponse {
+        use crate::cluster::state::{
+            IndexEngine, ManifestLeaseAcquireReason, ManifestWriterMutation, ManifestWriterPhase,
+        };
+
+        if let Err(reason) = mutation.validate() {
+            return ClusterResponse::Error(reason);
+        }
+        let Some(metadata) = state.indices.get(index_name) else {
+            return ClusterResponse::ManifestWriterAuthorityRejected {
+                reason: format!("index '{index_name}' does not exist"),
+            };
+        };
+        if !matches!(metadata.settings.engine, IndexEngine::RemoteStore) {
+            return ClusterResponse::ManifestWriterAuthorityRejected {
+                reason: format!(
+                    "index '{index_name}' uses engine '{}', not remote_store",
+                    metadata.settings.engine
+                ),
+            };
+        }
+        if metadata.uuid.as_str() != mutation.index_uuid() {
+            return ClusterResponse::ManifestWriterAuthorityRejected {
+                reason: format!(
+                    "index '{index_name}' UUID mismatch: expected {}, got {}",
+                    metadata.uuid,
+                    mutation.index_uuid()
+                ),
+            };
+        }
+        let Some(current) = state.manifest_writer_authorities.get(index_name).cloned() else {
+            return ClusterResponse::ManifestWriterAuthorityRejected {
+                reason: format!("index '{index_name}' has no manifest writer authority metadata"),
+            };
+        };
+        if current.index_uuid != mutation.index_uuid() {
+            return ClusterResponse::ManifestWriterAuthorityRejected {
+                reason: format!("manifest writer authority UUID mismatch for '{index_name}'"),
+            };
+        }
+
+        let mut updated = current.clone();
+        match mutation {
+            ManifestWriterMutation::Acquire {
+                expected,
+                candidate_node,
+                reason,
+                now_millis,
+                lease_duration_ms,
+                leader_term,
+            } => {
+                if !current.matches_expected(expected) {
+                    return ClusterResponse::ManifestWriterAuthorityRejected {
+                        reason: format!(
+                            "manifest writer authority for '{index_name}' changed concurrently (expected epoch={}, lease_id={}, phase={:?}; found epoch={}, lease_id={}, phase={:?})",
+                            expected.last_writer_epoch,
+                            expected.last_lease_id,
+                            expected.phase,
+                            current.last_writer_epoch,
+                            current.last_lease_id,
+                            current.phase,
+                        ),
+                    };
+                }
+                if !state.nodes.contains_key(candidate_node) {
+                    return ClusterResponse::ManifestWriterAuthorityRejected {
+                        reason: format!(
+                            "candidate node '{candidate_node}' is not a registered cluster member"
+                        ),
+                    };
+                }
+                if *leader_term < current.leader_term {
+                    return ClusterResponse::ManifestWriterAuthorityRejected {
+                        reason: format!(
+                            "manifest writer acquire leader_term {leader_term} is older than authority leader_term {}",
+                            current.leader_term
+                        ),
+                    };
+                }
+                match reason {
+                    ManifestLeaseAcquireReason::Unassigned => {
+                        if !current.phase.is_unassigned() {
+                            return ClusterResponse::ManifestWriterAuthorityRejected {
+                                reason: format!(
+                                    "index '{index_name}' already has an assigned manifest writer"
+                                ),
+                            };
+                        }
+                    }
+                    ManifestLeaseAcquireReason::Expired => {
+                        if current.phase.is_unassigned() {
+                            return ClusterResponse::ManifestWriterAuthorityRejected {
+                                reason: format!(
+                                    "index '{index_name}' manifest writer is unassigned, not expired"
+                                ),
+                            };
+                        }
+                        if *now_millis < current.lease_expires_at_millis {
+                            return ClusterResponse::ManifestWriterAuthorityRejected {
+                                reason: format!(
+                                    "manifest writer lease for '{index_name}' has not expired (now_millis={now_millis} < lease_expires_at_millis={})",
+                                    current.lease_expires_at_millis
+                                ),
+                            };
+                        }
+                    }
+                    ManifestLeaseAcquireReason::HolderUnavailable => {
+                        let Some(holder) = current.phase.holder_node() else {
+                            return ClusterResponse::ManifestWriterAuthorityRejected {
+                                reason: format!(
+                                    "index '{index_name}' has no assigned holder to replace"
+                                ),
+                            };
+                        };
+                        if state.nodes.contains_key(holder) {
+                            return ClusterResponse::ManifestWriterAuthorityRejected {
+                                reason: format!(
+                                    "manifest writer holder '{holder}' is still a registered cluster member"
+                                ),
+                            };
+                        }
+                    }
+                    ManifestLeaseAcquireReason::Transfer { from_holder } => {
+                        if current.phase.holder_node() != Some(from_holder.as_str()) {
+                            return ClusterResponse::ManifestWriterAuthorityRejected {
+                                reason: format!(
+                                    "manifest writer transfer expected holder '{from_holder}', found {:?}",
+                                    current.phase.holder_node()
+                                ),
+                            };
+                        }
+                    }
+                    ManifestLeaseAcquireReason::RevokeAndReplace => {
+                        if current.phase.is_unassigned() {
+                            return ClusterResponse::ManifestWriterAuthorityRejected {
+                                reason: format!(
+                                    "index '{index_name}' has no assigned manifest writer to revoke"
+                                ),
+                            };
+                        }
+                    }
+                }
+                let Some(next_epoch) = current.last_writer_epoch.checked_add(1) else {
+                    return ClusterResponse::Error(format!(
+                        "manifest writer epoch exhausted for index '{index_name}'"
+                    ));
+                };
+                let next_lease_id = raft_log_index.max(current.last_lease_id.saturating_add(1));
+                let Some(expires_at) = now_millis.checked_add(*lease_duration_ms) else {
+                    return ClusterResponse::Error(format!(
+                        "manifest writer lease expiration overflowed for index '{index_name}'"
+                    ));
+                };
+                updated.last_writer_epoch = next_epoch;
+                updated.last_lease_id = next_lease_id;
+                updated.renewal_seq = 0;
+                updated.leader_term = *leader_term;
+                updated.lease_expires_at_millis = expires_at;
+                updated.phase = ManifestWriterPhase::Fencing {
+                    holder_node: candidate_node.clone(),
+                    writer_epoch: next_epoch,
+                    lease_id: next_lease_id,
+                };
+            }
+            ManifestWriterMutation::Activate {
+                identity,
+                fenced_pointer_revision,
+                fenced_pointer_token,
+                now_millis,
+                lease_duration_ms,
+                leader_term,
+            } => {
+                if !state.nodes.contains_key(&identity.holder_node) {
+                    return ClusterResponse::ManifestWriterAuthorityRejected {
+                        reason: format!(
+                            "manifest writer holder '{}' is no longer a registered cluster member",
+                            identity.holder_node
+                        ),
+                    };
+                }
+                let expected_phase = ManifestWriterPhase::Fencing {
+                    holder_node: identity.holder_node.clone(),
+                    writer_epoch: identity.writer_epoch,
+                    lease_id: identity.lease_id,
+                };
+                if current.last_writer_epoch != identity.writer_epoch
+                    || current.phase != expected_phase
+                {
+                    return ClusterResponse::ManifestWriterAuthorityRejected {
+                        reason: format!(
+                            "manifest writer activation for '{index_name}' does not match current fencing authority"
+                        ),
+                    };
+                }
+                if *now_millis >= current.lease_expires_at_millis {
+                    return ClusterResponse::ManifestWriterAuthorityRejected {
+                        reason: format!(
+                            "fencing manifest writer lease for '{index_name}' expired at {} before activation (now={now_millis})",
+                            current.lease_expires_at_millis
+                        ),
+                    };
+                }
+                if *leader_term < current.leader_term {
+                    return ClusterResponse::ManifestWriterAuthorityRejected {
+                        reason: format!(
+                            "manifest writer activation leader_term {leader_term} is older than authority leader_term {}",
+                            current.leader_term
+                        ),
+                    };
+                }
+                let Some(expires_at) = now_millis.checked_add(*lease_duration_ms) else {
+                    return ClusterResponse::Error(format!(
+                        "manifest writer lease expiration overflowed for index '{index_name}'"
+                    ));
+                };
+                updated.leader_term = *leader_term;
+                updated.lease_expires_at_millis = expires_at;
+                updated.phase = ManifestWriterPhase::Active {
+                    holder_node: identity.holder_node.clone(),
+                    writer_epoch: identity.writer_epoch,
+                    lease_id: identity.lease_id,
+                    fenced_pointer_revision: *fenced_pointer_revision,
+                    fenced_pointer_token: fenced_pointer_token.clone(),
+                };
+            }
+            ManifestWriterMutation::Renew {
+                identity,
+                expected_fenced_pointer_revision,
+                expected_fenced_pointer_token,
+                now_millis,
+                lease_duration_ms,
+                leader_term,
+            } => {
+                if !state.nodes.contains_key(&identity.holder_node) {
+                    return ClusterResponse::ManifestWriterAuthorityRejected {
+                        reason: format!(
+                            "manifest writer holder '{}' is no longer a registered cluster member",
+                            identity.holder_node
+                        ),
+                    };
+                }
+                let expected_phase = ManifestWriterPhase::Active {
+                    holder_node: identity.holder_node.clone(),
+                    writer_epoch: identity.writer_epoch,
+                    lease_id: identity.lease_id,
+                    fenced_pointer_revision: *expected_fenced_pointer_revision,
+                    fenced_pointer_token: expected_fenced_pointer_token.clone(),
+                };
+                if current.last_writer_epoch != identity.writer_epoch
+                    || current.phase != expected_phase
+                {
+                    return ClusterResponse::ManifestWriterAuthorityRejected {
+                        reason: format!(
+                            "manifest writer renewal for '{index_name}' does not match current active authority and pointer fence"
+                        ),
+                    };
+                }
+                if *now_millis >= current.lease_expires_at_millis {
+                    return ClusterResponse::ManifestWriterAuthorityRejected {
+                        reason: format!(
+                            "manifest writer lease for '{index_name}' expired at {} and cannot be renewed in-place (now={now_millis})",
+                            current.lease_expires_at_millis
+                        ),
+                    };
+                }
+                if *leader_term < current.leader_term {
+                    return ClusterResponse::ManifestWriterAuthorityRejected {
+                        reason: format!(
+                            "manifest writer renewal leader_term {leader_term} is older than authority leader_term {}",
+                            current.leader_term
+                        ),
+                    };
+                }
+                let Some(next_renewal_seq) = current.renewal_seq.checked_add(1) else {
+                    return ClusterResponse::Error(format!(
+                        "manifest writer renewal_seq exhausted for index '{index_name}'"
+                    ));
+                };
+                let Some(expires_at) = now_millis.checked_add(*lease_duration_ms) else {
+                    return ClusterResponse::Error(format!(
+                        "manifest writer lease expiration overflowed for index '{index_name}'"
+                    ));
+                };
+                updated.renewal_seq = next_renewal_seq;
+                updated.leader_term = *leader_term;
+                updated.lease_expires_at_millis = expires_at;
+            }
+            ManifestWriterMutation::Release { identity } => {
+                if current.last_writer_epoch != identity.writer_epoch
+                    || !current.phase.matches_identity(identity)
+                {
+                    return ClusterResponse::ManifestWriterAuthorityRejected {
+                        reason: format!(
+                            "manifest writer release for '{index_name}' does not match current authority"
+                        ),
+                    };
+                }
+                updated.revoke_to_unassigned();
+            }
+        }
+
+        if let Err(reason) = updated.validate() {
+            return ClusterResponse::Error(reason);
+        }
+        state
+            .manifest_writer_authorities
+            .insert(index_name.to_string(), updated.clone());
+        state.version += 1;
+        ClusterResponse::ManifestWriterAuthorityApplied { authority: updated }
     }
 
     #[cfg(test)]
@@ -1031,6 +1357,15 @@ impl RaftStateMachine<TypeConfig> for ClusterStateMachine {
                         new_state.format_version,
                         crate::cluster::state::CLUSTER_STATE_FORMAT_VERSION
                     ),
+                ),
+            ));
+        }
+        if let Err(reason) = new_state.validate_manifest_writer_authorities() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                crate::consensus::UnsupportedRaftFormatError::new(
+                    "Raft cluster-state snapshot",
+                    format!("invalid manifest writer authority state: {reason}"),
                 ),
             ));
         }
@@ -3043,5 +3378,319 @@ mod tests {
         let state = handle.read().unwrap();
         assert_eq!(state.version, 2);
         assert!(state.roles.is_empty());
+    }
+
+    #[test]
+    fn manifest_writer_authority_lifecycle_acquire_activate_renew_transfer_expire_and_reject_stale()
+    {
+        use crate::cluster::state::{
+            IndexEngine, IndexSettings, IndexUuid, ManifestLeaseAcquireReason,
+            ManifestWriterIdentity, ManifestWriterMutation, ManifestWriterPhase,
+        };
+
+        let sm = ClusterStateMachine::new("test".into());
+        sm.apply_command(&ClusterCommand::AddNode {
+            node: make_node("node-1"),
+        });
+        sm.apply_command(&ClusterCommand::AddNode {
+            node: make_node("node-2"),
+        });
+
+        let remote_meta = IndexMetadata {
+            name: "events".into(),
+            uuid: IndexUuid::new("events-uuid"),
+            number_of_shards: 0,
+            number_of_replicas: 0,
+            shard_routing: HashMap::new(),
+            mappings: HashMap::new(),
+            dynamic: Default::default(),
+            settings: IndexSettings {
+                engine: IndexEngine::RemoteStore,
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            sm.apply_command(&ClusterCommand::CreateIndex {
+                metadata: remote_meta,
+            }),
+            ClusterResponse::Ok
+        );
+
+        let initial_expected = sm
+            .state_handle()
+            .read()
+            .unwrap()
+            .manifest_writer_authority("events")
+            .unwrap()
+            .expected_snapshot();
+        assert_eq!(initial_expected.last_writer_epoch, 0);
+        assert!(initial_expected.phase.is_unassigned());
+
+        // 1. Acquire on node-1 -> Fencing(epoch=1).
+        let version_before = sm.state_handle().read().unwrap().version;
+        let acquire_1 = sm.apply_command(&ClusterCommand::MutateManifestWriterAuthority {
+            index_name: "events".into(),
+            mutation: ManifestWriterMutation::Acquire {
+                expected: initial_expected.clone(),
+                candidate_node: "node-1".into(),
+                reason: ManifestLeaseAcquireReason::Unassigned,
+                now_millis: 1_000,
+                lease_duration_ms: 10_000,
+                leader_term: 1,
+            },
+        });
+        let fencing_1 = match acquire_1 {
+            ClusterResponse::ManifestWriterAuthorityApplied { authority } => authority,
+            other => panic!("expected ManifestWriterAuthorityApplied, got {other:?}"),
+        };
+        assert_eq!(fencing_1.last_writer_epoch, 1);
+        assert_eq!(
+            fencing_1.phase,
+            ManifestWriterPhase::Fencing {
+                holder_node: "node-1".into(),
+                writer_epoch: 1,
+                lease_id: fencing_1.last_lease_id,
+            }
+        );
+        assert_eq!(
+            sm.state_handle().read().unwrap().version,
+            version_before + 1
+        );
+
+        // Duplicate acquire with stale initial_expected must be rejected without bumping version.
+        let version_after_acquire = sm.state_handle().read().unwrap().version;
+        let dup_acquire = sm.apply_command(&ClusterCommand::MutateManifestWriterAuthority {
+            index_name: "events".into(),
+            mutation: ManifestWriterMutation::Acquire {
+                expected: initial_expected,
+                candidate_node: "node-2".into(),
+                reason: ManifestLeaseAcquireReason::Unassigned,
+                now_millis: 1_100,
+                lease_duration_ms: 10_000,
+                leader_term: 1,
+            },
+        });
+        assert!(matches!(
+            dup_acquire,
+            ClusterResponse::ManifestWriterAuthorityRejected { .. }
+        ));
+        assert_eq!(
+            sm.state_handle().read().unwrap().version,
+            version_after_acquire
+        );
+
+        // 2. Activate epoch 1 on node-1 after pointer fence.
+        let identity_1 = fencing_1.current_identity().unwrap();
+        let activate_1 = sm.apply_command(&ClusterCommand::MutateManifestWriterAuthority {
+            index_name: "events".into(),
+            mutation: ManifestWriterMutation::Activate {
+                identity: identity_1.clone(),
+                fenced_pointer_revision: 1,
+                fenced_pointer_token: "tok-rev-1".into(),
+                now_millis: 2_000,
+                lease_duration_ms: 10_000,
+                leader_term: 1,
+            },
+        });
+        let active_1 = match activate_1 {
+            ClusterResponse::ManifestWriterAuthorityApplied { authority } => authority,
+            other => panic!("expected active authority, got {other:?}"),
+        };
+        assert_eq!(active_1.lease_expires_at_millis, 12_000);
+        assert!(active_1.phase.is_active());
+
+        // 3. Renew epoch 1 on node-1 preserves epoch=1 and lease_id while extending deadline and bumping renewal_seq.
+        let renew_1 = sm.apply_command(&ClusterCommand::MutateManifestWriterAuthority {
+            index_name: "events".into(),
+            mutation: ManifestWriterMutation::Renew {
+                identity: identity_1.clone(),
+                expected_fenced_pointer_revision: 1,
+                expected_fenced_pointer_token: "tok-rev-1".into(),
+                now_millis: 8_000,
+                lease_duration_ms: 10_000,
+                leader_term: 2,
+            },
+        });
+        let renewed_1 = match renew_1 {
+            ClusterResponse::ManifestWriterAuthorityApplied { authority } => authority,
+            other => panic!("expected renewed authority, got {other:?}"),
+        };
+        assert_eq!(renewed_1.last_writer_epoch, 1);
+        assert_eq!(renewed_1.renewal_seq, 1);
+        assert_eq!(renewed_1.leader_term, 2);
+        assert_eq!(renewed_1.lease_expires_at_millis, 18_000);
+
+        // Premature Expired replacement before 18_000 must be rejected.
+        let premature_expire = sm.apply_command(&ClusterCommand::MutateManifestWriterAuthority {
+            index_name: "events".into(),
+            mutation: ManifestWriterMutation::Acquire {
+                expected: renewed_1.expected_snapshot(),
+                candidate_node: "node-2".into(),
+                reason: ManifestLeaseAcquireReason::Expired,
+                now_millis: 17_999,
+                lease_duration_ms: 10_000,
+                leader_term: 2,
+            },
+        });
+        assert!(matches!(
+            premature_expire,
+            ClusterResponse::ManifestWriterAuthorityRejected { .. }
+        ));
+
+        // In-place Renew at or after expiry (18_000) must be rejected (requires re-fencing a new epoch).
+        let expired_renew = sm.apply_command(&ClusterCommand::MutateManifestWriterAuthority {
+            index_name: "events".into(),
+            mutation: ManifestWriterMutation::Renew {
+                identity: identity_1.clone(),
+                expected_fenced_pointer_revision: 1,
+                expected_fenced_pointer_token: "tok-rev-1".into(),
+                now_millis: 18_000,
+                lease_duration_ms: 10_000,
+                leader_term: 2,
+            },
+        });
+        assert!(matches!(
+            expired_renew,
+            ClusterResponse::ManifestWriterAuthorityRejected { .. }
+        ));
+
+        // 4. Expired replacement at 18_000 (even by the same node-1!) allocates epoch 2 and enters Fencing.
+        let acquire_2 = sm.apply_command(&ClusterCommand::MutateManifestWriterAuthority {
+            index_name: "events".into(),
+            mutation: ManifestWriterMutation::Acquire {
+                expected: renewed_1.expected_snapshot(),
+                candidate_node: "node-1".into(),
+                reason: ManifestLeaseAcquireReason::Expired,
+                now_millis: 18_000,
+                lease_duration_ms: 10_000,
+                leader_term: 2,
+            },
+        });
+        let fencing_2 = match acquire_2 {
+            ClusterResponse::ManifestWriterAuthorityApplied { authority } => authority,
+            other => panic!("expected fencing epoch 2, got {other:?}"),
+        };
+        assert_eq!(fencing_2.last_writer_epoch, 2);
+        assert!(fencing_2.last_lease_id > renewed_1.last_lease_id);
+
+        // Stale epoch 1 identity is now rejected across Activate, Renew, and Release.
+        for stale_mutation in [
+            ManifestWriterMutation::Activate {
+                identity: identity_1.clone(),
+                fenced_pointer_revision: 2,
+                fenced_pointer_token: "tok-rev-2".into(),
+                now_millis: 19_000,
+                lease_duration_ms: 10_000,
+                leader_term: 2,
+            },
+            ManifestWriterMutation::Renew {
+                identity: identity_1.clone(),
+                expected_fenced_pointer_revision: 1,
+                expected_fenced_pointer_token: "tok-rev-1".into(),
+                now_millis: 19_000,
+                lease_duration_ms: 10_000,
+                leader_term: 2,
+            },
+            ManifestWriterMutation::Release {
+                identity: identity_1,
+            },
+        ] {
+            let v_before = sm.state_handle().read().unwrap().version;
+            let res = sm.apply_command(&ClusterCommand::MutateManifestWriterAuthority {
+                index_name: "events".into(),
+                mutation: stale_mutation,
+            });
+            assert!(matches!(
+                res,
+                ClusterResponse::ManifestWriterAuthorityRejected { .. }
+            ));
+            assert_eq!(sm.state_handle().read().unwrap().version, v_before);
+        }
+
+        // 5. Transfer from node-1 (epoch 2) to node-2 allocates epoch 3.
+        let transfer_3 = sm.apply_command(&ClusterCommand::MutateManifestWriterAuthority {
+            index_name: "events".into(),
+            mutation: ManifestWriterMutation::Acquire {
+                expected: fencing_2.expected_snapshot(),
+                candidate_node: "node-2".into(),
+                reason: ManifestLeaseAcquireReason::Transfer {
+                    from_holder: "node-1".into(),
+                },
+                now_millis: 20_000,
+                lease_duration_ms: 10_000,
+                leader_term: 2,
+            },
+        });
+        let fencing_3 = match transfer_3 {
+            ClusterResponse::ManifestWriterAuthorityApplied { authority } => authority,
+            other => panic!("expected transfer to epoch 3, got {other:?}"),
+        };
+        assert_eq!(fencing_3.last_writer_epoch, 3);
+        assert_eq!(fencing_3.phase.holder_node(), Some("node-2"));
+
+        // 6. Removing node-2 revokes the lease to Unassigned while preserving last_writer_epoch=3;
+        // re-acquiring on node-1 allocates epoch 4.
+        assert_eq!(
+            sm.apply_command(&ClusterCommand::RemoveNode {
+                node_id: "node-2".into(),
+            }),
+            ClusterResponse::Ok
+        );
+        let after_remove = sm
+            .state_handle()
+            .read()
+            .unwrap()
+            .manifest_writer_authority("events")
+            .unwrap()
+            .clone();
+        assert!(after_remove.phase.is_unassigned());
+        assert_eq!(after_remove.last_writer_epoch, 3);
+
+        let acquire_4 = sm.apply_command(&ClusterCommand::MutateManifestWriterAuthority {
+            index_name: "events".into(),
+            mutation: ManifestWriterMutation::Acquire {
+                expected: after_remove.expected_snapshot(),
+                candidate_node: "node-1".into(),
+                reason: ManifestLeaseAcquireReason::Unassigned,
+                now_millis: 21_000,
+                lease_duration_ms: 10_000,
+                leader_term: 2,
+            },
+        });
+        let fencing_4 = match acquire_4 {
+            ClusterResponse::ManifestWriterAuthorityApplied { authority } => authority,
+            other => panic!("expected epoch 4, got {other:?}"),
+        };
+        assert_eq!(fencing_4.last_writer_epoch, 4);
+
+        // Stale writer with forged higher epoch is rejected.
+        let forged = ManifestWriterIdentity {
+            index_uuid: "events-uuid".into(),
+            holder_node: "node-1".into(),
+            writer_epoch: 99,
+            lease_id: fencing_4.last_lease_id,
+        };
+        assert!(matches!(
+            sm.apply_command(&ClusterCommand::MutateManifestWriterAuthority {
+                index_name: "events".into(),
+                mutation: ManifestWriterMutation::Release { identity: forged },
+            }),
+            ClusterResponse::ManifestWriterAuthorityRejected { .. }
+        ));
+
+        // DeleteIndex removes the manifest writer authority record.
+        assert_eq!(
+            sm.apply_command(&ClusterCommand::DeleteIndex {
+                index_name: "events".into(),
+            }),
+            ClusterResponse::Ok
+        );
+        assert!(
+            sm.state_handle()
+                .read()
+                .unwrap()
+                .manifest_writer_authority("events")
+                .is_none()
+        );
     }
 }

@@ -2628,3 +2628,477 @@ async fn grpc_create_index_with_mappings_and_settings() {
     assert!(meta.mappings.contains_key("title"));
     assert!(meta.mappings.contains_key("year"));
 }
+
+#[tokio::test]
+async fn fs016_multi_node_manifest_writer_lease_forwarding_transfer_leader_change_and_stale_rejection()
+ {
+    use ferrissearch::cluster::state::{
+        IndexEngine, IndexSettings, IndexUuid, ManifestLeaseAcquireReason, ManifestWriterMutation,
+        ManifestWriterPhase,
+    };
+    use ferrissearch::consensus::types::ManifestWriterAuthorityRejectedError;
+
+    let (raft1, state1) = consensus::create_raft_instance_mem(1, "fs016-multi".into())
+        .await
+        .unwrap();
+    let (raft2, state2) = consensus::create_raft_instance_mem(2, "fs016-multi".into())
+        .await
+        .unwrap();
+    let (raft3, state3) = consensus::create_raft_instance_mem(3, "fs016-multi".into())
+        .await
+        .unwrap();
+
+    let addr1 = start_raft_follower_grpc_server(raft1.clone(), state1.clone(), "node-1").await;
+    let addr2 = start_raft_follower_grpc_server(raft2.clone(), state2.clone(), "node-2").await;
+    let addr3 = start_raft_follower_grpc_server(raft3.clone(), state3.clone(), "node-3").await;
+
+    consensus::bootstrap_single_node(&raft1, 1, addr1.to_string())
+        .await
+        .unwrap();
+    wait_for_leader(&raft1).await;
+
+    // Join node-2 and node-3 into the real 3-node Raft cluster.
+    let mut client1 = connect_grpc(addr1).await;
+    for (id, raft_id, addr) in [
+        ("node-1", 1u64, addr1),
+        ("node-2", 2, addr2),
+        ("node-3", 3, addr3),
+    ] {
+        client1
+            .join_cluster(tonic::Request::new(JoinRequest {
+                node_info: Some(ProtoNodeInfo {
+                    id: id.into(),
+                    name: id.into(),
+                    host: "127.0.0.1".into(),
+                    transport_port: addr.port() as u32,
+                    http_port: 19200 + raft_id as u32,
+                    roles: vec!["master".into(), "data".into()],
+                    raft_node_id: raft_id,
+                }),
+                raft_node_id: raft_id,
+            }))
+            .await
+            .unwrap();
+    }
+    raft1
+        .client_write(ClusterCommand::SetMaster {
+            node_id: "node-1".into(),
+        })
+        .await
+        .unwrap();
+
+    let remote_meta = IndexMetadata {
+        name: "events".into(),
+        uuid: IndexUuid::new("events-uuid"),
+        number_of_shards: 0,
+        number_of_replicas: 0,
+        shard_routing: HashMap::new(),
+        mappings: HashMap::new(),
+        dynamic: Default::default(),
+        settings: IndexSettings {
+            engine: IndexEngine::RemoteStore,
+            ..Default::default()
+        },
+    };
+    assert_eq!(
+        raft1
+            .client_write(ClusterCommand::CreateIndex {
+                metadata: remote_meta,
+            })
+            .await
+            .unwrap()
+            .data,
+        ClusterResponse::Ok
+    );
+
+    // Wait for all 3 nodes to replicate the initial Unassigned authority.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let ready = [&state1, &state2, &state3].iter().all(|s| {
+            s.read()
+                .unwrap()
+                .manifest_writer_authority("events")
+                .is_some()
+        });
+        if ready {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Calling MutateManifestWriterAuthority directly on follower node-2 must return FailedPrecondition.
+    let initial_expected = state2
+        .read()
+        .unwrap()
+        .manifest_writer_authority("events")
+        .unwrap()
+        .expected_snapshot();
+    let acquire_mutation = ManifestWriterMutation::Acquire {
+        expected: initial_expected.clone(),
+        candidate_node: "node-2".into(),
+        reason: ManifestLeaseAcquireReason::Unassigned,
+        now_millis: 10_000,
+        lease_duration_ms: 20_000,
+        leader_term: 1,
+    };
+    let mut client2 = connect_grpc(addr2).await;
+    let direct_follower_err = client2
+        .mutate_manifest_writer_authority(tonic::Request::new(ShardAuthorityMutationRequest {
+            index_name: "events".into(),
+            record_json: serde_json::to_vec(&acquire_mutation).unwrap(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(direct_follower_err.code(), tonic::Code::FailedPrecondition);
+
+    // Coordinator helper on follower node-2 forwards Acquire and Activate to leader node-1.
+    let cm2 = ClusterManager::with_shared_state(state2.clone());
+    let transport_client = TransportClient::new();
+    let fencing_auth = transport_client
+        .propose_manifest_writer_authority_mutation(&raft2, &cm2, "events", acquire_mutation)
+        .await
+        .expect("follower-forwarded Acquire must succeed");
+    assert_eq!(fencing_auth.last_writer_epoch, 1);
+    let identity_1 = fencing_auth.current_identity().unwrap();
+    assert_eq!(identity_1.holder_node, "node-2");
+
+    let active_auth = transport_client
+        .propose_manifest_writer_authority_mutation(
+            &raft2,
+            &cm2,
+            "events",
+            ManifestWriterMutation::Activate {
+                identity: identity_1.clone(),
+                fenced_pointer_revision: 1,
+                fenced_pointer_token: "fs1:s3:aa:-:bb".into(),
+                now_millis: 11_000,
+                lease_duration_ms: 20_000,
+                leader_term: 1,
+            },
+        )
+        .await
+        .expect("follower-forwarded Activate must succeed");
+    assert!(active_auth.phase.is_active());
+
+    // Transfer lease from node-2 (epoch 1) to node-3 (epoch 2) via follower node-3.
+    let cm3 = ClusterManager::with_shared_state(state3.clone());
+    let fencing_2 = transport_client
+        .propose_manifest_writer_authority_mutation(
+            &raft3,
+            &cm3,
+            "events",
+            ManifestWriterMutation::Acquire {
+                expected: active_auth.expected_snapshot(),
+                candidate_node: "node-3".into(),
+                reason: ManifestLeaseAcquireReason::Transfer {
+                    from_holder: "node-2".into(),
+                },
+                now_millis: 12_000,
+                lease_duration_ms: 20_000,
+                leader_term: 1,
+            },
+        )
+        .await
+        .expect("follower-forwarded Transfer must succeed");
+    assert_eq!(fencing_2.last_writer_epoch, 2);
+    let identity_2 = fencing_2.current_identity().unwrap();
+    assert_eq!(identity_2.holder_node, "node-3");
+
+    // Stale writer node-2 (epoch 1) is rejected over transport with ManifestWriterAuthorityRejectedError.
+    let stale_err = transport_client
+        .propose_manifest_writer_authority_mutation(
+            &raft2,
+            &cm2,
+            "events",
+            ManifestWriterMutation::Renew {
+                identity: identity_1,
+                expected_fenced_pointer_revision: 1,
+                expected_fenced_pointer_token: "fs1:s3:aa:-:bb".into(),
+                now_millis: 12_500,
+                lease_duration_ms: 20_000,
+                leader_term: 1,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        stale_err.is::<ManifestWriterAuthorityRejectedError>(),
+        "expected ManifestWriterAuthorityRejectedError, got {stale_err:#}"
+    );
+
+    // Activate epoch 2 on node-3 under leader term 1.
+    let active_2 = transport_client
+        .propose_manifest_writer_authority_mutation(
+            &raft3,
+            &cm3,
+            "events",
+            ManifestWriterMutation::Activate {
+                identity: identity_2.clone(),
+                fenced_pointer_revision: 2,
+                fenced_pointer_token: "fs1:s3:cc:-:dd".into(),
+                now_millis: 13_000,
+                lease_duration_ms: 20_000,
+                leader_term: 1,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        active_2.phase,
+        ManifestWriterPhase::Active {
+            holder_node: "node-3".into(),
+            writer_epoch: 2,
+            lease_id: identity_2.lease_id,
+            fenced_pointer_revision: 2,
+            fenced_pointer_token: "fs1:s3:cc:-:dd".into(),
+        }
+    );
+
+    // Simulate Raft leader change to term 2 on node-2: pre-election lease (leader_term=1)
+    // is conservatively paused until renewed under leader_term=2.
+    raft1.runtime_config().heartbeat(false);
+    raft1.runtime_config().elect(false);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !raft2.is_leader() {
+        let _ = raft2.trigger().elect().await;
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    raft2
+        .client_write(ClusterCommand::SetMaster {
+            node_id: "node-2".into(),
+        })
+        .await
+        .unwrap();
+
+    // Wait for node-3 to observe master_node == "node-2" and active_2.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let ready = {
+            let s3 = state3.read().unwrap();
+            s3.master_node.as_deref() == Some("node-2")
+                && s3
+                    .manifest_writer_authority("events")
+                    .is_some_and(|a| a.last_writer_epoch == 2 && a.phase.is_active())
+        };
+        if ready {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    assert!(
+        state3
+            .read()
+            .unwrap()
+            .validate_active_manifest_writer("events", &identity_2, 14_000, Some(2))
+            .is_err(),
+        "pre-election lease (term 1) must pause under new leader term 2 until renewed"
+    );
+
+    // Renew under new leader node-2 at leader_term=2 -> resumes active validity without bumping epoch.
+    let renewed_2 = transport_client
+        .propose_manifest_writer_authority_mutation(
+            &raft3,
+            &cm3,
+            "events",
+            ManifestWriterMutation::Renew {
+                identity: identity_2.clone(),
+                expected_fenced_pointer_revision: 2,
+                expected_fenced_pointer_token: "fs1:s3:cc:-:dd".into(),
+                now_millis: 14_000,
+                lease_duration_ms: 20_000,
+                leader_term: 2,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(renewed_2.last_writer_epoch, 2);
+    assert_eq!(renewed_2.leader_term, 2);
+    assert_eq!(renewed_2.renewal_seq, 1);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if state3
+            .read()
+            .unwrap()
+            .validate_active_manifest_writer("events", &identity_2, 15_000, Some(2))
+            .is_ok()
+        {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn fs016_persistent_disk_raft_restart_preserves_manifest_writer_epoch_and_active_lease() {
+    use ferrissearch::cluster::state::{
+        IndexEngine, IndexSettings, IndexUuid, ManifestLeaseAcquireReason, ManifestWriterMutation,
+    };
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let data_dir_str = data_dir.path().to_str().unwrap();
+    let expected_identity = {
+        let (raft, state_handle) =
+            consensus::create_raft_instance(1, "fs016-restart".into(), data_dir_str)
+                .await
+                .unwrap();
+        consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19391".into())
+            .await
+            .unwrap();
+        wait_for_leader(&raft).await;
+
+        raft.client_write(ClusterCommand::AddNode {
+            node: make_node("node-1"),
+        })
+        .await
+        .unwrap();
+        raft.client_write(ClusterCommand::CreateIndex {
+            metadata: IndexMetadata {
+                name: "events".into(),
+                uuid: IndexUuid::new("events-uuid"),
+                number_of_shards: 0,
+                number_of_replicas: 0,
+                shard_routing: HashMap::new(),
+                mappings: HashMap::new(),
+                dynamic: Default::default(),
+                settings: IndexSettings {
+                    engine: IndexEngine::RemoteStore,
+                    ..Default::default()
+                },
+            },
+        })
+        .await
+        .unwrap();
+
+        let initial = state_handle
+            .read()
+            .unwrap()
+            .manifest_writer_authority("events")
+            .unwrap()
+            .expected_snapshot();
+        let acquired = match raft
+            .client_write(ClusterCommand::MutateManifestWriterAuthority {
+                index_name: "events".into(),
+                mutation: ManifestWriterMutation::Acquire {
+                    expected: initial,
+                    candidate_node: "node-1".into(),
+                    reason: ManifestLeaseAcquireReason::Unassigned,
+                    now_millis: 1_000,
+                    lease_duration_ms: 30_000,
+                    leader_term: 1,
+                },
+            })
+            .await
+            .unwrap()
+            .data
+        {
+            ClusterResponse::ManifestWriterAuthorityApplied { authority } => authority,
+            other => panic!("unexpected acquire response: {other:?}"),
+        };
+        let identity = acquired.current_identity().unwrap();
+        raft.client_write(ClusterCommand::MutateManifestWriterAuthority {
+            index_name: "events".into(),
+            mutation: ManifestWriterMutation::Activate {
+                identity: identity.clone(),
+                fenced_pointer_revision: 1,
+                fenced_pointer_token: "fs1:local:1:2:3:aaaa".into(),
+                now_millis: 2_000,
+                lease_duration_ms: 30_000,
+                leader_term: 1,
+            },
+        })
+        .await
+        .unwrap()
+        .data
+        .into_result()
+        .unwrap();
+        raft.client_write(ClusterCommand::MutateManifestWriterAuthority {
+            index_name: "events".into(),
+            mutation: ManifestWriterMutation::Renew {
+                identity: identity.clone(),
+                expected_fenced_pointer_revision: 1,
+                expected_fenced_pointer_token: "fs1:local:1:2:3:aaaa".into(),
+                now_millis: 5_000,
+                lease_duration_ms: 30_000,
+                leader_term: 1,
+            },
+        })
+        .await
+        .unwrap()
+        .data
+        .into_result()
+        .unwrap();
+
+        let _ = raft.shutdown().await;
+        identity
+    };
+
+    // Restart from the persistent DiskLogStore in data_dir and verify state recovery.
+    let (restarted_raft, restarted_state) =
+        consensus::create_raft_instance(1, "fs016-restart".into(), data_dir_str)
+            .await
+            .unwrap();
+    let _ = restarted_raft.trigger().elect().await;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !restarted_raft.is_leader() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("restarted Raft node must become leader");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let recovered = loop {
+        if let Some(auth) = restarted_state
+            .read()
+            .unwrap()
+            .manifest_writer_authority("events")
+            .cloned()
+            && auth.renewal_seq == 1
+        {
+            break auth;
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(recovered.last_writer_epoch, 1);
+    assert_eq!(
+        recovered.current_identity().as_ref(),
+        Some(&expected_identity)
+    );
+    assert!(
+        restarted_state
+            .read()
+            .unwrap()
+            .validate_active_manifest_writer("events", &expected_identity, 10_000, Some(1))
+            .is_ok()
+    );
+
+    // Expiring and re-acquiring after restart advances to epoch 2 without reusing epoch 1.
+    let next = match restarted_raft
+        .client_write(ClusterCommand::MutateManifestWriterAuthority {
+            index_name: "events".into(),
+            mutation: ManifestWriterMutation::Acquire {
+                expected: recovered.expected_snapshot(),
+                candidate_node: "node-1".into(),
+                reason: ManifestLeaseAcquireReason::Expired,
+                now_millis: 40_000,
+                lease_duration_ms: 30_000,
+                leader_term: 2,
+            },
+        })
+        .await
+        .unwrap()
+        .data
+    {
+        ClusterResponse::ManifestWriterAuthorityApplied { authority } => authority,
+        other => panic!("unexpected post-restart acquire response: {other:?}"),
+    };
+    assert_eq!(next.last_writer_epoch, 2);
+    let _ = restarted_raft.shutdown().await;
+}

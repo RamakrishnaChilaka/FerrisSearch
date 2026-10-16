@@ -3,7 +3,7 @@
 use crate::transport::proto::*;
 use tonic::Status;
 
-const CLUSTER_STATE_WIRE_FORMAT_VERSION: u32 = 2;
+const CLUSTER_STATE_WIRE_FORMAT_VERSION: u32 = 3;
 
 pub(super) fn node_info_to_proto(n: &crate::cluster::state::NodeInfo) -> NodeInfo {
     NodeInfo {
@@ -344,6 +344,11 @@ pub fn cluster_state_to_proto(s: &crate::cluster::state::ClusterState) -> Cluste
             .filter_map(|role| serde_json::to_string(role).ok())
             .collect(),
         format_version: CLUSTER_STATE_WIRE_FORMAT_VERSION,
+        manifest_writer_authorities_json: s
+            .manifest_writer_authorities
+            .values()
+            .filter_map(|authority| serde_json::to_string(authority).ok())
+            .collect(),
     }
 }
 
@@ -499,6 +504,63 @@ pub fn proto_to_cluster_state(
             Status::invalid_argument(format!("invalid role in cluster state snapshot: {e}"))
         })?;
         state.roles.insert(role.name.clone(), role);
+    }
+    for authority_json in &p.manifest_writer_authorities_json {
+        let authority: crate::cluster::state::ManifestWriterAuthority =
+            serde_json::from_str(authority_json).map_err(|e| {
+                Status::invalid_argument(format!(
+                    "invalid manifest writer authority in cluster state snapshot: {e}"
+                ))
+            })?;
+        authority.validate().map_err(|e| {
+            Status::invalid_argument(format!(
+                "invalid manifest writer authority for index '{}' in cluster state snapshot: {e}",
+                authority.index_name
+            ))
+        })?;
+        let Some(index_meta) = state.indices.get(&authority.index_name) else {
+            return Err(Status::invalid_argument(format!(
+                "manifest writer authority references unknown index '{}' in cluster state snapshot",
+                authority.index_name
+            )));
+        };
+        if !matches!(
+            index_meta.settings.engine,
+            crate::cluster::state::IndexEngine::RemoteStore
+        ) {
+            return Err(Status::invalid_argument(format!(
+                "manifest writer authority for '{}' is invalid because engine is '{}', not remote_store",
+                authority.index_name, index_meta.settings.engine
+            )));
+        }
+        if index_meta.uuid.as_str() != authority.index_uuid {
+            return Err(Status::invalid_argument(format!(
+                "manifest writer authority UUID mismatch for index '{}' in cluster state snapshot",
+                authority.index_name
+            )));
+        }
+        if state
+            .manifest_writer_authorities
+            .insert(authority.index_name.clone(), authority.clone())
+            .is_some()
+        {
+            return Err(Status::invalid_argument(format!(
+                "duplicate manifest writer authority for index '{}' in cluster state snapshot",
+                authority.index_name
+            )));
+        }
+    }
+    for idx in state.indices.values() {
+        if matches!(
+            idx.settings.engine,
+            crate::cluster::state::IndexEngine::RemoteStore
+        ) && !state.manifest_writer_authorities.contains_key(&idx.name)
+        {
+            return Err(Status::invalid_argument(format!(
+                "remote_store index '{}' is missing manifest writer authority metadata in cluster state snapshot",
+                idx.name
+            )));
+        }
     }
     Ok(state)
 }

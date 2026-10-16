@@ -6,7 +6,7 @@
 >
 > **Current-behavior authority:** source and tests.
 >
-> **Last source audit:** 2026-10-16 for FS-014 and FS-015; 2026-10-15 for FS-013;
+> **Last source audit:** 2026-10-16 for FS-014, FS-015, and FS-016; 2026-10-15 for FS-013;
 > 2026-10-14 for FS-010 and FS-012; 2026-10-13 for FS-003,
 > FS-004, and FS-011; 2026-10-09 for
 > FS-002; 2026-10-08 for FS-001 and FS-007; 2026-09-27
@@ -566,7 +566,7 @@ refresh, and per-item metadata match the write contract.
 
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-002
 
-**Status (2026-10-16):** Implemented locally, pending merge. `StorageManager`
+**Status (2026-10-16):** Implemented and merged in PR #181. `StorageManager`
 now exposes `create_immutable`, `read_with_token`, `compare_and_swap`, and
 `compare_and_swap_optional`, backed by MAC-authenticated `CompareToken`s.
 Local filesystems use an OS `flock` lock file, checksummed two-slot
@@ -601,8 +601,25 @@ the selected protocol.
 
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-002
 
-**Evidence:** Raft knows index metadata but no authoritative manifest writer or
-monotonic writer epoch.
+**Status (2026-10-16):** Implemented locally, pending merge. `ClusterState`
+now stores one `ManifestWriterAuthority` (`Unassigned`, `Fencing`, `Active`)
+per `remote_store` index with a strictly monotonic `last_writer_epoch` and
+`last_lease_id` that are never reused across re-acquisitions, transfers, or
+holder removals. `ClusterCommand::MutateManifestWriterAuthority` and the
+`MutateManifestWriterAuthority` gRPC forwarding RPC conditionally execute
+`Acquire` (`Unassigned`, `Expired`, `HolderUnavailable`, `Transfer`,
+`RevokeAndReplace`), `Activate`, `Renew`, and `Release` transitions without
+putting split inventory or query scheduling state in Raft.
+
+**Completion evidence:** unit, state-machine, transport snapshot roundtrip,
+3-node real-Raft follower-forwarding/transfer/leader-change, and persistent
+`DiskLogStore` restart tests covering acquire, activate, renew, transfer,
+expiry, leader change, holder removal, and stale-writer rejection. Manifest
+parent/epoch/operation-ID versioning and fenced single-sequencer commit remain
+FS-017 and FS-018.
+
+**Historical evidence (before FS-016):** Raft knows index metadata but no
+authoritative manifest writer or monotonic writer epoch.
 
 **Outcome:** A minimal Raft-managed lease/epoch record elects one sequencer per
 index without putting split inventory or query scheduling state in Raft.
