@@ -12,6 +12,8 @@ pub struct ClusterHealth {
     pub number_of_nodes: usize,
     pub number_of_data_nodes: usize,
     pub unassigned_shards: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_store_publication: Option<crate::storage::PublicationCapabilityStatus>,
 }
 
 /// Compute cluster health status based on shard allocation.
@@ -83,6 +85,8 @@ pub async fn get_health(State(state): State<AppState>) -> Json<ClusterHealth> {
         .filter(|n| n.roles.contains(&crate::cluster::state::NodeRole::Data))
         .count();
     let (status, unassigned) = compute_health_status(&cs);
+    let capability = state.storage_manager.publication_capability_status();
+    let remote_store_publication = (!capability.supported).then_some(capability);
     Json(ClusterHealth {
         cluster_name: cs.cluster_name,
         status: status.to_string(),
@@ -90,6 +94,7 @@ pub async fn get_health(State(state): State<AppState>) -> Json<ClusterHealth> {
         number_of_nodes: cs.nodes.len(),
         number_of_data_nodes: data_nodes,
         unassigned_shards: unassigned,
+        remote_store_publication,
     })
 }
 

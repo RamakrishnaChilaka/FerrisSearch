@@ -1471,6 +1471,14 @@ pub(crate) async fn publish_docs(
         }
     };
 
+    if let Err(error) = state.storage_manager.ensure_publication_supported().await {
+        return Err(crate::api::error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "remote_store_publish_exception",
+            error,
+        ));
+    }
+
     let index_uuid = metadata.uuid.as_str().to_string();
     let split_id = uuid::Uuid::new_v4().to_string();
     let staging_dir = state.storage_manager.staging_dir(&index_uuid, &split_id);
@@ -1639,8 +1647,18 @@ pub(crate) async fn publish_docs(
                 split_id,
                 e
             );
+            let status = match e.downcast_ref::<crate::storage::ConditionalStorageError>() {
+                Some(
+                    crate::storage::ConditionalStorageError::Conflict { .. }
+                    | crate::storage::ConditionalStorageError::ImmutableConflict { .. },
+                ) => StatusCode::CONFLICT,
+                Some(crate::storage::ConditionalStorageError::UnsupportedBackend { .. }) => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
             return Err(crate::api::error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                status,
                 "remote_store_publish_exception",
                 format!("manifest publish failed: {e}"),
             ));
@@ -2431,5 +2449,153 @@ mod tests {
             cache_dir.exists(),
             "successful reader open should leave cache dir intact"
         );
+    }
+
+    #[tokio::test]
+    async fn remote_store_publish_fails_closed_before_staging_when_backend_is_unsupported_while_reads_and_health_work()
+     {
+        let temp_dir = TempDir::new().unwrap();
+        let storage_manager = Arc::new(StorageManager::new_in_path(temp_dir.path()).unwrap());
+        let (raft, shared_state) =
+            crate::consensus::create_raft_instance_mem(1, "remote-capability-test".to_string())
+                .await
+                .unwrap();
+        crate::consensus::bootstrap_single_node(&raft, 1, "127.0.0.1:19300".to_string())
+            .await
+            .unwrap();
+        for _ in 0..50 {
+            if raft.is_leader() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let cluster_manager = Arc::new(crate::cluster::ClusterManager::with_shared_state(
+            shared_state,
+        ));
+        let mut cs = crate::cluster::state::ClusterState::new("remote-capability-test".into());
+        cs.nodes.insert(
+            "node-1".into(),
+            NodeInfo {
+                id: "node-1".into(),
+                name: "node-1".into(),
+                host: "127.0.0.1".into(),
+                transport_port: 19300,
+                http_port: 19200,
+                roles: vec![NodeRole::Master, NodeRole::Data],
+                raft_node_id: 1,
+            },
+        );
+        let index_uuid = IndexUuid::new("idx-cap-1");
+        let metadata = IndexMetadata {
+            name: "events".into(),
+            uuid: index_uuid.clone(),
+            number_of_shards: 0,
+            number_of_replicas: 0,
+            shard_routing: HashMap::new(),
+            mappings: HashMap::from([(
+                "title".into(),
+                FieldMapping {
+                    field_type: FieldType::Text,
+                    dimension: None,
+                },
+            )]),
+            dynamic: DynamicMapping::False,
+            settings: IndexSettings {
+                engine: IndexEngine::RemoteStore,
+                refresh_interval_ms: None,
+                flush_threshold_bytes: None,
+                remote_store: None,
+                ..IndexSettings::default()
+            },
+        };
+        cs.indices.insert("events".into(), metadata.clone());
+        cluster_manager.update_state(cs);
+
+        let app_state = AppState {
+            cluster_manager,
+            shard_manager: Arc::new(crate::shard::ShardManager::new(
+                temp_dir.path(),
+                Duration::from_secs(60),
+            )),
+            transport_client: crate::transport::TransportClient::new(),
+            local_node_id: "node-1".into(),
+            raft,
+            worker_pools: crate::worker::WorkerPools::new(2, 2),
+            task_manager: Arc::new(crate::tasks::TaskManager::new()),
+            storage_manager: storage_manager.clone(),
+            security_manager: Arc::new(crate::security::SecurityManager::disabled()),
+            remote_store_reader_cache: Arc::new(RemoteSplitReaderCache::default()),
+            bulk_runtime: Arc::new(crate::api::index::BulkRuntime::default()),
+            sql_group_by_scan_limit: 1_000_000,
+            sql_approximate_top_k: false,
+        };
+
+        // Publish one valid split while the backend is supported.
+        let published = publish_docs(
+            &app_state,
+            "events",
+            &metadata,
+            vec![serde_json::json!({"_id": "1", "title": "initial readable split"})],
+        )
+        .await
+        .expect("initial publish should succeed");
+        assert_eq!(published["generation"], 1);
+
+        // Now mark the backend's publication capability as unsupported (e.g. uncertified shared mount or disabled S3 conditional put).
+        storage_manager.set_unsupported_capability_for_test(
+            "shared or network filesystem 'nfs4' is not certified for conditional manifest publication",
+        );
+
+        // Cluster health must remain 200/green and explicitly name the missing capability.
+        let axum::Json(health) =
+            crate::api::cluster::get_health(axum::extract::State(app_state.clone())).await;
+        let pub_status = health
+            .remote_store_publication
+            .expect("health must include remote_store_publication diagnostics when unsupported");
+        assert!(!pub_status.supported);
+        assert_eq!(pub_status.capability, "conditional_put_and_cas");
+        assert!(
+            pub_status
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("nfs4"))
+        );
+
+        // Publication endpoint must fail closed BEFORE creating any staging directory or new split bundle.
+        let staging_index_root = storage_manager
+            .local_workdir()
+            .join("staging")
+            .join(index_uuid.as_str());
+        let (status, axum::Json(err_body)) = publish_docs(
+            &app_state,
+            "events",
+            &metadata,
+            vec![serde_json::json!({"_id": "2", "title": "must not stage or publish"})],
+        )
+        .await
+        .expect_err("publish must fail closed when capability is unavailable");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            err_body["error"]["type"],
+            serde_json::json!("remote_store_publish_exception")
+        );
+        let reason = err_body["error"]["reason"].as_str().unwrap_or("");
+        assert!(
+            reason.contains("conditional_put_and_cas") && reason.contains("nfs4"),
+            "unexpected error reason: {reason}"
+        );
+        assert!(
+            !staging_index_root.exists()
+                || std::fs::read_dir(&staging_index_root).unwrap().count() == 0,
+            "failed publication on unsupported backend must not leave staged artifacts"
+        );
+
+        // Read-only operations (verify_splits and load_current_manifest) must still succeed on generation 1.
+        let verified = verify_splits(&app_state, "events", &metadata)
+            .await
+            .expect("verify_splits must still work on read-only remote data");
+        assert_eq!(verified["generation"], 1);
+        assert_eq!(verified["ok_count"], 1);
     }
 }
