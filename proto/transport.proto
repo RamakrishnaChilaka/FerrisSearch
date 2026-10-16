@@ -66,6 +66,7 @@ message IndexSettings {
     optional uint64 flush_threshold_bytes = 3;
     RemoteStoreSettings remote_store = 4;
     optional uint32 minimum_durable_copies = 5;
+    optional string replica_policy_json = 6;
 }
 
 message RemoteStoreSettings {
@@ -594,6 +595,16 @@ message CompleteFinalizeRecoveryResponse {
     string error = 2;
 }
 
+message CancelPeerRecoveryRequest {
+    string session_id = 1;
+    string reason = 2;
+}
+
+message CancelPeerRecoveryResponse {
+    bool cancelled = 1;
+    string error = 2;
+}
+
 // ─── Raft Consensus ─────────────────────────────────────────────────────────
 
 // Generic Raft RPCs — payloads are JSON-encoded openraft messages.
@@ -913,6 +924,7 @@ service InternalTransport {
     rpc FetchRecoveryOps(FetchRecoveryOpsRequest) returns (FetchRecoveryOpsResponse);
     rpc PrepareFinalizeRecovery(PrepareFinalizeRecoveryRequest) returns (PrepareFinalizeRecoveryResponse);
     rpc CompleteFinalizeRecovery(CompleteFinalizeRecoveryRequest) returns (CompleteFinalizeRecoveryResponse);
+    rpc CancelPeerRecovery(CancelPeerRecoveryRequest) returns (CancelPeerRecoveryResponse);
 
     // Dynamic settings (forwarded to leader)
     rpc UpdateSettings(UpdateSettingsRequest) returns (UpdateSettingsResponse);

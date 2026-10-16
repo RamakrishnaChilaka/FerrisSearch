@@ -472,6 +472,7 @@ fn make_full_cluster_state() -> DomainClusterState {
             refresh_interval_ms: Some(1500),
             flush_threshold_bytes: Some(65_536),
             minimum_durable_copies: 2,
+            replica_policy: None,
             remote_store: None,
         },
     });
@@ -3306,6 +3307,7 @@ fn roundtrip_rejects_unknown_non_empty_engine() {
                 refresh_interval_ms: None,
                 flush_threshold_bytes: None,
                 minimum_durable_copies: Some(1),
+                replica_policy_json: None,
                 remote_store: None,
             }),
             dynamic: "false".into(),

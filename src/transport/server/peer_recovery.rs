@@ -6,11 +6,12 @@ use crate::engine::{
 };
 use crate::shard::SourceRecoverySessionCleanup;
 use crate::transport::proto::{
-    CompleteFinalizeRecoveryRequest, CompleteFinalizeRecoveryResponse,
-    FetchRecoveryFileChunkRequest, FetchRecoveryFileChunkResponse, FetchRecoveryOpsRequest,
-    FetchRecoveryOpsResponse, MarkReplicaInSyncRequest, PrepareFinalizeRecoveryRequest,
-    PrepareFinalizeRecoveryResponse, RecoveryFileMetadata, RecoveryOperation, RecoveryWalCursor,
-    StartPeerRecoveryRequest, StartPeerRecoveryResponse,
+    CancelPeerRecoveryRequest, CancelPeerRecoveryResponse, CompleteFinalizeRecoveryRequest,
+    CompleteFinalizeRecoveryResponse, FetchRecoveryFileChunkRequest,
+    FetchRecoveryFileChunkResponse, FetchRecoveryOpsRequest, FetchRecoveryOpsResponse,
+    MarkReplicaInSyncRequest, PrepareFinalizeRecoveryRequest, PrepareFinalizeRecoveryResponse,
+    RecoveryFileMetadata, RecoveryOperation, RecoveryWalCursor, StartPeerRecoveryRequest,
+    StartPeerRecoveryResponse,
 };
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -1859,6 +1860,82 @@ impl TransportService {
         result_rx
             .await
             .map_err(|_| Status::internal("peer recovery settlement task stopped"))?
+    }
+
+    pub(super) async fn cancel_peer_recovery_inner(
+        &self,
+        request: CancelPeerRecoveryRequest,
+    ) -> Result<CancelPeerRecoveryResponse, Status> {
+        if request.session_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "peer recovery session_id is required",
+            ));
+        }
+        if self
+            .peer_recovery_state
+            .cancel_setup(&request.session_id, true)
+            .await
+        {
+            crate::metrics::record_peer_recovery_cancellation();
+            return Ok(CancelPeerRecoveryResponse {
+                cancelled: true,
+                error: String::new(),
+            });
+        }
+        let session = {
+            self.peer_recovery_state
+                .registry
+                .lock()
+                .await
+                .sessions
+                .get(&request.session_id)
+                .cloned()
+        };
+        let Some(session) = session else {
+            return Ok(CancelPeerRecoveryResponse {
+                cancelled: false,
+                error: String::new(),
+            });
+        };
+        {
+            let session_guard = session.lock().await;
+            if session_guard.finalize_preparing.load(Ordering::Acquire)
+                || session_guard.barrier_guard.is_some()
+                || session_guard.mark_submitted
+                || session_guard.settlement_running
+            {
+                return Err(Status::failed_precondition(
+                    "cannot cancel peer recovery session once finalization or admission settlement has begun",
+                ));
+            }
+        }
+        if let Some(removed) = self
+            .peer_recovery_state
+            .remove_session(&request.session_id)
+            .await
+        {
+            cleanup_session(removed).await;
+            crate::metrics::record_peer_recovery_cancellation();
+            tracing::info!(
+                session_id = request.session_id,
+                reason = request.reason,
+                "Cancelled peer recovery source session"
+            );
+            return Ok(CancelPeerRecoveryResponse {
+                cancelled: true,
+                error: String::new(),
+            });
+        }
+        Ok(CancelPeerRecoveryResponse {
+            cancelled: false,
+            error: String::new(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn has_active_source_recovery_session(&self, session_id: &str) -> bool {
+        let registry = self.peer_recovery_state.registry.lock().await;
+        registry.sessions.contains_key(session_id) || registry.setups.contains_key(session_id)
     }
 
     async fn settle_peer_recovery(

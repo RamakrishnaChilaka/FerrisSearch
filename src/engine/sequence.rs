@@ -307,14 +307,14 @@ impl SeqNoIntervals {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct SeqNoRange {
+pub struct SeqNoRange {
     pub start: u64,
     pub end: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct PrimaryTermSequenceRecord {
+pub struct PrimaryTermSequenceRecord {
     pub current_term: u64,
     pub max_seq_no_at_term_start: Option<u64>,
     pub processed_in_current_term_below_start_max: Vec<SeqNoRange>,
@@ -322,7 +322,7 @@ pub(crate) struct PrimaryTermSequenceRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct CommittedBoundaryRecord {
+pub struct CommittedBoundaryRecord {
     pub version: u32,
     pub processed_checkpoint: Option<u64>,
     pub persisted_checkpoint: Option<u64>,

@@ -487,6 +487,110 @@ impl RemoteStoreSettings {
     }
 }
 
+pub const DEFAULT_REPLICA_MAX_LAG_OPS: u64 = 1_000;
+pub const DEFAULT_REPLICA_LAG_TIMEOUT_MS: u64 = 60_000;
+pub const DEFAULT_RECOVERY_SESSION_TIMEOUT_MS: u64 = 600_000;
+pub const DEFAULT_RECOVERY_FINALIZE_TIMEOUT_MS: u64 = 20_000;
+pub const DEFAULT_RECOVERY_RETRY_INITIAL_BACKOFF_MS: u64 = 5_000;
+pub const DEFAULT_RECOVERY_RETRY_MAX_BACKOFF_MS: u64 = 60_000;
+
+/// Supported write acknowledgement modes that satisfy the durability contract.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteAcknowledgementMode {
+    /// Certify every authoritative in-sync replica (or settled exclusion) and
+    /// enforce `minimum_durable_copies`.
+    #[default]
+    InSyncReplicas,
+    /// Require all configured copies (`number_of_replicas + 1`) to be durable
+    /// (`minimum_durable_copies == number_of_replicas + 1`).
+    AllConfiguredCopies,
+}
+
+impl WriteAcknowledgementMode {
+    pub fn parse_name(name: &str) -> Result<Self, String> {
+        match name {
+            "in_sync_replicas" => Ok(Self::InSyncReplicas),
+            "all_configured_copies" => Ok(Self::AllConfiguredCopies),
+            other => Err(format!(
+                "unsupported write_ack_mode [{other}]; policy cannot acknowledge writes below the documented durability contract (supported: [in_sync_replicas, all_configured_copies])"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InSyncReplicas => "in_sync_replicas",
+            Self::AllConfiguredCopies => "all_configured_copies",
+        }
+    }
+}
+
+impl std::fmt::Display for WriteAcknowledgementMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Configurable replica lag, recovery timeout, retry backoff, and acknowledgement policy (`FS-026`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaPolicySettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lag_ops: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lag_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_session_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_finalize_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_retry_initial_backoff_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_retry_max_backoff_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_ack_mode: Option<WriteAcknowledgementMode>,
+}
+
+impl ReplicaPolicySettings {
+    pub fn is_empty(&self) -> bool {
+        self.max_lag_ops.is_none()
+            && self.lag_timeout_ms.is_none()
+            && self.recovery_session_timeout_ms.is_none()
+            && self.recovery_finalize_timeout_ms.is_none()
+            && self.recovery_retry_initial_backoff_ms.is_none()
+            && self.recovery_retry_max_backoff_ms.is_none()
+            && self.write_ack_mode.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectiveReplicaPolicy {
+    pub max_lag_ops: u64,
+    pub lag_timeout_ms: u64,
+    pub recovery_session_timeout_ms: u64,
+    pub recovery_finalize_timeout_ms: u64,
+    pub recovery_retry_initial_backoff_ms: u64,
+    pub recovery_retry_max_backoff_ms: u64,
+    pub minimum_durable_copies: u32,
+    pub write_ack_mode: WriteAcknowledgementMode,
+}
+
+impl Default for EffectiveReplicaPolicy {
+    fn default() -> Self {
+        Self {
+            max_lag_ops: DEFAULT_REPLICA_MAX_LAG_OPS,
+            lag_timeout_ms: DEFAULT_REPLICA_LAG_TIMEOUT_MS,
+            recovery_session_timeout_ms: DEFAULT_RECOVERY_SESSION_TIMEOUT_MS,
+            recovery_finalize_timeout_ms: DEFAULT_RECOVERY_FINALIZE_TIMEOUT_MS,
+            recovery_retry_initial_backoff_ms: DEFAULT_RECOVERY_RETRY_INITIAL_BACKOFF_MS,
+            recovery_retry_max_backoff_ms: DEFAULT_RECOVERY_RETRY_MAX_BACKOFF_MS,
+            minimum_durable_copies: 1,
+            write_ack_mode: WriteAcknowledgementMode::InSyncReplicas,
+        }
+    }
+}
+
 /// Per-index settings that control engine behavior.
 ///
 /// Common shard-maintenance settings and remote-store metadata share this
@@ -512,12 +616,45 @@ pub struct IndexSettings {
     /// Minimum acknowledged copies, including the primary. Request durability
     /// requires persisted operation proofs; async durability retains its crash window.
     pub minimum_durable_copies: u32,
+    /// Optional `local_shards` replica lag, recovery timeout, retry backoff, and ack policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_policy: Option<ReplicaPolicySettings>,
     // ── Remote-store engine settings ───────────────────────────────
     /// Optional `remote_store` configuration preserved in cluster state and
     /// transport snapshots. Only fields consumed by the current read path have
     /// runtime effects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_store: Option<RemoteStoreSettings>,
+}
+
+impl IndexSettings {
+    pub fn effective_replica_policy(&self) -> EffectiveReplicaPolicy {
+        let policy = self.replica_policy.as_ref();
+        EffectiveReplicaPolicy {
+            max_lag_ops: policy
+                .and_then(|p| p.max_lag_ops)
+                .unwrap_or(DEFAULT_REPLICA_MAX_LAG_OPS),
+            lag_timeout_ms: policy
+                .and_then(|p| p.lag_timeout_ms)
+                .unwrap_or(DEFAULT_REPLICA_LAG_TIMEOUT_MS),
+            recovery_session_timeout_ms: policy
+                .and_then(|p| p.recovery_session_timeout_ms)
+                .unwrap_or(DEFAULT_RECOVERY_SESSION_TIMEOUT_MS),
+            recovery_finalize_timeout_ms: policy
+                .and_then(|p| p.recovery_finalize_timeout_ms)
+                .unwrap_or(DEFAULT_RECOVERY_FINALIZE_TIMEOUT_MS),
+            recovery_retry_initial_backoff_ms: policy
+                .and_then(|p| p.recovery_retry_initial_backoff_ms)
+                .unwrap_or(DEFAULT_RECOVERY_RETRY_INITIAL_BACKOFF_MS),
+            recovery_retry_max_backoff_ms: policy
+                .and_then(|p| p.recovery_retry_max_backoff_ms)
+                .unwrap_or(DEFAULT_RECOVERY_RETRY_MAX_BACKOFF_MS),
+            minimum_durable_copies: self.minimum_durable_copies,
+            write_ack_mode: policy
+                .and_then(|p| p.write_ack_mode)
+                .unwrap_or(WriteAcknowledgementMode::InSyncReplicas),
+        }
+    }
 }
 
 impl Default for IndexSettings {
@@ -527,6 +664,7 @@ impl Default for IndexSettings {
             refresh_interval_ms: None,
             flush_threshold_bytes: None,
             minimum_durable_copies: 1,
+            replica_policy: None,
             remote_store: None,
         }
     }
@@ -537,6 +675,138 @@ fn parse_u32_setting(value: &serde_json::Value, name: &str) -> Result<u32, Strin
         .as_u64()
         .and_then(|value| u32::try_from(value).ok())
         .ok_or_else(|| format!("{name} must be an unsigned 32-bit integer"))
+}
+
+fn parse_optional_u64_setting(
+    value: &serde_json::Value,
+    name: &str,
+) -> Result<Option<u64>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_u64()
+        .map(Some)
+        .ok_or_else(|| format!("{name} must be an unsigned 64-bit integer"))
+}
+
+fn apply_replica_policy_fields(
+    policy: &mut ReplicaPolicySettings,
+    scope: &serde_json::Value,
+    prefix: &str,
+) -> Result<bool, String> {
+    let mut touched = false;
+    if let Some(nested) = scope.get("replica_policy") {
+        touched = true;
+        if nested.is_null() {
+            *policy = ReplicaPolicySettings::default();
+        } else {
+            let Some(obj) = nested.as_object() else {
+                return Err(format!("{prefix}.replica_policy must be a JSON object"));
+            };
+            for (key, value) in obj {
+                match key.as_str() {
+                    "max_lag_ops" | "replica_max_lag_ops" => {
+                        policy.max_lag_ops = parse_optional_u64_setting(
+                            value,
+                            &format!("{prefix}.replica_policy.{key}"),
+                        )?;
+                    }
+                    "lag_timeout_ms" | "replica_lag_timeout_ms" => {
+                        policy.lag_timeout_ms = parse_optional_u64_setting(
+                            value,
+                            &format!("{prefix}.replica_policy.{key}"),
+                        )?;
+                    }
+                    "recovery_session_timeout_ms" => {
+                        policy.recovery_session_timeout_ms = parse_optional_u64_setting(
+                            value,
+                            &format!("{prefix}.replica_policy.{key}"),
+                        )?;
+                    }
+                    "recovery_finalize_timeout_ms" => {
+                        policy.recovery_finalize_timeout_ms = parse_optional_u64_setting(
+                            value,
+                            &format!("{prefix}.replica_policy.{key}"),
+                        )?;
+                    }
+                    "recovery_retry_initial_backoff_ms" => {
+                        policy.recovery_retry_initial_backoff_ms = parse_optional_u64_setting(
+                            value,
+                            &format!("{prefix}.replica_policy.{key}"),
+                        )?;
+                    }
+                    "recovery_retry_max_backoff_ms" => {
+                        policy.recovery_retry_max_backoff_ms = parse_optional_u64_setting(
+                            value,
+                            &format!("{prefix}.replica_policy.{key}"),
+                        )?;
+                    }
+                    "write_ack_mode" => {
+                        if value.is_null() {
+                            policy.write_ack_mode = None;
+                        } else {
+                            let mode_str = value.as_str().ok_or_else(|| {
+                                format!("{prefix}.replica_policy.write_ack_mode must be a string")
+                            })?;
+                            policy.write_ack_mode =
+                                Some(WriteAcknowledgementMode::parse_name(mode_str)?);
+                        }
+                    }
+                    unknown => {
+                        return Err(format!(
+                            "unknown replica_policy setting [{prefix}.replica_policy.{unknown}]"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    for (flat_key, target) in [
+        ("replica_max_lag_ops", "max_lag_ops"),
+        ("replica_lag_timeout_ms", "lag_timeout_ms"),
+        ("recovery_session_timeout_ms", "recovery_session_timeout_ms"),
+        (
+            "recovery_finalize_timeout_ms",
+            "recovery_finalize_timeout_ms",
+        ),
+        (
+            "recovery_retry_initial_backoff_ms",
+            "recovery_retry_initial_backoff_ms",
+        ),
+        (
+            "recovery_retry_max_backoff_ms",
+            "recovery_retry_max_backoff_ms",
+        ),
+    ] {
+        if let Some(value) = scope.get(flat_key) {
+            touched = true;
+            let parsed = parse_optional_u64_setting(value, &format!("{prefix}.{flat_key}"))?;
+            match target {
+                "max_lag_ops" => policy.max_lag_ops = parsed,
+                "lag_timeout_ms" => policy.lag_timeout_ms = parsed,
+                "recovery_session_timeout_ms" => policy.recovery_session_timeout_ms = parsed,
+                "recovery_finalize_timeout_ms" => policy.recovery_finalize_timeout_ms = parsed,
+                "recovery_retry_initial_backoff_ms" => {
+                    policy.recovery_retry_initial_backoff_ms = parsed
+                }
+                "recovery_retry_max_backoff_ms" => policy.recovery_retry_max_backoff_ms = parsed,
+                _ => unreachable!(),
+            }
+        }
+    }
+    if let Some(value) = scope.get("write_ack_mode") {
+        touched = true;
+        if value.is_null() {
+            policy.write_ack_mode = None;
+        } else {
+            let mode_str = value
+                .as_str()
+                .ok_or_else(|| format!("{prefix}.write_ack_mode must be a string"))?;
+            policy.write_ack_mode = Some(WriteAcknowledgementMode::parse_name(mode_str)?);
+        }
+    }
+    Ok(touched)
 }
 
 /// Validated wrapper for index UUIDs.
@@ -643,14 +913,72 @@ pub struct IndexMetadata {
 impl IndexMetadata {
     pub fn validate_write_policy(&self) -> Result<(), String> {
         let minimum = self.settings.minimum_durable_copies;
-        if minimum == 0 || u64::from(minimum) > u64::from(self.number_of_replicas) + 1 {
+        let capacity = u64::from(self.number_of_replicas) + 1;
+        if minimum == 0 || u64::from(minimum) > capacity {
             return Err(format!(
-                "minimum_durable_copies must be between 1 and configured primary-plus-replica capacity {}; got {minimum}",
-                u64::from(self.number_of_replicas) + 1,
+                "minimum_durable_copies must be between 1 and configured primary-plus-replica capacity {capacity}; got {minimum}",
             ));
         }
-        if !self.settings.engine.uses_local_shards() && minimum != 1 {
-            return Err("minimum_durable_copies applies only to local_shards indices".into());
+        if !self.settings.engine.uses_local_shards() {
+            if minimum != 1 {
+                return Err("minimum_durable_copies applies only to local_shards indices".into());
+            }
+            if self
+                .settings
+                .replica_policy
+                .as_ref()
+                .is_some_and(|policy| !policy.is_empty())
+            {
+                return Err("replica_policy applies only to local_shards indices".into());
+            }
+            return Ok(());
+        }
+        if let Some(policy) = &self.settings.replica_policy {
+            if policy.max_lag_ops == Some(0) {
+                return Err("replica_max_lag_ops must be greater than zero".into());
+            }
+            if policy.lag_timeout_ms.is_some_and(|ms| ms < 50) {
+                return Err("replica_lag_timeout_ms must be at least 50 ms".into());
+            }
+            if policy
+                .recovery_session_timeout_ms
+                .is_some_and(|ms| ms < 500)
+            {
+                return Err("recovery_session_timeout_ms must be at least 500 ms".into());
+            }
+            if policy
+                .recovery_finalize_timeout_ms
+                .is_some_and(|ms| ms < 100)
+            {
+                return Err("recovery_finalize_timeout_ms must be at least 100 ms".into());
+            }
+            if policy.recovery_retry_initial_backoff_ms == Some(0) {
+                return Err("recovery_retry_initial_backoff_ms must be greater than zero".into());
+            }
+            if policy.recovery_retry_max_backoff_ms == Some(0) {
+                return Err("recovery_retry_max_backoff_ms must be greater than zero".into());
+            }
+        }
+        let effective = self.settings.effective_replica_policy();
+        if effective.recovery_finalize_timeout_ms > effective.recovery_session_timeout_ms {
+            return Err(format!(
+                "recovery_finalize_timeout_ms ({}) cannot exceed recovery_session_timeout_ms ({})",
+                effective.recovery_finalize_timeout_ms, effective.recovery_session_timeout_ms
+            ));
+        }
+        if effective.recovery_retry_initial_backoff_ms > effective.recovery_retry_max_backoff_ms {
+            return Err(format!(
+                "recovery_retry_initial_backoff_ms ({}) cannot exceed recovery_retry_max_backoff_ms ({})",
+                effective.recovery_retry_initial_backoff_ms,
+                effective.recovery_retry_max_backoff_ms
+            ));
+        }
+        if effective.write_ack_mode == WriteAcknowledgementMode::AllConfiguredCopies
+            && u64::from(minimum) != capacity
+        {
+            return Err(format!(
+                "write_ack_mode [all_configured_copies] requires minimum_durable_copies ({minimum}) to equal configured primary-plus-replica capacity ({capacity})"
+            ));
         }
         Ok(())
     }
@@ -689,6 +1017,15 @@ impl IndexMetadata {
                 updated.settings.flush_threshold_bytes = None;
             } else if let Some(value) = value.as_u64() {
                 updated.settings.flush_threshold_bytes = Some(value);
+            }
+        }
+        if let Some(index_scope) = body.get("index") {
+            let mut policy = updated.settings.replica_policy.clone().unwrap_or_default();
+            if apply_replica_policy_fields(&mut policy, index_scope, "index")? {
+                if !self.settings.engine.uses_local_shards() && !policy.is_empty() {
+                    return Err("replica_policy applies only to local_shards indices".into());
+                }
+                updated.settings.replica_policy = (!policy.is_empty()).then_some(policy);
             }
         }
         updated.validate_write_policy()?;
@@ -765,6 +1102,19 @@ impl IndexMetadata {
             metadata.settings.minimum_durable_copies =
                 parse_u32_setting(value, "settings.minimum_durable_copies")
                     .map_err(CreateIndexMetadataError::InvalidArgument)?;
+        }
+        if let Some(settings_scope) = body.get("settings") {
+            let mut policy = ReplicaPolicySettings::default();
+            if apply_replica_policy_fields(&mut policy, settings_scope, "settings")
+                .map_err(CreateIndexMetadataError::InvalidArgument)?
+            {
+                if !metadata.settings.engine.uses_local_shards() && !policy.is_empty() {
+                    return Err(CreateIndexMetadataError::InvalidArgument(
+                        "replica_policy applies only to local_shards indices".into(),
+                    ));
+                }
+                metadata.settings.replica_policy = (!policy.is_empty()).then_some(policy);
+            }
         }
         metadata
             .validate_write_policy()

@@ -761,7 +761,18 @@ covered before destructive mode can be enabled.
 
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-001, FS-005
 
-**Status (2026-09-27):** Partial. PR #143 recovery snapshots are hard-linked
+**Status (2026-10-16):** Implemented. `ShardSnapshotManifest` (format v1,
+`SHARD_SNAPSHOT_FORMAT_CAPABILITY`) and `ShardSnapshotCompletionMarker`
+(`shard-snapshot.manifest.json` + atomic `shard-snapshot.complete`) capture
+Tantivy segment files, committed WAL/sequence boundary, retained delete/client
+operation metadata, canonical history archives, vector index files and
+metadata (`ShardSnapshotVectorMetadata`), schema hash, index UUID, shard ID,
+allocation ID, primary term, and SHA-256 digests. Flushed shards persist
+`<shard_dir>/snapshot.latest` across process restarts, and `load_and_verify`
+rejects incomplete snapshots, checksum/length corruption, and unsupported
+format versions.
+
+**Historical status (2026-09-27):** Partial. PR #143 recovery snapshots are hard-linked
 Tantivy file sets taken at a WAL boundary under the translog lock, with a
 SHA-256 file manifest. They are scoped to a recovery session, not a persisted
 and versioned snapshot format. Vector state is rebuilt rather than captured, and
@@ -782,7 +793,17 @@ control-plane progress.
 
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-007, FS-022
 
-**Status (2026-09-27):** Partial.
+**Status (2026-10-16):** Implemented. `prepare_peer_recovery_target_blocking`
+stages incoming recovery files into `<shard_dir>.staging` without deleting an
+existing valid shard in `<shard_dir>`. `finalize_peer_recovery_target_blocking`
+validates the committed boundary, WAL archive, Tantivy commit files, and vector
+state inside `<shard_dir>.staging` before atomically swapping the verified
+directory into `<shard_dir>` (with crash-safe `<shard_dir>.backup` rollback).
+Checksums, simulated disk exhaustion (`ENOSPC`), interruption, retry, and
+process restart leave either the previous valid shard or the new valid
+snapshot, never a mixed state.
+
+**Historical status (2026-09-27):** Partial.
 - **Implemented** (PRs #143-#144):
   - The source serves files in chunks of at most 1 MiB.
   - The target verifies each file's SHA-256
@@ -809,7 +830,16 @@ snapshot, never a mixed state.
 
 **Class:** Scale blocker | **Gate:** 1 | **Depends on:** FS-022, FS-023
 
-**Status (2026-09-27):** Partial.
+**Status (2026-10-16):** Implemented. Recovery streams bounded WAL suffix
+chunks (`MAX_RECOVERY_OPS` / `MAX_RECOVERY_OP_BYTES`), deduplicates identical
+operations idempotently within and across chunks while rejecting conflicting
+duplicates, validates sequence ordering and gap-free suffix streaming in
+`apply_ordered_recovery_suffix_chunk`, enforces a contiguous final checkpoint
+(`processed_checkpoint == max_seq_no`) at the finalize barrier, and propagates
+cancellation via `CancelPeerRecovery` (`TargetRecoverySessionGuard`) to stop
+and clean up both target and source sessions immediately.
+
+**Historical status (2026-09-27):** Partial.
 - **Implemented:** catch-up pulls bounded batches through `FetchRecoveryOps`,
   each at most `MAX_RECOVERY_OPS` (1,024) operations under a byte limit. It
   starts at the snapshot boundary and preserves primary sequence numbers.
@@ -835,7 +865,15 @@ and the final checkpoint is contiguous.
 
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-012, FS-013, FS-024
 
-**Status (2026-09-27):** Partial. In-sync membership, allocation IDs, primary
+**Status (2026-10-16):** Implemented. `ReplicaCopyState` (`Unassigned`,
+`Initializing`, `Snapshotting`, `CatchingUp`, `InSync`, `Stale`, `Failed`) and
+`ReplicaStateRegistry` in `src/shard/replica_state.rs` validate per-copy state
+transitions, govern acknowledgement/promotion/recovery/live-replication
+eligibility, track retry backoff and lag observations, and export Prometheus
+gauges and transition counters (`ferrissearch_replica_copy_state_copies`,
+`ferrissearch_replica_state_transitions_total`).
+
+**Historical status (2026-09-27):** Partial. In-sync membership, allocation IDs, primary
 terms, and conditional admission and promotion are Raft-owned (PRs #143-#144).
 Pending-recovery markers are durable and restored on restart, and the TLA+
 model checks these transitions within bounds. The per-copy lifecycle is still
@@ -857,7 +895,20 @@ state transitions rather than incidental open-shard status.
 
 **Class:** Release blocker | **Gate:** 1 | **Depends on:** FS-013, FS-025
 
-**Status (2026-09-27):** Not started. PRs #143-#144 added node-level settings,
+**Status (2026-10-16):** Implemented. `IndexSettings.replica_policy`
+(`ReplicaPolicySettings` / `EffectiveReplicaPolicy` /
+`WriteAcknowledgementMode`) replicates lag thresholds (`max_lag_ops`,
+`lag_timeout_ms`), recovery timeouts (`recovery_session_timeout_ms`,
+`recovery_finalize_timeout_ms`), retry backoff
+(`recovery_retry_initial_backoff_ms`, `recovery_retry_max_backoff_ms`), and
+supported acknowledgement policy (`in_sync_replicas`,
+`all_configured_copies`) through Raft, rejects unsafe modes and invalid
+combinations, exposes effective settings via `GET /{index}/_settings`, and
+applies committed settings on every node (including followers without request
+ingress or shard reopen) via `ShardManager::reconcile_applied_settings` in the
+applied-state reconciler.
+
+**Historical status (2026-09-27):** Not started. PRs #143-#144 added node-level settings,
 not reactive cluster settings: `max_concurrent_peer_recoveries`,
 `shard_io_failure_escalation_attempts`, and
 `shard_io_failure_escalation_window_ms`.
