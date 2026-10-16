@@ -489,9 +489,20 @@ impl StorageManager {
             }
 
             // Reverify reachability immediately before deletion.
+            let active_leases = self.active_snapshot_leases_for_index(index_uuid, now_ms);
+            let pinned_by_active_lease = active_leases.iter().any(|lease| {
+                entry
+                    .generation
+                    .is_some_and(|g| g > 0 && g == lease.manifest_generation)
+                    || entry
+                        .split_id
+                        .as_ref()
+                        .is_some_and(|sid| lease.pinned_split_ids.contains(sid))
+            });
             let still_reclaimable = reverified_by_path
                 .get(entry.path.as_str())
                 .is_some_and(|reverified| reverified.reclaimable && !reverified.pinned)
+                && !pinned_by_active_lease
                 && !self
                     .locally_pinned_splits_for_index(index_uuid)
                     .iter()

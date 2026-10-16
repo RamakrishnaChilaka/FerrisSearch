@@ -586,6 +586,18 @@ pub fn create_router(mut state: AppState) -> Router {
             post(index::seal_remote_store_delta),
         )
         .route("/{index}/_seal", post(index::seal_remote_store_delta))
+        .route(
+            "/{index}/_remote_store/compact",
+            post(index::compact_remote_store_splits),
+        )
+        .route(
+            "/{index}/_compact",
+            post(index::compact_remote_store_splits),
+        )
+        .route(
+            "/{index}/_remote_store/rollback",
+            post(index::rollback_remote_store_manifest),
+        )
         // Document operations
         .route("/{index}/_doc", post(index::index_document))
         .route("/{index}/_doc/{id}", put(index::index_document_with_id))

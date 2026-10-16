@@ -5230,9 +5230,23 @@ impl HotEngine {
                 for clause in &bq.must_not {
                     subqueries.push((Occur::MustNot, self.build_query(clause)?));
                 }
-                // filter = must without scoring (Tantivy doesn't distinguish, so treat as Must)
+                // filter = must without scoring (Tantivy doesn't distinguish, so treat as Must,
+                // except SnapshotFilter which is pushed as MustNot over excluded _id terms to preserve BM25 scores)
                 for clause in &bq.filter {
-                    subqueries.push((Occur::Must, self.build_query(clause)?));
+                    if let QueryClause::SnapshotFilter(params) = clause {
+                        let excluded_terms = self.build_snapshot_excluded_terms(params)?;
+                        if !excluded_terms.is_empty() {
+                            if subqueries.is_empty() {
+                                subqueries.push((Occur::Must, Box::new(AllQuery)));
+                            }
+                            subqueries.push((
+                                Occur::MustNot,
+                                Box::new(tantivy::query::TermSetQuery::new(excluded_terms)),
+                            ));
+                        }
+                    } else {
+                        subqueries.push((Occur::Must, self.build_query(clause)?));
+                    }
                 }
 
                 if subqueries.is_empty() {
@@ -5328,7 +5342,68 @@ impl HotEngine {
                     Ok(Box::new(AllQuery))
                 }
             }
+            QueryClause::SnapshotFilter(params) => {
+                let excluded_terms = self.build_snapshot_excluded_terms(params)?;
+                if excluded_terms.is_empty() {
+                    Ok(Box::new(AllQuery))
+                } else {
+                    Ok(Box::new(BooleanQuery::new(vec![
+                        (Occur::Must, Box::new(AllQuery)),
+                        (
+                            Occur::MustNot,
+                            Box::new(tantivy::query::TermSetQuery::new(excluded_terms)),
+                        ),
+                    ])))
+                }
+            }
         }
+    }
+
+    fn build_snapshot_excluded_terms(
+        &self,
+        params: &crate::search::SnapshotFilterParams,
+    ) -> Result<Vec<Term>> {
+        let id_field = self
+            .field_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .id_field;
+        let mut excluded_ids: std::collections::BTreeSet<String> =
+            params.excluded_doc_ids.iter().cloned().collect();
+
+        if params.min_exclusive_seq_no.is_some() || params.max_inclusive_seq_no.is_some() {
+            let searcher = self.reader.searcher();
+            for (seg_ord, segment) in searcher.segment_readers().iter().enumerate() {
+                let Ok(seq_col) = segment.fast_fields().u64(SEQ_NO_FIELD_NAME) else {
+                    continue;
+                };
+                let id_fast = StringFastFieldReader::open(segment.fast_fields(), "_id");
+                for doc_id in segment.doc_ids_alive() {
+                    let seq_no = seq_col.first(doc_id).unwrap_or(0);
+                    let below_min = params.min_exclusive_seq_no.is_some_and(|min| seq_no <= min);
+                    let above_max = params.max_inclusive_seq_no.is_some_and(|max| seq_no > max);
+                    if below_min || above_max {
+                        let mut text = String::new();
+                        if let Some(ref reader) = id_fast
+                            && reader.first_text(doc_id, &mut text)
+                        {
+                            excluded_ids.insert(text);
+                        } else if let Ok(stored) = searcher.doc::<TantivyDocument>(
+                            tantivy::DocAddress::new(seg_ord as u32, doc_id),
+                        ) && let Some(id_str) =
+                            stored.get_all(id_field).next().and_then(|v| v.as_str())
+                        {
+                            excluded_ids.insert(id_str.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(excluded_ids
+            .into_iter()
+            .map(|id| Term::from_field_text(id_field, &id))
+            .collect())
     }
 
     /// Flush with translog retention: commit to disk and truncate WAL entries

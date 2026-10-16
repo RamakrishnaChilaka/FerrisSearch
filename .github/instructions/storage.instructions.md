@@ -47,18 +47,23 @@ Do not collapse these responsibilities into API handlers.
   versioned document deletion are not implemented yet.
 - Standard `_doc`, `_bulk`, `_update`, and `_delete` APIs remain rejected with
   `501` on `ImmutableOnly` shardless `remote_store` indices. Tiered indices
-  (`lifecycle_mode: "tiered"` / `hot_delta` enabled, FS-034..FS-036) own routed
+  (`lifecycle_mode: "tiered"` / `hot_delta` enabled, FS-034..FS-041) own routed
   mutable hot-delta shards, enumerate contiguous seal boundaries, seal bounded
   ranges into immutable splits via `POST /{index}/_remote_store/seal` under
   `ResourceGovernor` and `WorkClass::Maintenance` limits, record contiguous
   per-shard `published_watermarks` (`ShardPublishedWatermark`) in the committed
-  manifest generation, and retire sealed hot-delta ranges idempotently only
-  after manifest commit and queryability.
-- There is no object-store split compactor or tombstone lifecycle yet. The
-  FS-021 janitor defaults to `dry_run = true` and in destructive mode reclaims
-  only unpinned `Abandoned` and `Superseded` objects outside the active-lease
-  and retention horizons when listing and lineage are healthy. Node-local cache
-  reaping remains separate from object-store reclamation.
+  manifest generation, retire sealed hot-delta ranges idempotently only after
+  manifest commit and queryability, resolve one pinned `ReadSnapshot` across hot
+  delta and immutable splits with versioned tombstone supersession (FS-037/FS-038),
+  and compact splits with fenced `CompactionLineageRecord` replacement via
+  `POST /{index}/_remote_store/compact` (FS-039/FS-040).
+- The janitor (`run_janitor`, FS-021/FS-041) defaults to `dry_run = true` and in
+  destructive mode marks from the current manifest, every generation in the
+  retention window, and every active `SnapshotRetentionLease`, sweeping only
+  unpinned `Abandoned` and `Superseded` objects (including compacted split
+  bundles whose source generations have expired) when listing and lineage are
+  healthy. Node-local cache reaping remains separate from object-store
+  reclamation.
 - Split hydration currently downloads the full bundle into memory before
   writing/extracting it; do not describe this as streaming hydration.
 - Root scheduling performs per-query leaf status discovery. There is no
