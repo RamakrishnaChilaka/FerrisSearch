@@ -8,6 +8,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
   test:
@@ -34,8 +37,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-nodebug-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-nodebug-v1-
 
       - name: Cache TLA+ tools
         uses: actions/cache@v4
@@ -68,6 +71,12 @@ jobs:
       - name: Validate bulk cancellation and multi-copy boundaries
         timeout-minutes: 3
         run: cargo test --features protocol-trace --lib fs014
+
+      - name: Prune linked test executables before cache save
+        if: always()
+        run: |
+          rm -f target/debug/ferrissearch target/debug/ferris-cli
+          find target/debug/deps -maxdepth 1 -type f -executable ! -name "*.so" -delete 2>/dev/null || true
 
   tla-model-check:
     runs-on: ubuntu-latest
