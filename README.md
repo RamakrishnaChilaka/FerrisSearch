@@ -95,16 +95,16 @@ up to five seconds for remote metadata catch-up. Slow or failed opening returns
 `shards_acknowledged: false`, not a failed create. Creation does not wait for
 replicas or for every node to apply the state.
 
-### Two useful execution paths—and one intended future
+### Two execution engines and a unified tiered lifecycle
 
-| Engine | What exists now | Write path | Query path |
+| Engine / Mode | What exists now | Write path | Query path |
 |---|---|---|---|
-| `local_shards` | Mutable Tantivy + USearch shards, WAL, routing, replica RPCs | Standard document and bulk APIs | Local/remote shard scatter-gather |
-| `remote_store` | Shardless immutable split bundles and generation manifests in local or S3-compatible storage | Dedicated manual split publication API | Root/leaf pruning, assignment, hydration, cache, and merge |
+| `local_shards` (`mutable_only`) | Mutable Tantivy + USearch shards, WAL, routing, replica RPCs | Standard document and bulk APIs | Local/remote shard scatter-gather |
+| `remote_store` (`immutable_only`) | Shardless immutable split bundles and fenced generation manifests in local or S3-compatible storage | Fenced split publication API (`/_remote_store/publish`) | Root/leaf pruning, assignment, hydration, cache, and merge |
+| `tiered` (`local_shards` + `remote_store`) | Replicated hot-delta shards sealed into immutable object-store splits with contiguous watermarks | Standard document/bulk APIs + `/_remote_store/seal` | Unified `ReadSnapshot` across hot delta and immutable splits |
 
-The long-term architecture does not keep these as two independent products. It
-turns mutable, near-real-time data into immutable object-store splits under one
-version and snapshot model:
+Tiered mode converges mutable, near-real-time data and immutable object-store
+splits under one version and snapshot model:
 
 ```text
 durable mutable delta
@@ -116,8 +116,9 @@ durable mutable delta
   -> snapshot-safe garbage collection
 ```
 
-That lifecycle is the central 12-24 month roadmap, not a claim about the current
-implementation.
+See the [Production V1 and research evidence package](docs/production-v1-and-research-evidence.md)
+for the implemented scope and explicit post-cut deferrals (such as remote-split
+vector search and sequencer-free multi-writer manifest merging).
 
 ## Five-Minute Tour
 
@@ -523,7 +524,7 @@ flowchart LR
 | Mutable data plane | WAL, primary mutation, replica apply, refresh, local Tantivy/USearch |
 | Immutable data plane | Split bundles, manifests, schema summaries, object storage |
 | Query plane | Tantivy matching/fast fields/partials, root/leaf fan-out, Arrow transport, residual DataFusion |
-| Maintenance plane | Flush, force merge, cache reaping; compaction and object GC are roadmap work |
+| Maintenance plane | Flush, force merge, cache reaping, split compaction, snapshot-safe object GC, backup/restore/repair |
 
 Split inventories, query assignments, and cache state do not belong in Raft.
 
@@ -589,28 +590,41 @@ production ready**. The most important limits are:
   for visibility and refresh-failure semantics and
   [ADR 0001, D13](docs/adr/0001-write-consistency-and-retry-contract.md#d13-unimplemented-parameters-fail-loudly)
   for endpoint-specific conditions and unsupported aliases.
-- Replica bootstrap uses file snapshot plus physical-order WAL streaming, but
-  source sessions and retention pins remain process-local and general D10
-  rollback/resync is not implemented.
+- Replica bootstrap stages verified `ShardSnapshotManifest` snapshots into
+  `<shard_dir>.staging` with atomic swap and rollback, then streams bounded,
+  ordered, gap-free WAL suffix chunks under an explicit `ReplicaCopyState`
+  state machine. General D10 divergent-history rollback/resync remains outside
+  the current model.
 - Bulk intake uses bounded, checksum-verified disk staging, bounded shard
   units, and ordered streamed results. Late malformed action lines still
   reject the request before writes. Admission, byte limits, cancellation,
   and reproduction are documented in [bounded bulk ingestion](docs/bulk-ingestion.md).
-- Remote manifest publication is serialized only inside one process; there is
-  no cross-process compare-and-set or writer fencing.
-- Remote-store ingest is manual, not near-real-time, and there is no unified
-  update/delete, compaction, retention, or object-store GC lifecycle.
-- Cold split hydration buffers full bundles, and cache/query/background work do
-  not share one complete resource budget.
-- End-to-end cancellation, deadline propagation, and admission control are
-  incomplete.
+- Remote manifest publication uses a single Raft-leased sequencer per index
+  (`ManifestWriterAuthority`) and storage compare-and-swap (`CompareToken` /
+  ETag conditional PUTs) with parallel split producers; true sequencer-free
+  concurrent manifest merging is outside the V1 design.
+- Tiered indices (`lifecycle_mode: "tiered"`) ingest into replicated local
+  hot-delta shards, seal bounded sequence ranges into immutable splits
+  (`/_remote_store/seal`), resolve one cross-layer `ReadSnapshot` with
+  versioned tombstones, compact splits (`/_remote_store/compact`), and sweep
+  expired unreachable objects (`/_remote_store/janitor`). Remote-split k-NN
+  vector execution remains unsupported (`501`).
+- Bundle hydration streams in 64 KiB chunks under `ResourceGovernor` byte
+  reservations and the unified node cache governor (`/_nodes/cache/inventory`).
+- End-to-end cancellation (`RequestCancellationContext`), monotonic deadline
+  propagation, per-class admission queues (`AdmissionController`), and
+  per-principal/per-index resource quotas (`/_security/quota*`) bound
+  distributed work.
 - OpenSearch compatibility is a tested subset, not a drop-in contract. See the
   [versioned compatibility matrix](docs/opensearch-compatibility.md) for every
   routed endpoint, important semantic differences, and unsupported surfaces.
-- Security is API-key based and opt-in; there is no SSO/OIDC/LDAP layer.
+- Security is API-key based and opt-in with Raft-replicated roles, tenant
+  quotas, and redacted audit logs (`/_security/audit`); there is no
+  SSO/OIDC/LDAP layer.
 
-These are ranked as engineering work, not hidden as caveats:
-[The Next 50 Engineering Tasks](docs/next-50-tasks.md).
+Completion evidence and explicit post-cut deferrals are recorded in:
+[The Next 50 Engineering Tasks](docs/next-50-tasks.md) and
+[Production V1 And Research Evidence Package](docs/production-v1-and-research-evidence.md).
 
 ## API Surface
 
@@ -621,16 +635,16 @@ endpoint and semantics inventory.
 
 | Area | Representative endpoints |
 |---|---|
-| Index | `PUT /{index}`, `DELETE /{index}`, `GET/PUT /{index}/_settings` |
+| Index | `PUT /{index}`, `DELETE /{index}`, `GET/PUT /{index}/_settings`, `GET/PUT/POST /{index}/_mapping` |
 | Documents | `POST /{index}/_doc`, `POST/PUT /{index}/_doc/{id}`, `GET/DELETE /{index}/_doc/{id}`, `POST /{index}/_update/{id}`, `POST/PUT /{index}/_create/{id}` |
 | Bulk | `POST /_bulk`, `POST /{index}/_bulk` |
 | Search | `GET/POST /{index}/_search`, `GET/POST /{index}/_count` |
 | SQL | `POST /{index}/_sql`, `/_sql`, `/{index}/_sql/stream`, `/_sql/stream`, `/{index}/_sql/explain` |
 | Catalog | `/_cat/nodes`, `/_cat/indices`, `/_cat/shards`, `/_cat/segments`, `/_cat/master` |
-| Maintenance | `/{index}/_refresh`, `/{index}/_flush`, `/{index}/_forcemerge`, `/_tasks/{id}` |
-| Security | `/_security/api_key`, `/_security/role/{name}` |
-| Remote store | `/{index}/_remote_store/publish`, `/{index}/_remote_store/verify` |
-| Observability | `/_cluster/health`, `/_cluster/state`, `/_metrics` |
+| Maintenance | `/{index}/_refresh`, `/{index}/_flush`, `/{index}/_forcemerge`, `/_tasks/{id}`, `/_snapshot/{snapshot_id}*` |
+| Security | `/_security/api_key`, `/_security/role/{name}`, `/_security/quota*`, `/_security/audit` |
+| Remote store & lifecycle | `/{index}/_remote_store/{publish,verify,inventory,janitor,seal,compact,rollback,repair}`, `/{index}/_lifecycle/{migrate,rollback,status}` |
+| Observability | `/_cluster/health`, `/_cluster/state`, `/_nodes/cache/inventory`, `/_metrics` |
 
 Unsupported behavior should fail explicitly rather than return
 shape-compatible false success.
@@ -696,6 +710,7 @@ Read:
 | Document | Purpose |
 |---|---|
 | [Architecture roadmap](docs/architecture-roadmap.md) | Canonical future direction and release gates |
+| [Production V1 and research evidence](docs/production-v1-and-research-evidence.md) | Gate 0–4 verification, ablation studies, formal TLA+ matrix, and explicit deferrals |
 | [AI agent guide](docs/ai-agent-guide.md) | Context, planning, validation, and handoff rules for GPT/Claude/Copilot |
 | [OpenSearch compatibility matrix](docs/opensearch-compatibility.md) | Versioned endpoint, semantic-difference, evidence, and unsupported-surface inventory |
 | [Remote-store live runbook](docs/remote-store-rustfs-live-runbook.md) | Shared S3-compatible storage validation |

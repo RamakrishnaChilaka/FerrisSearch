@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "matrix_version": "2026-10-15",
-  "source_baseline": "d1aa226 + FS-014",
+  "matrix_version": "2026-10-17",
+  "source_baseline": "v0.3.0 (FS-001..FS-050)",
   "product": "FerrisSearch pre-1.0",
   "claim": "OpenSearch-style REST API subset",
   "classifications": {
@@ -188,6 +188,50 @@
       ]
     },
     {
+      "id": "index-mapping-get",
+      "methods": ["GET"],
+      "path": "/{index}/_mapping",
+      "classification": "partial",
+      "summary": "Returns FerrisSearch index mappings, schema_generation, schema_hash, and schema_history.",
+      "evidence": [
+        "src/api/index/mod.rs#get_index_mappings",
+        "tests/rest_api_integration.rs#fs047_050_scale_scheduling_mixed_schema_generations_tenant_isolation_and_research_evidence_suite"
+      ]
+    },
+    {
+      "id": "index-mapping-put",
+      "methods": ["PUT", "POST"],
+      "path": "/{index}/_mapping",
+      "classification": "partial",
+      "summary": "Applies additive field mappings via Raft and advances schema_generation; incompatible field-type or dimension changes are rejected.",
+      "evidence": [
+        "src/api/index/mod.rs#put_index_mappings",
+        "tests/rest_api_integration.rs#fs047_050_scale_scheduling_mixed_schema_generations_tenant_isolation_and_research_evidence_suite"
+      ]
+    },
+    {
+      "id": "index-mappings-get",
+      "methods": ["GET"],
+      "path": "/{index}/_mappings",
+      "classification": "partial",
+      "summary": "Alias of GET /{index}/_mapping returning FerrisSearch mappings and schema lineage.",
+      "evidence": [
+        "src/api/index/mod.rs#get_index_mappings",
+        "tests/rest_api_integration.rs#fs047_050_scale_scheduling_mixed_schema_generations_tenant_isolation_and_research_evidence_suite"
+      ]
+    },
+    {
+      "id": "index-mappings-put",
+      "methods": ["PUT", "POST"],
+      "path": "/{index}/_mappings",
+      "classification": "partial",
+      "summary": "Alias of PUT/POST /{index}/_mapping for additive field evolution.",
+      "evidence": [
+        "src/api/index/mod.rs#put_index_mappings",
+        "tests/rest_api_integration.rs#fs047_050_scale_scheduling_mixed_schema_generations_tenant_isolation_and_research_evidence_suite"
+      ]
+    },
+    {
       "id": "remote-store-publish",
       "methods": ["POST"],
       "path": "/{index}/_remote_store/publish",
@@ -230,6 +274,160 @@
       "evidence": [
         "src/api/index/mod.rs#run_remote_store_janitor",
         "tests/rest_api_integration.rs#fs017_021_multi_node_fenced_publish_retry_failover_inventory_and_janitor_end_to_end"
+      ]
+    },
+    {
+      "id": "remote-store-seal",
+      "methods": ["POST"],
+      "path": "/{index}/_remote_store/seal",
+      "classification": "intentionally_different",
+      "summary": "FerrisSearch-only bounded hot-delta sealing into immutable object-store splits with contiguous watermark commit.",
+      "evidence": [
+        "src/api/index/mod.rs#seal_remote_store_delta",
+        "tests/rest_api_integration.rs#fs034_fs035_fs036_tiered_hot_delta_bounded_sealing_and_visibility_watermark"
+      ]
+    },
+    {
+      "id": "index-seal-alias",
+      "methods": ["POST"],
+      "path": "/{index}/_seal",
+      "classification": "intentionally_different",
+      "summary": "FerrisSearch alias of POST /{index}/_remote_store/seal.",
+      "evidence": [
+        "src/api/index/mod.rs#seal_remote_store_delta",
+        "tests/rest_api_integration.rs#fs034_fs035_fs036_tiered_hot_delta_bounded_sealing_and_visibility_watermark"
+      ]
+    },
+    {
+      "id": "remote-store-compact",
+      "methods": ["POST"],
+      "path": "/{index}/_remote_store/compact",
+      "classification": "intentionally_different",
+      "summary": "FerrisSearch-only fenced, idempotent split compactor that commits replacement lineage and upgrades older schema generations.",
+      "evidence": [
+        "src/api/index/mod.rs#compact_remote_store_splits",
+        "tests/rest_api_integration.rs#fs037_through_fs041_cross_layer_snapshot_tombstones_compaction_and_gc"
+      ]
+    },
+    {
+      "id": "index-compact-alias",
+      "methods": ["POST"],
+      "path": "/{index}/_compact",
+      "classification": "intentionally_different",
+      "summary": "FerrisSearch alias of POST /{index}/_remote_store/compact.",
+      "evidence": [
+        "src/api/index/mod.rs#compact_remote_store_splits",
+        "tests/rest_api_integration.rs#fs037_through_fs041_cross_layer_snapshot_tombstones_compaction_and_gc"
+      ]
+    },
+    {
+      "id": "remote-store-rollback",
+      "methods": ["POST"],
+      "path": "/{index}/_remote_store/rollback",
+      "classification": "intentionally_different",
+      "summary": "FerrisSearch-only forward-moving manifest rollback to a retained generation.",
+      "evidence": [
+        "src/api/index/mod.rs#rollback_remote_store_manifest",
+        "tests/rest_api_integration.rs#fs037_through_fs041_cross_layer_snapshot_tombstones_compaction_and_gc"
+      ]
+    },
+    {
+      "id": "remote-store-repair",
+      "methods": ["POST"],
+      "path": "/{index}/_remote_store/repair",
+      "classification": "intentionally_different",
+      "summary": "FerrisSearch-only manifest pointer repair from verified parent lineage or explicit quarantine on irreparable corruption.",
+      "evidence": [
+        "src/api/index/mod.rs#repair_remote_store_handler",
+        "tests/rest_api_integration.rs#fs042_cluster_backup_verify_restore_and_remote_store_repair_workflows"
+      ]
+    },
+    {
+      "id": "lifecycle-migrate",
+      "methods": ["POST"],
+      "path": "/{index}/_lifecycle/migrate",
+      "classification": "intentionally_different",
+      "summary": "FerrisSearch-only online migration of local_shards indices to the unified tiered lifecycle with oracle equivalence verification.",
+      "evidence": [
+        "src/api/index/mod.rs#migrate_index_lifecycle_handler",
+        "tests/rest_api_integration.rs#fs043_online_lifecycle_migration_equivalence_interruption_and_rollback"
+      ]
+    },
+    {
+      "id": "lifecycle-rollback",
+      "methods": ["POST"],
+      "path": "/{index}/_lifecycle/rollback",
+      "classification": "intentionally_different",
+      "summary": "FerrisSearch-only online rollback of a migrated tiered index back to mutable_only.",
+      "evidence": [
+        "src/api/index/mod.rs#rollback_index_lifecycle_handler",
+        "tests/rest_api_integration.rs#fs043_online_lifecycle_migration_equivalence_interruption_and_rollback"
+      ]
+    },
+    {
+      "id": "lifecycle-status",
+      "methods": ["GET"],
+      "path": "/{index}/_lifecycle/status",
+      "classification": "intentionally_different",
+      "summary": "FerrisSearch-only index lifecycle mode and migration status inspection.",
+      "evidence": [
+        "src/api/index/mod.rs#get_index_lifecycle_status_handler",
+        "tests/rest_api_integration.rs#fs043_online_lifecycle_migration_equivalence_interruption_and_rollback"
+      ]
+    },
+    {
+      "id": "cluster-snapshot-create",
+      "methods": ["POST", "PUT"],
+      "path": "/_snapshot/{snapshot_id}",
+      "classification": "intentionally_different",
+      "summary": "FerrisSearch cluster backup workflow writing ClusterBackupManifest and shard/remote-store artifacts; not the OpenSearch repository-scoped snapshot API.",
+      "evidence": [
+        "src/api/index/mod.rs#create_cluster_snapshot_handler",
+        "tests/rest_api_integration.rs#fs042_cluster_backup_verify_restore_and_remote_store_repair_workflows"
+      ]
+    },
+    {
+      "id": "cluster-snapshot-get",
+      "methods": ["GET"],
+      "path": "/_snapshot/{snapshot_id}",
+      "classification": "intentionally_different",
+      "summary": "Gets a FerrisSearch ClusterBackupManifest by snapshot ID.",
+      "evidence": [
+        "src/api/index/mod.rs#get_cluster_snapshot_handler",
+        "tests/rest_api_integration.rs#fs042_cluster_backup_verify_restore_and_remote_store_repair_workflows"
+      ]
+    },
+    {
+      "id": "cluster-snapshot-verify",
+      "methods": ["POST"],
+      "path": "/_snapshot/{snapshot_id}/_verify",
+      "classification": "intentionally_different",
+      "summary": "Verifies checksums and lineage of a FerrisSearch cluster backup.",
+      "evidence": [
+        "src/api/index/mod.rs#verify_cluster_snapshot_handler",
+        "tests/rest_api_integration.rs#fs042_cluster_backup_verify_restore_and_remote_store_repair_workflows"
+      ]
+    },
+    {
+      "id": "cluster-snapshot-restore",
+      "methods": ["POST"],
+      "path": "/_snapshot/{snapshot_id}/_restore",
+      "classification": "intentionally_different",
+      "summary": "Restores indices, documents, versions, and remote-store state from a verified FerrisSearch cluster backup.",
+      "evidence": [
+        "src/api/index/mod.rs#restore_cluster_snapshot_handler",
+        "tests/rest_api_integration.rs#fs042_cluster_backup_verify_restore_and_remote_store_repair_workflows"
+      ]
+    },
+    {
+      "id": "nodes-cache-inventory",
+      "methods": ["GET"],
+      "path": "/_nodes/cache/inventory",
+      "classification": "intentionally_different",
+      "summary": "FerrisSearch unified node cache governor inventory across artifact, reader, column, and staging tiers.",
+      "evidence": [
+        "src/api/index/mod.rs#get_node_cache_inventory_handler",
+        "tests/rest_api_integration.rs#fs047_050_scale_scheduling_mixed_schema_generations_tenant_isolation_and_research_evidence_suite"
       ]
     },
     {
@@ -413,6 +611,50 @@
       ]
     },
     {
+      "id": "security-quota-list",
+      "methods": ["GET"],
+      "path": "/_security/quota",
+      "classification": "intentionally_different",
+      "summary": "Lists FerrisSearch Raft-replicated per-principal and per-index resource quotas.",
+      "evidence": [
+        "src/api/security.rs#get_quotas",
+        "tests/rest_api_integration.rs#fs047_050_scale_scheduling_mixed_schema_generations_tenant_isolation_and_research_evidence_suite"
+      ]
+    },
+    {
+      "id": "security-quota-put",
+      "methods": ["PUT"],
+      "path": "/_security/quota/{scope}/{id}",
+      "classification": "intentionally_different",
+      "summary": "Creates or updates a FerrisSearch per-principal or per-index concurrency/byte quota.",
+      "evidence": [
+        "src/api/security.rs#put_quota",
+        "tests/rest_api_integration.rs#fs047_050_scale_scheduling_mixed_schema_generations_tenant_isolation_and_research_evidence_suite"
+      ]
+    },
+    {
+      "id": "security-quota-delete",
+      "methods": ["DELETE"],
+      "path": "/_security/quota/{scope}/{id}",
+      "classification": "intentionally_different",
+      "summary": "Deletes a FerrisSearch per-principal or per-index resource quota.",
+      "evidence": [
+        "src/api/security.rs#delete_quota",
+        "tests/rest_api_integration.rs#fs047_050_scale_scheduling_mixed_schema_generations_tenant_isolation_and_research_evidence_suite"
+      ]
+    },
+    {
+      "id": "security-audit-log",
+      "methods": ["GET"],
+      "path": "/_security/audit",
+      "classification": "intentionally_different",
+      "summary": "Returns FerrisSearch structured, secret-redacted security audit log entries.",
+      "evidence": [
+        "src/api/security.rs#get_audit_log",
+        "tests/rest_api_integration.rs#fs047_050_scale_scheduling_mixed_schema_generations_tenant_isolation_and_research_evidence_suite"
+      ]
+    },
+    {
       "id": "search-query-string",
       "methods": ["GET"],
       "path": "/{index}/_search",
@@ -535,14 +777,6 @@
     }
   ],
   "important_unsupported": [
-    {
-      "id": "mapping-update",
-      "methods": ["PUT"],
-      "path": "/{index}/_mapping",
-      "classification": "unsupported",
-      "summary": "No public mapping-update route; dynamic mapping is internal and additive.",
-      "evidence": ["src/api/mod.rs#create_router"]
-    },
     {
       "id": "multi-search",
       "methods": ["GET", "POST"],
