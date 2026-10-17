@@ -1,8 +1,8 @@
 # OpenSearch Compatibility Matrix
 
 > - **Status:** Current implemented behavior
-> - **Matrix version:** 2026-10-15
-> - **Source baseline:** `d1aa226` plus FS-014
+> - **Matrix version:** 2026-10-17
+> - **Source baseline:** `v0.3.0` (`FS-001`..`FS-050`)
 > - **Product claim:** OpenSearch-style REST API subset
 > - **Canonical inventory:** [`opensearch-compatibility.json`](opensearch-compatibility.json)
 
@@ -130,11 +130,14 @@ and `src/api/index/fs014_tests.rs`.
   details. If every shard fails, the request returns
   `search_phase_execution_exception`; client parse failures are 400,
   unavailable targets 503, and other engine failures 500.
-  `allow_partial_search_results=false` is not implemented.
+  On `remote_store` indices, `allow_partial_search_results` defaults to `true`
+  (returning HTTP 200 with `_shards.failed` when at least one split succeeds);
+  explicitly setting `allow_partial_search_results=false` rejects the query when
+  any split fails unrecoverably.
 - `_count` supports match-all and POST query bodies. `_count?q=...` and
   `_msearch` are unsupported.
 - Remote-store search is shardless and can report conservative split-pruning
-  counters. A failed split is not silently dropped.
+  and scheduling counters. A failed split is not silently dropped.
 
 Evidence:
 `.github/instructions/search.instructions.md`,
@@ -203,10 +206,28 @@ The status applies only to the scope described in the canonical JSON entry.
 | `DELETE` | `/{index}` | Partial |
 | `GET` | `/{index}/_settings` | Partial |
 | `PUT` | `/{index}/_settings` | Partial |
+| `GET` | `/{index}/_mapping` | Partial |
+| `PUT`, `POST` | `/{index}/_mapping` | Partial |
+| `GET` | `/{index}/_mappings` | Partial |
+| `PUT`, `POST` | `/{index}/_mappings` | Partial |
 | `POST` | `/{index}/_remote_store/publish` | Intentionally different |
 | `POST` | `/{index}/_remote_store/verify` | Intentionally different |
 | `GET`, `POST` | `/{index}/_remote_store/inventory` | Intentionally different |
 | `POST` | `/{index}/_remote_store/janitor` | Intentionally different |
+| `POST` | `/{index}/_remote_store/seal` | Intentionally different |
+| `POST` | `/{index}/_seal` | Intentionally different |
+| `POST` | `/{index}/_remote_store/compact` | Intentionally different |
+| `POST` | `/{index}/_compact` | Intentionally different |
+| `POST` | `/{index}/_remote_store/rollback` | Intentionally different |
+| `POST` | `/{index}/_remote_store/repair` | Intentionally different |
+| `POST` | `/{index}/_lifecycle/migrate` | Intentionally different |
+| `POST` | `/{index}/_lifecycle/rollback` | Intentionally different |
+| `GET` | `/{index}/_lifecycle/status` | Intentionally different |
+| `POST`, `PUT` | `/_snapshot/{snapshot_id}` | Intentionally different |
+| `GET` | `/_snapshot/{snapshot_id}` | Intentionally different |
+| `POST` | `/_snapshot/{snapshot_id}/_verify` | Intentionally different |
+| `POST` | `/_snapshot/{snapshot_id}/_restore` | Intentionally different |
+| `GET` | `/_nodes/cache/inventory` | Intentionally different |
 | `POST` | `/{index}/_doc` | Partial |
 | `PUT`, `POST` | `/{index}/_doc/{id}` | Partial |
 | `GET` | `/{index}/_doc/{id}` | Partial |
@@ -231,6 +252,10 @@ The status applies only to the scope described in the canonical JSON entry.
 | `PUT` | `/_security/role/{name}` | Intentionally different |
 | `GET` | `/_security/role/{name}` | Intentionally different |
 | `DELETE` | `/_security/role/{name}` | Intentionally different |
+| `GET` | `/_security/quota` | Intentionally different |
+| `PUT` | `/_security/quota/{scope}/{id}` | Intentionally different |
+| `DELETE` | `/_security/quota/{scope}/{id}` | Intentionally different |
+| `GET` | `/_security/audit` | Intentionally different |
 | `GET`, `POST` | `/{index}/_refresh` | Partial |
 | `GET`, `POST` | `/{index}/_flush` | Partial |
 | `POST` | `/{index}/_forcemerge` | Intentionally different |
@@ -239,12 +264,12 @@ The status applies only to the scope described in the canonical JSON entry.
 
 | Surface | Examples | Migration impact |
 |---|---|---|
-| Mapping updates | `PUT /{index}/_mapping` | No public route; current dynamic mapping is additive and internal. |
+| In-place mapping type changes | `PUT /{index}/_mapping` (changing existing field types) | Only additive field mappings are supported; incompatible field-type or dimension changes are rejected with `400`. |
 | Multi-search and count query string | `/_msearch`, `/{index}/_count?q=...` | Submit supported searches individually and use POST count bodies. |
 | Aliases | `/_aliases`, `/{index}/_alias/*` | No alias-based atomic cutover or routing. |
 | Index templates and data streams | `/_index_template/*`, `/_data_stream/*` | Provision concrete indices explicitly. |
 | PIT, scroll, and named snapshots | point-in-time, `/_search/scroll` | Only request-scoped current readers exist; no public stable multi-request snapshot. |
-| Snapshot/restore repositories | `/_snapshot/*` | No OpenSearch backup/restore API. |
+| Snapshot/restore repositories | `/_snapshot/{repository}/{snapshot}` | OpenSearch multi-repository snapshot APIs are not implemented; FerrisSearch provides its own `/_snapshot/{snapshot_id}` cluster backup/verify/restore routes. |
 | Index lifecycle management | `/_plugins/_ism/*` | No ISM/ILM policy engine. |
 | OpenSearch Security plugin | `/_plugins/_security/api/*` | FerrisSearch's smaller `/_security/*` model is not wire compatible. |
 | Full write parameter surface | routing, pipelines, external versions, aliases, data streams | Safety-relevant unsupported parameters fail explicitly. |
