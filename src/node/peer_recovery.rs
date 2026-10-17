@@ -4347,6 +4347,14 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), flush_rx.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), policy_rx.changed())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(*refresh_rx.borrow(), Duration::from_millis(2500));
         assert_eq!(*flush_rx.borrow(), 1_048_576);
         let observed_policy = *policy_rx.borrow();
@@ -4354,6 +4362,21 @@ mod tests {
         assert_eq!(observed_policy.lag_timeout_ms, 80);
         assert_eq!(observed_policy.recovery_retry_initial_backoff_ms, 75);
         assert_eq!(observed_policy.recovery_retry_max_backoff_ms, 300);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while follower_shards
+                .isr_tracker
+                .effective_max_lag_ops("reactive-idx")
+                != 2
+                || follower_shards
+                    .isr_tracker
+                    .effective_lag_timeout("reactive-idx", Duration::from_secs(60))
+                    != Duration::from_millis(80)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(
             follower_shards
                 .isr_tracker
