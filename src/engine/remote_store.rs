@@ -6732,19 +6732,6 @@ mod tests {
         let cluster_manager = Arc::new(crate::cluster::ClusterManager::with_shared_state(
             shared_state,
         ));
-        let mut cs = crate::cluster::state::ClusterState::new("remote-capability-test".into());
-        cs.nodes.insert(
-            "node-1".into(),
-            NodeInfo {
-                id: "node-1".into(),
-                name: "node-1".into(),
-                host: "127.0.0.1".into(),
-                transport_port: 19300,
-                http_port: 19200,
-                roles: vec![NodeRole::Master, NodeRole::Data],
-                raft_node_id: 1,
-            },
-        );
         let index_uuid = IndexUuid::new("idx-cap-1");
         let metadata = IndexMetadata {
             name: "events".into(),
@@ -6768,8 +6755,24 @@ mod tests {
                 ..IndexSettings::default()
             },
         };
-        cs.add_index(metadata.clone());
-        cluster_manager.update_state(cs);
+        raft.client_write(crate::consensus::types::ClusterCommand::AddNode {
+            node: NodeInfo {
+                id: "node-1".into(),
+                name: "node-1".into(),
+                host: "127.0.0.1".into(),
+                transport_port: 19300,
+                http_port: 19200,
+                roles: vec![NodeRole::Master, NodeRole::Data],
+                raft_node_id: 1,
+            },
+        })
+        .await
+        .unwrap();
+        raft.client_write(crate::consensus::types::ClusterCommand::CreateIndex {
+            metadata: metadata.clone(),
+        })
+        .await
+        .unwrap();
 
         let app_state = AppState {
             cluster_manager,

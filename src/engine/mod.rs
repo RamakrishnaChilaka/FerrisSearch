@@ -341,11 +341,9 @@ impl Drop for PeerRecoveryRetentionPin {
                 let _ = translog.release_retention_pin(pin_id);
             }
         };
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::spawn_blocking(release);
-        } else {
-            release();
-        }
+        let _ = std::thread::Builder::new()
+            .name("peer-recovery-pin-release".into())
+            .spawn(release);
     }
 }
 

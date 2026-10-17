@@ -176,6 +176,7 @@ async fn atomic_real_raft_queued_autocreates_use_winning_metadata() {
     let winner_uuid = winner.uuid.clone();
     let raft = cluster.nodes[0].state.raft.clone();
     cluster.leader_gate.pause();
+    cluster.gate.pause();
     let first = tokio::spawn(async move {
         raft.client_write(ClusterCommand::CreateIndex { metadata: winner })
             .await
@@ -209,6 +210,7 @@ async fn atomic_real_raft_queued_autocreates_use_winning_metadata() {
             .contains_key(index),
     );
     cluster.leader_gate.resume();
+    cluster.gate.resume();
     assert_eq!(first.await.unwrap().data, ClusterResponse::Ok);
     let mut failures = Vec::new();
     for create in creates {

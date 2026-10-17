@@ -507,11 +507,9 @@ impl Drop for PreparedSourceSnapshot {
                 );
             }
         };
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::spawn_blocking(cleanup);
-        } else {
-            cleanup();
-        }
+        let _ = std::thread::Builder::new()
+            .name("peer-recovery-snapshot-cleanup".into())
+            .spawn(cleanup);
     }
 }
 
@@ -1016,7 +1014,7 @@ impl TransportService {
                 && registry.setups.contains_key(&task_session_id);
             if !still_active {
                 drop(registry);
-                drop(prepared);
+                let _ = tokio::task::spawn_blocking(move || drop(prepared)).await;
                 return;
             }
 
@@ -1461,7 +1459,7 @@ impl TransportService {
         }
 
         let engine = self
-            .get_or_open_shard(&request.index_name, request.shard_id)
+            .get_or_open_shard_without_reopen(&request.index_name, request.shard_id)
             .await?;
         let Some(shard_dir) = self
             .shard_manager

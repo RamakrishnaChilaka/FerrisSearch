@@ -6554,11 +6554,33 @@ impl TransportService {
     }
 
     #[allow(clippy::result_large_err)]
+    async fn get_or_open_shard_without_reopen(
+        &self,
+        index_name: &str,
+        shard_id: u32,
+    ) -> Result<Arc<dyn crate::engine::SearchEngine>, Status> {
+        self.get_or_open_shard_inner(index_name, shard_id, None, false)
+            .await
+    }
+
+    #[allow(clippy::result_large_err)]
     async fn get_or_open_shard_with_override(
         &self,
         index_name: &str,
         shard_id: u32,
         open_override: Option<DynamicShardOpenOverride>,
+    ) -> Result<Arc<dyn crate::engine::SearchEngine>, Status> {
+        self.get_or_open_shard_inner(index_name, shard_id, open_override, true)
+            .await
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn get_or_open_shard_inner(
+        &self,
+        index_name: &str,
+        shard_id: u32,
+        open_override: Option<DynamicShardOpenOverride>,
+        reopen_on_schema_evolution: bool,
     ) -> Result<Arc<dyn crate::engine::SearchEngine>, Status> {
         let state = self.cluster_manager.get_state();
         let Some(metadata) = state.indices.get(index_name) else {
@@ -6593,7 +6615,10 @@ impl TransportService {
                 return Err(pre_execution_copy_unavailable_status(&error)
                     .unwrap_or_else(|| Status::failed_precondition(format!("{error:#}"))));
             }
-            if !engine.has_all_mapped_fields(&metadata.mappings) {
+            if reopen_on_schema_evolution
+                && metadata.effective_schema_generation() > 1
+                && !engine.has_all_mapped_fields(&metadata.mappings)
+            {
                 engine = self
                     .shard_manager
                     .reopen_shard(
