@@ -158,6 +158,10 @@ impl ShardFailure {
     pub(crate) fn to_json(&self) -> Value {
         self.details.clone()
     }
+
+    pub(crate) fn is_client_error(&self) -> bool {
+        self.status == StatusCode::BAD_REQUEST
+    }
 }
 
 pub(crate) fn shard_stats(successful: u32, failed: u32, failures: &[ShardFailure]) -> Value {

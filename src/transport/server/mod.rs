@@ -2517,8 +2517,9 @@ impl InternalTransport for TransportService {
         let mut all_hits = Vec::new();
         let mut total_hits: usize = 0;
 
-        let estimated_bytes =
-            ((search_req.size.saturating_add(search_req.from)).max(1) as u64).saturating_mul(256);
+        let max_possible_hits = engine.doc_count().max(1);
+        let requested_window = (search_req.size.saturating_add(search_req.from) as u64).max(1);
+        let estimated_bytes = requested_window.min(max_possible_hits).saturating_mul(256);
 
         // Run all blocking engine work on the search pool
         let search_result = crate::worker::with_task_request_context(ctx.clone(), async {
@@ -2547,7 +2548,7 @@ impl InternalTransport for TransportService {
                 .await?;
             if let Ok((ref hits, _, _, ref knn_hits)) = res {
                 let actual_bytes = ((hits.len() + knn_hits.len()) as u64).saturating_mul(256);
-                let _ = mem_reservation.reconcile(actual_bytes);
+                mem_reservation.reconcile(actual_bytes)?;
             }
             Ok(res)
         })
@@ -2828,7 +2829,10 @@ impl InternalTransport for TransportService {
             })?;
 
         let columns: Vec<String> = req.columns;
-        let estimated_bytes = ((search_req.size.max(1) as u64)
+        let max_possible_rows = engine.doc_count().max(1);
+        let requested_rows = (search_req.size as u64).max(1);
+        let estimated_bytes = (requested_rows
+            .min(max_possible_rows)
             .saturating_mul((columns.len().max(1) as u64) * 32))
         .max(256);
 
@@ -2850,7 +2854,7 @@ impl InternalTransport for TransportService {
                 .await?;
             if let Ok(Some(ref batch_res)) = res {
                 let actual = batch_res.batch.get_array_memory_size() as u64;
-                let _ = mem_reservation.reconcile(actual);
+                mem_reservation.reconcile(actual)?;
             }
             Ok(res)
         })
