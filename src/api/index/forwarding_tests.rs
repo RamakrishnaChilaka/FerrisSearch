@@ -263,12 +263,8 @@ impl ForwardingCluster {
             .unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             while nodes.iter().skip(1).any(|node| {
-                node.state
-                    .cluster_manager
-                    .get_state()
-                    .master_node
-                    .as_deref()
-                    != Some("node-1")
+                let state = node.state.cluster_manager.get_state();
+                state.master_node.as_deref() != Some("node-1") || state.nodes.len() != nodes.len()
             }) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
