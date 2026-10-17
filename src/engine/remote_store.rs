@@ -1189,11 +1189,13 @@ pub(crate) async fn execute_leaf_search_batch(
     let mut outcomes = Vec::with_capacity(assigned_splits.len());
     for split in assigned_splits {
         crate::worker::check_current_request_active(crate::worker::ExecutionStage::Search)?;
-        let estimated_query_bytes =
-            ((search_req.size.saturating_add(search_req.from)).max(1) as u64).saturating_mul(256);
-        let _query_memory_reservation = context.worker_pools.resource_governor().try_reserve(
+        let requested_window = (search_req.size.saturating_add(search_req.from) as u64).max(1);
+        let initial_estimated_bytes = requested_window
+            .min(split.size_bytes.max(1))
+            .saturating_mul(256);
+        let mut query_memory_reservation = context.worker_pools.resource_governor().try_reserve(
             crate::worker::ResourcePoolKind::Memory,
-            estimated_query_bytes,
+            initial_estimated_bytes,
         )?;
         let outcome = match context
             .reader_cache
@@ -1201,6 +1203,9 @@ pub(crate) async fn execute_leaf_search_batch(
             .await
         {
             Ok(reader) => {
+                let max_possible_hits = reader.engine.doc_count().max(1);
+                query_memory_reservation
+                    .reconcile(requested_window.min(max_possible_hits).saturating_mul(256))?;
                 let engine = Arc::clone(&reader.engine);
                 let search_req = search_req.for_remote_split(&split.split_id);
                 match context
@@ -1208,13 +1213,17 @@ pub(crate) async fn execute_leaf_search_batch(
                     .spawn_search(move || engine.search_query(&search_req))
                     .await
                 {
-                    Ok(Ok((hits, total_hits, partial_aggs))) => LeafSplitSearchOutcome {
-                        split_id: split.split_id.clone(),
-                        hits,
-                        total_hits,
-                        partial_aggs,
-                        error: None,
-                    },
+                    Ok(Ok((hits, total_hits, partial_aggs))) => {
+                        let actual_bytes = (hits.len() as u64).saturating_mul(256);
+                        query_memory_reservation.reconcile(actual_bytes)?;
+                        LeafSplitSearchOutcome {
+                            split_id: split.split_id.clone(),
+                            hits,
+                            total_hits,
+                            partial_aggs,
+                            error: None,
+                        }
+                    }
                     Ok(Err(error))
                         if crate::search::query_string::query_error_is_client(&error)
                             || crate::worker::is_cancellation_or_deadline_error(&error) =>
@@ -1633,29 +1642,31 @@ fn apply_remote_store_batch_results(
                     error
                 );
                 let error_text = format!("{error:#}");
-                let is_terminal = split_error_is_terminal(&error_text);
+                let mut any_retryable = false;
                 for split in &assigned_splits {
                     if accumulator.completed_split_ids.contains(&split.split_id) {
                         accumulator.duplicate_responses_suppressed += 1;
                         continue;
                     }
-                    accumulator.failures.insert(
+                    let failure = ShardFailure::from_error(
+                        index_name,
                         split.split_id.clone(),
-                        ShardFailure::from_error(
-                            index_name,
-                            split.split_id.clone(),
-                            &node_id,
-                            &error,
-                        ),
+                        &node_id,
+                        &error,
                     );
+                    let is_terminal = split_error_is_terminal(&error_text)
+                        || crate::search::query_string::query_error_is_client(&error)
+                        || failure.is_client_error();
+                    accumulator.failures.insert(split.split_id.clone(), failure);
                     if is_terminal {
                         accumulator.terminal_failures += 1;
                     } else {
+                        any_retryable = true;
                         accumulator.retryable_failures += 1;
                         next_pending.push(split.clone());
                     }
                 }
-                if !is_terminal {
+                if any_retryable {
                     newly_unhealthy_nodes.insert(node_id);
                 }
             }
@@ -2286,10 +2297,7 @@ pub(crate) async fn search_with_resolved_snapshot(
         let mut batch_results = Vec::with_capacity(raw_batch_results.len());
         for (node_id, assigned, result) in raw_batch_results {
             match result {
-                Err(error)
-                    if crate::worker::is_cancellation_or_deadline_error(&error)
-                        || crate::search::query_string::query_error_is_client(&error) =>
-                {
+                Err(error) if crate::worker::is_cancellation_or_deadline_error(&error) => {
                     return Err(query_error_response(error));
                 }
                 other => batch_results.push((node_id, assigned, other)),
@@ -2382,7 +2390,9 @@ pub(crate) async fn search_with_resolved_snapshot(
     if let Some(error) = all_shards_failed_response(accumulator.successful, &shard_failures) {
         return Err(error);
     }
-    if !allow_partial && !shard_failures.is_empty() {
+    if (!allow_partial || shard_failures.iter().any(ShardFailure::is_client_error))
+        && !shard_failures.is_empty()
+    {
         return Err(all_shards_failed_response(0, &shard_failures).expect("non-empty failures"));
     }
 
