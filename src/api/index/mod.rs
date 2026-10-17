@@ -269,6 +269,7 @@ pub(crate) async fn ensure_local_index_shards_open(
                 continue;
             }
             if !existing_engine.has_all_mapped_fields(&metadata.mappings) {
+                drop(existing_engine);
                 let _ = state
                     .shard_manager
                     .reopen_shard(

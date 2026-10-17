@@ -343,6 +343,25 @@ async fn get_or_open_read_shard(
                 pre_execution_copy_unavailable_status(&error)
                     .unwrap_or_else(|| Status::failed_precondition(format!("{error:#}")))
             })?;
+        if !engine.has_all_mapped_fields(&metadata.mappings) {
+            drop(engine);
+            let reopened = shard_manager
+                .reopen_shard(
+                    index_name.to_string(),
+                    shard_id,
+                    metadata.mappings.clone(),
+                    metadata.settings.clone(),
+                    metadata.uuid.to_string(),
+                    allocation_id,
+                )
+                .await
+                .map_err(|error| {
+                    Status::unavailable(format!(
+                        "failed to reopen shard [{index_name}][{shard_id}] with evolved mappings: {error:#}"
+                    ))
+                })?;
+            return Ok(reopened);
+        }
         return Ok(engine);
     }
 
@@ -1202,18 +1221,21 @@ impl InternalTransport for TransportService {
                     );
                 }
                 crate::metrics::DOCS_INDEXED_TOTAL.inc();
-                Ok(Response::new(ShardDocResponse {
-                    success: true,
-                    doc_id: id,
-                    error: String::new(),
-                    seq_no: Some(seq_no),
-                    primary_term: Some(primary_term),
-                    created,
-                    write_refresh,
-                    failure: None,
-                    version: Some(version),
-                    write_acknowledgement: Some(write_acknowledgement),
-                }))
+                Ok(self.maybe_attach_index_state_version(
+                    &req.index_name,
+                    Response::new(ShardDocResponse {
+                        success: true,
+                        doc_id: id,
+                        error: String::new(),
+                        seq_no: Some(seq_no),
+                        primary_term: Some(primary_term),
+                        created,
+                        write_refresh,
+                        failure: None,
+                        version: Some(version),
+                        write_acknowledgement: Some(write_acknowledgement),
+                    }),
+                ))
             }
             Err(e)
                 if WriteFailure::before_wal(&e)
@@ -1337,13 +1359,11 @@ impl InternalTransport for TransportService {
                     || operation.if_seq_no.is_some()
                     || operation.client_operation.is_some()
             }) {
-                return bulk_writes::execute_ordered_bulk(
-                    self,
-                    req,
-                    write_deadline,
-                    refresh_deadline,
-                )
-                .await;
+                let index_name = req.index_name.clone();
+                let response =
+                    bulk_writes::execute_ordered_bulk(self, req, write_deadline, refresh_deadline)
+                        .await?;
+                return Ok(self.maybe_attach_index_state_version(&index_name, response));
             }
         }
 
@@ -1687,16 +1707,19 @@ impl InternalTransport for TransportService {
                 }
                 let doc_count = ids.len() as u64;
                 crate::metrics::BULK_DOCS_TOTAL.inc_by(doc_count);
-                Ok(Response::new(ShardBulkResponse {
-                    success: true,
-                    doc_ids: ids,
-                    error: String::new(),
-                    start_seq_no: Some(start_seq_no),
-                    primary_term: Some(primary_term),
-                    results,
-                    failure: None,
-                    write_acknowledgement: Some(write_acknowledgement),
-                }))
+                Ok(self.maybe_attach_index_state_version(
+                    &req.index_name,
+                    Response::new(ShardBulkResponse {
+                        success: true,
+                        doc_ids: ids,
+                        error: String::new(),
+                        start_seq_no: Some(start_seq_no),
+                        primary_term: Some(primary_term),
+                        results,
+                        failure: None,
+                        write_acknowledgement: Some(write_acknowledgement),
+                    }),
+                ))
             }
             Err(e)
                 if WriteFailure::before_wal(&e) && crate::engine::is_write_validation_error(&e) =>
@@ -6547,6 +6570,24 @@ impl TransportService {
             .map_err(|error| format!("primary acknowledgement durability proof revoked: {error:#}"))
     }
 
+    fn maybe_attach_index_state_version<T>(
+        &self,
+        index_name: &str,
+        mut response: Response<T>,
+    ) -> Response<T> {
+        let index_version = self.transport_client.required_state_version(index_name);
+        if index_version > 0 {
+            response.metadata_mut().insert(
+                crate::transport::state_wait::STATE_VERSION_HEADER,
+                index_version
+                    .to_string()
+                    .parse()
+                    .expect("u64 is valid ASCII metadata"),
+            );
+        }
+        response
+    }
+
     #[allow(clippy::result_large_err)]
     async fn get_or_open_shard(
         &self,
@@ -6600,7 +6641,7 @@ impl TransportService {
         let assigned = self
             .assigned_local_shard(index_name, shard_id)
             .map_err(Status::failed_precondition)?;
-        if let Some(mut engine) = self.shard_manager.get_shard(index_name, shard_id) {
+        if let Some(engine) = self.shard_manager.get_shard(index_name, shard_id) {
             if let Err(error) = self.shard_manager.validate_open_copy_identity(
                 index_name,
                 shard_id,
@@ -6619,16 +6660,21 @@ impl TransportService {
                 return Err(pre_execution_copy_unavailable_status(&error)
                     .unwrap_or_else(|| Status::failed_precondition(format!("{error:#}"))));
             }
+            let target_mappings = open_override
+                .as_ref()
+                .map(|ov| &ov.mappings)
+                .unwrap_or(&metadata.mappings);
             if reopen_on_schema_evolution
-                && metadata.effective_schema_generation() > 1
-                && !engine.has_all_mapped_fields(&metadata.mappings)
+                && (open_override.is_some() || metadata.effective_schema_generation() > 1)
+                && !engine.has_all_mapped_fields(target_mappings)
             {
-                engine = self
+                drop(engine);
+                let reopened = self
                     .shard_manager
                     .reopen_shard(
                         index_name.to_string(),
                         shard_id,
-                        metadata.mappings.clone(),
+                        target_mappings.clone(),
                         metadata.settings.clone(),
                         assigned.index_uuid.clone(),
                         assigned.allocation_id,
@@ -6639,6 +6685,7 @@ impl TransportService {
                             "failed to reopen shard [{index_name}][{shard_id}] with evolved mappings: {error:#}"
                         ))
                     })?;
+                return Ok(reopened);
             }
             return Ok(engine);
         }
