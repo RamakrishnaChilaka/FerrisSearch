@@ -179,24 +179,52 @@ pub(crate) struct DistributedDslSearchResult {
     pub remote_store_stats: Option<RemoteStoreSearchStats>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RemoteStoreSchedulingStats {
+    pub snapshot_id: String,
+    pub manifest_generation: u64,
+    pub schema_generation: u64,
+    pub candidate_window: usize,
+    pub eligible_leaves: usize,
+    pub batches_dispatched: usize,
+    pub assignment_ids: Vec<String>,
+    pub reader_warm_assignments: usize,
+    pub artifact_warm_assignments: usize,
+    pub cold_assignments: usize,
+    pub assigned_bytes: u64,
+    pub hydrated_bytes: u64,
+    pub retry_rounds: usize,
+    pub retried_splits: usize,
+    pub duplicate_responses_suppressed: usize,
+    pub retryable_failures: usize,
+    pub terminal_failures: usize,
+    pub allow_partial_results: bool,
+    pub partial_results: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RemoteStoreSearchStats {
     pub published_splits: usize,
     pub candidate_splits: usize,
     pub pruned_splits: usize,
     pub assigned_splits: usize,
+    pub scheduling: Option<RemoteStoreSchedulingStats>,
 }
 
 impl RemoteStoreSearchStats {
     pub(crate) fn to_response_json(&self) -> Value {
-        serde_json::json!({
+        let mut out = serde_json::json!({
             "pruning": {
                 "published_splits": self.published_splits,
                 "candidate_splits": self.candidate_splits,
                 "pruned_splits": self.pruned_splits,
                 "assigned_splits": self.assigned_splits,
             }
-        })
+        });
+        if let Some(ref sched) = self.scheduling {
+            out["scheduling"] = serde_json::to_value(sched).unwrap_or(Value::Null);
+        }
+        out
     }
 }
 
@@ -224,11 +252,7 @@ pub(crate) async fn ensure_local_index_shards_open(
             );
             continue;
         };
-        if state
-            .shard_manager
-            .get_shard(index_name, *shard_id)
-            .is_some()
-        {
+        if let Some(existing_engine) = state.shard_manager.get_shard(index_name, *shard_id) {
             if let Err(error) = state.shard_manager.validate_open_copy_identity(
                 index_name,
                 *shard_id,
@@ -242,6 +266,20 @@ pub(crate) async fn ensure_local_index_shards_open(
                     shard_id,
                     error
                 );
+                continue;
+            }
+            if !existing_engine.has_all_mapped_fields(&metadata.mappings) {
+                let _ = state
+                    .shard_manager
+                    .reopen_shard(
+                        index_name.to_string(),
+                        *shard_id,
+                        metadata.mappings.clone(),
+                        metadata.settings.clone(),
+                        metadata.uuid.to_string(),
+                        allocation_id,
+                    )
+                    .await;
             }
             continue;
         }
@@ -1402,6 +1440,9 @@ pub(crate) async fn execute_distributed_dsl_search(
     if let Some(error) = all_shards_failed_response(successful, &shard_failures) {
         return Err(error);
     }
+    if search_req.allow_partial_results() == Some(false) && !shard_failures.is_empty() {
+        return Err(all_shards_failed_response(0, &shard_failures).expect("non-empty failures"));
+    }
 
     let merge_started = std::time::Instant::now();
     let mut remote_store_stats = None;
@@ -1499,6 +1540,19 @@ pub async fn search_documents_dsl(
         },
         _ => None,
     };
+    let requested_allow_partial = match req.get("allow_partial_search_results") {
+        Some(v) if !v.is_null() => match v.as_bool() {
+            Some(b) => Some(b),
+            None => {
+                return crate::api::error_response(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    "Invalid query DSL: 'allow_partial_search_results' must be a boolean",
+                );
+            }
+        },
+        _ => None,
+    };
     let mut search_req: crate::search::SearchRequest = match serde_json::from_value(req) {
         Ok(r) => r,
         Err(e) => {
@@ -1511,6 +1565,9 @@ pub async fn search_documents_dsl(
     };
     if let Some(generation) = requested_snapshot_gen {
         search_req = search_req.with_snapshot_generation(generation);
+    }
+    if let Some(allow_partial) = requested_allow_partial {
+        search_req = search_req.with_allow_partial_results(allow_partial);
     }
 
     // Validate search_after request shape before dispatching to shards.
@@ -2874,6 +2931,24 @@ pub async fn get_index_lifecycle_status_handler(
 pub async fn get_node_cache_inventory_handler(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<Value>) {
+    if state.security_manager.enabled()
+        && let Some((key_id, _)) = crate::worker::current_request_principal()
+        && let Some(p) = state.security_manager.find_principal_by_id(&key_id)
+        && !p.indices.is_empty()
+        && !state.security_manager.authorize(
+            &p,
+            &crate::security::ClassifiedRequest {
+                action: crate::security::SecurityAction::ClusterAdmin,
+                index: None,
+            },
+        )
+    {
+        return crate::api::error_response(
+            StatusCode::FORBIDDEN,
+            "security_exception",
+            "insufficient permissions: tenant-scoped principals cannot inspect global node cache inventory",
+        );
+    }
     let cache_inventory = state.storage_manager.cache_inventory_snapshot();
     let leaf_inventory = state.remote_store_reader_cache.leaf_inventory_snapshot();
     (
@@ -2882,6 +2957,246 @@ pub async fn get_node_cache_inventory_handler(
             "node_id": state.local_node_id,
             "cache_inventory": cache_inventory,
             "leaf_inventory": leaf_inventory,
+        })),
+    )
+}
+
+/// GET /{index}/_mapping or GET /{index}/_mappings — Inspect current index mappings
+/// and logical schema generation lineage (`FS-048`, ADR 0005).
+pub async fn get_index_mappings(
+    State(state): State<AppState>,
+    Path(index_name): Path<crate::common::IndexName>,
+) -> (StatusCode, Json<Value>) {
+    let cluster_state = state.cluster_manager.get_state();
+    let Some(metadata) = cluster_state.indices.get(index_name.as_str()) else {
+        return crate::api::error_response(
+            StatusCode::NOT_FOUND,
+            "index_not_found_exception",
+            format!("no such index [{index_name}]"),
+        );
+    };
+    let schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            index_name.to_string(): {
+                "mappings": {
+                    "dynamic": metadata.dynamic.to_string(),
+                    "properties": metadata.mappings,
+                },
+                "schema_generation": metadata.effective_schema_generation(),
+                "schema_hash": schema_hash,
+                "schema_history": metadata.schema_history(),
+            }
+        })),
+    )
+}
+
+/// PUT/POST /{index}/_mapping or PUT/POST /{index}/_mappings — Apply an additive
+/// schema evolution, advancing the index's monotonic `schema_generation` while
+/// rejecting incompatible field-type redefinitions, removals, or renames (`FS-048`, ADR 0005).
+pub async fn put_index_mappings(
+    State(state): State<AppState>,
+    Path(index_name): Path<crate::common::IndexName>,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    let cluster_state = state.cluster_manager.get_state();
+    let Some(metadata) = cluster_state.indices.get(index_name.as_str()).cloned() else {
+        return crate::api::error_response(
+            StatusCode::NOT_FOUND,
+            "index_not_found_exception",
+            format!("no such index [{index_name}]"),
+        );
+    };
+
+    let mapping_scope = body.get("mappings").unwrap_or(&body);
+    let Some(scope_obj) = mapping_scope.as_object() else {
+        return illegal_argument("mapping update body must be a JSON object");
+    };
+    for forbidden_key in ["remove_fields", "drop_fields", "rename_fields", "aliases"] {
+        if scope_obj.contains_key(forbidden_key) || body.get(forbidden_key).is_some() {
+            return illegal_argument(format!(
+                "unsupported schema mutation [{forbidden_key}]: field removal, rename, and aliasing are rejected within a schema lineage (recreate the index)"
+            ));
+        }
+    }
+
+    let next_dynamic = match scope_obj.get("dynamic").or_else(|| body.get("dynamic")) {
+        Some(v) => {
+            let Some(s) = v.as_str() else {
+                return illegal_argument("'dynamic' must be a string [true, false, strict]");
+            };
+            match s {
+                "true" => crate::cluster::state::DynamicMapping::True,
+                "false" => crate::cluster::state::DynamicMapping::False,
+                "strict" => crate::cluster::state::DynamicMapping::Strict,
+                other => {
+                    return illegal_argument(format!(
+                        "invalid dynamic mapping policy [{other}]; supported: [true, false, strict]"
+                    ));
+                }
+            }
+        }
+        None => metadata.dynamic.clone(),
+    };
+
+    let props_val = scope_obj.get("properties");
+    let mut new_fields: HashMap<String, crate::cluster::state::FieldMapping> = HashMap::new();
+    if let Some(props) = props_val {
+        let Some(props_obj) = props.as_object() else {
+            return mapper_parsing_error_response("'properties' must be a JSON object");
+        };
+        if let Err(err) =
+            crate::common::validate_mapping_field_names(props_obj.keys().map(String::as_str))
+        {
+            return mapper_parsing_error_response(err);
+        }
+        for (field_name, def_val) in props_obj {
+            let mapping: crate::cluster::state::FieldMapping =
+                match serde_json::from_value(def_val.clone()) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        return mapper_parsing_error_response(format!(
+                            "invalid mapping for field [{field_name}]: {e}"
+                        ));
+                    }
+                };
+            let type_name = match mapping.field_type {
+                crate::cluster::state::FieldType::Text => "text",
+                crate::cluster::state::FieldType::Keyword => "keyword",
+                crate::cluster::state::FieldType::Integer => "integer",
+                crate::cluster::state::FieldType::Float => "float",
+                crate::cluster::state::FieldType::Boolean => "boolean",
+                crate::cluster::state::FieldType::Date => "date",
+                crate::cluster::state::FieldType::KnnVector => "knn_vector",
+            };
+            if let Err(err) = crate::common::validate_builtin_body_mapping_entry(
+                field_name,
+                type_name,
+                mapping.dimension.is_some(),
+            ) {
+                return mapper_parsing_error_response(err);
+            }
+            if matches!(
+                mapping.field_type,
+                crate::cluster::state::FieldType::KnnVector
+            ) && mapping.dimension.unwrap_or(0) == 0
+            {
+                return mapper_parsing_error_response(format!(
+                    "knn_vector field [{field_name}] requires a positive dimension"
+                ));
+            }
+            new_fields.insert(field_name.clone(), mapping);
+        }
+    } else if scope_obj.get("dynamic").is_none() {
+        return illegal_argument("mapping update must specify 'properties' or 'dynamic'");
+    }
+
+    if let Err(reason) = metadata.validate_additive_mapping_update(&new_fields) {
+        return mapper_parsing_error_response(reason);
+    }
+
+    let requested_fields = new_fields.clone();
+    let mut only_additive: HashMap<String, crate::cluster::state::FieldMapping> = HashMap::new();
+    for (k, v) in new_fields {
+        if !metadata.mappings.contains_key(&k) {
+            only_additive.insert(k, v);
+        }
+    }
+
+    if !only_additive.is_empty() || next_dynamic != metadata.dynamic {
+        if let Some(master) = match resolve_leader_or_master(&state, "mapping update") {
+            Ok(m) => m,
+            Err(e) => return e,
+        } {
+            if let Err(e) = state
+                .transport_client
+                .forward_add_mappings(&master, index_name.as_str(), &only_additive, &next_dynamic)
+                .await
+            {
+                if let Some(status) = e
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<tonic::Status>())
+                    && status.code() == tonic::Code::InvalidArgument
+                {
+                    return mapper_parsing_error_response(status.message());
+                }
+                return crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "forward_exception",
+                    format!("Failed to forward mapping update to master: {e:#}"),
+                );
+            }
+        } else {
+            let cmd = crate::consensus::types::ClusterCommand::AddMappings {
+                index_name: index_name.to_string(),
+                new_fields: only_additive,
+                dynamic: next_dynamic,
+            };
+            if let Err(e) = raft_write(&state, cmd).await {
+                return e;
+            }
+            state
+                .transport_client
+                .acknowledge_state(index_name.as_str(), state.cluster_manager.version());
+        }
+    }
+
+    let updated_cs = match index_cluster_state(&state, index_name.as_str()).await {
+        Ok(cs) => cs,
+        Err(e) => return e,
+    };
+    let Some(updated_meta) = updated_cs.indices.get(index_name.as_str()).cloned() else {
+        return crate::api::error_response(
+            StatusCode::NOT_FOUND,
+            "index_not_found_exception",
+            format!("no such index [{index_name}]"),
+        );
+    };
+
+    if let Err(reason) = updated_meta.validate_additive_mapping_update(&requested_fields) {
+        return mapper_parsing_error_response(reason);
+    }
+
+    // Reopen any open local shards on this node with the evolved mappings so
+    // local segments immediately expose the new additive fields.
+    for shard_id in updated_meta.shard_routing.keys() {
+        if state
+            .shard_manager
+            .get_shard(index_name.as_str(), *shard_id)
+            .is_some()
+            && let Some(allocation_id) =
+                updated_cs.shard_allocation_id(index_name.as_str(), *shard_id, &state.local_node_id)
+            && let Err(e) = state
+                .shard_manager
+                .reopen_shard(
+                    index_name.to_string(),
+                    *shard_id,
+                    updated_meta.mappings.clone(),
+                    updated_meta.settings.clone(),
+                    updated_meta.uuid.to_string(),
+                    allocation_id,
+                )
+                .await
+        {
+            return crate::api::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "shard_not_available_exception",
+                format!(
+                    "failed to reopen shard [{index_name}][{shard_id}] after mapping update: {e:#}"
+                ),
+            );
+        }
+    }
+
+    let schema_hash = crate::storage::compute_schema_hash(&updated_meta.mappings);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "acknowledged": true,
+            "index": index_name.as_str(),
+            "schema_generation": updated_meta.effective_schema_generation(),
+            "schema_hash": schema_hash,
         })),
     )
 }

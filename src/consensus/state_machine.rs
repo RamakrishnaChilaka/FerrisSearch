@@ -918,13 +918,20 @@ impl ClusterStateMachine {
                 dynamic,
             } => {
                 if let Some(existing) = state.indices.get_mut(index_name) {
+                    let prev_gen = existing.effective_schema_generation();
+                    let prev_hash = crate::storage::compute_schema_hash(&existing.mappings);
+                    let mut added_any = false;
                     for (name, mapping) in new_fields {
-                        existing
-                            .mappings
-                            .entry(name.clone())
-                            .or_insert(mapping.clone());
+                        if !existing.mappings.contains_key(name) {
+                            existing.mappings.insert(name.clone(), mapping.clone());
+                            added_any = true;
+                        }
                     }
+                    let dynamic_changed = existing.dynamic != *dynamic;
                     existing.dynamic = dynamic.clone();
+                    if added_any || dynamic_changed {
+                        existing.record_schema_generation_advance(prev_gen, prev_hash);
+                    }
                     state.version += 1;
                 }
                 ClusterResponse::Ok

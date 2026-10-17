@@ -735,6 +735,10 @@ struct RequestCancellationState {
     default_stage: Mutex<ExecutionStage>,
     last_error_class: Mutex<Option<StableErrorClass>>,
     trace_ids: Mutex<RequestTraceIds>,
+    principal_context: Arc<Mutex<Option<(String, String)>>>,
+    target_indices: Arc<Mutex<Vec<String>>>,
+    retained_guards: Arc<Mutex<Vec<Box<dyn Any + Send + Sync>>>>,
+    security_denial_status: Arc<AtomicU64>,
     stage_ledger: Arc<StageTimingLedger>,
     children: Mutex<Vec<Weak<RequestCancellationState>>>,
     cleanup_hooks: Mutex<Vec<Box<dyn FnOnce() + Send + 'static>>>,
@@ -779,6 +783,10 @@ impl RequestCancellationContext {
                 default_stage: Mutex::new(ExecutionStage::Search),
                 last_error_class: Mutex::new(None),
                 trace_ids: Mutex::new(RequestTraceIds::new_for_context_id(id)),
+                principal_context: Arc::new(Mutex::new(None)),
+                target_indices: Arc::new(Mutex::new(Vec::new())),
+                retained_guards: Arc::new(Mutex::new(Vec::new())),
+                security_denial_status: Arc::new(AtomicU64::new(0)),
                 stage_ledger: Arc::new(StageTimingLedger::default()),
                 children: Mutex::new(Vec::new()),
                 cleanup_hooks: Mutex::new(Vec::new()),
@@ -799,6 +807,10 @@ impl RequestCancellationContext {
                 default_stage: Mutex::new(ExecutionStage::Search),
                 last_error_class: Mutex::new(None),
                 trace_ids: Mutex::new(RequestTraceIds::new_for_context_id(id)),
+                principal_context: Arc::new(Mutex::new(None)),
+                target_indices: Arc::new(Mutex::new(Vec::new())),
+                retained_guards: Arc::new(Mutex::new(Vec::new())),
+                security_denial_status: Arc::new(AtomicU64::new(0)),
                 stage_ledger: Arc::new(StageTimingLedger::default()),
                 children: Mutex::new(Vec::new()),
                 cleanup_hooks: Mutex::new(Vec::new()),
@@ -915,6 +927,65 @@ impl RequestCancellationContext {
         true
     }
 
+    pub fn set_principal(&self, principal_id: &str, principal_name: &str) {
+        *self
+            .inner
+            .principal_context
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            Some((principal_id.to_string(), principal_name.to_string()));
+    }
+
+    pub fn principal(&self) -> Option<(String, String)> {
+        self.inner
+            .principal_context
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    pub fn add_target_index(&self, index: &str) {
+        let trimmed = index.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let mut indices = self
+            .inner
+            .target_indices
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !indices.iter().any(|existing| existing == trimmed) {
+            indices.push(trimmed.to_string());
+        }
+    }
+
+    pub fn target_indices(&self) -> Vec<String> {
+        self.inner
+            .target_indices
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    pub fn retain_guard<G: Any + Send + Sync>(&self, guard: G) {
+        self.inner
+            .retained_guards
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(Box::new(guard));
+    }
+
+    pub fn record_security_denial_status(&self, status: u16) {
+        self.inner
+            .security_denial_status
+            .store(u64::from(status), Ordering::Release);
+    }
+
+    pub fn security_denial_status(&self) -> Option<u16> {
+        let val = self.inner.security_denial_status.load(Ordering::Acquire);
+        (val > 0).then_some(val as u16)
+    }
+
     pub fn stage_ledger(&self) -> &Arc<StageTimingLedger> {
         &self.inner.stage_ledger
     }
@@ -964,6 +1035,10 @@ impl RequestCancellationContext {
                 default_stage: Mutex::new(self.default_stage()),
                 last_error_class: Mutex::new(self.last_error_class()),
                 trace_ids: Mutex::new(self.trace_ids()),
+                principal_context: Arc::clone(&self.inner.principal_context),
+                target_indices: Arc::clone(&self.inner.target_indices),
+                retained_guards: Arc::clone(&self.inner.retained_guards),
+                security_denial_status: Arc::clone(&self.inner.security_denial_status),
                 stage_ledger: Arc::clone(&self.inner.stage_ledger),
                 children: Mutex::new(Vec::new()),
                 cleanup_hooks: Mutex::new(Vec::new()),
@@ -1317,6 +1392,44 @@ pub fn set_current_trace_task_id(raw: &str) {
     if let Some(ctx) = current_request_context() {
         let _ = ctx.set_task_id(raw);
     }
+}
+
+pub fn set_current_request_principal(principal_id: &str, principal_name: &str) {
+    if let Some(ctx) = current_request_context() {
+        ctx.set_principal(principal_id, principal_name);
+    }
+}
+
+pub fn current_request_principal() -> Option<(String, String)> {
+    current_request_context().and_then(|ctx| ctx.principal())
+}
+
+pub fn add_current_request_index(index: &str) {
+    if let Some(ctx) = current_request_context() {
+        ctx.add_target_index(index);
+    }
+}
+
+pub fn current_request_indices() -> Vec<String> {
+    current_request_context()
+        .map(|ctx| ctx.target_indices())
+        .unwrap_or_default()
+}
+
+pub fn retain_current_request_guard<G: Any + Send + Sync>(guard: G) {
+    if let Some(ctx) = current_request_context() {
+        ctx.retain_guard(guard);
+    }
+}
+
+pub fn record_current_request_security_denial(status: u16) {
+    if let Some(ctx) = current_request_context() {
+        ctx.record_security_denial_status(status);
+    }
+}
+
+pub fn current_request_security_denial() -> Option<u16> {
+    current_request_context().and_then(|ctx| ctx.security_denial_status())
 }
 
 // ── Bounded Admission Queues & Background Work Prioritization (FS-030, FS-032) ──

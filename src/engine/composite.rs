@@ -1227,6 +1227,13 @@ impl SearchEngine for CompositeEngine {
         self.text.fail_stop_writes(reason);
     }
 
+    fn has_all_mapped_fields(
+        &self,
+        mappings: &std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
+    ) -> bool {
+        self.text.has_all_mapped_fields(mappings)
+    }
+
     #[cfg(test)]
     fn inject_wal_write_failures_for_test(&self, raw_os_error: i32, attempts: usize) {
         self.text

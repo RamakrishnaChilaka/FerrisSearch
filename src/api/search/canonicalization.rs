@@ -86,6 +86,10 @@ pub(super) fn canonicalize_query_clause_fields(
         crate::search::QueryClause::Terms(fields) => canonicalize_query_field_map(fields, mappings),
         crate::search::QueryClause::Range(fields) => canonicalize_query_field_map(fields, mappings),
         crate::search::QueryClause::Fuzzy(fields) => canonicalize_query_field_map(fields, mappings),
+        crate::search::QueryClause::Exists(params) => {
+            params.field = canonicalize_sql_source_field_name(&params.field, mappings)?;
+            Ok(())
+        }
         crate::search::QueryClause::Bool(bool_query) => {
             for nested in &mut bool_query.must {
                 canonicalize_query_clause_fields(nested, mappings)?;

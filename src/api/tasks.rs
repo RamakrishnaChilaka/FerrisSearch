@@ -216,6 +216,13 @@ pub async fn get_task(
 ) -> (StatusCode, Json<Value>) {
     crate::worker::set_current_trace_task_id(&task_id);
     if let Some(task) = state.task_manager.get_local_force_merge(&task_id) {
+        crate::worker::add_current_request_index(&task.index_name);
+        if let Err(err) = state.security_manager.authorize_current_request_index(
+            crate::security::SecurityAction::IndexRead,
+            &task.index_name,
+        ) {
+            return err.into_response_json();
+        }
         return (StatusCode::OK, Json(local_task_response(&task)));
     }
 
@@ -226,6 +233,13 @@ pub async fn get_task(
             format!("task [{task_id}] not found"),
         );
     };
+    crate::worker::add_current_request_index(&cluster_task.index_name);
+    if let Err(err) = state.security_manager.authorize_current_request_index(
+        crate::security::SecurityAction::IndexRead,
+        &cluster_task.index_name,
+    ) {
+        return err.into_response_json();
+    }
 
     let children = resolve_cluster_children(&state, &cluster_task).await;
     let status = cluster_status(&children);

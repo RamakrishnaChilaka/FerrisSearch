@@ -84,9 +84,10 @@ them with `RequestCancellationContext`, `RequestDeadline`, `RequestTraceIds`,
 `StageTimingLedger`, `StableErrorClass` (`Retryable`, `Terminal`, `Corruption`,
 `Overload`, FS-033), bounded per-class `AdmissionController` queues (`Search`,
 `Sql`, `Write`, `Hydration`, `Recovery`, `Maintenance`) with foreground-pressure
-throttling and starvation-free aging promotion (FS-032), and `ResourceGovernor`
+throttling and starvation-free aging promotion (FS-032), `ResourceGovernor`
 byte reservations (`Memory`, `TempDisk`, `PersistentCache`,
-`ObjectStoreInflight`). Tenant quotas (FS-049) remain future work.
+`ObjectStoreInflight`), and `SecurityManager` per-principal/per-index resource
+quotas (`TenantQuotaConfig`, FS-049).
 
 ## Tasks And Maintenance
 

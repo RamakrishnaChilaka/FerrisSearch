@@ -270,7 +270,7 @@ pub(crate) async fn create_cluster_snapshot(
         if metadata.uses_remote_store()
             && let Some(manifest) = state
                 .storage_manager
-                .load_current_manifest(&index_uuid, Some(&schema_hash))
+                .load_current_manifest_for_metadata(metadata)
                 .await
                 .map_err(|e| {
                     crate::api::error_response(
@@ -282,7 +282,7 @@ pub(crate) async fn create_cluster_snapshot(
         {
             state
                 .storage_manager
-                .verify_manifest_lineage_chain(&index_uuid, &manifest, Some(&schema_hash))
+                .verify_manifest_lineage_chain_for_metadata(metadata, &manifest)
                 .await
                 .map_err(|e| {
                     crate::api::error_response(
@@ -1262,7 +1262,7 @@ pub(crate) async fn repair_remote_store_index(
     let mut pointer_repaired = false;
     let (current_manifest, current_manifest_path) = match state
         .storage_manager
-        .load_manifest_for_snapshot(&index_uuid, None, Some(&expected_schema_hash))
+        .load_manifest_for_snapshot_with_metadata(metadata, None)
         .await
     {
         Ok(Some((m, path, _, _))) => (m, path),
@@ -1312,11 +1312,11 @@ pub(crate) async fn repair_remote_store_index(
             for (gen_num, manifest_loc) in candidate_generations {
                 if let Ok(m) = state
                     .storage_manager
-                    .load_manifest(&index_uuid, gen_num, Some(&expected_schema_hash))
+                    .load_manifest(&index_uuid, gen_num, None)
                     .await
                     && state
                         .storage_manager
-                        .verify_manifest_lineage_chain(&index_uuid, &m, Some(&expected_schema_hash))
+                        .verify_manifest_lineage_chain_for_metadata(metadata, &m)
                         .await
                         .is_ok()
                 {
@@ -1647,13 +1647,19 @@ pub(crate) async fn repair_remote_store_index(
         }
         let next_gen = current_manifest.generation + 1;
         let op_id = format!("repair-{index_uuid}-g{next_gen}");
+        let repaired_schema_gen = metadata
+            .effective_schema_generation()
+            .max(current_manifest.schema_generation);
+        let repaired_schema_hash = metadata
+            .expected_schema_hash_for_generation(repaired_schema_gen)
+            .unwrap_or_else(|| expected_schema_hash.clone());
         let repaired_manifest = crate::storage::RemoteStoreManifest {
             version: crate::storage::REMOTE_MANIFEST_FORMAT_VERSION,
             engine: IndexEngine::RemoteStore,
             index_uuid: index_uuid.clone(),
             index_name: index_name.to_string(),
-            schema_generation: current_manifest.schema_generation,
-            schema_hash: expected_schema_hash,
+            schema_generation: repaired_schema_gen,
+            schema_hash: repaired_schema_hash,
             generation: next_gen,
             parent_generation: current_manifest.generation,
             parent_manifest_path: Some(current_manifest_path),
@@ -1666,6 +1672,16 @@ pub(crate) async fn repair_remote_store_index(
             compaction_lineage: Vec::new(),
             splits: updated_splits,
         };
+        state
+            .storage_manager
+            .validate_manifest_for_metadata(metadata, &repaired_manifest)
+            .map_err(|e| {
+                crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "remote_store_repair_exception",
+                    format!("repaired manifest failed schema validation: {e:#}"),
+                )
+            })?;
         let ptr = state
             .storage_manager
             .publish_manifest(&repaired_manifest)
@@ -2037,7 +2053,7 @@ pub(crate) async fn migrate_index_lifecycle(
     let expected_schema_hash = crate::storage::compute_schema_hash(&refreshed_meta.mappings);
     let mut current_manifest = state
         .storage_manager
-        .load_current_manifest(&index_uuid, Some(&expected_schema_hash))
+        .load_current_manifest_for_metadata(&refreshed_meta)
         .await
         .map_err(|e| {
             crate::api::error_response(
@@ -2220,6 +2236,13 @@ pub(crate) async fn migrate_index_lifecycle(
             field_terms,
         };
         new_split.set_seal_range(&seal_range_meta);
+        let schema_generation = refreshed_meta.effective_schema_generation();
+        new_split
+            .tags
+            .insert("schema_generation".into(), schema_generation.to_string());
+        new_split
+            .tags
+            .insert("schema_hash".into(), expected_schema_hash.clone());
         let fp = sha256_prefixed(format!("bootstrap-{index_uuid}-{operation_id}").as_bytes());
         let now_ms = now_epoch_ms();
         let intent = crate::storage::PublicationIntentRecord {
@@ -2228,7 +2251,7 @@ pub(crate) async fn migrate_index_lifecycle(
             index_name: index_name.to_string(),
             operation_id: operation_id.clone(),
             request_fingerprint: fp.clone(),
-            schema_generation: 1,
+            schema_generation,
             schema_hash: expected_schema_hash.clone(),
             split_id: split_id.clone(),
             planned_bundle_path: bundle_key,
@@ -2237,41 +2260,64 @@ pub(crate) async fn migrate_index_lifecycle(
             created_at: chrono::Utc::now().to_rfc3339(),
             created_at_epoch_ms: now_ms,
         };
-        let _ = state
+        state
             .storage_manager
             .stage_publication_intent(&intent)
-            .await;
+            .await
+            .map_err(|e| {
+                crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "remote_store_publish_exception",
+                    format!("failed to stage bootstrap publication intent: {e:#}"),
+                )
+            })?;
         let prep = crate::storage::PublicationPreparedRecord {
             format_version: crate::storage::PUBLICATION_RECORD_FORMAT_VERSION,
             index_uuid: index_uuid.clone(),
             index_name: index_name.to_string(),
             operation_id: operation_id.clone(),
             request_fingerprint: fp.clone(),
-            schema_generation: 1,
+            schema_generation,
             schema_hash: expected_schema_hash.clone(),
             producer_node_id: state.local_node_id.clone(),
             prepared_at: chrono::Utc::now().to_rfc3339(),
             prepared_at_epoch_ms: now_ms,
             split: new_split,
         };
-        let _ = state
+        state
             .storage_manager
             .write_publication_prepared(&prep)
-            .await;
+            .await
+            .map_err(|e| {
+                crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "remote_store_publish_exception",
+                    format!("failed to write bootstrap prepared record: {e:#}"),
+                )
+            })?;
         let seq_req = ForwardedSequencerCommitRequest {
             operation_id,
             request_fingerprint: fp,
-            schema_generation: 1,
+            schema_generation,
             schema_hash: expected_schema_hash.clone(),
             settings: refreshed_meta.settings.remote_store.clone(),
             known_authority: None,
         };
-        let _ = coordinate_sequencer_commit(state, index_name, &index_uuid, &seq_req).await;
+        match coordinate_sequencer_commit(state, index_name, &index_uuid, &seq_req).await {
+            ForwardedSequencerCommitResponse::Committed(_) => {}
+            other => {
+                return Err(crate::api::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "remote_store_publish_exception",
+                    format!("bootstrap split commit failed: {other:?}"),
+                ));
+            }
+        }
     }
 
     current_manifest = state
         .storage_manager
-        .load_current_manifest(&index_uuid, Some(&expected_schema_hash))
+        .load_current_manifest_for_metadata(&refreshed_meta)
         .await
         .map_err(|e| {
             crate::api::error_response(
@@ -2596,10 +2642,9 @@ pub(crate) async fn rollback_index_lifecycle(
     .await?;
 
     // Reconstruct retired base documents from published splits + current hot delta.
-    let expected_schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
     let current_manifest = state
         .storage_manager
-        .load_current_manifest(&index_uuid, Some(&expected_schema_hash))
+        .load_current_manifest_for_metadata(metadata)
         .await
         .map_err(|e| {
             crate::api::error_response(
@@ -2824,10 +2869,9 @@ pub(crate) async fn get_index_lifecycle_status(
     metadata: &IndexMetadata,
 ) -> Result<Value, (StatusCode, Json<Value>)> {
     let index_uuid = metadata.uuid.to_string();
-    let expected_schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
     let current_manifest = state
         .storage_manager
-        .load_current_manifest(&index_uuid, Some(&expected_schema_hash))
+        .load_current_manifest_for_metadata(metadata)
         .await
         .ok()
         .flatten();

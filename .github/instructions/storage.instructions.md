@@ -75,9 +75,13 @@ Do not collapse these responsibilities into API handlers.
   (`LeafCapabilityInventorySnapshot`, FS-046) with piggybacked batch warmth
   updates and conservative fallback.
 - Cluster backup, verification, restore (`/_snapshot/{snapshot_id}*`, FS-042),
-  remote-store repair/quarantine (`/{index}/_remote_store/repair`, FS-042), and
+  remote-store repair/quarantine (`/{index}/_remote_store/repair`, FS-042),
   explicit online lifecycle migration/rollback (`/{index}/_lifecycle/migrate`
-  and `/{index}/_lifecycle/rollback`, FS-043) are supported.
+  and `/{index}/_lifecycle/rollback`, FS-043), bounded $O(S \cdot L)$ top-$K$
+  split scheduling with deduplicated retry and `RemoteStoreSchedulingStats`
+  (FS-047), and additive mixed schema-generation execution across splits with
+  compaction schema upgrade (`SchemaLineageMetadata`, `/{index}/_mapping`,
+  FS-048) are supported.
 - No hotcache sidecar is consumed yet, and remote split readers do not support
   the vector path.
 

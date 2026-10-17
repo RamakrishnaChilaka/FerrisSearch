@@ -1850,12 +1850,26 @@ impl StorageManager {
                     )
                 } else {
                     let parent = self
-                        .load_manifest_for_pointer(
-                            &req.index_uuid,
-                            &pointer,
-                            Some(&req.schema_hash),
-                        )
+                        .load_manifest_for_pointer(&req.index_uuid, &pointer, None)
                         .await?;
+                    if req.schema_generation < parent.schema_generation {
+                        anyhow::bail!(
+                            "regressing schema_generation in manifest commit for index '{}': parent schema_generation={}, request schema_generation={}",
+                            req.index_uuid,
+                            parent.schema_generation,
+                            req.schema_generation
+                        );
+                    }
+                    if req.schema_generation == parent.schema_generation
+                        && parent.schema_hash != req.schema_hash
+                    {
+                        anyhow::bail!(
+                            "manifest schema_hash mismatch at schema_generation {}: parent={}, request={}",
+                            req.schema_generation,
+                            parent.schema_hash,
+                            req.schema_hash
+                        );
+                    }
                     (
                         parent.generation,
                         Some(pointer.manifest_path.clone()),
@@ -1889,6 +1903,13 @@ impl StorageManager {
                 split_entry.tags.insert(
                     "schema_generation".into(),
                     req.schema_generation.to_string(),
+                );
+                split_entry
+                    .tags
+                    .insert("schema_hash".into(), req.schema_hash.clone());
+                split_entry.tags.insert(
+                    "bundle_format_version".into(),
+                    SPLIT_BUNDLE_FORMAT_VERSION.to_string(),
                 );
                 let parent_split_ids = split_entry.parent_split_ids()?;
                 if !parent_split_ids.is_empty() {

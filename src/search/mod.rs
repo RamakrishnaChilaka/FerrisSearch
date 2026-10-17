@@ -139,17 +139,27 @@ pub enum QueryClause {
     Prefix(HashMap<String, serde_json::Value>),
     /// Fuzzy query: `{ "fuzzy": { "field": { "value": "rsut", "fuzziness": 1 } } }`
     Fuzzy(HashMap<String, FuzzyParams>),
+    /// Field presence query: `{ "exists": { "field": "region" } }` (`FS-048`, ADR 0005 section 3.5).
+    Exists(ExistsParams),
     /// Internal/pinned snapshot visibility and supersession filter (`FS-037`, `FS-038`).
     SnapshotFilter(SnapshotFilterParams),
 }
 
-/// Snapshot visibility and supersession filter parameters (`FS-037`, `FS-038`).
+/// Parameters for `{ "exists": { "field": "..." } }`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExistsParams {
+    pub field: String,
+}
+
+/// Snapshot visibility and supersession filter parameters (`FS-037`, `FS-038`, `FS-047`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnapshotFilterParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_partial_results: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excluded_doc_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -316,7 +326,14 @@ impl SearchRequest {
         self.query.snapshot_generation()
     }
 
+    pub fn allow_partial_results(&self) -> Option<bool> {
+        self.query
+            .snapshot_filter_params()
+            .and_then(|p| p.allow_partial_results)
+    }
+
     pub fn with_snapshot_generation(mut self, generation: u64) -> Self {
+        let existing_allow = self.allow_partial_results();
         let base = self.query.without_snapshot_filters();
         self.query = QueryClause::Bool(BoolQuery {
             must: vec![base],
@@ -324,8 +341,26 @@ impl SearchRequest {
             must_not: Vec::new(),
             filter: vec![QueryClause::SnapshotFilter(SnapshotFilterParams {
                 snapshot_generation: Some(generation),
+                allow_partial_results: existing_allow,
                 ..Default::default()
             })],
+        });
+        self
+    }
+
+    pub fn with_allow_partial_results(mut self, allow: bool) -> Self {
+        let mut params = self
+            .query
+            .snapshot_filter_params()
+            .cloned()
+            .unwrap_or_default();
+        params.allow_partial_results = Some(allow);
+        let base = self.query.without_snapshot_filters();
+        self.query = QueryClause::Bool(BoolQuery {
+            must: vec![base],
+            should: Vec::new(),
+            must_not: Vec::new(),
+            filter: vec![QueryClause::SnapshotFilter(params)],
         });
         self
     }
@@ -342,9 +377,12 @@ impl SearchRequest {
         cloned
     }
 
-    pub fn with_snapshot_filter(&self, params: SnapshotFilterParams) -> Self {
+    pub fn with_snapshot_filter(&self, mut params: SnapshotFilterParams) -> Self {
+        if params.allow_partial_results.is_none() {
+            params.allow_partial_results = self.allow_partial_results();
+        }
         let mut cloned = self.without_snapshot_filters();
-        if !params.has_execution_filter() {
+        if !params.has_execution_filter() && params.allow_partial_results.is_none() {
             return cloned;
         }
         let base = cloned.query;
@@ -368,6 +406,7 @@ impl SearchRequest {
         self.with_snapshot_filter(SnapshotFilterParams {
             snapshot_id: params.snapshot_id,
             snapshot_generation: params.snapshot_generation,
+            allow_partial_results: params.allow_partial_results,
             excluded_doc_ids: excluded,
             split_excluded_doc_ids: std::collections::BTreeMap::new(),
             min_exclusive_seq_no: None,

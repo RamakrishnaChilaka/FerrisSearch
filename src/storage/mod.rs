@@ -353,6 +353,8 @@ impl StorageManager {
     /// the storage URI. `local_workdir` must be a writable local filesystem
     /// path; it's created if missing.
     pub fn new(path: String, local_workdir: PathBuf) -> Result<Self> {
+        crate::cluster::state::validate_external_object_store_uri(&path)
+            .map_err(anyhow::Error::msg)?;
         let (backend, initial_capability) = match storage_scheme(&path) {
             StorageScheme::Local => {
                 let root = normalize_local_root(&path)?;
@@ -2440,6 +2442,233 @@ impl StorageManager {
         Ok(Some(manifest))
     }
 
+    /// Validate a manifest and its published splits against an index's logical
+    /// schema generation lineage and physical format capability window (`FS-048`, ADR 0005).
+    pub fn validate_manifest_for_metadata(
+        &self,
+        metadata: &crate::cluster::state::IndexMetadata,
+        manifest: &RemoteStoreManifest,
+    ) -> Result<()> {
+        let target_gen = metadata.effective_schema_generation();
+        if manifest.schema_generation == 0 || manifest.schema_generation > target_gen {
+            anyhow::bail!(
+                "manifest generation {} for index '{}' declares schema_generation {} outside valid lineage window 1..={}",
+                manifest.generation,
+                manifest.index_uuid,
+                manifest.schema_generation,
+                target_gen
+            );
+        }
+        let Some(expected_manifest_hash) =
+            metadata.expected_schema_hash_for_generation(manifest.schema_generation)
+        else {
+            anyhow::bail!(
+                "manifest generation {} for index '{}' declares unknown schema_generation {} (not in schema_history)",
+                manifest.generation,
+                manifest.index_uuid,
+                manifest.schema_generation
+            );
+        };
+        if manifest.schema_hash != expected_manifest_hash {
+            anyhow::bail!(
+                "manifest schema_hash mismatch at schema_generation {}: expected {}, payload declares {}",
+                manifest.schema_generation,
+                expected_manifest_hash,
+                manifest.schema_hash
+            );
+        }
+        for split in manifest.published_splits() {
+            let split_gen = split.schema_generation()?;
+            let _ = split.bundle_format_version()?;
+            if split_gen > manifest.schema_generation || split_gen > target_gen {
+                anyhow::bail!(
+                    "split '{}' in manifest generation {} declares schema_generation {} > manifest/target schema_generation ({}/{})",
+                    split.split_id,
+                    manifest.generation,
+                    split_gen,
+                    manifest.schema_generation,
+                    target_gen
+                );
+            }
+            if let Some(split_hash) = split.schema_hash() {
+                let Some(expected_split_hash) =
+                    metadata.expected_schema_hash_for_generation(split_gen)
+                else {
+                    anyhow::bail!(
+                        "split '{}' declares unknown schema_generation {}",
+                        split.split_id,
+                        split_gen
+                    );
+                };
+                if split_hash != expected_split_hash {
+                    anyhow::bail!(
+                        "split '{}' schema_hash mismatch at schema_generation {}: expected {}, split declares {}",
+                        split.split_id,
+                        split_gen,
+                        expected_split_hash,
+                        split_hash
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn verify_manifest_lineage_chain_for_metadata(
+        &self,
+        metadata: &crate::cluster::state::IndexMetadata,
+        head: &RemoteStoreManifest,
+    ) -> Result<()> {
+        let index_uuid = metadata.uuid.as_str();
+        self.validate_manifest_for_metadata(metadata, head)?;
+        let mut current = head.clone();
+        let mut steps = 0usize;
+        while current.parent_generation > 0 {
+            steps += 1;
+            if steps > MAX_LINEAGE_WALK_GENERATIONS {
+                anyhow::bail!(
+                    "manifest lineage chain exceeded {MAX_LINEAGE_WALK_GENERATIONS} generations for index '{index_uuid}'"
+                );
+            }
+            let Some(ref parent_path) = current.parent_manifest_path else {
+                anyhow::bail!(
+                    "manifest generation {} for index '{}' is missing parent_manifest_path for parent_generation {}",
+                    current.generation,
+                    index_uuid,
+                    current.parent_generation
+                );
+            };
+            let (parent, _) = self
+                .load_manifest_at_path(index_uuid, parent_path, current.parent_generation, None)
+                .await
+                .with_context(|| {
+                    format!(
+                        "broken manifest lineage for index '{}' at generation {}: parent generation {} at '{}' could not be loaded",
+                        index_uuid, current.generation, current.parent_generation, parent_path
+                    )
+                })?;
+            if parent.writer_epoch > current.writer_epoch {
+                anyhow::bail!(
+                    "broken manifest lineage for index '{}': parent generation {} has writer_epoch {} > child generation {} writer_epoch {}",
+                    index_uuid,
+                    parent.generation,
+                    parent.writer_epoch,
+                    current.generation,
+                    current.writer_epoch
+                );
+            }
+            if parent.schema_generation > current.schema_generation {
+                anyhow::bail!(
+                    "broken manifest lineage for index '{}': parent generation {} has schema_generation {} > child schema_generation {}",
+                    index_uuid,
+                    parent.generation,
+                    parent.schema_generation,
+                    current.schema_generation
+                );
+            }
+            self.validate_manifest_for_metadata(metadata, &parent)?;
+            current = parent;
+        }
+        Ok(())
+    }
+
+    pub async fn load_current_manifest_for_metadata(
+        &self,
+        metadata: &crate::cluster::state::IndexMetadata,
+    ) -> Result<Option<RemoteStoreManifest>> {
+        let index_uuid = metadata.uuid.as_str();
+        let Some(pointer) = self.load_manifest_pointer(index_uuid).await? else {
+            return Ok(None);
+        };
+        if pointer.current_generation == 0 {
+            return Ok(None);
+        }
+        let manifest = self
+            .load_manifest_for_pointer(index_uuid, &pointer, None)
+            .await?;
+        self.verify_manifest_lineage_chain_for_metadata(metadata, &manifest)
+            .await?;
+        Ok(Some(manifest))
+    }
+
+    pub async fn load_manifest_for_snapshot_with_metadata(
+        &self,
+        metadata: &crate::cluster::state::IndexMetadata,
+        requested_generation: Option<u64>,
+    ) -> Result<Option<(RemoteStoreManifest, String, String, u64)>> {
+        let index_uuid = metadata.uuid.as_str();
+        match requested_generation {
+            Some(0) => Ok(None),
+            Some(target_gen) => {
+                let Some(pointer) = self.load_manifest_pointer(index_uuid).await? else {
+                    anyhow::bail!(
+                        "requested snapshot_generation {target_gen} does not exist (no manifest pointer for index '{index_uuid}')"
+                    );
+                };
+                if pointer.current_generation == 0 || target_gen > pointer.current_generation {
+                    anyhow::bail!(
+                        "requested snapshot_generation {target_gen} exceeds current committed generation {}",
+                        pointer.current_generation
+                    );
+                }
+                let mut next_path = Some(pointer.manifest_path.clone());
+                let mut expected_gen = pointer.current_generation;
+                let mut steps = 0usize;
+                while let Some(m_path) = next_path.take() {
+                    steps += 1;
+                    if steps > MAX_LINEAGE_WALK_GENERATIONS {
+                        anyhow::bail!(
+                            "manifest lineage walk exceeded {MAX_LINEAGE_WALK_GENERATIONS} generations"
+                        );
+                    }
+                    let (manifest, checksum) = self
+                        .load_manifest_at_path(index_uuid, &m_path, expected_gen, None)
+                        .await?;
+                    if steps == 1 {
+                        pointer.validate_manifest_agreement(&manifest, &checksum)?;
+                    }
+                    self.validate_manifest_for_metadata(metadata, &manifest)?;
+                    if manifest.generation == target_gen {
+                        return Ok(Some((manifest, m_path, checksum, pointer.pointer_revision)));
+                    }
+                    if manifest.parent_generation == 0 || manifest.parent_generation < target_gen {
+                        break;
+                    }
+                    expected_gen = manifest.parent_generation;
+                    next_path = manifest.parent_manifest_path;
+                }
+                anyhow::bail!(
+                    "requested snapshot_generation {target_gen} is not available in committed manifest lineage for index '{index_uuid}'"
+                )
+            }
+            None => {
+                let Some(pointer) = self.load_manifest_pointer(index_uuid).await? else {
+                    return Ok(None);
+                };
+                if pointer.current_generation == 0 {
+                    return Ok(None);
+                }
+                let (manifest, checksum) = self
+                    .load_manifest_at_path(
+                        index_uuid,
+                        &pointer.manifest_path,
+                        pointer.current_generation,
+                        None,
+                    )
+                    .await?;
+                pointer.validate_manifest_agreement(&manifest, &checksum)?;
+                self.verify_manifest_lineage_chain_for_metadata(metadata, &manifest)
+                    .await?;
+                Ok(Some((
+                    manifest,
+                    pointer.manifest_path,
+                    checksum,
+                    pointer.pointer_revision,
+                )))
+            }
+        }
+    }
+
     /// Publish a manifest atomically: write the immutable generation first
     /// via `create_immutable`, then conditionally update `manifest.current.json`
     /// via `compare_and_swap_optional`. Returns the new pointer.
@@ -3404,6 +3633,8 @@ impl RemoteStoreManifest {
             let _ = split.parent_split_ids()?;
             let _ = split.replaced_by_split_ids()?;
             let _ = split.replaced_at_generation()?;
+            let _ = split.schema_generation()?;
+            let _ = split.bundle_format_version()?;
         }
         self.validate_compaction_lineage()?;
         for (shard_id, wm) in &self.published_watermarks {
@@ -3769,6 +4000,57 @@ pub struct RemoteSplitManifest {
 }
 
 impl RemoteSplitManifest {
+    pub fn schema_generation(&self) -> Result<u64> {
+        let Some(raw) = self.tags.get("schema_generation") else {
+            return Ok(1);
+        };
+        let generation = raw.parse::<u64>().with_context(|| {
+            format!(
+                "split '{}' has invalid schema_generation tag '{raw}'",
+                self.split_id
+            )
+        })?;
+        if generation == 0 {
+            anyhow::bail!(
+                "split '{}' has invalid zero schema_generation",
+                self.split_id
+            );
+        }
+        Ok(generation)
+    }
+
+    pub fn schema_hash(&self) -> Option<&str> {
+        self.tags.get("schema_hash").map(String::as_str)
+    }
+
+    pub fn bundle_format_version(&self) -> Result<u32> {
+        let Some(raw) = self.tags.get("bundle_format_version") else {
+            return Ok(SPLIT_BUNDLE_FORMAT_VERSION);
+        };
+        let version = raw.parse::<u32>().map_err(|_| {
+            crate::common::unsupported_index_format(
+                "remote split bundle",
+                format!(
+                    "split '{}' has malformed bundle_format_version '{raw}'",
+                    self.split_id
+                ),
+            )
+        })?;
+        if !SPLIT_BUNDLE_FORMAT_CAPABILITY.supports_read(version) {
+            return Err(crate::common::unsupported_index_format(
+                "remote split bundle",
+                format!(
+                    "split '{}' bundle_format_version {} is outside supported read window {}..={}",
+                    self.split_id,
+                    version,
+                    SPLIT_BUNDLE_FORMAT_CAPABILITY.min_read_version,
+                    SPLIT_BUNDLE_FORMAT_CAPABILITY.max_read_version
+                ),
+            ));
+        }
+        Ok(version)
+    }
+
     pub fn set_seal_range(&mut self, range: &SplitSealRangeMetadata) {
         self.tags
             .insert("seal_shard_id".into(), range.shard_id.to_string());
@@ -4067,6 +4349,7 @@ mod tests {
                 hotcache_bytes: Some(4096),
                 split_cache_bytes: Some(8192),
                 hot_delta: None,
+                ..Default::default()
             }),
             published_watermarks: BTreeMap::new(),
             compaction_lineage: Vec::new(),

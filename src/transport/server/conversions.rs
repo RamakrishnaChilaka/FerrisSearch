@@ -108,6 +108,9 @@ pub(super) fn index_settings_to_proto(
                     .hot_delta
                     .as_ref()
                     .map(|hd| serde_json::to_string(hd).expect("hot_delta policy must serialize")),
+                schema_lineage_json: remote_store.schema_lineage.as_ref().map(|sl| {
+                    serde_json::to_string(sl).expect("schema_lineage metadata must serialize")
+                }),
             }
         }),
     }
@@ -131,6 +134,18 @@ fn proto_to_remote_store_settings(
         ),
         _ => None,
     };
+    let schema_lineage = match settings.schema_lineage_json.as_deref() {
+        Some(raw) if !raw.is_empty() => Some(
+            serde_json::from_str::<crate::cluster::state::SchemaLineageMetadata>(raw).map_err(
+                |error| {
+                    Status::invalid_argument(format!(
+                        "unsupported cluster-state wire format: invalid schema_lineage_json: {error}"
+                    ))
+                },
+            )?,
+        ),
+        _ => None,
+    };
     let remote_store = crate::cluster::state::RemoteStoreSettings {
         object_store_uri: settings.object_store_uri.clone(),
         manifest_path: settings.manifest_path.clone(),
@@ -140,6 +155,7 @@ fn proto_to_remote_store_settings(
         hotcache_bytes: settings.hotcache_bytes,
         split_cache_bytes: settings.split_cache_bytes,
         hot_delta,
+        schema_lineage,
     };
 
     if remote_store.is_empty() {

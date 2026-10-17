@@ -579,6 +579,25 @@ pub fn create_router(mut state: AppState) -> Router {
         .route(
             "/_nodes/cache/inventory",
             get(index::get_node_cache_inventory_handler),
+        )
+        .route("/_security/audit", get(security::get_audit_log))
+        .route("/_security/quota", get(security::get_quotas))
+        .route("/_security/quota/{scope}/{id}", put(security::put_quota))
+        .route(
+            "/_security/quota/{scope}/{id}",
+            delete(security::delete_quota),
+        )
+        .route(
+            "/{index}/_mapping",
+            get(index::get_index_mappings)
+                .put(index::put_index_mappings)
+                .post(index::put_index_mappings),
+        )
+        .route(
+            "/{index}/_mappings",
+            get(index::get_index_mappings)
+                .put(index::put_index_mappings)
+                .post(index::put_index_mappings),
         );
 
     Router::new()

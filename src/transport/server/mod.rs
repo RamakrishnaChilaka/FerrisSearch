@@ -4767,6 +4767,7 @@ impl InternalTransport for TransportService {
 
         let dynamic = conversions::proto_to_dynamic_mapping(&req.dynamic)?;
 
+        let requested_fields = new_fields.clone();
         let cmd = crate::consensus::types::ClusterCommand::AddMappings {
             index_name: req.index_name.clone(),
             new_fields,
@@ -4775,6 +4776,12 @@ impl InternalTransport for TransportService {
         raft.client_write(cmd)
             .await
             .map_err(|e| Status::internal(format!("Raft AddMappings failed: {e}")))?;
+        let committed_cs = self.cluster_manager.get_state();
+        if let Some(meta) = committed_cs.indices.get(&req.index_name)
+            && let Err(reason) = meta.validate_additive_mapping_update(&requested_fields)
+        {
+            return Err(Status::invalid_argument(reason));
+        }
         self.transport_client
             .acknowledge_state(&req.index_name, self.cluster_manager.version());
 
@@ -6567,7 +6574,7 @@ impl TransportService {
         let assigned = self
             .assigned_local_shard(index_name, shard_id)
             .map_err(Status::failed_precondition)?;
-        if let Some(engine) = self.shard_manager.get_shard(index_name, shard_id) {
+        if let Some(mut engine) = self.shard_manager.get_shard(index_name, shard_id) {
             if let Err(error) = self.shard_manager.validate_open_copy_identity(
                 index_name,
                 shard_id,
@@ -6585,6 +6592,24 @@ impl TransportService {
                 .await;
                 return Err(pre_execution_copy_unavailable_status(&error)
                     .unwrap_or_else(|| Status::failed_precondition(format!("{error:#}"))));
+            }
+            if !engine.has_all_mapped_fields(&metadata.mappings) {
+                engine = self
+                    .shard_manager
+                    .reopen_shard(
+                        index_name.to_string(),
+                        shard_id,
+                        metadata.mappings.clone(),
+                        metadata.settings.clone(),
+                        assigned.index_uuid.clone(),
+                        assigned.allocation_id,
+                    )
+                    .await
+                    .map_err(|error| {
+                        Status::unavailable(format!(
+                            "failed to reopen shard [{index_name}][{shard_id}] with evolved mappings: {error:#}"
+                        ))
+                    })?;
             }
             return Ok(engine);
         }
