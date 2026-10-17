@@ -660,7 +660,9 @@ fn authorize_bulk_index(
     principal: Option<&crate::security::Principal>,
     index: &str,
 ) -> Result<(), BulkTargetFailure> {
+    crate::worker::add_current_request_index(index);
     if crate::security::is_protected_system_index(index) {
+        crate::worker::record_current_request_security_denial(StatusCode::FORBIDDEN.as_u16());
         return Err(BulkTargetFailure {
             status: StatusCode::FORBIDDEN,
             error_type: "security_exception".into(),
@@ -685,12 +687,29 @@ fn authorize_bulk_index(
                 index: Some(index.to_string()),
             },
         )
-        .map_err(|error| BulkTargetFailure {
-            status: error.status,
-            error_type: error.error_type.into(),
-            reason: error.reason.to_string(),
-            failure: None,
-        })
+        .map_err(|error| {
+            crate::worker::record_current_request_security_denial(error.status.as_u16());
+            BulkTargetFailure {
+                status: error.status,
+                error_type: error.error_type.into(),
+                reason: error.reason.to_string(),
+                failure: None,
+            }
+        })?;
+    let index_quota = state
+        .security_manager
+        .acquire_quota_lease(None, Some(index), 0)
+        .map_err(|error| {
+            crate::worker::record_current_request_security_denial(error.status.as_u16());
+            BulkTargetFailure {
+                status: error.status,
+                error_type: error.error_type.into(),
+                reason: error.reason.to_string(),
+                failure: None,
+            }
+        })?;
+    crate::worker::retain_current_request_guard(index_quota);
+    Ok(())
 }
 
 async fn bulk_metadata(
@@ -738,9 +757,16 @@ impl BulkExecution {
         mut self,
         documents: Vec<BulkDoc>,
     ) -> Result<(Self, Vec<StoredResult>), BulkError> {
+        let current_ctx = crate::worker::current_request_context();
         Ok(tokio::spawn(async move {
-            let results = self.batch(documents).await;
-            (self, results)
+            let fut = async move {
+                let results = self.batch(documents).await;
+                (self, results)
+            };
+            match current_ctx {
+                Some(ctx) => crate::worker::with_task_request_context(ctx, fut).await,
+                None => fut.await,
+            }
         })
         .await?)
     }
@@ -799,6 +825,29 @@ impl BulkExecution {
                     &failure.reason,
                 ));
                 continue;
+            }
+            let item_bytes = serde_json::to_vec(&document.payload)
+                .map(|v| v.len() as u64)
+                .unwrap_or(0)
+                .saturating_add(document.doc_id.len() as u64);
+            match self.state.security_manager.charge_additional_quota_bytes(
+                self.principal.as_ref().map(|p| p.key_id.as_str()),
+                Some(&index),
+                item_bytes,
+            ) {
+                Ok(guard) => crate::worker::retain_current_request_guard(guard),
+                Err(error) => {
+                    crate::worker::record_current_request_security_denial(error.status.as_u16());
+                    items[position] = Some(bulk_error_item(
+                        &document.action,
+                        Some(&index),
+                        &document.doc_id,
+                        error.status,
+                        error.error_type,
+                        error.reason,
+                    ));
+                    continue;
+                }
             }
             if !self.metadata.contains_key(&index) {
                 self.metadata.insert(

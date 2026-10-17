@@ -165,10 +165,9 @@ async fn count_remote_store_docs_from_manifest(
     index_name: &str,
     metadata: &crate::cluster::state::IndexMetadata,
 ) -> Result<(u64, u32, u32), (StatusCode, Json<Value>)> {
-    let expected_schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
     let manifest = match state
         .storage_manager
-        .load_current_manifest(metadata.uuid.as_str(), Some(&expected_schema_hash))
+        .load_current_manifest_for_metadata(metadata)
         .await
     {
         Ok(Some(manifest)) => manifest,
@@ -406,6 +405,8 @@ pub struct SearchParams {
     size: usize,
     #[serde(default)]
     from: usize,
+    #[serde(default)]
+    allow_partial_search_results: Option<bool>,
 }
 
 fn default_query() -> String {
@@ -434,7 +435,7 @@ pub(crate) fn max_score_from_hits(hits: &[serde_json::Value]) -> serde_json::Val
 }
 
 fn query_string_search_request(params: &SearchParams) -> crate::search::SearchRequest {
-    crate::search::SearchRequest {
+    let mut req = crate::search::SearchRequest {
         query: crate::search::QueryClause::QueryString(crate::search::QueryStringParams {
             query: params.q.clone(),
             default_field: params.df.clone(),
@@ -445,7 +446,11 @@ fn query_string_search_request(params: &SearchParams) -> crate::search::SearchRe
         sort: vec![],
         search_after: None,
         aggs: HashMap::new(),
+    };
+    if let Some(allow) = params.allow_partial_search_results {
+        req = req.with_allow_partial_results(allow);
     }
+    req
 }
 
 #[derive(Deserialize, Default)]
@@ -1213,6 +1218,24 @@ async fn execute_sql_query_with_plan(
     total_start: Instant,
     record_metrics: bool,
 ) -> Result<SqlExecutionResult, (StatusCode, Json<Value>)> {
+    crate::worker::add_current_request_index(&plan.index_name);
+    if crate::security::is_protected_system_index(&plan.index_name) {
+        return Err(crate::security::protected_system_index_error(
+            &plan.index_name,
+        ));
+    }
+    state
+        .security_manager
+        .authorize_current_request_index(
+            crate::security::SecurityAction::IndexRead,
+            &plan.index_name,
+        )
+        .map_err(crate::security::SecurityError::into_response_json)?;
+    let index_quota_lease = state
+        .security_manager
+        .acquire_quota_lease(None, Some(&plan.index_name), 0)
+        .map_err(crate::security::SecurityError::into_response_json)?;
+    crate::worker::retain_current_request_guard(index_quota_lease);
     let cluster_state = crate::api::index::index_cluster_state(state, &plan.index_name).await?;
     let metadata = match cluster_state.indices.get(&plan.index_name) {
         Some(m) => m.clone(),
@@ -2197,21 +2220,28 @@ fn authorize_global_sql_index(
     principal: Option<&crate::security::Principal>,
     index_name: &str,
 ) -> Option<(StatusCode, Json<Value>)> {
+    crate::worker::add_current_request_index(index_name);
     if crate::security::is_protected_system_index(index_name) {
         return Some(crate::security::protected_system_index_error(index_name));
     }
 
-    state
+    if let Err(err) = state.security_manager.authorize_or_error(
+        principal,
+        &crate::security::ClassifiedRequest {
+            action: crate::security::SecurityAction::IndexRead,
+            index: Some(index_name.to_string()),
+        },
+    ) {
+        return Some(err.into_response_json());
+    }
+    match state
         .security_manager
-        .authorize_or_error(
-            principal,
-            &crate::security::ClassifiedRequest {
-                action: crate::security::SecurityAction::IndexRead,
-                index: Some(index_name.to_string()),
-            },
-        )
-        .err()
-        .map(crate::security::SecurityError::into_response_json)
+        .acquire_quota_lease(None, Some(index_name), 0)
+    {
+        Ok(lease) => crate::worker::retain_current_request_guard(lease),
+        Err(err) => return Some(err.into_response_json()),
+    }
+    None
 }
 
 /// SHOW TABLES — list all indices with doc counts, engine, and shard info.

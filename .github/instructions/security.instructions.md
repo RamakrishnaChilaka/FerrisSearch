@@ -27,6 +27,8 @@ This is the canonical example of the control-plane idiom — read `control-plane
 - `GET /_security/api_key` / `GET /_security/api_key/{id}` — list/get **metadata only**; never return `hash_sha256` or any secret.
 - `DELETE /_security/api_key/{id}` — 404 if the id is not in the dynamic store (bootstrap keys are not deletable here).
 - `PUT /_security/role/{name}`, `GET /_security/role[/{name}]`, `DELETE /_security/role/{name}` — custom role CRUD.
+- `GET /_security/audit` — structured, redacted audit log (`AuditLogEntry`, `AuditOutcome::Allowed | Unauthenticated | Forbidden | QuotaExceeded`) with principal and resolved target-index attribution (`FS-049`).
+- `GET /_security/quota`, `PUT /_security/quota/{scope}/{id}`, `DELETE /_security/quota/{scope}/{id}` — per-principal (`scope = "principal"`) and per-index (`scope = "index"`) concurrency and inflight-byte quotas (`TenantQuotaConfig`), rejecting overload with `429 tenant_quota_exceeded_exception` (`error_class: "overload"`, `FS-049`).
 - Writes use the coordinator pattern (`resolve_leader_or_master` → `forward_*` else `raft_write`); reads serve locally from `cluster_manager.get_state()`. Handlers must still function when security is disabled.
 - Endpoint authz is automatic: `classify_request` maps `["_security", ..]` (and `["_plugins","_security",..]`) to `SecurityAction::SecurityAdmin`, enforced by `auth_middleware` when security is enabled. A non-admin principal therefore gets 403 on `/_security/*` without any handler-side check.
 

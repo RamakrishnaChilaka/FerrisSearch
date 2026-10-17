@@ -258,6 +258,13 @@ pub async fn cat_shards(State(state): State<AppState>, params: Query<CatParams>)
         if crate::security::is_protected_system_index(idx_name) {
             continue;
         }
+        if state
+            .security_manager
+            .authorize_current_request_index(crate::security::SecurityAction::IndexRead, idx_name)
+            .is_err()
+        {
+            continue;
+        }
 
         let meta = &cs.indices[idx_name];
         let mut shard_ids: Vec<u32> = meta.shard_routing.keys().copied().collect();
@@ -371,6 +378,13 @@ pub async fn cat_indices(State(state): State<AppState>, params: Query<CatParams>
         if crate::security::is_protected_system_index(idx_name) {
             continue;
         }
+        if state
+            .security_manager
+            .authorize_current_request_index(crate::security::SecurityAction::IndexRead, idx_name)
+            .is_err()
+        {
+            continue;
+        }
 
         let meta = &cs.indices[idx_name];
         let health = if meta.shard_routing.iter().any(|(shard_id, routing)| {
@@ -481,6 +495,13 @@ pub async fn cat_segments(State(state): State<AppState>, params: Query<CatParams
 
     for idx_name in index_names {
         if crate::security::is_protected_system_index(idx_name) {
+            continue;
+        }
+        if state
+            .security_manager
+            .authorize_current_request_index(crate::security::SecurityAction::IndexRead, idx_name)
+            .is_err()
+        {
             continue;
         }
 

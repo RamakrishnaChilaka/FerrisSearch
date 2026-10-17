@@ -246,6 +246,7 @@ struct CachedRemoteSplitReader {
     index_uuid: String,
     split_id: String,
     size_bytes: u64,
+    opened_schema_generation: u64,
     last_access_epoch_ms: AtomicU64,
     engine: Arc<crate::engine::tantivy::HotEngine>,
     _pin: crate::storage::SplitCachePin,
@@ -1039,6 +1040,7 @@ impl RemoteSplitReaderCache {
         split: &AssignedRemoteSplit,
     ) -> anyhow::Result<Arc<CachedRemoteSplitReader>> {
         crate::worker::check_current_request_active(crate::worker::ExecutionStage::Hydration)?;
+        let target_schema_gen = metadata.effective_schema_generation();
         let key = reader_cache_key(metadata.uuid.as_str(), &split.split_id, &split.checksum);
         if let Some(reader) = self
             .readers
@@ -1046,6 +1048,7 @@ impl RemoteSplitReaderCache {
             .unwrap_or_else(|e| e.into_inner())
             .get(&key)
             .cloned()
+            && reader.opened_schema_generation == target_schema_gen
         {
             context.storage_manager.record_cache_tier_hit("reader");
             reader.touch(context.storage_manager.as_ref());
@@ -1093,6 +1096,7 @@ impl RemoteSplitReaderCache {
             index_uuid: index_uuid.clone(),
             split_id: split_id.clone(),
             size_bytes,
+            opened_schema_generation: target_schema_gen,
             last_access_epoch_ms: AtomicU64::new(now_epoch_ms()),
             engine,
             _pin: pin,
@@ -1101,10 +1105,15 @@ impl RemoteSplitReaderCache {
 
         let reader = {
             let mut readers = self.readers.write().unwrap_or_else(|e| e.into_inner());
-            readers
-                .entry(key)
-                .or_insert_with(|| Arc::clone(&entry))
-                .clone()
+            match readers.get(&key) {
+                Some(existing) if existing.opened_schema_generation == target_schema_gen => {
+                    Arc::clone(existing)
+                }
+                _ => {
+                    readers.insert(key, Arc::clone(&entry));
+                    Arc::clone(&entry)
+                }
+            }
         };
         reader.touch(context.storage_manager.as_ref());
         self.sync_reader_accounting(context.storage_manager.as_ref());
@@ -1368,38 +1377,57 @@ fn assign_remote_store_splits(
 ) -> HashMap<String, Vec<AssignedRemoteSplit>> {
     let mut assignments: HashMap<String, Vec<AssignedRemoteSplit>> = HashMap::new();
 
-    for split in pending_splits {
-        let mut candidates: Vec<_> = leaf_nodes
-            .iter()
-            .filter(|node| !unhealthy_nodes.contains(&node.id))
-            .filter(|node| {
-                statuses
-                    .get(&node.id)
-                    .is_some_and(|status| status.leaf_capable)
-            })
-            .map(|node| {
-                (
-                    node.id.clone(),
-                    rendezvous_score(index_uuid, generation, &split.split_id, &node.id),
-                )
-            })
-            .collect();
-        candidates.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-        let window_len = candidates.len().clamp(1, REMOTE_STORE_RENDEZVOUS_WINDOW);
+    // Pre-filter capable leaves once so per-split candidate selection runs in a
+    // single linear pass over healthy leaves without O(L log L) sorting (`FS-047`).
+    let eligible_leaves: Vec<(&str, &LeafStatusSnapshot)> = leaf_nodes
+        .iter()
+        .filter(|node| !unhealthy_nodes.contains(&node.id))
+        .filter_map(|node| {
+            let status = statuses.get(&node.id)?;
+            status.leaf_capable.then_some((node.id.as_str(), status))
+        })
+        .collect();
+    if eligible_leaves.is_empty() {
+        return assignments;
+    }
 
-        let mut best: Option<(String, u8, u64, usize, u32)> = None;
-        for (node_id, score) in candidates.iter().take(window_len) {
-            let Some(status) = statuses.get(node_id) else {
-                continue;
-            };
+    let candidate_beats = |cand: (&str, u32), existing: (&str, u32)| -> bool {
+        cand.1 > existing.1 || (cand.1 == existing.1 && cand.0 < existing.0)
+    };
+
+    for split in pending_splits {
+        // Maintain bounded top-K (K = REMOTE_STORE_RENDEZVOUS_WINDOW = 2) highest
+        // rendezvous candidates in O(L) without heap allocation.
+        let mut top1: Option<(&str, &LeafStatusSnapshot, u32)> = None;
+        let mut top2: Option<(&str, &LeafStatusSnapshot, u32)> = None;
+        for &(node_id, status) in &eligible_leaves {
+            let score = rendezvous_score(index_uuid, generation, &split.split_id, node_id);
+            match top1 {
+                None => top1 = Some((node_id, status, score)),
+                Some((id1, st1, sc1)) if candidate_beats((node_id, score), (id1, sc1)) => {
+                    top2 = Some((id1, st1, sc1));
+                    top1 = Some((node_id, status, score));
+                }
+                _ => match top2 {
+                    None => top2 = Some((node_id, status, score)),
+                    Some((id2, _, sc2)) if candidate_beats((node_id, score), (id2, sc2)) => {
+                        top2 = Some((node_id, status, score));
+                    }
+                    _ => {}
+                },
+            }
+        }
+
+        let mut best: Option<(&str, u8, u64, usize, u32)> = None;
+        for (node_id, status, score) in [top1, top2].into_iter().flatten() {
             let candidate = (
-                node_id.clone(),
+                node_id,
                 split_warmth_rank(status, &split.split_id),
                 status.inflight_bytes,
                 status.queue_depth,
-                *score,
+                score,
             );
-            let replace = match &best {
+            let replace = match best {
                 None => true,
                 Some(current) => {
                     candidate.1 > current.1
@@ -1419,11 +1447,25 @@ fn assign_remote_store_splits(
         }
 
         if let Some((node_id, ..)) = best {
-            assignments.entry(node_id).or_default().push(split.clone());
+            assignments
+                .entry(node_id.to_string())
+                .or_default()
+                .push(split.clone());
         }
     }
 
     assignments
+}
+
+fn split_error_is_terminal(error_text: &str) -> bool {
+    let lower = error_text.to_ascii_lowercase();
+    lower.contains("unsupported") && lower.contains("format")
+        || lower.contains("recreate the index")
+        || lower.contains("mapper_parsing_exception")
+        || lower.contains("parsing_exception")
+        || lower.contains("illegal_argument_exception")
+        || lower.contains("schema does not match authoritative mappings")
+        || lower.contains("decompression bomb")
 }
 
 #[derive(Default)]
@@ -1433,6 +1475,10 @@ struct RemoteStoreSearchAccumulator {
     successful: u32,
     partial_aggs: Vec<HashMap<String, PartialAggResult>>,
     failures: BTreeMap<String, ShardFailure>,
+    completed_split_ids: HashSet<String>,
+    duplicate_responses_suppressed: usize,
+    retryable_failures: usize,
+    terminal_failures: usize,
 }
 
 struct RemoteStoreRoundOutcome {
@@ -1458,9 +1504,14 @@ fn apply_remote_store_batch_results(
     let mut made_progress = false;
 
     for (node_id, assigned_splits, result) in batch_results {
+        let assigned_set: HashSet<&str> = assigned_splits
+            .iter()
+            .map(|s| s.split_id.as_str())
+            .collect();
         match result {
             Ok(outcomes) => {
                 let mut node_failed = false;
+                let mut seen_in_batch: HashSet<String> = HashSet::new();
                 for outcome in outcomes {
                     let LeafSplitSearchOutcome {
                         split_id,
@@ -1470,6 +1521,15 @@ fn apply_remote_store_batch_results(
                         error,
                     } = outcome;
 
+                    // Deduplicate duplicate or out-of-assignment responses (`FS-047`, ADR 0003 invariant 6).
+                    if !assigned_set.contains(split_id.as_str())
+                        || !seen_in_batch.insert(split_id.clone())
+                        || accumulator.completed_split_ids.contains(&split_id)
+                    {
+                        accumulator.duplicate_responses_suppressed += 1;
+                        continue;
+                    }
+
                     if let Some(error) = error {
                         tracing::error!(
                             "remote_store: split {} failed on leaf {} for {}: {}",
@@ -1478,24 +1538,36 @@ fn apply_remote_store_batch_results(
                             index_name,
                             error
                         );
-                        if let Some(split) = split_lookup.get(&split_id) {
-                            next_pending.push(split.clone());
+                        let is_terminal = split_error_is_terminal(&error);
+                        if is_terminal {
+                            accumulator.terminal_failures += 1;
+                        } else {
+                            accumulator.retryable_failures += 1;
+                            if let Some(split) = split_lookup.get(&split_id) {
+                                next_pending.push(split.clone());
+                            }
+                            node_failed = true;
                         }
+                        let (status, error_type) = if error.contains("recreate the index")
+                            || error.contains("schema does not match authoritative mappings")
+                        {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "unsupported_index_format_exception",
+                            )
+                        } else {
+                            (StatusCode::INTERNAL_SERVER_ERROR, "search_exception")
+                        };
                         accumulator.failures.insert(
                             split_id.clone(),
                             ShardFailure::new(
-                                index_name,
-                                split_id,
-                                &node_id,
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "search_exception",
-                                error,
+                                index_name, split_id, &node_id, status, error_type, error,
                             ),
                         );
-                        node_failed = true;
                         continue;
                     }
 
+                    accumulator.completed_split_ids.insert(split_id.clone());
                     accumulator.failures.remove(&split_id);
                     made_progress = true;
                     accumulator.successful += 1;
@@ -1523,6 +1595,32 @@ fn apply_remote_store_batch_results(
                     accumulator.split_hit_lists.push(hit_list);
                 }
 
+                // Any split assigned in this batch that the leaf omitted from `outcomes`
+                // is treated as a retryable missing-split outcome (`FS-047`).
+                for split in &assigned_splits {
+                    if !seen_in_batch.contains(&split.split_id)
+                        && !accumulator.completed_split_ids.contains(&split.split_id)
+                    {
+                        accumulator.retryable_failures += 1;
+                        node_failed = true;
+                        next_pending.push(split.clone());
+                        accumulator.failures.insert(
+                            split.split_id.clone(),
+                            ShardFailure::new(
+                                index_name,
+                                split.split_id.clone(),
+                                &node_id,
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "remote_store_leaf_incomplete_batch_exception",
+                                format!(
+                                    "leaf [{}] omitted assigned split [{}] from batch response",
+                                    node_id, split.split_id
+                                ),
+                            ),
+                        );
+                    }
+                }
+
                 if node_failed {
                     newly_unhealthy_nodes.insert(node_id);
                 }
@@ -1534,7 +1632,13 @@ fn apply_remote_store_batch_results(
                     index_name,
                     error
                 );
+                let error_text = format!("{error:#}");
+                let is_terminal = split_error_is_terminal(&error_text);
                 for split in &assigned_splits {
+                    if accumulator.completed_split_ids.contains(&split.split_id) {
+                        accumulator.duplicate_responses_suppressed += 1;
+                        continue;
+                    }
                     accumulator.failures.insert(
                         split.split_id.clone(),
                         ShardFailure::from_error(
@@ -1544,9 +1648,16 @@ fn apply_remote_store_batch_results(
                             &error,
                         ),
                     );
+                    if is_terminal {
+                        accumulator.terminal_failures += 1;
+                    } else {
+                        accumulator.retryable_failures += 1;
+                        next_pending.push(split.clone());
+                    }
                 }
-                newly_unhealthy_nodes.insert(node_id);
-                next_pending.extend(assigned_splits);
+                if !is_terminal {
+                    newly_unhealthy_nodes.insert(node_id);
+                }
             }
         }
     }
@@ -1595,11 +1706,7 @@ pub(crate) async fn resolve_index_read_snapshot(
     let expected_schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
     let loaded = state
         .storage_manager
-        .load_manifest_for_snapshot(
-            metadata.uuid.as_str(),
-            requested_generation,
-            Some(&expected_schema_hash),
-        )
+        .load_manifest_for_snapshot_with_metadata(metadata, requested_generation)
         .await
         .map_err(|error| {
             let msg = format!("{error:#}");
@@ -1803,6 +1910,7 @@ pub(crate) async fn resolve_index_read_snapshot(
                 crate::search::SnapshotFilterParams {
                     snapshot_id: Some(snapshot_id.clone()),
                     snapshot_generation: Some(manifest_generation),
+                    allow_partial_results: None,
                     excluded_doc_ids: shard_excluded.into_iter().collect(),
                     split_excluded_doc_ids: BTreeMap::new(),
                     min_exclusive_seq_no: wm_seq,
@@ -1819,6 +1927,7 @@ pub(crate) async fn resolve_index_read_snapshot(
                 crate::search::SnapshotFilterParams {
                     snapshot_id: Some(snapshot_id.clone()),
                     snapshot_generation: Some(manifest_generation),
+                    allow_partial_results: None,
                     excluded_doc_ids: Vec::new(),
                     split_excluded_doc_ids: BTreeMap::new(),
                     min_exclusive_seq_no: wm_seq,
@@ -1949,9 +2058,19 @@ pub(crate) async fn search_with_resolved_snapshot(
         candidate_splits: split_plans.len(),
         pruned_splits: published_split_count.saturating_sub(split_plans.len()),
         assigned_splits: 0,
+        scheduling: None,
     };
+    let allow_partial = search_req.allow_partial_results().unwrap_or(true);
     if split_plans.is_empty() {
         validate_empty_search_request(state, metadata, &clean_req).await?;
+        remote_store_stats.scheduling = Some(crate::api::index::RemoteStoreSchedulingStats {
+            snapshot_id: resolved.snapshot.snapshot_id.clone(),
+            manifest_generation: manifest.generation,
+            schema_generation: metadata.effective_schema_generation(),
+            candidate_window: REMOTE_STORE_RENDEZVOUS_WINDOW,
+            allow_partial_results: allow_partial,
+            ..Default::default()
+        });
         return Ok(DistributedDslSearchResult {
             all_hits: Vec::new(),
             total_hits: 0,
@@ -1968,6 +2087,7 @@ pub(crate) async fn search_with_resolved_snapshot(
         clean_req.with_snapshot_filter(crate::search::SnapshotFilterParams {
             snapshot_id: Some(resolved.snapshot.snapshot_id.clone()),
             snapshot_generation: Some(manifest.generation),
+            allow_partial_results: search_req.allow_partial_results(),
             excluded_doc_ids: Vec::new(),
             split_excluded_doc_ids: resolved.split_excluded_doc_ids.clone(),
             min_exclusive_seq_no: None,
@@ -2027,11 +2147,20 @@ pub(crate) async fn search_with_resolved_snapshot(
     let mut pending_splits = split_plans.clone();
     let mut unhealthy_nodes = HashSet::new();
     let mut accumulator = RemoteStoreSearchAccumulator::default();
-    let mut failed = 0u32;
     let mut assigned_split_ids = HashSet::new();
+    let mut assignment_ids = Vec::new();
+    let mut batches_dispatched = 0usize;
+    let mut reader_warm_assignments = 0usize;
+    let mut artifact_warm_assignments = 0usize;
+    let mut cold_assignments = 0usize;
+    let mut assigned_bytes = 0u64;
+    let mut hydrated_bytes = 0u64;
+    let mut retried_splits = 0usize;
 
     let mut round_index = 0usize;
     while !pending_splits.is_empty() {
+        crate::worker::check_current_request_active(crate::worker::ExecutionStage::Search)
+            .map_err(query_error_response)?;
         let round_started = std::time::Instant::now();
         let assignments = assign_remote_store_splits(
             metadata.uuid.as_str(),
@@ -2042,7 +2171,6 @@ pub(crate) async fn search_with_resolved_snapshot(
             &unhealthy_nodes,
         );
         if assignments.is_empty() {
-            failed += pending_splits.len() as u32;
             for split in &pending_splits {
                 accumulator
                     .failures
@@ -2060,16 +2188,36 @@ pub(crate) async fn search_with_resolved_snapshot(
             }
             break;
         }
-        for split in assignments.values().flatten() {
-            assigned_split_ids.insert(split.split_id.clone());
+        let mut sorted_batches: Vec<(String, Vec<AssignedRemoteSplit>)> =
+            assignments.into_iter().collect();
+        sorted_batches.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (node_id, splits) in &sorted_batches {
+            let status_opt = statuses.get(node_id);
+            for split in splits {
+                if assigned_split_ids.insert(split.split_id.clone()) {
+                    assigned_bytes = assigned_bytes.saturating_add(split.size_bytes);
+                }
+                let rank = status_opt.map_or(0, |st| split_warmth_rank(st, &split.split_id));
+                match rank {
+                    2 => reader_warm_assignments += 1,
+                    1 => artifact_warm_assignments += 1,
+                    _ => {
+                        cold_assignments += 1;
+                        hydrated_bytes = hydrated_bytes.saturating_add(split.size_bytes);
+                    }
+                }
+            }
         }
 
         let mut work = Vec::new();
-        for (node_id, splits) in assignments {
+        for (node_id, splits) in sorted_batches {
             let assignment_id = format!(
-                "assign-g{}-r{}-{}",
-                manifest.generation, round_index, node_id
+                "assign-{}-r{}-{}",
+                resolved.snapshot.snapshot_id, round_index, node_id
             );
+            assignment_ids.push(assignment_id.clone());
+            batches_dispatched += 1;
             crate::worker::set_current_trace_assignment_id(&assignment_id);
             let node_id_for_result = node_id.clone();
             if node_id == state.local_node_id {
@@ -2134,7 +2282,19 @@ pub(crate) async fn search_with_resolved_snapshot(
             }
         }
 
-        let batch_results = futures::future::join_all(work).await;
+        let raw_batch_results = futures::future::join_all(work).await;
+        let mut batch_results = Vec::with_capacity(raw_batch_results.len());
+        for (node_id, assigned, result) in raw_batch_results {
+            match result {
+                Err(error)
+                    if crate::worker::is_cancellation_or_deadline_error(&error)
+                        || crate::search::query_string::query_error_is_client(&error) =>
+                {
+                    return Err(query_error_response(error));
+                }
+                other => batch_results.push((node_id, assigned, other)),
+            }
+        }
         let outcome_now_ms = now_epoch_ms();
         for (node_id, _assigned, result) in &batch_results {
             match result {
@@ -2182,16 +2342,48 @@ pub(crate) async fn search_with_resolved_snapshot(
         if round.next_pending.is_empty() {
             break;
         }
-        if !round.made_progress && round.next_pending.len() == pending_splits.len() {
-            failed += round.next_pending.len() as u32;
-            break;
+        let deduped_next = dedupe_pending_splits(round.next_pending);
+        if !round.made_progress && deduped_next.len() == pending_splits.len() {
+            let any_healthy_remaining = leaf_nodes.iter().any(|n| {
+                !unhealthy_nodes.contains(&n.id)
+                    && statuses.get(&n.id).is_some_and(|st| st.leaf_capable)
+            });
+            if !any_healthy_remaining {
+                break;
+            }
         }
-        pending_splits = dedupe_pending_splits(round.next_pending);
+        retried_splits = retried_splits.saturating_add(deduped_next.len());
+        pending_splits = deduped_next;
     }
     remote_store_stats.assigned_splits = assigned_split_ids.len();
     let shard_failures: Vec<_> = accumulator.failures.into_values().collect();
+    let failed = shard_failures.len() as u32;
+    remote_store_stats.scheduling = Some(crate::api::index::RemoteStoreSchedulingStats {
+        snapshot_id: resolved.snapshot.snapshot_id.clone(),
+        manifest_generation: manifest.generation,
+        schema_generation: metadata.effective_schema_generation(),
+        candidate_window: REMOTE_STORE_RENDEZVOUS_WINDOW,
+        eligible_leaves: leaf_nodes.len(),
+        batches_dispatched,
+        assignment_ids,
+        reader_warm_assignments,
+        artifact_warm_assignments,
+        cold_assignments,
+        assigned_bytes,
+        hydrated_bytes,
+        retry_rounds: round_index.saturating_sub(1),
+        retried_splits,
+        duplicate_responses_suppressed: accumulator.duplicate_responses_suppressed,
+        retryable_failures: accumulator.retryable_failures,
+        terminal_failures: accumulator.terminal_failures,
+        allow_partial_results: allow_partial,
+        partial_results: failed > 0 && accumulator.successful > 0,
+    });
     if let Some(error) = all_shards_failed_response(accumulator.successful, &shard_failures) {
         return Err(error);
+    }
+    if !allow_partial && !shard_failures.is_empty() {
+        return Err(all_shards_failed_response(0, &shard_failures).expect("non-empty failures"));
     }
 
     let merge_started = std::time::Instant::now();
@@ -2892,7 +3084,7 @@ pub(crate) async fn publish_docs_with_tombstones(
         })
         .collect();
 
-    let schema_generation = 1u64;
+    let schema_generation = metadata.effective_schema_generation();
     let schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
     let request_fingerprint = if tombstones.is_empty() {
         match crate::storage::compute_publication_request_fingerprint(
@@ -3553,10 +3745,9 @@ pub(crate) async fn verify_splits(
         ));
     }
 
-    let expected_schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
     let manifest = match state
         .storage_manager
-        .load_current_manifest(metadata.uuid.as_str(), Some(&expected_schema_hash))
+        .load_current_manifest_for_metadata(metadata)
         .await
     {
         Ok(Some(m)) => m,
@@ -3714,10 +3905,9 @@ pub(crate) async fn reconcile_published_watermark_retirement(
     if !metadata.is_tiered() {
         return Ok(retired_by_shard);
     }
-    let expected_schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
     let Some(manifest) = state
         .storage_manager
-        .load_current_manifest(metadata.uuid.as_str(), Some(&expected_schema_hash))
+        .load_current_manifest_for_metadata(metadata)
         .await?
     else {
         return Ok(retired_by_shard);
@@ -3813,7 +4003,7 @@ pub(super) async fn seal_hot_delta_with_mode(
     let expected_schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
     let current_manifest = state
         .storage_manager
-        .load_current_manifest(metadata.uuid.as_str(), Some(&expected_schema_hash))
+        .load_current_manifest_for_metadata(metadata)
         .await
         .map_err(|error| {
             crate::api::error_response(
@@ -4124,7 +4314,7 @@ pub(super) async fn seal_hot_delta_with_mode(
             crate::api::error_response(StatusCode::BAD_REQUEST, "mapper_parsing_exception", error)
         })?;
 
-        let schema_generation = 1u64;
+        let schema_generation = metadata.effective_schema_generation();
         let schema_hash = expected_schema_hash.clone();
         let fingerprint_payload = serde_json::json!({
             "kind": "hot_delta_seal_v1",
@@ -4501,7 +4691,7 @@ pub(super) async fn seal_hot_delta_with_mode(
         if options.retire_after_commit {
             let committed_manifest = state
                 .storage_manager
-                .load_current_manifest(&index_uuid, Some(&schema_hash))
+                .load_current_manifest_for_metadata(metadata)
                 .await
                 .map_err(|error| {
                     crate::api::error_response(
@@ -4589,10 +4779,9 @@ pub(crate) async fn get_document_from_published_splits(
     shard_id: u32,
     doc_id: &str,
 ) -> anyhow::Result<Option<crate::engine::DocumentRead>> {
-    let expected_schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
     let Some(manifest) = state
         .storage_manager
-        .load_current_manifest(metadata.uuid.as_str(), Some(&expected_schema_hash))
+        .load_current_manifest_for_metadata(metadata)
         .await?
     else {
         return Ok(None);
@@ -4814,7 +5003,7 @@ pub(crate) async fn compact_splits(
     let expected_schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
     let Some(current_manifest) = state
         .storage_manager
-        .load_current_manifest(&index_uuid, Some(&expected_schema_hash))
+        .load_current_manifest_for_metadata(metadata)
         .await
         .map_err(|error| {
             crate::api::error_response(
@@ -4989,12 +5178,18 @@ pub(crate) async fn compact_splits(
             }
             let total_records = (total_live + total_tombstones).max(1);
             let tombstone_ratio = (total_tombstones as f64) / (total_records as f64);
+            let target_schema_gen = metadata.effective_schema_generation();
+            let has_outdated_schema_gen = window
+                .iter()
+                .any(|(_, sp)| sp.schema_generation().unwrap_or(1) < target_schema_gen);
             let policy_eligible = options.force
+                || has_outdated_schema_gen
                 || window.len() >= min_input_splits
                 || overlap_docs >= min_overlap_docs
                 || tombstone_ratio >= min_tombstone_ratio;
             if policy_eligible
-                && (window.len() >= min_input_splits || (options.force && !window.is_empty()))
+                && (window.len() >= min_input_splits
+                    || ((options.force || has_outdated_schema_gen) && !window.is_empty()))
             {
                 chosen = Some(window);
                 break;
@@ -5242,7 +5437,7 @@ pub(crate) async fn compact_splits(
         crate::api::error_response(StatusCode::BAD_REQUEST, "mapper_parsing_exception", error)
     })?;
 
-    let schema_generation = 1u64;
+    let schema_generation = metadata.effective_schema_generation();
     let schema_hash = expected_schema_hash.clone();
     let fingerprint_payload = serde_json::json!({
         "kind": "remote_store_compact_v1",
@@ -5567,6 +5762,7 @@ pub(crate) async fn compact_splits(
                 "operation_id": outcome.operation_id,
                 "generation": outcome.generation,
                 "parent_generation": outcome.parent_generation,
+                "output_schema_generation": schema_generation,
                 "input_split_ids": input_split_ids,
                 "output_split_id": outcome.split_id,
                 "splits_compacted": input_split_ids.len(),
@@ -5653,13 +5849,12 @@ pub(crate) async fn rollback_manifest(
     }
 
     let index_uuid = metadata.uuid.as_str().to_string();
-    let expected_schema_hash = crate::storage::compute_schema_hash(&metadata.mappings);
     let lock_arc = state.storage_manager.sequencer_lock(&index_uuid).await;
     let _sequencer_guard = lock_arc.lock().await;
 
     let Some((current_manifest, current_path, _, current_rev)) = state
         .storage_manager
-        .load_manifest_for_snapshot(&index_uuid, None, Some(&expected_schema_hash))
+        .load_manifest_for_snapshot_with_metadata(metadata, None)
         .await
         .map_err(|error| {
             crate::api::error_response(
@@ -5689,11 +5884,7 @@ pub(crate) async fn rollback_manifest(
 
     let Some((target_manifest, _, _, _)) = state
         .storage_manager
-        .load_manifest_for_snapshot(
-            &index_uuid,
-            Some(target_generation),
-            Some(&expected_schema_hash),
-        )
+        .load_manifest_for_snapshot_with_metadata(metadata, Some(target_generation))
         .await
         .map_err(|error| {
             crate::api::error_response(
@@ -5811,15 +6002,20 @@ pub(crate) async fn rollback_manifest(
         format!("sha256:{raw_fp}")
     };
 
+    let rollback_schema_gen = metadata
+        .effective_schema_generation()
+        .max(current_manifest.schema_generation)
+        .max(target_manifest.schema_generation);
+    let rollback_schema_hash = metadata
+        .expected_schema_hash_for_generation(rollback_schema_gen)
+        .unwrap_or_else(|| crate::storage::compute_schema_hash(&metadata.mappings));
     let rollback_manifest = crate::storage::RemoteStoreManifest {
         version: crate::storage::REMOTE_MANIFEST_FORMAT_VERSION,
         engine: crate::cluster::state::IndexEngine::RemoteStore,
         index_uuid: index_uuid.clone(),
         index_name: index_name.to_string(),
-        schema_generation: current_manifest
-            .schema_generation
-            .max(target_manifest.schema_generation),
-        schema_hash: expected_schema_hash,
+        schema_generation: rollback_schema_gen,
+        schema_hash: rollback_schema_hash,
         generation: next_generation,
         parent_generation: current_manifest.generation,
         parent_manifest_path: Some(current_path),
@@ -6750,5 +6946,131 @@ mod tests {
         assert!(fallback.leaf_capable);
         assert!(fallback.inflight_bytes > 0);
         assert_eq!(cache.leaf_inventory_snapshot().conservative_fallbacks, 1);
+    }
+
+    #[test]
+    fn fs047_scale_split_assignment_bounded_candidate_window_and_deduplicated_retry_semantics() {
+        // 1. Large-scale assignment simulation: 512 splits across 32 leaves.
+        let leaves: Vec<NodeInfo> = (0..32)
+            .map(|i| test_leaf(&format!("leaf-{i:02}")))
+            .collect();
+        let splits: Vec<AssignedRemoteSplit> = (0..512)
+            .map(|i| test_split(&format!("split-{i:04}")))
+            .collect();
+        let mut statuses = HashMap::new();
+        for leaf in &leaves {
+            statuses.insert(leaf.id.clone(), test_status(&[]));
+        }
+
+        let started = std::time::Instant::now();
+        let assigned_1 = assign_remote_store_splits(
+            "idx-scale",
+            42,
+            &splits,
+            &leaves,
+            &statuses,
+            &HashSet::new(),
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "512x32 bounded candidate assignment took too long: {elapsed:?}"
+        );
+        let total_assigned: usize = assigned_1.values().map(Vec::len).sum();
+        assert_eq!(total_assigned, 512);
+
+        // Determinism: repeating with identical state yields identical assignments.
+        let assigned_2 = assign_remote_store_splits(
+            "idx-scale",
+            42,
+            &splits,
+            &leaves,
+            &statuses,
+            &HashSet::new(),
+        );
+        assert_eq!(assigned_1, assigned_2);
+
+        // 2. Deduplicated retry & duplicate/out-of-assignment response suppression + terminal vs retryable errors.
+        let split_a = test_split("split-a");
+        let split_b = test_split("split-b");
+        let split_c = test_split("split-c");
+        let split_lookup = HashMap::from([
+            (split_a.split_id.clone(), split_a.clone()),
+            (split_b.split_id.clone(), split_b.clone()),
+            (split_c.split_id.clone(), split_c.clone()),
+        ]);
+        let mut accumulator = RemoteStoreSearchAccumulator::default();
+
+        // Round 0:
+        // - leaf-1 was assigned [split_a, split_b], returns duplicate split_a, omits split_b, and includes unassigned split-rogue!
+        // - leaf-2 was assigned [split_c], fails with terminal unsupported format error.
+        let round_0 = apply_remote_store_batch_results(
+            "idx-scale",
+            vec![
+                (
+                    "leaf-1".to_string(),
+                    vec![split_a.clone(), split_b.clone()],
+                    Ok(vec![
+                        LeafSplitSearchOutcome {
+                            split_id: "split-a".into(),
+                            hits: vec![
+                                serde_json::json!({"_id": "1", "_score": 1.0, "_source": {"v": 1}}),
+                            ],
+                            total_hits: 1,
+                            partial_aggs: HashMap::new(),
+                            error: None,
+                        },
+                        // Duplicate split-a in the same batch must be suppressed!
+                        LeafSplitSearchOutcome {
+                            split_id: "split-a".into(),
+                            hits: vec![
+                                serde_json::json!({"_id": "1", "_score": 1.0, "_source": {"v": 1}}),
+                            ],
+                            total_hits: 1,
+                            partial_aggs: HashMap::new(),
+                            error: None,
+                        },
+                        // Out-of-assignment split-rogue must be suppressed!
+                        LeafSplitSearchOutcome {
+                            split_id: "split-rogue".into(),
+                            hits: vec![
+                                serde_json::json!({"_id": "99", "_score": 1.0, "_source": {"v": 99}}),
+                            ],
+                            total_hits: 1,
+                            partial_aggs: HashMap::new(),
+                            error: None,
+                        },
+                    ]),
+                ),
+                (
+                    "leaf-2".to_string(),
+                    vec![split_c.clone()],
+                    Ok(vec![LeafSplitSearchOutcome {
+                        split_id: "split-c".into(),
+                        hits: Vec::new(),
+                        total_hits: 0,
+                        partial_aggs: HashMap::new(),
+                        error: Some(
+                            "unsupported remote split bundle format_version 99; recreate the index"
+                                .into(),
+                        ),
+                    }]),
+                ),
+            ],
+            &split_lookup,
+            &mut accumulator,
+        );
+
+        // split-a counted exactly once; duplicate split-a and split-rogue suppressed (2 total).
+        assert_eq!(accumulator.successful, 1);
+        assert_eq!(accumulator.total_hits, 1);
+        assert_eq!(accumulator.duplicate_responses_suppressed, 2);
+        // split-b was omitted by leaf-1 -> treated as retryable failure and queued in next_pending!
+        // split-c failed with terminal format error -> NOT queued in next_pending!
+        assert_eq!(accumulator.retryable_failures, 1);
+        assert_eq!(accumulator.terminal_failures, 1);
+        assert_eq!(round_0.next_pending, vec![split_b.clone()]);
+        assert!(round_0.newly_unhealthy_nodes.contains("leaf-1"));
+        assert!(!round_0.newly_unhealthy_nodes.contains("leaf-2"));
     }
 }

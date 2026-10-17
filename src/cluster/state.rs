@@ -639,6 +639,45 @@ impl HotDeltaSealPolicy {
     }
 }
 
+/// Monotonic logical schema generation and fingerprint history for an index (`FS-048`, ADR 0005).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SchemaLineageMetadata {
+    pub current_generation: u64,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub history: std::collections::BTreeMap<u64, String>,
+}
+
+/// Validate that an object-store URI does not embed credentials (`FS-049`).
+pub fn validate_external_object_store_uri(uri: &str) -> Result<(), String> {
+    let trimmed = uri.trim();
+    if let Some((_, rest)) = trimmed.split_once("://")
+        && let Some(authority) = rest.split('/').next()
+        && authority.contains('@')
+    {
+        return Err(
+            "object_store_uri must not embed userinfo or credentials; configure object-store credentials externally via environment or host identity"
+                .into(),
+        );
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    for forbidden in [
+        "aws_secret_access_key",
+        "aws_access_key_id",
+        "aws_session_token",
+        "secret_key=",
+        "access_key=",
+        "password=",
+        "token=",
+    ] {
+        if lower.contains(forbidden) {
+            return Err(format!(
+                "object_store_uri must not contain credential parameter [{forbidden}]; configure object-store credentials externally"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Engine-specific metadata and cache settings for `remote_store`.
 ///
 /// These values do not alter `local_shards`. The current remote read path uses
@@ -670,6 +709,9 @@ pub struct RemoteStoreSettings {
     /// Optional mutable hot-delta and bounded split-sealing policy (`FS-034`, `FS-035`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hot_delta: Option<HotDeltaSealPolicy>,
+    /// Optional logical schema generation lineage (`FS-048`, ADR 0005).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_lineage: Option<SchemaLineageMetadata>,
 }
 
 impl RemoteStoreSettings {
@@ -682,6 +724,18 @@ impl RemoteStoreSettings {
             && self.hotcache_bytes.is_none()
             && self.split_cache_bytes.is_none()
             && self.hot_delta.is_none()
+            && self.schema_lineage.is_none()
+    }
+
+    pub fn has_remote_store_fields(&self) -> bool {
+        self.object_store_uri.is_some()
+            || self.manifest_path.is_some()
+            || self.manifest_generation.is_some()
+            || self.manifest_checksum.is_some()
+            || self.manifest_refresh_ms.is_some()
+            || self.hotcache_bytes.is_some()
+            || self.split_cache_bytes.is_some()
+            || self.hot_delta.is_some()
     }
 
     pub fn has_enabled_hot_delta(&self) -> bool {
@@ -700,6 +754,11 @@ impl RemoteStoreSettings {
         } else {
             Self::default()
         };
+
+        if let Some(ref uri) = parsed.object_store_uri {
+            validate_external_object_store_uri(uri)
+                .map_err(CreateIndexMetadataError::InvalidArgument)?;
+        }
 
         if let Some(hot_delta_val) = body
             .pointer("/settings/hot_delta")
@@ -1170,6 +1229,84 @@ pub struct IndexMetadata {
 }
 
 impl IndexMetadata {
+    pub fn effective_schema_generation(&self) -> u64 {
+        self.settings
+            .remote_store
+            .as_ref()
+            .and_then(|rs| rs.schema_lineage.as_ref())
+            .map(|sl| sl.current_generation.max(1))
+            .unwrap_or(1)
+    }
+
+    pub fn schema_history(&self) -> std::collections::BTreeMap<u64, String> {
+        self.settings
+            .remote_store
+            .as_ref()
+            .and_then(|rs| rs.schema_lineage.as_ref())
+            .map(|sl| sl.history.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn expected_schema_hash_for_generation(&self, generation: u64) -> Option<String> {
+        let current_gen = self.effective_schema_generation();
+        if generation == 0 || generation > current_gen {
+            return None;
+        }
+        if generation == current_gen {
+            return Some(crate::storage::compute_schema_hash(&self.mappings));
+        }
+        self.settings
+            .remote_store
+            .as_ref()
+            .and_then(|rs| rs.schema_lineage.as_ref())
+            .and_then(|sl| sl.history.get(&generation).cloned())
+    }
+
+    pub fn record_schema_generation_advance(
+        &mut self,
+        previous_generation: u64,
+        previous_schema_hash: String,
+    ) {
+        let rs = self
+            .settings
+            .remote_store
+            .get_or_insert_with(RemoteStoreSettings::default);
+        let lineage = rs
+            .schema_lineage
+            .get_or_insert_with(|| SchemaLineageMetadata {
+                current_generation: previous_generation.max(1),
+                history: std::collections::BTreeMap::new(),
+            });
+        let prev = previous_generation.max(lineage.current_generation).max(1);
+        lineage.history.insert(prev, previous_schema_hash);
+        lineage.current_generation = prev + 1;
+    }
+
+    pub fn validate_additive_mapping_update(
+        &self,
+        new_fields: &HashMap<String, FieldMapping>,
+    ) -> Result<bool, String> {
+        let mut added_any = false;
+        for (name, incoming) in new_fields {
+            if let Some(existing) = self.mappings.get(name) {
+                if existing.field_type != incoming.field_type
+                    || existing.dimension != incoming.dimension
+                {
+                    return Err(format!(
+                        "cannot change field [{name}] from type [{:?} (dim={:?})] to [{:?} (dim={:?})]; incompatible schema evolution is rejected (recreate the index to change field types)",
+                        existing.field_type,
+                        existing.dimension,
+                        incoming.field_type,
+                        incoming.dimension,
+                    ));
+                }
+            } else {
+                added_any = true;
+            }
+        }
+        Ok(added_any)
+    }
+
     pub fn uses_local_shards(&self) -> bool {
         self.settings.engine.uses_local_shards() || self.number_of_shards > 0
     }
@@ -3473,6 +3610,7 @@ mod tests {
                 hotcache_bytes: Some(8 * 1024 * 1024),
                 split_cache_bytes: Some(256 * 1024 * 1024),
                 hot_delta: None,
+                ..Default::default()
             }),
             ..Default::default()
         };

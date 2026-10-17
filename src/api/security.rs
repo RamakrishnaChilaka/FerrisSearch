@@ -34,6 +34,20 @@ pub struct CreateApiKeyBody {
     pub roles: Vec<String>,
     #[serde(default)]
     pub indices: Vec<String>,
+    #[serde(default)]
+    pub max_concurrent_requests: Option<usize>,
+    #[serde(default)]
+    pub max_inflight_bytes: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct AuditQueryParams {
+    #[serde(default)]
+    pub principal_id: Option<String>,
+    #[serde(default)]
+    pub outcome: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -139,6 +153,16 @@ pub async fn create_api_key(
             }
         }
         Err(e) => return e,
+    }
+
+    if parsed.max_concurrent_requests.is_some() || parsed.max_inflight_bytes.is_some() {
+        state.security_manager.set_principal_quota(
+            &record.id,
+            crate::security::TenantQuotaConfig {
+                max_concurrent_requests: parsed.max_concurrent_requests,
+                max_inflight_bytes: parsed.max_inflight_bytes,
+            },
+        );
     }
 
     (
@@ -299,7 +323,14 @@ pub async fn put_role(
 /// `GET /_security/role` — list all custom role definitions.
 pub async fn list_roles(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     let cs = state.cluster_manager.get_state();
-    let mut roles: Vec<&SecurityRoleDefinition> = cs.roles.values().collect();
+    let mut roles: Vec<&SecurityRoleDefinition> = cs
+        .roles
+        .values()
+        .filter(|r| {
+            !r.name
+                .starts_with(crate::security::INTERNAL_QUOTA_ROLE_PREFIX)
+        })
+        .collect();
     roles.sort_by(|a, b| a.name.cmp(&b.name));
     let list: Vec<Value> = roles.into_iter().map(role_to_json).collect();
     (StatusCode::OK, Json(json!({ "roles": list })))
@@ -310,6 +341,13 @@ pub async fn get_role(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> (StatusCode, Json<Value>) {
+    if name.starts_with(crate::security::INTERNAL_QUOTA_ROLE_PREFIX) {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "resource_not_found_exception",
+            format!("role [{name}] not found"),
+        );
+    }
     let cs = state.cluster_manager.get_state();
     match cs.roles.get(&name) {
         Some(role) => (StatusCode::OK, Json(role_to_json(role))),
@@ -326,7 +364,9 @@ pub async fn delete_role(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> (StatusCode, Json<Value>) {
-    if !state.cluster_manager.get_state().roles.contains_key(&name) {
+    if name.starts_with(crate::security::INTERNAL_QUOTA_ROLE_PREFIX)
+        || !state.cluster_manager.get_state().roles.contains_key(&name)
+    {
         return error_response(
             StatusCode::NOT_FOUND,
             "resource_not_found_exception",
@@ -360,5 +400,184 @@ pub async fn delete_role(
     (
         StatusCode::OK,
         Json(json!({ "name": name, "deleted": true })),
+    )
+}
+
+// ─── Tenant Quotas & Structured Redacted Audit Log (FS-049) ──────────────────
+
+/// `GET /_security/audit` — inspect structured, redacted security and admission audit records.
+pub async fn get_audit_log(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<AuditQueryParams>,
+) -> (StatusCode, Json<Value>) {
+    let outcome_filter = match params.outcome.as_deref() {
+        Some(raw) => match crate::security::AuditOutcome::from_label(raw) {
+            Some(o) => Some(o),
+            None => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "illegal_argument_exception",
+                    format!(
+                        "invalid audit outcome filter [{raw}]; supported: [allowed, unauthenticated, forbidden, quota_exceeded]"
+                    ),
+                );
+            }
+        },
+        None => None,
+    };
+    let limit = params.limit.unwrap_or(100);
+    let (total_recorded, entries) = state.security_manager.audit_log_entries(
+        params.principal_id.as_deref(),
+        outcome_filter,
+        limit,
+    );
+    (
+        StatusCode::OK,
+        Json(json!({
+            "total_recorded": total_recorded,
+            "retained": entries.len(),
+            "entries": entries,
+        })),
+    )
+}
+
+/// `GET /_security/quota` — inspect active per-principal and per-index resource quotas.
+pub async fn get_quotas(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::OK,
+        Json(state.security_manager.quota_snapshot()),
+    )
+}
+
+/// `PUT /_security/quota/{scope}/{id}` — configure a per-principal (`scope = "principal"`)
+/// or per-index (`scope = "index"`) concurrency and inflight-byte quota (`FS-049`).
+pub async fn put_quota(
+    State(state): State<AppState>,
+    Path((scope, id)): Path<(String, String)>,
+    body: Bytes,
+) -> (StatusCode, Json<Value>) {
+    if id.trim().is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            "quota target id is required",
+        );
+    }
+    let parsed: crate::security::TenantQuotaConfig = match parse_body(&body) {
+        Ok(q) => q,
+        Err(e) => return e,
+    };
+    if parsed.max_concurrent_requests == Some(0) || parsed.max_inflight_bytes == Some(0) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            "quota limits must be greater than zero when specified",
+        );
+    }
+    match scope.as_str() {
+        "principal" => state.security_manager.set_principal_quota(&id, parsed),
+        "index" => state.security_manager.set_index_quota(&id, parsed),
+        other => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "illegal_argument_exception",
+                format!("unsupported quota scope [{other}]; expected 'principal' or 'index'"),
+            );
+        }
+    }
+    let role_record = crate::security::encode_quota_role_record(&scope, &id, parsed);
+    match resolve_leader_or_master(&state, "quota update") {
+        Ok(Some(master)) => {
+            if let Err(e) = state
+                .transport_client
+                .forward_put_role(&master, &role_record)
+                .await
+            {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "forward_exception",
+                    format!("Failed to forward quota update to master: {e}"),
+                );
+            }
+        }
+        Ok(None) => {
+            let cmd = ClusterCommand::PutRole { role: role_record };
+            if let Err(e) = raft_write(&state, cmd).await {
+                return e;
+            }
+        }
+        Err(e) => return e,
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "scope": scope,
+            "id": id,
+            "max_concurrent_requests": parsed.max_concurrent_requests,
+            "max_inflight_bytes": parsed.max_inflight_bytes,
+            "acknowledged": true,
+        })),
+    )
+}
+
+/// `DELETE /_security/quota/{scope}/{id}` — remove a per-principal or per-index quota.
+pub async fn delete_quota(
+    State(state): State<AppState>,
+    Path((scope, id)): Path<(String, String)>,
+) -> (StatusCode, Json<Value>) {
+    let role_key = format!(
+        "{}{scope}:{id}",
+        crate::security::INTERNAL_QUOTA_ROLE_PREFIX
+    );
+    let in_cluster = state
+        .cluster_manager
+        .get_state()
+        .roles
+        .contains_key(&role_key);
+    let removed = match scope.as_str() {
+        "principal" => state.security_manager.remove_principal_quota(&id) || in_cluster,
+        "index" => state.security_manager.remove_index_quota(&id) || in_cluster,
+        other => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "illegal_argument_exception",
+                format!("unsupported quota scope [{other}]; expected 'principal' or 'index'"),
+            );
+        }
+    };
+    if !removed {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "resource_not_found_exception",
+            format!("quota [{scope}/{id}] not found"),
+        );
+    }
+    if in_cluster {
+        match resolve_leader_or_master(&state, "quota deletion") {
+            Ok(Some(master)) => {
+                if let Err(e) = state
+                    .transport_client
+                    .forward_delete_role(&master, &role_key)
+                    .await
+                {
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "forward_exception",
+                        format!("Failed to forward quota deletion to master: {e}"),
+                    );
+                }
+            }
+            Ok(None) => {
+                let cmd = ClusterCommand::DeleteRole { name: role_key };
+                if let Err(e) = raft_write(&state, cmd).await {
+                    return e;
+                }
+            }
+            Err(e) => return e,
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(json!({ "scope": scope, "id": id, "deleted": true })),
     )
 }

@@ -121,6 +121,21 @@ fn presence_query(index: &Index, field_name: &str) -> Result<Box<dyn Query>, Que
     Err(QueryParserError::FieldNotIndexed(field_name.to_string()))
 }
 
+pub(crate) fn build_exists_query(
+    index: &Index,
+    field_name: &str,
+) -> anyhow::Result<Box<dyn Query>> {
+    let trimmed = field_name.trim();
+    if trimmed.is_empty() {
+        return Err(parsing_error(
+            "exists",
+            QueryParserError::SyntaxError("exists query 'field' must not be empty".into()),
+        ));
+    }
+    presence_query(index, trimmed)
+        .map_err(|error| parsing_error(&format!("exists:{trimmed}"), error))
+}
+
 pub(crate) fn parse_query_string(
     index: &Index,
     query: &str,

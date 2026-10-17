@@ -725,6 +725,13 @@ pub trait SearchEngine: Send + Sync {
 
     fn fail_stop_writes(&self, reason: &str);
 
+    fn has_all_mapped_fields(
+        &self,
+        _mappings: &std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
+    ) -> bool {
+        true
+    }
+
     fn ensure_write_health(&self) -> Result<()> {
         match self.write_failure_reason() {
             Some(reason) => Err(crate::wal::WalFailStoppedError { reason }.into()),

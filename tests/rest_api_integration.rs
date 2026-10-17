@@ -539,6 +539,25 @@ impl RestTestHarness {
         Ok((status, value))
     }
 
+    async fn post_ndjson_auth(
+        &self,
+        path: &str,
+        api_key: &str,
+        body: &str,
+    ) -> Result<(StatusCode, Value)> {
+        let response = self
+            .client
+            .post(format!("{}{}", self.base_url, path))
+            .header("Authorization", format!("ApiKey {api_key}"))
+            .header(CONTENT_TYPE, "application/x-ndjson")
+            .body(body.to_string())
+            .send()
+            .await?;
+        let status = response.status();
+        let value = response.json().await?;
+        Ok((status, value))
+    }
+
     /// GET that returns the raw status without parsing a body — useful for
     /// asserting auth outcomes on endpoints whose success body is large.
     async fn get_status_auth(&self, path: &str, api_key: &str) -> Result<StatusCode> {
@@ -9752,6 +9771,509 @@ async fn fs043_online_lifecycle_migration_equivalence_interruption_and_rollback(
     );
     assert_eq!(final_search_b["hits"]["hits"][1]["_id"], json!("o-3"));
     assert_eq!(final_search_b["hits"]["hits"][2]["_id"], json!("o-4"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn fs047_050_scale_scheduling_mixed_schema_generations_tenant_isolation_and_research_evidence_suite()
+-> Result<()> {
+    let admin = "admin-secret";
+    let harness = RestTestHarness::start_security_enabled(vec![bootstrap_admin_key(admin)]).await?;
+
+    // ── Part 1 (FS-049): External Object-Store Credential Enforcement ──
+    let (cred_uri_st, cred_uri_b) = harness
+        .put_json_auth(
+            "/bad-creds-idx",
+            admin,
+            json!({
+                "engine": "remote_store",
+                "settings": {
+                    "remote_store": {
+                        "object_store_uri": "s3://access:secret@my-bucket/prefix"
+                    }
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(cred_uri_st, StatusCode::BAD_REQUEST, "{cred_uri_b}");
+    assert_eq!(
+        cred_uri_b["error"]["type"],
+        json!("illegal_argument_exception")
+    );
+
+    // ── Part 2 (FS-048 & FS-047): Mixed Schema Generations, Compaction Upgrade, Rollback, and Scheduling Telemetry ──
+    let (create_st, create_b) = harness
+        .put_json_auth(
+            "/mixed-schema-events",
+            admin,
+            json!({
+                "engine": "remote_store",
+                "settings": {
+                    "lifecycle_mode": "tiered",
+                    "number_of_shards": 1,
+                    "number_of_replicas": 0
+                },
+                "mappings": {
+                    "properties": {
+                        "title": { "type": "text" },
+                        "price": { "type": "float" }
+                    }
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(create_st, StatusCode::OK, "{create_b}");
+
+    // Ingest generation-1 documents and seal Split 1 at schema_generation = 1.
+    for (id, title, price) in [
+        ("doc-1", "rust search engine", 10.5),
+        ("doc-2", "columnar execution", 20.0),
+    ] {
+        let (st, b) = harness
+            .put_json_auth(
+                &format!("/mixed-schema-events/_doc/{id}?refresh=true"),
+                admin,
+                json!({ "title": title, "price": price }),
+            )
+            .await?;
+        assert_eq!(st, StatusCode::CREATED, "{b}");
+    }
+    let (seal1_st, seal1_b) = harness
+        .post_json_auth(
+            "/mixed-schema-events/_remote_store/seal",
+            admin,
+            json!({ "force": true }),
+        )
+        .await?;
+    assert_eq!(seal1_st, StatusCode::OK, "{seal1_b}");
+    assert_eq!(seal1_b["splits_sealed"], json!(1));
+
+    // Reject incompatible type change (price: float -> keyword) and field removal via PUT /_mapping!
+    let (bad_map_st, bad_map_b) = harness
+        .put_json_auth(
+            "/mixed-schema-events/_mapping",
+            admin,
+            json!({
+                "properties": {
+                    "price": { "type": "keyword" }
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(bad_map_st, StatusCode::BAD_REQUEST, "{bad_map_b}");
+    assert_eq!(
+        bad_map_b["error"]["type"],
+        json!("mapper_parsing_exception")
+    );
+
+    let (bad_rm_st, bad_rm_b) = harness
+        .put_json_auth(
+            "/mixed-schema-events/_mapping",
+            admin,
+            json!({
+                "remove_fields": ["price"]
+            }),
+        )
+        .await?;
+    assert_eq!(bad_rm_st, StatusCode::BAD_REQUEST, "{bad_rm_b}");
+
+    // Warm Split 1's reader at schema_generation = 1 BEFORE advancing mappings so
+    // we verify that an already-cached remote split reader cleanly evolves to generation 2!
+    let (warm1_st, warm1_b) = harness
+        .post_json_auth(
+            "/mixed-schema-events/_search",
+            admin,
+            json!({ "query": { "match_all": {} } }),
+        )
+        .await?;
+    assert_eq!(warm1_st, StatusCode::OK, "{warm1_b}");
+    assert_eq!(warm1_b["hits"]["total"]["value"], json!(2));
+
+    // Apply additive schema evolution (adding 'region' Keyword and 'StockCount' Integer) -> schema_generation = 2!
+    let (map2_st, map2_b) = harness
+        .put_json_auth(
+            "/mixed-schema-events/_mapping",
+            admin,
+            json!({
+                "properties": {
+                    "region": { "type": "keyword" },
+                    "StockCount": { "type": "integer" }
+                }
+            }),
+        )
+        .await?;
+    assert_eq!(map2_st, StatusCode::OK, "{map2_b}");
+    assert_eq!(map2_b["acknowledged"], json!(true));
+    assert_eq!(map2_b["schema_generation"], json!(2));
+
+    let (get_map_st, get_map_b) = harness
+        .get_json_auth("/mixed-schema-events/_mapping", admin)
+        .await?;
+    assert_eq!(get_map_st, StatusCode::OK, "{get_map_b}");
+    assert_eq!(
+        get_map_b["mixed-schema-events"]["schema_generation"],
+        json!(2)
+    );
+    assert!(
+        get_map_b["mixed-schema-events"]["schema_history"]["1"]
+            .as_str()
+            .is_some_and(|h| h.starts_with("sha256:"))
+    );
+
+    // Ingest generation-2 documents with 'region' and 'StockCount' and seal Split 2 at schema_generation = 2.
+    for (id, title, price, region, stock) in [
+        ("doc-3", "vector hybrid query", 30.0, "us-east", 100),
+        ("doc-4", "object store compaction", 40.0, "eu-west", 250),
+    ] {
+        let (st, b) = harness
+            .put_json_auth(
+                &format!("/mixed-schema-events/_doc/{id}?refresh=true"),
+                admin,
+                json!({
+                    "title": title,
+                    "price": price,
+                    "region": region,
+                    "StockCount": stock
+                }),
+            )
+            .await?;
+        assert_eq!(st, StatusCode::CREATED, "{b}");
+    }
+    let (seal2_st, seal2_b) = harness
+        .post_json_auth(
+            "/mixed-schema-events/_remote_store/seal",
+            admin,
+            json!({ "force": true }),
+        )
+        .await?;
+    assert_eq!(seal2_st, StatusCode::OK, "{seal2_b}");
+    assert_eq!(seal2_b["splits_sealed"], json!(1));
+
+    // Query across mixed schema generations (Split 1 at schema_generation=1, Split 2 at schema_generation=2):
+    // 1. DSL exists query on additive field 'region' matches only doc-3 and doc-4.
+    let (exists_st, exists_b) = harness
+        .post_json_auth(
+            "/mixed-schema-events/_search",
+            admin,
+            json!({
+                "query": { "exists": { "field": "region" } },
+                "sort": [{ "price": "asc" }]
+            }),
+        )
+        .await?;
+    assert_eq!(exists_st, StatusCode::OK, "{exists_b}");
+    assert_eq!(exists_b["hits"]["total"]["value"], json!(2));
+    assert_eq!(exists_b["hits"]["hits"][0]["_id"], json!("doc-3"));
+    assert_eq!(exists_b["hits"]["hits"][1]["_id"], json!("doc-4"));
+
+    // Verify FS-047 scheduling telemetry on search response:
+    let sched = &exists_b["remote_store"]["scheduling"];
+    assert_eq!(sched["manifest_generation"], json!(2));
+    assert_eq!(sched["schema_generation"], json!(2));
+    assert_eq!(sched["candidate_window"], json!(2));
+    assert!(sched["eligible_leaves"].as_u64().unwrap_or(0) >= 1);
+    assert!(sched["assigned_bytes"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(sched["allow_partial_results"], json!(true));
+    assert_eq!(sched["partial_results"], json!(false));
+
+    // 2. DSL must_not exists query matches doc-1 and doc-2, and _source does not gain synthesized keys!
+    let (missing_st, missing_b) = harness
+        .post_json_auth(
+            "/mixed-schema-events/_search",
+            admin,
+            json!({
+                "query": { "bool": { "must_not": [{ "exists": { "field": "region" } }] } },
+                "sort": [{ "price": "asc" }]
+            }),
+        )
+        .await?;
+    assert_eq!(missing_st, StatusCode::OK, "{missing_b}");
+    assert_eq!(missing_b["hits"]["total"]["value"], json!(2));
+    assert_eq!(missing_b["hits"]["hits"][0]["_id"], json!("doc-1"));
+    assert!(
+        missing_b["hits"]["hits"][0]["_source"]
+            .get("region")
+            .is_none(),
+        "_source must not gain a synthesized key for additive field"
+    );
+
+    // 3. SQL projection with quoted ("StockCount") and unquoted (region) identifiers across mixed schema generations:
+    let (sql_proj_st, sql_proj_b) = harness
+        .post_json_auth(
+            "/mixed-schema-events/_sql/explain",
+            admin,
+            json!({
+                "query": "SELECT price, region, \"StockCount\" AS stock FROM \"mixed-schema-events\" ORDER BY price ASC",
+                "analyze": true
+            }),
+        )
+        .await?;
+    assert_eq!(sql_proj_st, StatusCode::OK, "{sql_proj_b}");
+    assert_eq!(sql_proj_b["row_count"], json!(4));
+    assert_eq!(sql_proj_b["rows"][0]["price"], json!(10.5));
+    assert_eq!(sql_proj_b["rows"][0]["region"], Value::Null);
+    assert_eq!(sql_proj_b["rows"][0]["stock"], Value::Null);
+    assert_eq!(sql_proj_b["rows"][2]["price"], json!(30.0));
+    assert_eq!(sql_proj_b["rows"][2]["region"], json!("us-east"));
+    assert_eq!(sql_proj_b["rows"][2]["stock"], json!(100));
+    // Verify EXPLAIN ANALYZE includes FS-047 scheduling & byte/cache/retry telemetry!
+    assert_eq!(
+        sql_proj_b["remote_store"]["scheduling"]["schema_generation"],
+        json!(2)
+    );
+    assert!(
+        sql_proj_b["remote_store"]["scheduling"]["assignment_ids"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty())
+    );
+
+    // 4. SQL GROUP BY over additive field 'region' (`tantivy_grouped_partials`) across mixed schema generations:
+    let (sql_grp_st, sql_grp_b) = harness
+        .post_json_auth(
+            "/mixed-schema-events/_sql",
+            admin,
+            json!({
+                "query": "SELECT region, COUNT(*) AS cnt, SUM(stockcount) AS total_stock FROM \"mixed-schema-events\" GROUP BY region ORDER BY cnt DESC, region ASC"
+            }),
+        )
+        .await?;
+    assert_eq!(sql_grp_st, StatusCode::OK, "{sql_grp_b}");
+    assert_eq!(
+        sql_grp_b["execution_mode"],
+        json!("tantivy_grouped_partials")
+    );
+    let grp_rows = sql_grp_b["rows"].as_array().unwrap();
+    assert_eq!(grp_rows.len(), 3, "{sql_grp_b}");
+    assert_eq!(grp_rows[0]["region"], Value::Null);
+    assert_eq!(grp_rows[0]["cnt"], json!(2));
+
+    // 5. Compaction upgrades older schema_generation splits into schema_generation = 2 while retaining rollback generation!
+    let (compact_st, compact_b) = harness
+        .post_json_auth(
+            "/mixed-schema-events/_remote_store/compact",
+            admin,
+            json!({ "force": true }),
+        )
+        .await?;
+    assert_eq!(compact_st, StatusCode::OK, "{compact_b}");
+    assert_eq!(compact_b["status"], json!("committed"));
+    assert_eq!(compact_b["output_schema_generation"], json!(2));
+    assert_eq!(compact_b["splits_compacted"], json!(2));
+
+    // Forward rollback to generation 2 (mixed-generation splits) remains readable!
+    let (rb_gen_st, rb_gen_b) = harness
+        .post_json_auth(
+            "/mixed-schema-events/_remote_store/rollback",
+            admin,
+            json!({ "target_generation": 2 }),
+        )
+        .await?;
+    assert_eq!(rb_gen_st, StatusCode::OK, "{rb_gen_b}");
+    assert_eq!(rb_gen_b["published_splits"], json!(2));
+
+    // ── Part 3 (FS-049): Multi-Tenant Security, Quotas, Body-Routed Charging, and Redacted Audit Log ──
+    let (key_a_st, key_a_b) = harness
+        .post_json_auth(
+            "/_security/api_key",
+            admin,
+            json!({
+                "name": "tenant-a-writer",
+                "roles": ["write"],
+                "indices": ["tenant-a-*"]
+            }),
+        )
+        .await?;
+    assert_eq!(key_a_st, StatusCode::CREATED, "{key_a_b}");
+    let tenant_a_secret = key_a_b["api_key"].as_str().unwrap().to_string();
+    let tenant_a_id = key_a_b["id"].as_str().unwrap().to_string();
+
+    let (key_b_st, key_b_b) = harness
+        .post_json_auth(
+            "/_security/api_key",
+            admin,
+            json!({
+                "name": "tenant-b-writer",
+                "roles": ["write"],
+                "indices": ["tenant-b-*"]
+            }),
+        )
+        .await?;
+    assert_eq!(key_b_st, StatusCode::CREATED, "{key_b_b}");
+    let tenant_b_secret = key_b_b["api_key"].as_str().unwrap().to_string();
+
+    // Create tenant-a-orders and tenant-b-orders as admin
+    for idx in ["tenant-a-orders", "tenant-b-orders"] {
+        let (st, b) = harness
+            .put_json_auth(
+                &format!("/{idx}"),
+                admin,
+                json!({
+                    "settings": { "number_of_shards": 1, "number_of_replicas": 0 },
+                    "mappings": {
+                        "properties": {
+                            "item": { "type": "keyword" },
+                            "amount": { "type": "integer" }
+                        }
+                    }
+                }),
+            )
+            .await?;
+        assert_eq!(st, StatusCode::OK, "{b}");
+    }
+
+    // Tenant A writes to tenant-a-orders and Tenant B writes to tenant-b-orders via /_bulk
+    let (bulk_a_st, bulk_a_b) = harness
+        .post_ndjson_auth(
+            "/_bulk?refresh=true",
+            &tenant_a_secret,
+            "{\"index\":{\"_index\":\"tenant-a-orders\",\"_id\":\"a1\"}}\n{\"item\":\"laptop\",\"amount\":1200}\n",
+        )
+        .await?;
+    assert_eq!(bulk_a_st, StatusCode::OK, "{bulk_a_b}");
+    assert_eq!(bulk_a_b["errors"], json!(false));
+
+    let (bulk_b_st, bulk_b_b) = harness
+        .post_ndjson_auth(
+            "/_bulk?refresh=true",
+            &tenant_b_secret,
+            "{\"index\":{\"_index\":\"tenant-b-orders\",\"_id\":\"b1\"}}\n{\"item\":\"server\",\"amount\":5000}\n",
+        )
+        .await?;
+    assert_eq!(bulk_b_st, StatusCode::OK, "{bulk_b_b}");
+    assert_eq!(bulk_b_b["errors"], json!(false));
+
+    // Cross-tenant /_bulk item from Tenant A targeting tenant-b-orders must fail at item level with 403
+    // and be attributed as 'forbidden' with target_indices=['tenant-b-orders'] in the audit log!
+    let (bulk_cross_st, bulk_cross_b) = harness
+        .post_ndjson_auth(
+            "/_bulk",
+            &tenant_a_secret,
+            "{\"index\":{\"_index\":\"tenant-b-orders\",\"_id\":\"b-unauth\"}}\n{\"item\":\"intrusion\",\"amount\":1}\n",
+        )
+        .await?;
+    assert_eq!(bulk_cross_st, StatusCode::OK, "{bulk_cross_b}");
+    assert_eq!(bulk_cross_b["errors"], json!(true));
+    assert_eq!(bulk_cross_b["items"][0]["index"]["status"], json!(403));
+
+    // Cross-tenant SQL on body-routed /_sql from Tenant A referencing tenant-b-orders must be denied with 403!
+    let (sql_cross_st, sql_cross_b) = harness
+        .post_json_auth(
+            "/_sql",
+            &tenant_a_secret,
+            json!({
+                "query": "SELECT item FROM \"tenant-b-orders\""
+            }),
+        )
+        .await?;
+    assert_eq!(sql_cross_st, StatusCode::FORBIDDEN, "{sql_cross_b}");
+
+    // And on index-scoped /tenant-a-orders/_sql, a subquery attempting to read tenant-b-orders is also rejected!
+    let (semijoin_st, _) = harness
+        .post_json_auth(
+            "/tenant-a-orders/_sql",
+            &tenant_a_secret,
+            json!({
+                "query": "SELECT item FROM \"tenant-a-orders\" WHERE item IN (SELECT item FROM \"tenant-b-orders\")"
+            }),
+        )
+        .await?;
+    assert!(
+        matches!(semijoin_st, StatusCode::BAD_REQUEST | StatusCode::FORBIDDEN),
+        "unexpected status for cross-index subquery: {semijoin_st}"
+    );
+
+    // Cross-tenant global node cache inventory access by Tenant A is denied with 403!
+    let (cache_inv_st, _) = harness
+        .get_json_auth("/_nodes/cache/inventory", &tenant_a_secret)
+        .await?;
+    assert_eq!(cache_inv_st, StatusCode::FORBIDDEN);
+
+    // Trigger a force-merge task on tenant-b-orders as admin and verify Tenant A cannot read it via GET /_tasks/{task_id}!
+    let (fm_st, fm_b) = harness
+        .post_json_auth("/tenant-b-orders/_forcemerge", admin, json!({}))
+        .await?;
+    assert_eq!(fm_st, StatusCode::ACCEPTED, "{fm_b}");
+    let task_id = fm_b["task"]["id"].as_str().unwrap();
+    let (task_cross_st, _) = harness
+        .get_json_auth(&format!("/_tasks/{task_id}"), &tenant_a_secret)
+        .await?;
+    assert_eq!(task_cross_st, StatusCode::FORBIDDEN);
+
+    // Configure a strict byte quota on tenant-a-orders via PUT /_security/quota/index/tenant-a-orders
+    // and verify Tenant A's oversized write is rejected with 429 overload while Tenant B is unaffected!
+    let (q_put_st, q_put_b) = harness
+        .put_json_auth(
+            "/_security/quota/index/tenant-a-orders",
+            admin,
+            json!({
+                "max_concurrent_requests": 4,
+                "max_inflight_bytes": 10
+            }),
+        )
+        .await?;
+    assert_eq!(q_put_st, StatusCode::OK, "{q_put_b}");
+
+    let (over_st, over_b) = harness
+        .put_json_auth(
+            "/tenant-a-orders/_doc/a2",
+            &tenant_a_secret,
+            json!({ "item": "oversized-payload-for-quota", "amount": 999 }),
+        )
+        .await?;
+    assert_eq!(over_st, StatusCode::TOO_MANY_REQUESTS, "{over_b}");
+    assert_eq!(
+        over_b["error"]["type"],
+        json!("tenant_quota_exceeded_exception")
+    );
+    assert_eq!(over_b["error"]["error_class"], json!("overload"));
+
+    // Tenant B remains completely unaffected by Tenant A's quota overload!
+    let (b_ok_st, b_ok_b) = harness
+        .post_json_auth(
+            "/_sql",
+            &tenant_b_secret,
+            json!({
+                "query": "SELECT item, amount FROM \"tenant-b-orders\""
+            }),
+        )
+        .await?;
+    assert_eq!(b_ok_st, StatusCode::OK, "{b_ok_b}");
+    assert_eq!(b_ok_b["rows"].as_array().map(Vec::len), Some(1));
+
+    // Verify GET /_security/audit contains complete, redacted records for Allowed, Forbidden, and QuotaExceeded
+    // without leaking any plaintext secrets!
+    let (audit_st, audit_b) = harness
+        .get_json_auth("/_security/audit?limit=50", admin)
+        .await?;
+    assert_eq!(audit_st, StatusCode::OK, "{audit_b}");
+    let audit_str = audit_b.to_string();
+    assert!(
+        !audit_str.contains(&tenant_a_secret) && !audit_str.contains(&tenant_b_secret),
+        "audit log must never leak plaintext API key secrets"
+    );
+    let entries = audit_b["entries"].as_array().unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|e| e["outcome"] == json!("quota_exceeded")
+                && e["principal_id"] == json!(tenant_a_id)),
+        "audit log must record quota_exceeded for tenant A: {audit_b}"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|e| e["outcome"] == json!("forbidden") && e["principal_id"] == json!(tenant_a_id)),
+        "audit log must record forbidden cross-tenant access for tenant A: {audit_b}"
+    );
+    assert!(
+        entries.iter().any(|e| e["path"] == json!("/_bulk")
+            && e["outcome"] == json!("forbidden")
+            && e["target_indices"]
+                .as_array()
+                .is_some_and(|arr| arr.contains(&json!("tenant-b-orders")))),
+        "body-routed /_bulk cross-tenant denial must be recorded as forbidden with target_indices: {audit_b}"
+    );
 
     Ok(())
 }

@@ -383,6 +383,13 @@ impl WriterState {
         }
     }
 
+    fn read_only() -> Self {
+        Self {
+            writer: None,
+            failure: Some("remote split reader is read-only".to_string()),
+        }
+    }
+
     fn writer_mut(&mut self, context: &str) -> Result<&mut IndexWriter> {
         self.writer.as_mut().ok_or_else(|| {
             anyhow::Error::new(TantivyWriterUnavailableError {
@@ -1042,6 +1049,9 @@ pub(crate) fn validate_search_request_with_mappings(
                     )?;
                 }
             }
+            crate::search::QueryClause::Exists(params) => {
+                crate::search::query_string::build_exists_query(index, &params.field)?;
+            }
             crate::search::QueryClause::Bool(query) => {
                 for clause in query
                     .must
@@ -1646,8 +1656,19 @@ impl HotEngine {
 
         // Keep the per-shard writer heap modest so nodes reopening many local shards
         // do not reserve multiple GiB before they can finish recovery.
-        let writer = index.writer(TANTIVY_WRITER_HEAP_BYTES)?;
-        let automatic_merge_policy = writer.get_merge_policy();
+        // Already-built remote splits opened from the local split cache are strictly
+        // read-only and do not acquire Tantivy's exclusive writer lock (`FS-048`).
+        let (writer_state, automatic_merge_policy) =
+            if index_exists && matches!(purpose, HotEnginePurpose::RemoteSplit) {
+                (
+                    WriterState::read_only(),
+                    Arc::new(tantivy::merge_policy::NoMergePolicy) as Arc<dyn MergePolicy>,
+                )
+            } else {
+                let writer = index.writer(TANTIVY_WRITER_HEAP_BYTES)?;
+                let merge_policy = writer.get_merge_policy();
+                (WriterState::ready(writer), merge_policy)
+            };
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
@@ -1681,7 +1702,7 @@ impl HotEngine {
             index,
             reader,
             reader_reload_lock: Mutex::new(()),
-            writer: Arc::new(RwLock::new(WriterState::ready(writer))),
+            writer: Arc::new(RwLock::new(writer_state)),
             maintenance_lock: Mutex::new(()),
             automatic_merge_policy: RwLock::new(automatic_merge_policy),
             #[cfg(test)]
@@ -4547,10 +4568,18 @@ impl HotEngine {
         let column_store =
             crate::hybrid::column_store::ColumnStore::new(ids, scores, projected_columns);
 
-        // Build type hints from the SqlFieldReader variants so that zero-result
-        // queries still produce correctly-typed Arrow columns (e.g. Float64 for
-        // price) instead of defaulting to Utf8.
+        // Build type hints from the SqlFieldReader variants and authoritative
+        // schema/mapping registry so zero-result or mixed-schema-generation
+        // segments still produce correctly-typed Arrow columns (FS-048).
         let mut type_hints = std::collections::HashMap::new();
+        for column in columns {
+            if registry.field_types.contains_key(column) || schema.get_field(column).is_ok() {
+                type_hints.insert(
+                    column.clone(),
+                    column_kind_for_column(&schema, registry.field_types.get(column), column),
+                );
+            }
+        }
         if let Some(first_segment) = field_plans.first() {
             for (i, column) in columns.iter().enumerate() {
                 let kind = match &first_segment[i] {
@@ -4563,14 +4592,6 @@ impl HotEngine {
                     SqlFieldReader::SourceFallback => continue,
                 };
                 type_hints.insert(column.clone(), kind);
-            }
-        } else {
-            // No segments — derive types from the Tantivy schema directly
-            for column in columns {
-                type_hints.insert(
-                    column.clone(),
-                    column_kind_for_column(&schema, registry.field_types.get(column), column),
-                );
             }
         }
         let batch =
@@ -4591,6 +4612,23 @@ impl HotEngine {
                 .get(name),
             Some(crate::cluster::state::FieldType::Keyword)
         )
+    }
+
+    pub fn has_all_mapped_fields(
+        &self,
+        mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+    ) -> bool {
+        let registry = self
+            .field_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        mappings.iter().all(|(name, mapping)| {
+            matches!(
+                mapping.field_type,
+                crate::cluster::state::FieldType::KnnVector
+            ) || crate::common::is_builtin_body_field(name)
+                || registry.fields.contains_key(name)
+        })
     }
 
     fn validate_keyword_documents<'a>(
@@ -5253,6 +5291,9 @@ impl HotEngine {
                     // Empty bool matches all
                     Ok(Box::new(AllQuery))
                 } else {
+                    if subqueries.iter().all(|(occur, _)| *occur == Occur::MustNot) {
+                        subqueries.insert(0, (Occur::Must, Box::new(AllQuery)));
+                    }
                     Ok(Box::new(BooleanQuery::new(subqueries)))
                 }
             }
@@ -5341,6 +5382,9 @@ impl HotEngine {
                 } else {
                     Ok(Box::new(AllQuery))
                 }
+            }
+            QueryClause::Exists(params) => {
+                crate::search::query_string::build_exists_query(&self.index, &params.field)
             }
             QueryClause::SnapshotFilter(params) => {
                 let excluded_terms = self.build_snapshot_excluded_terms(params)?;
@@ -6842,9 +6886,10 @@ impl HotEngine {
                                 }
 
                                 // Determine if we can use flat array path:
-                                // single-column keyword GROUP BY with known dictionary size < 2M
+                                // single-column keyword GROUP BY with known positive dictionary size < 2M
                                 let use_flat = key_readers.len() == 1
                                     && matches!(key_readers[0], GroupKeyReader::Str(_))
+                                    && key_readers[0].num_terms() > 0
                                     && key_readers[0].num_terms() < 2_000_000;
 
                                 if use_flat {
@@ -7341,28 +7386,32 @@ fn open_num_col(
     let field = schema.get_field(field_name).ok()?;
     let entry = schema.get_field_entry(field);
     match entry.field_type() {
-        tantivy::schema::FieldType::F64(_) => {
-            let col = fast_fields.f64(entry.name()).ok()?;
-            if let Some(values) = get_or_build_cached_grouped_f64(cache_ctx, entry.name(), &col) {
-                Some(NumCol::CachedF64(values))
+        tantivy::schema::FieldType::F64(options) => {
+            if let Ok(col) = fast_fields.f64(entry.name()) {
+                if let Some(values) = get_or_build_cached_grouped_f64(cache_ctx, entry.name(), &col)
+                {
+                    Some(NumCol::CachedF64(values))
+                } else {
+                    Some(NumCol::F64(col))
+                }
+            } else if options.is_fast() {
+                Some(NumCol::CachedF64(std::sync::Arc::from([])))
             } else {
-                Some(NumCol::F64(col))
+                None
             }
         }
-        tantivy::schema::FieldType::I64(_) => {
-            let col = fast_fields.i64(entry.name()).ok()?;
-            if let Some(values) = get_or_build_cached_grouped_i64(cache_ctx, entry.name(), &col) {
-                Some(NumCol::CachedI64(values))
+        tantivy::schema::FieldType::I64(options) | tantivy::schema::FieldType::U64(options) => {
+            if let Ok(col) = fast_fields.i64(entry.name()) {
+                if let Some(values) = get_or_build_cached_grouped_i64(cache_ctx, entry.name(), &col)
+                {
+                    Some(NumCol::CachedI64(values))
+                } else {
+                    Some(NumCol::I64(col))
+                }
+            } else if options.is_fast() {
+                Some(NumCol::CachedI64(std::sync::Arc::from([])))
             } else {
-                Some(NumCol::I64(col))
-            }
-        }
-        tantivy::schema::FieldType::U64(_) => {
-            let col = fast_fields.i64(entry.name()).ok()?;
-            if let Some(values) = get_or_build_cached_grouped_i64(cache_ctx, entry.name(), &col) {
-                Some(NumCol::CachedI64(values))
-            } else {
-                Some(NumCol::I64(col))
+                None
             }
         }
         _ => None,
@@ -7497,8 +7546,7 @@ fn pair_null_bucket_capacity(approx_groups: usize) -> usize {
 
 #[derive(Clone)]
 struct StringFastFieldReader {
-    str_col: tantivy::columnar::StrColumn,
-    ord_col: tantivy::columnar::Column<u64>,
+    inner: Option<(tantivy::columnar::StrColumn, tantivy::columnar::Column<u64>)>,
     cached_ords: Option<std::sync::Arc<[Option<u64>]>>,
 }
 
@@ -7507,10 +7555,16 @@ impl StringFastFieldReader {
         let str_col = fast_fields.str(field_name).ok().flatten()?;
         let ord_col = str_col.ords().clone();
         Some(Self {
-            str_col,
-            ord_col,
+            inner: Some((str_col, ord_col)),
             cached_ords: None,
         })
+    }
+
+    fn empty() -> Self {
+        Self {
+            inner: None,
+            cached_ords: None,
+        }
     }
 
     fn with_cached_ords(mut self, cached_ords: std::sync::Arc<[Option<u64>]>) -> Self {
@@ -7522,8 +7576,10 @@ impl StringFastFieldReader {
     fn first_ord(&self, doc: tantivy::DocId) -> Option<u64> {
         if let Some(cached) = &self.cached_ords {
             cached.get(doc as usize).copied().flatten()
+        } else if let Some((_, ref ord_col)) = self.inner {
+            ord_col.first(doc)
         } else {
-            self.ord_col.first(doc)
+            None
         }
     }
 
@@ -7533,8 +7589,10 @@ impl StringFastFieldReader {
             for (index, doc) in docs.iter().enumerate() {
                 output[index] = cached.get(*doc as usize).copied().flatten();
             }
+        } else if let Some((_, ref ord_col)) = self.inner {
+            ord_col.first_vals(docs, output);
         } else {
-            self.ord_col.first_vals(docs, output);
+            output.fill(None);
         }
     }
 
@@ -7549,11 +7607,16 @@ impl StringFastFieldReader {
 
     #[inline]
     fn ord_to_str(&self, ord: u64, buf: &mut String) -> bool {
-        self.str_col.ord_to_str(ord, buf).unwrap_or(false)
+        self.inner
+            .as_ref()
+            .and_then(|(str_col, _)| str_col.ord_to_str(ord, buf).ok())
+            .unwrap_or(false)
     }
 
     fn num_terms(&self) -> usize {
-        self.str_col.num_terms()
+        self.inner
+            .as_ref()
+            .map_or(0, |(str_col, _)| str_col.num_terms())
     }
 }
 
@@ -7634,6 +7697,11 @@ fn open_sql_field_reader(
             .i64(entry.name())
             .map(SqlFieldReader::I64)
             .unwrap_or(SqlFieldReader::SourceFallback),
+        tantivy::schema::FieldType::Str(options) if options.is_fast() => {
+            let reader = StringFastFieldReader::open(fast_fields, entry.name())
+                .unwrap_or_else(StringFastFieldReader::empty);
+            SqlFieldReader::Str(reader)
+        }
         _ => StringFastFieldReader::open(fast_fields, entry.name())
             .map(SqlFieldReader::Str)
             .unwrap_or(SqlFieldReader::SourceFallback),
@@ -7917,7 +7985,15 @@ fn open_group_key_reader(
     cache_ctx: Option<GroupedCacheContext<'_>>,
 ) -> Option<GroupKeyReader> {
     if let Some(spec) = crate::search::decode_derived_group_key(field_name) {
-        let base = StringFastFieldReader::open(fast_fields, &spec.source_field)?;
+        let base = StringFastFieldReader::open(fast_fields, &spec.source_field).or_else(|| {
+            let field = schema.get_field(&spec.source_field).ok()?;
+            match schema.get_field_entry(field).field_type() {
+                tantivy::schema::FieldType::Str(options) if options.is_fast() => {
+                    Some(StringFastFieldReader::empty())
+                }
+                _ => None,
+            }
+        })?;
         let base = if let Some(cached_ords) =
             get_or_build_cached_grouped_string_ords(cache_ctx, &spec.source_field, &base)
         {
@@ -7933,23 +8009,47 @@ fn open_group_key_reader(
     let field = schema.get_field(field_name).ok()?;
     let entry = schema.get_field_entry(field);
     match entry.field_type() {
-        tantivy::schema::FieldType::F64(_) => {
-            let col = fast_fields.f64(entry.name()).ok()?;
-            if let Some(values) = get_or_build_cached_grouped_f64(cache_ctx, entry.name(), &col) {
-                Some(GroupKeyReader::CachedF64(values))
+        tantivy::schema::FieldType::F64(options) => {
+            if let Ok(col) = fast_fields.f64(entry.name()) {
+                if let Some(values) = get_or_build_cached_grouped_f64(cache_ctx, entry.name(), &col)
+                {
+                    Some(GroupKeyReader::CachedF64(values))
+                } else {
+                    Some(GroupKeyReader::F64(col))
+                }
+            } else if options.is_fast() {
+                Some(GroupKeyReader::CachedF64(std::sync::Arc::from([])))
             } else {
-                Some(GroupKeyReader::F64(col))
+                None
             }
         }
-        tantivy::schema::FieldType::I64(_) | tantivy::schema::FieldType::U64(_) => {
-            let col = fast_fields.i64(entry.name()).ok()?;
-            if let Some(values) = get_or_build_cached_grouped_i64(cache_ctx, entry.name(), &col) {
-                Some(GroupKeyReader::CachedI64(values))
+        tantivy::schema::FieldType::I64(options) | tantivy::schema::FieldType::U64(options) => {
+            if let Ok(col) = fast_fields.i64(entry.name()) {
+                if let Some(values) = get_or_build_cached_grouped_i64(cache_ctx, entry.name(), &col)
+                {
+                    Some(GroupKeyReader::CachedI64(values))
+                } else {
+                    Some(GroupKeyReader::I64(col))
+                }
+            } else if options.is_fast() {
+                Some(GroupKeyReader::CachedI64(std::sync::Arc::from([])))
             } else {
-                Some(GroupKeyReader::I64(col))
+                None
             }
         }
-        tantivy::schema::FieldType::Str(_) | tantivy::schema::FieldType::Bytes(_) => {
+        tantivy::schema::FieldType::Str(options) => {
+            let reader = StringFastFieldReader::open(fast_fields, entry.name())
+                .or_else(|| options.is_fast().then(StringFastFieldReader::empty))?;
+            let reader = if let Some(cached_ords) =
+                get_or_build_cached_grouped_string_ords(cache_ctx, entry.name(), &reader)
+            {
+                base_or_cached(reader, cached_ords)
+            } else {
+                reader
+            };
+            Some(GroupKeyReader::Str(reader))
+        }
+        tantivy::schema::FieldType::Bytes(_) => {
             let reader = StringFastFieldReader::open(fast_fields, entry.name())?;
             let reader = if let Some(cached_ords) =
                 get_or_build_cached_grouped_string_ords(cache_ctx, entry.name(), &reader)
@@ -7962,6 +8062,13 @@ fn open_group_key_reader(
         }
         _ => None,
     }
+}
+
+fn base_or_cached(
+    reader: StringFastFieldReader,
+    cached_ords: std::sync::Arc<[Option<u64>]>,
+) -> StringFastFieldReader {
+    reader.with_cached_ords(cached_ords)
 }
 
 struct ResolvedGroupedAggSpec {
@@ -9823,6 +9930,22 @@ impl tantivy::collector::Collector for AggCollector {
         for spec in &self.specs {
             if let Some(data) = merged.remove(&spec.name) {
                 results.insert(spec.name.clone(), convert_to_partial(&spec.kind, data));
+            } else if matches!(spec.kind, AggKind::Terms)
+                && self
+                    .schema
+                    .get_field(&spec.field_name)
+                    .ok()
+                    .is_some_and(|f| self.schema.get_field_entry(f).is_fast())
+            {
+                results.insert(
+                    spec.name.clone(),
+                    convert_to_partial(
+                        &spec.kind,
+                        SegmentAggData::Terms {
+                            counts: HashMap::new(),
+                        },
+                    ),
+                );
             }
         }
         Ok(results)

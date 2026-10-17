@@ -1266,7 +1266,7 @@ and update traffic is measured separately from query traffic.
 
 ### FS-047 — Scale Split Assignment, Retry, And Partial-Failure Semantics
 
-**Class:** Scale blocker | **Gate:** 3 | **Depends on:** FS-028, FS-029, FS-046
+**Status:** Implemented (`assign_remote_store_splits` $O(S \cdot L)$ bounded top-$K$ candidate selection, `RemoteStoreSchedulingStats`, snapshot-pinned `assignment_ids`, `duplicate_responses_suppressed`, `split_error_is_terminal`, `allow_partial_search_results`, and `EXPLAIN ANALYZE` scheduling telemetry) | **Class:** Scale blocker | **Gate:** 3 | **Depends on:** FS-028, FS-029, FS-046
 
 **Evidence:** rendezvous ranking and assignment cost grows with split/leaf
 counts; root/leaf retries lack a complete request-ID and error contract.
@@ -1281,7 +1281,7 @@ ANALYZE reports assignment, cache, retry, and byte costs.
 
 ### FS-048 — Execute Mixed Schema Generations Safely
 
-**Class:** Release blocker | **Gate:** 3 | **Depends on:** FS-005, FS-039
+**Status:** Implemented (`SchemaLineageMetadata`, `GET/PUT/POST /{index}/_mapping`, `validate_manifest_for_metadata`, `QueryClause::Exists`, `StringFastFieldReader::empty`, typed-null materialization across DSL and SQL, incompatible field-type rejection, and compaction schema-generation upgrade) | **Class:** Release blocker | **Gate:** 3 | **Depends on:** FS-005, FS-039
 
 **Evidence:** a single schema hash currently assumes all readable splits share
 one mapping fingerprint.
@@ -1296,7 +1296,7 @@ is tested, and rollback retains a readable generation.
 
 ### FS-049 — Enforce Tenant-Aware Security And Resource Isolation
 
-**Class:** Release blocker | **Gate:** 3 | **Depends on:** FS-030, FS-031, FS-033
+**Status:** Implemented (`TenantQuotaConfig`, `TenantQuotaLease`, `AuditLogEntry`, `AuditOutcome`, `GET /_security/audit`, `GET/PUT/DELETE /_security/quota*`, `validate_external_object_store_uri`, cross-tenant task/cache/`_cat`/semijoin isolation, and body-routed target-index charging) | **Class:** Release blocker | **Gate:** 3 | **Depends on:** FS-030, FS-031, FS-033
 
 **Evidence:** HTTP authn/authz and transport TLS exist, but admission, object
 storage, task execution, audit, and caches do not yet form a tenant isolation
@@ -1312,7 +1312,7 @@ complete/redacted, and adversarial multi-tenant tests show bounded isolation.
 
 ### FS-050 — Produce The Production V1 And Research Evidence Package
 
-**Class:** Release blocker + research opportunity | **Gate:** 4 | **Depends on:** FS-006, FS-008,
+**Status:** Implemented ([`docs/production-v1-and-research-evidence.md`](production-v1-and-research-evidence.md) and `fs047_050_scale_scheduling_mixed_schema_generations_tenant_isolation_and_research_evidence_suite`) | **Class:** Release blocker + research opportunity | **Gate:** 4 | **Depends on:** FS-006, FS-008,
 FS-019, FS-037, FS-041, FS-042, FS-047, FS-048, FS-049
 
 **Evidence:** FerrisSearch's defensible thesis—search-aware pruning, cache-aware

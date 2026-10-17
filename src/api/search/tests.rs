@@ -301,6 +301,7 @@ fn sql_response_body_includes_remote_store_pruning_stats_when_present() {
             candidate_splits: 1,
             pruned_splits: 1,
             assigned_splits: 1,
+            ..Default::default()
         }),
         timings: crate::hybrid::SqlTimings::default(),
     };

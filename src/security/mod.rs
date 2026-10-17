@@ -13,6 +13,43 @@ use std::sync::{Arc, RwLock};
 use crate::cluster::state::{ClusterState, SecurityRoleDefinition};
 
 pub const SECURITY_INDEX_NAME: &str = ".ferris_security";
+pub const INTERNAL_QUOTA_ROLE_PREFIX: &str = "__quota:";
+
+pub fn encode_quota_role_record(
+    scope: &str,
+    id: &str,
+    quota: TenantQuotaConfig,
+) -> SecurityRoleDefinition {
+    let mut cluster = Vec::new();
+    if let Some(c) = quota.max_concurrent_requests {
+        cluster.push(format!("max_concurrent_requests={c}"));
+    }
+    if let Some(b) = quota.max_inflight_bytes {
+        cluster.push(format!("max_inflight_bytes={b}"));
+    }
+    SecurityRoleDefinition {
+        name: format!("{INTERNAL_QUOTA_ROLE_PREFIX}{scope}:{id}"),
+        cluster,
+        indices: Vec::new(),
+        index_privileges: Vec::new(),
+    }
+}
+
+pub fn decode_quota_role_record(
+    role: &SecurityRoleDefinition,
+) -> Option<(&str, &str, TenantQuotaConfig)> {
+    let rest = role.name.strip_prefix(INTERNAL_QUOTA_ROLE_PREFIX)?;
+    let (scope, id) = rest.split_once(':')?;
+    let mut cfg = TenantQuotaConfig::default();
+    for entry in &role.cluster {
+        if let Some(v) = entry.strip_prefix("max_concurrent_requests=") {
+            cfg.max_concurrent_requests = v.parse::<usize>().ok();
+        } else if let Some(v) = entry.strip_prefix("max_inflight_bytes=") {
+            cfg.max_inflight_bytes = v.parse::<u64>().ok();
+        }
+    }
+    Some((scope, id, cfg))
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SecurityConfig {
@@ -57,6 +94,168 @@ pub enum SecurityAction {
     MetricsRead,
 }
 
+impl SecurityAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ClusterMonitor => "cluster:monitor",
+            Self::ClusterStateRead => "cluster:state",
+            Self::ClusterAdmin => "cluster:admin",
+            Self::IndexRead => "indices:data/read",
+            Self::IndexWrite => "indices:data/write",
+            Self::IndexAdmin => "indices:admin",
+            Self::SecurityAdmin => "cluster:admin/security",
+            Self::MetricsRead => "cluster:monitor/metrics",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantQuotaConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_requests: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inflight_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditOutcome {
+    Allowed,
+    Unauthenticated,
+    Forbidden,
+    QuotaExceeded,
+}
+
+impl AuditOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::Unauthenticated => "unauthenticated",
+            Self::Forbidden => "forbidden",
+            Self::QuotaExceeded => "quota_exceeded",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label.trim() {
+            "allowed" => Some(Self::Allowed),
+            "unauthenticated" => Some(Self::Unauthenticated),
+            "forbidden" => Some(Self::Forbidden),
+            "quota_exceeded" => Some(Self::QuotaExceeded),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditLogEntry {
+    pub seq: u64,
+    pub timestamp_epoch_ms: u64,
+    pub request_id: String,
+    pub principal_id: String,
+    pub principal_name: String,
+    pub action: String,
+    pub method: String,
+    pub path: String,
+    pub target_indices: Vec<String>,
+    pub outcome: AuditOutcome,
+    pub status: u16,
+    pub reason: String,
+    pub redacted: bool,
+}
+
+#[derive(Debug, Default)]
+struct TenantQuotaEntry {
+    config: TenantQuotaConfig,
+    active_requests: usize,
+    inflight_bytes: u64,
+    rejected_concurrency_total: u64,
+    rejected_bytes_total: u64,
+    admitted_total: u64,
+}
+
+#[derive(Debug, Default)]
+struct TenantQuotaState {
+    principal_quotas: std::collections::HashMap<String, TenantQuotaEntry>,
+    index_quotas: std::collections::HashMap<String, TenantQuotaEntry>,
+}
+
+const DEFAULT_MAX_AUDIT_LOG_ENTRIES: usize = 4_096;
+
+#[derive(Debug)]
+struct AuditLogState {
+    next_seq: u64,
+    max_entries: usize,
+    entries: std::collections::VecDeque<AuditLogEntry>,
+}
+
+impl Default for AuditLogState {
+    fn default() -> Self {
+        Self {
+            next_seq: 1,
+            max_entries: DEFAULT_MAX_AUDIT_LOG_ENTRIES,
+            entries: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+pub struct TenantQuotaBytesGuard {
+    manager: Arc<SecurityManager>,
+    principal_id: Option<String>,
+    index_name: Option<String>,
+    reserved_bytes: u64,
+}
+
+impl Drop for TenantQuotaBytesGuard {
+    fn drop(&mut self) {
+        let mut guard = self
+            .manager
+            .quotas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(ref pid) = self.principal_id
+            && let Some(entry) = guard.principal_quotas.get_mut(pid)
+        {
+            entry.inflight_bytes = entry.inflight_bytes.saturating_sub(self.reserved_bytes);
+        }
+        if let Some(ref idx) = self.index_name
+            && let Some(entry) = guard.index_quotas.get_mut(idx)
+        {
+            entry.inflight_bytes = entry.inflight_bytes.saturating_sub(self.reserved_bytes);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct TenantQuotaLease {
+    manager: Arc<SecurityManager>,
+    principal_id: Option<String>,
+    index_name: Option<String>,
+    reserved_bytes: u64,
+}
+
+impl Drop for TenantQuotaLease {
+    fn drop(&mut self) {
+        let mut guard = self
+            .manager
+            .quotas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(ref pid) = self.principal_id
+            && let Some(entry) = guard.principal_quotas.get_mut(pid)
+        {
+            entry.active_requests = entry.active_requests.saturating_sub(1);
+            entry.inflight_bytes = entry.inflight_bytes.saturating_sub(self.reserved_bytes);
+        }
+        if let Some(ref idx) = self.index_name
+            && let Some(entry) = guard.index_quotas.get_mut(idx)
+        {
+            entry.active_requests = entry.active_requests.saturating_sub(1);
+            entry.inflight_bytes = entry.inflight_bytes.saturating_sub(self.reserved_bytes);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ClassifiedRequest {
     pub action: SecurityAction,
@@ -93,6 +292,8 @@ pub struct SecurityManager {
     /// Shared, Raft-replicated cluster state for dynamic API keys/roles. `None`
     /// for the static-only constructors (`new`/`disabled`) used in unit tests.
     dynamic_state: Option<Arc<RwLock<ClusterState>>>,
+    quotas: std::sync::Mutex<TenantQuotaState>,
+    audit_log: std::sync::Mutex<AuditLogState>,
 }
 
 impl SecurityManager {
@@ -142,6 +343,8 @@ impl SecurityManager {
             auto_create_security_index: config.auto_create_security_index,
             api_keys,
             dynamic_state,
+            quotas: std::sync::Mutex::new(TenantQuotaState::default()),
+            audit_log: std::sync::Mutex::new(AuditLogState::default()),
         })
     }
 
@@ -151,6 +354,8 @@ impl SecurityManager {
             auto_create_security_index: false,
             api_keys: Vec::new(),
             dynamic_state: None,
+            quotas: std::sync::Mutex::new(TenantQuotaState::default()),
+            audit_log: std::sync::Mutex::new(AuditLogState::default()),
         }
     }
 
@@ -232,6 +437,50 @@ impl SecurityManager {
         false
     }
 
+    pub fn find_principal_by_id(&self, key_id: &str) -> Option<Principal> {
+        if let Some(record) = self.api_keys.iter().find(|r| r.id == key_id) {
+            return Some(Principal {
+                name: record.name.clone(),
+                key_id: record.id.clone(),
+                roles: record.roles.clone(),
+                indices: record.indices.clone(),
+            });
+        }
+        if let Some(state) = &self.dynamic_state {
+            let guard = state.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(record) = guard.api_keys.get(key_id) {
+                return Some(Principal {
+                    name: record.name.clone(),
+                    key_id: record.id.clone(),
+                    roles: record.roles.clone(),
+                    indices: record.indices.clone(),
+                });
+            }
+        }
+        None
+    }
+
+    pub fn authorize_current_request_index(
+        &self,
+        action: SecurityAction,
+        index_name: &str,
+    ) -> Result<(), SecurityError> {
+        if !self.enabled() {
+            return Ok(());
+        }
+        let Some((key_id, _)) = crate::worker::current_request_principal() else {
+            return Ok(());
+        };
+        let principal = self.find_principal_by_id(&key_id);
+        self.authorize_or_error(
+            principal.as_ref(),
+            &ClassifiedRequest {
+                action,
+                index: Some(index_name.to_string()),
+            },
+        )
+    }
+
     pub fn authorize_or_error(
         &self,
         principal: Option<&Principal>,
@@ -259,6 +508,355 @@ impl SecurityManager {
             })
         }
     }
+
+    pub fn set_principal_quota(&self, principal_id: &str, quota: TenantQuotaConfig) {
+        let mut guard = self.quotas.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = guard
+            .principal_quotas
+            .entry(principal_id.to_string())
+            .or_default();
+        entry.config = quota;
+    }
+
+    pub fn remove_principal_quota(&self, principal_id: &str) -> bool {
+        self.quotas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .principal_quotas
+            .remove(principal_id)
+            .is_some()
+    }
+
+    pub fn set_index_quota(&self, index_name: &str, quota: TenantQuotaConfig) {
+        let mut guard = self.quotas.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = guard
+            .index_quotas
+            .entry(index_name.to_string())
+            .or_default();
+        entry.config = quota;
+    }
+
+    pub fn remove_index_quota(&self, index_name: &str) -> bool {
+        self.quotas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .index_quotas
+            .remove(index_name)
+            .is_some()
+    }
+
+    fn sync_dynamic_quotas_locked(&self, guard: &mut TenantQuotaState) {
+        let Some(ref state) = self.dynamic_state else {
+            return;
+        };
+        let cs = state.read().unwrap_or_else(|e| e.into_inner());
+        for role in cs.roles.values() {
+            if let Some((scope, id, cfg)) = decode_quota_role_record(role) {
+                match scope {
+                    "principal" => {
+                        guard
+                            .principal_quotas
+                            .entry(id.to_string())
+                            .or_default()
+                            .config = cfg;
+                    }
+                    "index" => {
+                        guard.index_quotas.entry(id.to_string()).or_default().config = cfg;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    pub fn quota_snapshot(&self) -> serde_json::Value {
+        let mut guard = self.quotas.lock().unwrap_or_else(|e| e.into_inner());
+        self.sync_dynamic_quotas_locked(&mut guard);
+        let mut principals = serde_json::Map::new();
+        for (id, entry) in &guard.principal_quotas {
+            principals.insert(
+                id.clone(),
+                serde_json::json!({
+                    "max_concurrent_requests": entry.config.max_concurrent_requests,
+                    "max_inflight_bytes": entry.config.max_inflight_bytes,
+                    "active_requests": entry.active_requests,
+                    "inflight_bytes": entry.inflight_bytes,
+                    "admitted_total": entry.admitted_total,
+                    "rejected_concurrency_total": entry.rejected_concurrency_total,
+                    "rejected_bytes_total": entry.rejected_bytes_total,
+                }),
+            );
+        }
+        let mut indices = serde_json::Map::new();
+        for (idx, entry) in &guard.index_quotas {
+            indices.insert(
+                idx.clone(),
+                serde_json::json!({
+                    "max_concurrent_requests": entry.config.max_concurrent_requests,
+                    "max_inflight_bytes": entry.config.max_inflight_bytes,
+                    "active_requests": entry.active_requests,
+                    "inflight_bytes": entry.inflight_bytes,
+                    "admitted_total": entry.admitted_total,
+                    "rejected_concurrency_total": entry.rejected_concurrency_total,
+                    "rejected_bytes_total": entry.rejected_bytes_total,
+                }),
+            );
+        }
+        serde_json::json!({
+            "principals": principals,
+            "indices": indices,
+        })
+    }
+
+    pub fn acquire_quota_lease(
+        self: &Arc<Self>,
+        principal_id: Option<&str>,
+        index_name: Option<&str>,
+        bytes: u64,
+    ) -> Result<TenantQuotaLease, SecurityError> {
+        let mut guard = self.quotas.lock().unwrap_or_else(|e| e.into_inner());
+        self.sync_dynamic_quotas_locked(&mut guard);
+        if let Some(pid) = principal_id
+            && let Some(entry) = guard.principal_quotas.get_mut(pid)
+        {
+            if let Some(max_conc) = entry.config.max_concurrent_requests
+                && entry.active_requests >= max_conc
+            {
+                entry.rejected_concurrency_total += 1;
+                return Err(SecurityError {
+                    status: StatusCode::TOO_MANY_REQUESTS,
+                    error_type: "tenant_quota_exceeded_exception",
+                    reason: "principal concurrent request quota exceeded",
+                });
+            }
+            if let Some(max_bytes) = entry.config.max_inflight_bytes
+                && entry.inflight_bytes.saturating_add(bytes) > max_bytes
+            {
+                entry.rejected_bytes_total += 1;
+                return Err(SecurityError {
+                    status: StatusCode::TOO_MANY_REQUESTS,
+                    error_type: "tenant_quota_exceeded_exception",
+                    reason: "principal inflight byte quota exceeded",
+                });
+            }
+        }
+        if let Some(idx) = index_name
+            && let Some(entry) = guard.index_quotas.get_mut(idx)
+        {
+            if let Some(max_conc) = entry.config.max_concurrent_requests
+                && entry.active_requests >= max_conc
+            {
+                entry.rejected_concurrency_total += 1;
+                return Err(SecurityError {
+                    status: StatusCode::TOO_MANY_REQUESTS,
+                    error_type: "tenant_quota_exceeded_exception",
+                    reason: "index concurrent request quota exceeded",
+                });
+            }
+            if let Some(max_bytes) = entry.config.max_inflight_bytes
+                && entry.inflight_bytes.saturating_add(bytes) > max_bytes
+            {
+                entry.rejected_bytes_total += 1;
+                return Err(SecurityError {
+                    status: StatusCode::TOO_MANY_REQUESTS,
+                    error_type: "tenant_quota_exceeded_exception",
+                    reason: "index inflight byte quota exceeded",
+                });
+            }
+        }
+
+        let mut leased_principal = None;
+        if let Some(pid) = principal_id
+            && let Some(entry) = guard.principal_quotas.get_mut(pid)
+        {
+            entry.active_requests += 1;
+            entry.inflight_bytes = entry.inflight_bytes.saturating_add(bytes);
+            entry.admitted_total += 1;
+            leased_principal = Some(pid.to_string());
+        }
+        let mut leased_index = None;
+        if let Some(idx) = index_name
+            && let Some(entry) = guard.index_quotas.get_mut(idx)
+        {
+            entry.active_requests += 1;
+            entry.inflight_bytes = entry.inflight_bytes.saturating_add(bytes);
+            entry.admitted_total += 1;
+            leased_index = Some(idx.to_string());
+        }
+        drop(guard);
+
+        Ok(TenantQuotaLease {
+            manager: Arc::clone(self),
+            principal_id: leased_principal,
+            index_name: leased_index,
+            reserved_bytes: bytes,
+        })
+    }
+
+    pub fn charge_additional_quota_bytes(
+        self: &Arc<Self>,
+        principal_id: Option<&str>,
+        index_name: Option<&str>,
+        bytes: u64,
+    ) -> Result<TenantQuotaBytesGuard, SecurityError> {
+        if bytes == 0 {
+            return Ok(TenantQuotaBytesGuard {
+                manager: Arc::clone(self),
+                principal_id: None,
+                index_name: None,
+                reserved_bytes: 0,
+            });
+        }
+        let mut guard = self.quotas.lock().unwrap_or_else(|e| e.into_inner());
+        self.sync_dynamic_quotas_locked(&mut guard);
+        if let Some(pid) = principal_id
+            && let Some(entry) = guard.principal_quotas.get_mut(pid)
+            && let Some(max_bytes) = entry.config.max_inflight_bytes
+            && entry.inflight_bytes.saturating_add(bytes) > max_bytes
+        {
+            entry.rejected_bytes_total += 1;
+            return Err(SecurityError {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                error_type: "tenant_quota_exceeded_exception",
+                reason: "principal inflight byte quota exceeded",
+            });
+        }
+        if let Some(idx) = index_name
+            && let Some(entry) = guard.index_quotas.get_mut(idx)
+            && let Some(max_bytes) = entry.config.max_inflight_bytes
+            && entry.inflight_bytes.saturating_add(bytes) > max_bytes
+        {
+            entry.rejected_bytes_total += 1;
+            return Err(SecurityError {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                error_type: "tenant_quota_exceeded_exception",
+                reason: "index inflight byte quota exceeded",
+            });
+        }
+        let mut leased_principal = None;
+        if let Some(pid) = principal_id
+            && let Some(entry) = guard.principal_quotas.get_mut(pid)
+        {
+            entry.inflight_bytes = entry.inflight_bytes.saturating_add(bytes);
+            leased_principal = Some(pid.to_string());
+        }
+        let mut leased_index = None;
+        if let Some(idx) = index_name
+            && let Some(entry) = guard.index_quotas.get_mut(idx)
+        {
+            entry.inflight_bytes = entry.inflight_bytes.saturating_add(bytes);
+            leased_index = Some(idx.to_string());
+        }
+        drop(guard);
+        Ok(TenantQuotaBytesGuard {
+            manager: Arc::clone(self),
+            principal_id: leased_principal,
+            index_name: leased_index,
+            reserved_bytes: bytes,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_audit_event(
+        &self,
+        principal: Option<&Principal>,
+        action: SecurityAction,
+        method: &str,
+        path: &str,
+        target_indices: &[String],
+        outcome: AuditOutcome,
+        status: u16,
+        reason: &str,
+        had_auth_header: bool,
+    ) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let req_id = crate::worker::current_request_context()
+            .map(|ctx| ctx.trace_ids().request_id)
+            .unwrap_or_else(|| "req-0".to_string());
+        let (clean_path, path_redacted) = redact_sensitive_audit_text(path);
+        let (clean_reason, reason_redacted) = redact_sensitive_audit_text(reason);
+        let (principal_id, principal_name) = match principal {
+            Some(p) => (p.key_id.clone(), p.name.clone()),
+            None => crate::worker::current_request_principal()
+                .unwrap_or_else(|| ("anonymous".to_string(), "anonymous".to_string())),
+        };
+        let mut audit = self.audit_log.lock().unwrap_or_else(|e| e.into_inner());
+        let seq = audit.next_seq;
+        audit.next_seq = audit.next_seq.saturating_add(1);
+        let entry = AuditLogEntry {
+            seq,
+            timestamp_epoch_ms: now_ms,
+            request_id: req_id,
+            principal_id,
+            principal_name,
+            action: action.as_str().to_string(),
+            method: method.to_string(),
+            path: clean_path,
+            target_indices: target_indices.to_vec(),
+            outcome,
+            status,
+            reason: clean_reason,
+            redacted: had_auth_header || path_redacted || reason_redacted,
+        };
+        audit.entries.push_back(entry);
+        let cap = audit.max_entries.max(1);
+        while audit.entries.len() > cap {
+            audit.entries.pop_front();
+        }
+    }
+
+    pub fn audit_log_entries(
+        &self,
+        principal_filter: Option<&str>,
+        outcome_filter: Option<AuditOutcome>,
+        limit: usize,
+    ) -> (u64, Vec<AuditLogEntry>) {
+        let audit = self.audit_log.lock().unwrap_or_else(|e| e.into_inner());
+        let total = audit.next_seq.saturating_sub(1);
+        let cap = limit.clamp(1, 1_000);
+        let filtered: Vec<AuditLogEntry> = audit
+            .entries
+            .iter()
+            .rev()
+            .filter(|e| {
+                principal_filter.is_none_or(|pf| e.principal_id == pf || e.principal_name == pf)
+                    && outcome_filter.is_none_or(|of| e.outcome == of)
+            })
+            .take(cap)
+            .cloned()
+            .collect();
+        (total, filtered)
+    }
+}
+
+pub fn redact_sensitive_audit_text(input: &str) -> (String, bool) {
+    let lower = input.to_ascii_lowercase();
+    for marker in [
+        "apikey ",
+        "bearer ",
+        "authorization:",
+        "aws_secret_access_key",
+        "aws_session_token",
+        "private_key",
+        "secret=",
+        "api_key=",
+        "password=",
+        "sha256:",
+    ] {
+        if lower.contains(marker) {
+            return ("[REDACTED]".to_string(), true);
+        }
+    }
+    // Redact any raw 64-character hex token (API key secret or SHA-256 hash).
+    for token in input.split(|c: char| !c.is_ascii_hexdigit()) {
+        if token.len() == 64 {
+            return (input.replace(token, "[REDACTED]"), true);
+        }
+    }
+    (input.to_string(), false)
 }
 
 pub async fn auth_middleware(
@@ -266,12 +864,59 @@ pub async fn auth_middleware(
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let classified = classify_request(&method, &path);
+    if let Some(ref idx) = classified.index {
+        crate::worker::add_current_request_index(idx);
+    }
+    let content_len = req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+
     if !security.enabled() {
+        let _quota_lease = match security.acquire_quota_lease(
+            Some("anonymous"),
+            classified.index.as_deref(),
+            content_len,
+        ) {
+            Ok(lease) => lease,
+            Err(err) => {
+                let indices = crate::worker::current_request_indices();
+                security.record_audit_event(
+                    None,
+                    classified.action,
+                    method.as_str(),
+                    &path,
+                    &indices,
+                    AuditOutcome::QuotaExceeded,
+                    err.status.as_u16(),
+                    err.reason,
+                    false,
+                );
+                return security_error(err.status, err.error_type, err.reason);
+            }
+        };
         return next.run(req).await;
     }
 
-    let classified = classify_request(req.method(), req.uri().path());
+    let had_auth_header = req.headers().contains_key(header::AUTHORIZATION);
     let Some(api_key) = extract_api_key(&req) else {
+        let indices = crate::worker::current_request_indices();
+        security.record_audit_event(
+            None,
+            classified.action,
+            method.as_str(),
+            &path,
+            &indices,
+            AuditOutcome::Unauthenticated,
+            StatusCode::UNAUTHORIZED.as_u16(),
+            "missing Authorization header",
+            had_auth_header,
+        );
         return security_error(
             StatusCode::UNAUTHORIZED,
             "security_exception",
@@ -280,6 +925,18 @@ pub async fn auth_middleware(
     };
 
     let Some(principal) = security.authenticate_api_key(api_key) else {
+        let indices = crate::worker::current_request_indices();
+        security.record_audit_event(
+            None,
+            classified.action,
+            method.as_str(),
+            &path,
+            &indices,
+            AuditOutcome::Unauthenticated,
+            StatusCode::UNAUTHORIZED.as_u16(),
+            "invalid API key",
+            true,
+        );
         return security_error(
             StatusCode::UNAUTHORIZED,
             "security_exception",
@@ -287,7 +944,21 @@ pub async fn auth_middleware(
         );
     };
 
+    crate::worker::set_current_request_principal(&principal.key_id, &principal.name);
+
     if !security.authorize(&principal, &classified) {
+        let indices = crate::worker::current_request_indices();
+        security.record_audit_event(
+            Some(&principal),
+            classified.action,
+            method.as_str(),
+            &path,
+            &indices,
+            AuditOutcome::Forbidden,
+            StatusCode::FORBIDDEN.as_u16(),
+            "insufficient permissions",
+            true,
+        );
         return security_error(
             StatusCode::FORBIDDEN,
             "security_exception",
@@ -295,8 +966,57 @@ pub async fn auth_middleware(
         );
     }
 
-    req.extensions_mut().insert(principal);
-    next.run(req).await
+    let _quota_lease = match security.acquire_quota_lease(
+        Some(&principal.key_id),
+        classified.index.as_deref(),
+        content_len,
+    ) {
+        Ok(lease) => lease,
+        Err(err) => {
+            let indices = crate::worker::current_request_indices();
+            security.record_audit_event(
+                Some(&principal),
+                classified.action,
+                method.as_str(),
+                &path,
+                &indices,
+                AuditOutcome::QuotaExceeded,
+                err.status.as_u16(),
+                err.reason,
+                true,
+            );
+            return security_error(err.status, err.error_type, err.reason);
+        }
+    };
+
+    req.extensions_mut().insert(principal.clone());
+    let response = next.run(req).await;
+    let indices = crate::worker::current_request_indices();
+    let effective_status = crate::worker::current_request_security_denial()
+        .and_then(|s| StatusCode::from_u16(s).ok())
+        .unwrap_or_else(|| response.status());
+    let status = effective_status.as_u16();
+    let (outcome, reason) = match effective_status {
+        StatusCode::FORBIDDEN => (AuditOutcome::Forbidden, "insufficient permissions"),
+        StatusCode::TOO_MANY_REQUESTS => (
+            AuditOutcome::QuotaExceeded,
+            "quota or admission limit exceeded",
+        ),
+        StatusCode::UNAUTHORIZED => (AuditOutcome::Unauthenticated, "unauthenticated"),
+        _ => (AuditOutcome::Allowed, "authorized"),
+    };
+    security.record_audit_event(
+        Some(&principal),
+        classified.action,
+        method.as_str(),
+        &path,
+        &indices,
+        outcome,
+        status,
+        reason,
+        true,
+    );
+    response
 }
 
 pub fn is_protected_system_index(index: &str) -> bool {
@@ -449,7 +1169,7 @@ fn classify_index_action(method: &Method, action: &str) -> SecurityAction {
         },
         "_update" | "_create" | "_bulk" => SecurityAction::IndexWrite,
         "_search" | "_count" | "_sql" => SecurityAction::IndexRead,
-        "_settings" => match *method {
+        "_settings" | "_mapping" | "_mappings" => match *method {
             Method::GET => SecurityAction::IndexRead,
             _ => SecurityAction::IndexAdmin,
         },
@@ -562,14 +1282,7 @@ fn extract_api_key(req: &Request<Body>) -> Option<&str> {
 }
 
 fn security_error(status: StatusCode, error_type: &str, reason: &str) -> Response {
-    (
-        status,
-        Json(serde_json::json!({
-            "error": { "type": error_type, "reason": reason },
-            "status": status.as_u16()
-        })),
-    )
-        .into_response()
+    crate::api::error_response(status, error_type, reason).into_response()
 }
 
 fn normalize_sha256_hash(hash: &str) -> Option<String> {
@@ -1008,5 +1721,78 @@ mod tests {
     fn hex_encode_roundtrips_known_bytes() {
         assert_eq!(hex_encode(&[0x00, 0x0f, 0xa0, 0xff]), "000fa0ff");
         assert_eq!(hex_encode(&[]), "");
+    }
+
+    #[test]
+    fn fs049_tenant_quotas_and_redacted_audit_log_enforce_isolation() {
+        let manager = Arc::new(
+            SecurityManager::new(SecurityConfig {
+                enabled: true,
+                auto_create_security_index: false,
+                bootstrap_api_keys: vec![SecurityApiKeyConfig {
+                    id: "tenant-a".into(),
+                    name: "tenant-a-user".into(),
+                    hash_sha256: sha256_hex("secret-a"),
+                    roles: vec!["write".into()],
+                    indices: vec!["tenant-a-*".into()],
+                }],
+            })
+            .unwrap(),
+        );
+        manager.set_principal_quota(
+            "tenant-a",
+            TenantQuotaConfig {
+                max_concurrent_requests: Some(1),
+                max_inflight_bytes: Some(1024),
+            },
+        );
+        manager.set_index_quota(
+            "tenant-a-logs",
+            TenantQuotaConfig {
+                max_concurrent_requests: Some(2),
+                max_inflight_bytes: Some(512),
+            },
+        );
+
+        let lease1 = manager
+            .acquire_quota_lease(Some("tenant-a"), Some("tenant-a-logs"), 256)
+            .expect("first request within quota must succeed");
+
+        // Second concurrent request for tenant-a must fail with 429 Too Many Requests.
+        let err_conc = manager
+            .acquire_quota_lease(Some("tenant-a"), Some("tenant-a-logs"), 64)
+            .expect_err("second concurrent request must exceed principal concurrency quota");
+        assert_eq!(err_conc.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(err_conc.error_type, "tenant_quota_exceeded_exception");
+
+        drop(lease1);
+
+        // Request exceeding index byte quota (600 > 512) must fail with 429.
+        let err_bytes = manager
+            .acquire_quota_lease(Some("tenant-a"), Some("tenant-a-logs"), 600)
+            .expect_err("request exceeding index byte quota must be rejected");
+        assert_eq!(err_bytes.status, StatusCode::TOO_MANY_REQUESTS);
+
+        // Verify redaction of bearer/api_key and 64-char hex hashes in audit events.
+        let raw_hash = "a".repeat(64);
+        manager.record_audit_event(
+            None,
+            SecurityAction::IndexRead,
+            "GET",
+            "/tenant-a-logs/_search?api_key=supersecret",
+            &["tenant-a-logs".to_string()],
+            AuditOutcome::Unauthenticated,
+            401,
+            &format!("presented invalid hash {raw_hash}"),
+            true,
+        );
+        let (total, entries) =
+            manager.audit_log_entries(None, Some(AuditOutcome::Unauthenticated), 10);
+        assert_eq!(total, 1);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].redacted);
+        assert_eq!(entries[0].path, "[REDACTED]");
+        assert!(!entries[0].reason.contains(&raw_hash));
+        assert!(entries[0].reason.contains("[REDACTED]"));
     }
 }

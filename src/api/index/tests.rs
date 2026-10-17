@@ -114,6 +114,7 @@ fn remote_store_search_stats_response_json_contains_pruning_counters() {
         candidate_splits: 2,
         pruned_splits: 3,
         assigned_splits: 2,
+        ..Default::default()
     };
 
     assert_eq!(
