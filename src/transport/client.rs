@@ -356,6 +356,15 @@ impl TransportClient {
         Ok(version)
     }
 
+    fn observe_optional_response_state<T>(&self, response: &tonic::Response<T>, index_name: &str) {
+        if let Ok(Some(version)) = crate::transport::state_wait::decode_optional_u64(
+            response.metadata(),
+            crate::transport::state_wait::STATE_VERSION_HEADER,
+        ) {
+            self.acknowledge_state(index_name, version);
+        }
+    }
+
     async fn wait_for_response_state<T>(
         &self,
         response: &tonic::Response<T>,
@@ -582,8 +591,9 @@ impl TransportClient {
         let response = client
             .index_doc(request)
             .await
-            .map_err(super::write_failure::WriteFailure::from_rpc_status)?
-            .into_inner();
+            .map_err(super::write_failure::WriteFailure::from_rpc_status)?;
+        self.observe_optional_response_state(&response, &index_name);
+        let response = response.into_inner();
         if response.success {
             super::write_acknowledgement::validate_write_acknowledgement(
                 response.write_acknowledgement.as_ref(),
@@ -630,8 +640,9 @@ impl TransportClient {
         let response = client
             .bulk_index(request)
             .await
-            .map_err(super::write_failure::WriteFailure::from_rpc_status)?
-            .into_inner();
+            .map_err(super::write_failure::WriteFailure::from_rpc_status)?;
+        self.observe_optional_response_state(&response, index_name);
+        let response = response.into_inner();
         if response.success && !docs.is_empty() {
             super::write_acknowledgement::validate_write_acknowledgement(
                 response.write_acknowledgement.as_ref(),
@@ -886,8 +897,9 @@ impl TransportClient {
         let response = client
             .bulk_index(request)
             .await
-            .map_err(super::write_failure::WriteFailure::from_rpc_status)?
-            .into_inner();
+            .map_err(super::write_failure::WriteFailure::from_rpc_status)?;
+        self.observe_optional_response_state(&response, index_name);
+        let response = response.into_inner();
         decode_shard_bulk_operations_response(docs, refresh, &node.id, response)
             .map_err(super::write_failure::WriteFailure::after_dispatch)
     }
