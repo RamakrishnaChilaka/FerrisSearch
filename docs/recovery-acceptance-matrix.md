@@ -506,3 +506,109 @@ The current design does not set production recovery-time or foreground-latency
 targets without measurements. Resource limits themselves are testable contracts:
 report configured budgets, observed usage, fixed overhead, and violations.
 Performance certification is a later result, separate from safety certification.
+
+## D10 Process Qualification Evidence (October 18, 2026)
+
+**Scope:** Bounded failover/rejoin qualification, not production sign-off or
+unrestricted divergent-history recovery. No production implementation changes
+were needed for the exercised schedules.
+
+**Source and environment:** Base `3371b948a5cd56aae41c2db72bb6f7839735e249`
+plus the test-only qualification in
+[`tests/restart_regression/d10_qualification.rs`](../tests/restart_regression/d10_qualification.rs)
+and its existing process harness. The run used Rust `1.99.0`, Cargo `1.99.0`,
+the checked-in lockfile, Linux x86-64/WSL2, the `protocol-trace` feature,
+unoptimized builds with dev/test debug information disabled, and no incremental
+compilation. These are correctness results, not latency or recovery-time claims.
+
+### Exercised Schedule And Outcomes
+
+The final schedule passed three repetitions with three independent node
+processes, real Raft/gRPC, one local shard, two replicas, request durability,
+and `minimum_durable_copies = 2`. Each repetition starts with eight documents.
+Two rounds each release eight client mutations together: an update/update
+pair, a delete/delete pair, and two update/delete pairs.
+
+| Boundary | Observed result | Matrix coverage |
+|---|---|---|
+| Discard successful update and delete replies at client ingress, after a non-primary coordinator receives the backend response. | The submitting socket receives zero response bytes. Retrying each stable client `operation_id` after promotion, rejoin, and another replica restart returns the original sequence, term, version, and result without allocating another operation. | External client-response-loss and retained retry portions of W07/W08. This is not W03's primary-to-coordinator response-loss boundary. |
+| Concurrent conditional mutations before and after primary loss. | Each round has four successes and four HTTP409 conflicts, with at least one successful update and delete. The source oracle identifies each winning update; losers do not advance sequence allocation. | Bounded update/delete portions of W01/W05. |
+| Kill the primary process after recording exact copy state. | A surviving in-sync replica obtains fresh ACTIVE authority in a higher term. Both survivors preserve the acknowledged values/deletes and accept new operations with the two-copy floor. | F01 and the failover portion of E01. |
+| Restart the old primary after further updates and deletes. | It rejoins as an in-sync replica under a fresh allocation. Every local copy matches the exact source/absence oracle; durable identity, canonical certificate, and replica fence match applied Raft metadata. | Bounded stale-copy rejoin portions of R02/R08/E01. |
+| Flush all copies, then restart the recovered replica again. | Original retry receipts survive, retrying an earlier update does not overwrite its newer value, deletes stay absent, and all three processed/persisted checkpoints equal the final maximum sequence. | Flush/restart/snapshot-transfer portions of W07; no clock-skew or retry-epoch-retirement claim. |
+
+The ten pre-existing restart regressions and
+`live_stale_primary_requests_fail_after_real_raft_promotion` also passed.
+The latter uses real in-memory Raft nodes and live transport, rather than OS
+process isolation: it pauses old-primary work before replication, partitions
+metadata, promotes/fences the new copies, rejects delayed old requests without
+target mutation, and peer-recovers the old copy under a fresh allocation.
+The `canonical` library-name filter passed 19 tests, and the serialized
+write-authority witness passed its strict checker and ten validator controls.
+
+An initial qualification attempt failed because its checkpoint-only probe ran
+immediately after ordinary replica restart, before the local engine reopened.
+The corrected fixture verifies exact local document reads before sampling
+sequence state. It does not skip a copy, relax an oracle assertion, add a
+settling sleep, or change the production protocol. Retain that failed attempt
+alongside successful runs.
+
+### Reproduction And Retained Evidence
+
+```bash
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}"
+export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+export CARGO_INCREMENTAL=0
+export CARGO_BIN_EXE_ferrissearch="$CARGO_TARGET_DIR/debug/ferrissearch"
+export FERRIS_RECOVERY_TEST_LOG_DIR="$PWD/target/recovery-qualification"
+mkdir -p "$FERRIS_RECOVERY_TEST_LOG_DIR"
+export STALE_PRIMARY_EVIDENCE_OUTPUT="$FERRIS_RECOVERY_TEST_LOG_DIR/stale-primary.jsonl"
+
+cargo test --locked --features protocol-trace \
+  --test restart_regression --test stale_primary_failover \
+  -- --test-threads=1 --nocapture
+
+# Repeat only the combined qualification schedule.
+cargo test --locked --features protocol-trace \
+  --test restart_regression d10_qualification -- --nocapture
+```
+
+`FERRIS_RECOVERY_TEST_LOG_DIR` retains per-run child logs and
+`d10-qualification.jsonl`, including successful and failed attempts. Its
+per-run subdirectories inherit tempfile's hidden `.tmp*` names. The journal
+records response-loss barriers, original/retried receipts, conditional
+outcomes, routing/authority transitions, the exact source/absence oracle,
+and final per-copy checkpoints. New child guards kill and reap owned
+processes even if startup or an assertion fails.
+
+The qualification run also retained a machine-readable summary, source and
+lockfile hashes, toolchain/build provenance, command output, the stale-primary
+observations, the serialized authority witness, and the complete TLC log.
+These session artifacts are not a substitute for running the checked-in
+regressions on a later source revision.
+
+### Formal And Fault-Model Limits
+
+The unchanged fast TLA+ matrix matched all 80 configured expected outcomes,
+including negative controls, on October 18, 2026. The pinned TLA+ tools
+`1.7.4` reported TLC `2.19`. Within its two-copy, two-operation,
+two-authority-epoch, one-restart bounds, the supplementary FS013 checks
+also allow one missing-replica-proof intent, one post-WAL failure, and one
+metadata-quorum outage/restoration:
+
+| Configuration | Generated / distinct states | Depth | Outcome |
+|---|---|---|---|
+| `fs013-one` | 122,629 / 51,450 | 24 | Safety invariants pass with copy floor one. |
+| `fs013-two` | 107,129 / 43,200 | 23 | Safety invariants pass with copy floor two. |
+
+The [formal-model record](../specs/tla/README.md#supplementary-fs013-authority-checks)
+owns the individual model assumptions and retained negative controls. These
+bounded checks are not a general D10 proof or evidence of byte-level power-loss
+durability.
+
+The combined process schedule covers client-response loss and process
+crash/restart with intact disks. Metadata partition and delayed old-term work
+are exercised separately by the live stale-primary suite. It does not combine
+those faults with disk loss, storage-I/O failure, asynchronous durability, or
+encrypted transport. Unrestricted conflicting-history rollback, vector snapshot
+recovery, and recovery-time/resource certification remain outside this record.
