@@ -609,6 +609,19 @@ cargo test -- test_name                         # Single test by name
   cause, stop realtime reads, promote a live ISR copy, and recover the repaired
   old process under fresh allocation. Verify known and uncertain operations
   plus all final durable certificates; never heal the old in-process copy.
+- `tests/restart_regression/d10_qualification.rs` combines discarded client
+  update/delete replies, concurrent conditional mutations, primary process
+  loss, promotion, and old-primary rejoin. Preserve successful updates and
+  deletes in each concurrent round, exact retry receipts without sequence
+  allocation, and per-copy oracle/certificate/checkpoint checks.
+- After an ordinary replica restart, verify local document reads before
+  sampling its sequence-state RPC. Applied in-sync metadata does not imply
+  that its engine has reopened.
+- `FERRIS_RECOVERY_TEST_LOG_DIR` optionally retains per-run child logs and the
+  D10 phase/receipt oracle journal. Keep those artifacts for failed schedules
+  too. Every spawned child has a kill/reap guard, including failed startup.
+  This coverage does not qualify power loss, unrestricted divergence rollback,
+  or vector snapshot recovery.
 
 ### Request Crash Regression (tests/request_crash_regression.rs)
 - Use child processes for abort-reproducing requests and worker probes; an

@@ -17,6 +17,9 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::OwnedMutexGuard;
 
+#[path = "restart_regression/d10_qualification.rs"]
+mod d10_qualification;
+
 const INDEX_NAME: &str = "restart-regression";
 const CLUSTER_NAME: &str = "restart-regression-cluster";
 const DOC_COUNT: usize = 12_000;
@@ -133,6 +136,22 @@ impl NodeProcess {
     }
 }
 
+impl Drop for NodeProcess {
+    fn drop(&mut self) {
+        match self.child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => {
+                if let Err(error) = self.child.kill() {
+                    eprintln!("failed to kill test node {}: {error}", self.child.id());
+                }
+                if let Err(error) = self.child.wait() {
+                    eprintln!("failed to reap test node {}: {error}", self.child.id());
+                }
+            }
+        }
+    }
+}
+
 struct RestartClusterHarness {
     _process_guard: OwnedMutexGuard<()>,
     _temp_dir: TempDir,
@@ -149,6 +168,16 @@ impl RestartClusterHarness {
     async fn start_with_peer_recovery_limit(limit: Option<usize>) -> Result<Self> {
         let process_guard = process_test_lock().clone().lock_owned().await;
         let temp_dir = tempfile::tempdir()?;
+        let log_dir = match std::env::var_os("FERRIS_RECOVERY_TEST_LOG_DIR") {
+            Some(root) => PathBuf::from(root).join(
+                temp_dir
+                    .path()
+                    .file_name()
+                    .context("recovery test directory has no name")?,
+            ),
+            None => temp_dir.path().to_path_buf(),
+        };
+        fs::create_dir_all(&log_dir)?;
         let port_reservations = (0..6)
             .map(|_| TcpListener::bind("127.0.0.1:0"))
             .collect::<std::io::Result<Vec<_>>>()?;
@@ -161,7 +190,7 @@ impl RestartClusterHarness {
             .map(|(position, idx)| NodeConfig {
                 name: format!("node-{idx}"),
                 data_dir: temp_dir.path().join(format!("node-{idx}")),
-                log_path: temp_dir.path().join(format!("node-{idx}.log")),
+                log_path: log_dir.join(format!("node-{idx}.log")),
                 http_port: ports[position * 2],
                 transport_port: ports[position * 2 + 1],
                 raft_node_id: idx as u64,
